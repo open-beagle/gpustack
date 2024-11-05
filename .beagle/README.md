@@ -40,3 +40,20 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.3.2 \
   --worker-ip <host-ip> --server-url http://myserver --token mytoken
 ```
+
+## build
+
+```bash
+# cann
+docker run -it --rm \
+  -v $PWD/:/go/src/github.com/open-beagle/gpustack \
+  -w /go/src/github.com/open-beagle/gpustack \
+  --entrypoint=bash \
+  registry.cn-qingdao.aliyuncs.com/wod/cann:py310
+
+python3 -m venv $PWD/.venv
+source $PWD/.venv/bin/activate
+git config --global --add safe.directory /go/src/github.com/open-beagle/gpustack
+export PIP_USE_PEP517=1
+make build
+```
