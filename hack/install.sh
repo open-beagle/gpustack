@@ -44,6 +44,8 @@ function download_ui() {
   fi
   cp -a "${tmp_ui_path}/ui/dist/." "${ui_path}"
 
+  cp -r ${ROOT_DIR}/.beagle/static/* ${ROOT_DIR}/gpustack/ui/static/
+
   rm -rf "${tmp_ui_path}"
 }
 
