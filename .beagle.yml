@@ -20,7 +20,7 @@ steps:
         from_secret: SOCKS5_PROXY
 
   - name: python
-    image: registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
     environment:
       VERSION: v0.3.2
       POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
@@ -33,34 +33,34 @@ steps:
       - make build
 
   - name: docker-cuda
-    image: registry.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
     volumes:
       - name: docker
         path: /var/run/docker.sock
     settings:
-      base: registry.cn-qingdao.aliyuncs.com/wod/cuda:12.4.1-py310
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.4.1-py310
       dockerfile: .beagle/cuda.dockerfile
       repo: wod/gpustack
       version: "v0.3.2-cuda"
       args: "TARGETOS=linux,TARGETARCH=amd64"
-      registry: registry.cn-qingdao.aliyuncs.com
+      registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
         from_secret: REGISTRY_USER_ALIYUN
       registry_password:
         from_secret: REGISTRY_PASSWORD_ALIYUN
 
   - name: docker-cann
-    image: registry.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
     volumes:
       - name: docker
         path: /var/run/docker.sock
     settings:
-      base: registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3-py310-kernel910b
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3-py310-kernel910b
       dockerfile: .beagle/cann.dockerfile
       repo: wod/gpustack
       version: "v0.3.2-cann"
       args: "TARGETOS=linux,TARGETARCH=arm64"
-      registry: registry.cn-qingdao.aliyuncs.com
+      registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
         from_secret: REGISTRY_USER_ALIYUN
       registry_password:
