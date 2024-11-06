@@ -17,7 +17,7 @@ COPY dist/*.whl /tmp/
 
 RUN WHEEL_PACKAGE="$(ls /tmp/*_aarch64.whl)" && \
   pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
-  pip3 install $WHEEL_PACKAGE &&\
+  pip3 install --use-pep517 $WHEEL_PACKAGE &&\
   rm /tmp/*.whl && \
   pip3 cache purge
 
