@@ -51,14 +51,7 @@ docker run -it --rm \
   -e VERSION=v0.3.2 \
   -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
-  bash
-
-rm -rf $PWD/.venv
-python3 -m venv $PWD/.venv
-source $PWD/.venv/bin/activate
-git config --global --add safe.directory /go/src/github.com/open-beagle/gpustack
-pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
-make build
+  bash .beagle/build.sh
 ```
 
 ## cache
