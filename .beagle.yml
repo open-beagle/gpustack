@@ -13,6 +13,19 @@ clone:
   disable: true
 
 steps:
+  - name: s3-cache
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-s3-cache:1.0
+    settings:
+      restore: true
+      mount:
+        - ./.git
+        - ./.venv
+      endpoint: https://cache.ali.wodcloud.com
+      access_key:
+        from_secret: S3_ACCESS_KEY_ALIYUN
+      secret_key:
+        from_secret: S3_SECRET_KEY_ALIYUN
+
   - name: fetch
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-git:1.0
     settings:
@@ -70,6 +83,20 @@ kind: secret
 name: SOCKS5_PROXY
 get:
   name: SOCKS5_PROXY
+  path: devops-secrets
+
+---
+kind: secret
+name: REGISTRY_USER_ALIYUN
+get:
+  name: REGISTRY_USER_ALIYUN
+  path: devops-secrets
+
+---
+kind: secret
+name: REGISTRY_PASSWORD_ALIYUN
+get:
+  name: REGISTRY_PASSWORD_ALIYUN
   path: devops-secrets
 
 ---
