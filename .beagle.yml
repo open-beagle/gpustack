@@ -6,6 +6,11 @@ trigger:
   branch:
     - dev
 
+volumes:
+  - name: docker
+    host:
+      path: /var/run/docker.sock
+      
 workspace:
   path: /go/src/github.com/open-beagle/gpustack
 
