@@ -48,12 +48,15 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
-  --entrypoint=bash \
-  registry.cn-qingdao.aliyuncs.com/wod/cann:py310
+  -e VERSION=v0.3.2 \
+  -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
+  registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
+  bash
 
+rm -rf $PWD/.venv
 python3 -m venv $PWD/.venv
 source $PWD/.venv/bin/activate
 git config --global --add safe.directory /go/src/github.com/open-beagle/gpustack
-export PIP_USE_PEP517=1
+pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 make build
 ```

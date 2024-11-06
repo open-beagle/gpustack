@@ -64,6 +64,7 @@ function set_version() {
   gpustack::util::sed "s/__git_commit__ = .*/__git_commit__ = '${git_commit_short}'/" "${version_file}"
 
   # Update the poetry version
+  pip install msgpack
   poetry version "${GIT_VERSION}"
 }
 

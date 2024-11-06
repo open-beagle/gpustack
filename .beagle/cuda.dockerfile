@@ -1,4 +1,4 @@
-ARG BASE=registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3-py310-kernel910b
+ARG BASE=registry.cn-qingdao.aliyuncs.com/wod/cuda:12.4.1-py310
 
 FROM $BASE
 
@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY dist/*.whl /tmp/
 
-RUN WHEEL_PACKAGE="$(ls /tmp/*_aarch64.whl)" && \
+RUN WHEEL_PACKAGE="$(ls /tmp/*_x86_64.whl)[vllm]" && \
   pip3 install $WHEEL_PACKAGE &&\
   rm /tmp/*.whl && \
   pip3 cache purge
