@@ -23,6 +23,7 @@ steps:
     image: registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
     environment:
       VERSION: v0.3.2
+      POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
     commands:
       - rm -rf $PWD/.venv
       - git config --global --add safe.directory /go/src/github.com/open-beagle/gpustack
