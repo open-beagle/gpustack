@@ -29,7 +29,8 @@ docker push registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.3.2
 docker run -d --gpus all -p 6080:80 --ipc=host --shm-size=2g --name gpustack \
   -v /data/gpustack:/var/lib/gpustack \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.3.2 \
-  --bootstrap-password 'beagle!@#123'
+  --bootstrap-password 'beagle!@#123' \
+  --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
 docker rm -f gpustack && rm -rf /data/gpustack
 
@@ -38,6 +39,30 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /data/gpustack:/var/lib/gpustack \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.3.2 \
+  --worker-ip <host-ip> --server-url http://myserver --token mytoken
+```
+
+## deployNPU
+
+```bash
+# default user admin
+docker run -d -p 6080:80 --privileged --ipc=host --shm-size=2g --name gpustack \
+  -v /usr/share/hwdata:/usr/share/hwdata \
+  -v /data/gpustack/data:/var/lib/gpustack \
+  -e ASCEND_VISIBLE_DEVICES=0-7 \
+  -e TZ=Asia/Shanghai \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.2-cann \
+  --bootstrap-password 'beagle!@#123' \
+  --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
+
+docker rm -f gpustack && rm -rf /data/gpustack
+
+# start worker node
+docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
+  -p 10150:10150 -p 40000-41024:40000-41024 \
+  -v /usr/share/hwdata:/usr/share/hwdata \
+  -v /data/gpustack/data:/var/lib/gpustack \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.2-cann \
   --worker-ip <host-ip> --server-url http://myserver --token mytoken
 ```
 
@@ -52,6 +77,39 @@ docker run -it --rm \
   -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
   bash .beagle/build.sh
+```
+
+## tools
+
+```bash
+# llama-box
+export LLAMA_BOX_VERSION=v0.0.73 && \
+mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
+curl -x socks5://www.ali.wodcloud.com:1283 \
+  -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip \
+  -fL https://github.com/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip
+
+# gguf-parser-go
+export GGUF_PARSER_GO_VERSION=v0.12.0 && \
+mkdir -p ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION} && \
+curl -x socks5://www.ali.wodcloud.com:1283 \
+  -o ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-arm64 \
+  -fL https://github.com/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-arm64
+
+# fastfetch
+export FASTFETCH_VERSION=2.25.0.1 && \
+mkdir -p ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION} && \
+curl -x socks5://www.ali.wodcloud.com:1283 \
+  -o ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-aarch64.zip \
+  -fL https://github.com/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-aarch64.zip
+
+export FASTFETCH_VERSION=2.25.0.1 && \
+mkdir -p ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION} && \
+curl -x socks5://www.ali.wodcloud.com:1283 \
+  -o ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-aarch64.rpm \
+  -fL https://github.com/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-aarch64.rpm
+
+mc cp -r ./downloads/gpustack/ aliyun/vscode/gpustack/
 ```
 
 ## cache
