@@ -46,6 +46,8 @@ function download_ui() {
 
   cp -r ${ROOT_DIR}/.beagle/static/* ${ROOT_DIR}/gpustack/ui/static/
 
+  echo "div[id^="rc-menu-uuid-"][id$="-help"]{display:none;}" >> ${ROOT_DIR}/gpustack/ui/css/umi.1730856620935.css
+
   rm -rf "${tmp_ui_path}"
 }
 
