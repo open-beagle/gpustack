@@ -46,7 +46,10 @@ function download_ui() {
 
   cp -r ${ROOT_DIR}/.beagle/static/* ${ROOT_DIR}/gpustack/ui/static/
 
-  echo "div[id^="rc-menu-uuid-"][id$="-help"]{display:none;}" >> ${ROOT_DIR}/gpustack/ui/css/umi.1730856620935.css
+  # 禁用help&lang菜单
+  UMI_CSS="$(ls ${ROOT_DIR}/gpustack/ui/css/umi.*.css)"
+  echo "div[data-menu-id^="rc-menu-uuid-"][data-menu-id$="-help"]{display:none;}" >> $UMI_CSS
+  echo "div[data-menu-id^="rc-menu-uuid-"][data-menu-id$="-lang"]{display:none;}" >> $UMI_CSS
 
   rm -rf "${tmp_ui_path}"
 }
