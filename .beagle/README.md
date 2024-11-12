@@ -58,10 +58,11 @@ docker run -d -p 6080:80 --privileged --ipc=host --shm-size=2g --name gpustack \
 docker rm -f gpustack && rm -rf /data/gpustack
 
 # start worker node
-docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
+docker run -d --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /usr/share/hwdata:/usr/share/hwdata \
   -v /data/gpustack/data:/var/lib/gpustack \
+  -e ASCEND_VISIBLE_DEVICES=0-7 \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.2-cann \
   --worker-ip <host-ip> --server-url http://myserver --token mytoken
 ```
