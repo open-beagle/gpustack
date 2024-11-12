@@ -39,7 +39,9 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /data/gpustack:/var/lib/gpustack \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.3.2 \
-  --worker-ip <host-ip> --server-url http://myserver --token mytoken
+  --server-url http://myserver --token mytoken \
+  --worker-ip <host-ip> \
+  --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 ```
 
 ## deployNPU
@@ -64,7 +66,9 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   -v /data/gpustack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.2-cann \
-  --worker-ip <host-ip> --server-url http://myserver --token mytoken
+  --server-url http://myserver:6080 --token mytoken \
+  --worker-ip <host-ip>  \
+  --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 ```
 
 ## build
