@@ -46,14 +46,22 @@ function download_ui() {
 
   cp -r ${ROOT_DIR}/.beagle/static/* ${ROOT_DIR}/gpustack/ui/static/
 
+  # 登录页-修改版权信息
+  UMI_JS="$(ls ${ROOT_DIR}/gpustack/ui/js/umi.*.js)"
+  sed 's/数澈软件/北京比格/g' $UMI_JS >/tmp/umi.js
+  mv /tmp/umi.js $UMI_JS
+
+  # 登录页-修改帮助超链接
+  sed 's/https:\/\/docs.gpustack.ai/https:\/\/www.bc-cloud.com/g' ${ROOT_DIR}/gpustack/ui/index.html >/tmp/index.html
+  mv /tmp/index.html ${ROOT_DIR}/gpustack/ui/index.html
+
   # 禁用help&lang菜单
   UMI_CSS="$(ls ${ROOT_DIR}/gpustack/ui/css/umi.*.css)"
-  echo "div[data-menu-id^="rc-menu-uuid-"][data-menu-id$="-help"]{display:none;}" >> $UMI_CSS
-  echo "div[data-menu-id^="rc-menu-uuid-"][data-menu-id$="-lang"]{display:none;}" >> $UMI_CSS
+  echo "div[data-menu-id^="rc-menu-uuid-"][data-menu-id$="-help"]{display:none;}" >>$UMI_CSS
+  echo "div[data-menu-id^="rc-menu-uuid-"][data-menu-id$="-lang"]{display:none;}" >>$UMI_CSS
 
   rm -rf "${tmp_ui_path}"
 }
-
 
 #
 # main
