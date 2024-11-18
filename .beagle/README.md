@@ -86,33 +86,72 @@ docker run -it --rm \
 
 ## tools
 
+### aarch64 cann
+
 ```bash
+rm -rf ./downloads/gpustack/
+
 # llama-box
 export LLAMA_BOX_VERSION=v0.0.73 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
-curl -x socks5://www.ali.wodcloud.com:1283 \
+curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip \
   -fL https://github.com/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip
 
 # gguf-parser-go
 export GGUF_PARSER_GO_VERSION=v0.12.0 && \
 mkdir -p ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION} && \
-curl -x socks5://www.ali.wodcloud.com:1283 \
+curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-arm64 \
   -fL https://github.com/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-arm64
 
 # fastfetch
 export FASTFETCH_VERSION=2.25.0.1 && \
 mkdir -p ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION} && \
-curl -x socks5://www.ali.wodcloud.com:1283 \
+curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-aarch64.zip \
   -fL https://github.com/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-aarch64.zip
 
 export FASTFETCH_VERSION=2.25.0.1 && \
 mkdir -p ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION} && \
-curl -x socks5://www.ali.wodcloud.com:1283 \
+curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-aarch64.rpm \
   -fL https://github.com/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-aarch64.rpm
+
+mc cp -r ./downloads/gpustack/ aliyun/vscode/gpustack/
+```
+
+### amd64 cuda 12.4
+
+```bash
+rm -rf ./downloads/gpustack/
+
+# llama-box
+export LLAMA_BOX_VERSION=v0.0.73 && \
+mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
+curl -x $SOCKS5_PROXY_LOCAL \
+  -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-amd64-cuda-12.4.zip \
+  -fL https://github.com/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-amd64-cuda-12.4.zip
+
+# gguf-parser-go
+export GGUF_PARSER_GO_VERSION=v0.12.0 && \
+mkdir -p ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION} && \
+curl -x $SOCKS5_PROXY_LOCAL \
+  -o ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-amd64 \
+  -fL https://github.com/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-amd64
+
+# fastfetch
+export FASTFETCH_VERSION=2.25.0.1 && \
+mkdir -p ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION} && \
+curl -x $SOCKS5_PROXY_LOCAL \
+  -o ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-amd64.zip \
+  -fL https://github.com/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-amd64.zip
+
+export FASTFETCH_VERSION=2.25.0.1 && \
+mkdir -p ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION} && \
+curl -x $SOCKS5_PROXY_LOCAL \
+  -o ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-amd64.rpm \
+  -fL https://github.com/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION}/fastfetch-linux-amd64.rpm
 
 mc cp -r ./downloads/gpustack/ aliyun/vscode/gpustack/
 ```
