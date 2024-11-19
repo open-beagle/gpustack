@@ -51,7 +51,7 @@ steps:
       - name: docker
         path: /var/run/docker.sock
     settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.4.1-py310
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04
       dockerfile: .beagle/cuda.dockerfile
       repo: wod/gpustack
       version: "v0.3.3-cuda"
