@@ -25,6 +25,7 @@ RUN WHEEL_PACKAGE="$(ls /tmp/**-any.whl)[vllm]" && \
   rm /tmp/*.whl && \
   pip3 cache purge
 
-RUN gpustack download-tools --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
+RUN gpustack download-tools \
+  --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
 ENTRYPOINT [ "gpustack", "start" ]

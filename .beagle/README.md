@@ -112,19 +112,34 @@ docker run -it --rm \
     tzdata \
     python3 \
     python3-pip && \
-  timedatectl set-timezone Asia/Shanghai && \
   WHEEL_PACKAGE="$(ls /go/src/github.com/open-beagle/gpustack/dist/*.whl)[vllm]" && \
   pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
   pip3 install $WHEEL_PACKAGE
 
   gpustack download-tools --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
+docker pull registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1 && \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
   -e DEBIAN_FRONTEND=noninteractive \
   registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1 \
   bash
+
+  apt-get update && apt-get install -y \
+    git \
+    curl \
+    wget \
+    tzdata \
+    python3 \
+    python3-pip && \
+  WHEEL_PACKAGE="$(ls /go/src/github.com/open-beagle/gpustack/dist/*.whl)" && \
+  pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
+  pip3 install $WHEEL_PACKAGE
+
+  gpustack download-tools \
+    --arch arm64 --device npu \
+    --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 ```
 
 ## tools
