@@ -9,9 +9,14 @@ LABEL maintainer=$AUTHOR version=$VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
-  wget \
-  tzdata \
-  && rm -rf /var/lib/apt/lists/*
+    git \
+    curl \
+    wget \
+    tzdata \
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && timedatectl set-timezone Asia/Shanghai
 
 COPY dist/*.whl /tmp/
 
