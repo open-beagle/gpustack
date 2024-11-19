@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY dist/*.whl /tmp/
 
-RUN WHEEL_PACKAGE="$(ls /tmp/*_aarch64.whl)" && \
+RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
   pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
   pip3 install --use-pep517 $WHEEL_PACKAGE &&\
   rm /tmp/*.whl && \

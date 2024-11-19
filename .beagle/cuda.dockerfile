@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY dist/*.whl /tmp/
 
-RUN WHEEL_PACKAGE="$(ls /tmp/*_x86_64.whl)[vllm]" && \
+RUN WHEEL_PACKAGE="$(ls /tmp/**-any.whl)[vllm]" && \
   pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
   pip3 install $WHEEL_PACKAGE &&\
   rm /tmp/*.whl && \
