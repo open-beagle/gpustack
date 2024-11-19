@@ -9,7 +9,8 @@ git remote add upstream git@github.com:gpustack/gpustack.git
 
 git fetch upstream
 
-git merge 0.3.2
+# 0.3.2
+git merge upstream/main
 ```
 
 ## images
@@ -53,7 +54,7 @@ docker run -d -p 6080:80 --privileged --ipc=host --shm-size=2g --name gpustack \
   -v /data/gpustack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.2-cann \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.3-cann \
   --bootstrap-password 'beagle!@#123' \
   --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
@@ -65,7 +66,7 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   -v /usr/share/hwdata:/usr/share/hwdata \
   -v /data/gpustack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.2-cann \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.3-cann \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip>  \
   --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
@@ -78,7 +79,7 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
-  -e VERSION=v0.3.2 \
+  -e VERSION=v0.3.3 \
   -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
   bash .beagle/build.sh
