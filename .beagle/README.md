@@ -32,7 +32,7 @@ docker tag nvidia/cuda:12.5.1-runtime-ubuntu22.04 registry.cn-qingdao.aliyuncs.c
 docker push registry.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04
 
 # cann
-docker pull ascendai/cann:ubuntu-python3.10-cann8.0.rc3.beta1 && \
+docker pull --platform=linux/arm64 ascendai/cann:ubuntu-python3.10-cann8.0.rc3.beta1 && \
 docker tag ascendai/cann:ubuntu-python3.10-cann8.0.rc3.beta1 registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1 && \
 docker push registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1
 ```
@@ -118,6 +118,13 @@ docker run -it --rm \
   pip3 install $WHEEL_PACKAGE
 
   gpustack download-tools --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
+
+docker run -it --rm \
+  -v $PWD/:/go/src/github.com/open-beagle/gpustack \
+  -w /go/src/github.com/open-beagle/gpustack \
+  -e DEBIAN_FRONTEND=noninteractive \
+  registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1 \
+  bash
 ```
 
 ## tools
