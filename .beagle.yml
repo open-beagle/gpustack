@@ -94,7 +94,7 @@ steps:
   - name: harbor-cuda
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:v0.3.3-cuda
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:v0.3.2-cuda
       target: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:v0.3-cuda
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -105,7 +105,7 @@ steps:
   - name: harbor-cann
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:v0.3.3-cann
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:v0.3.2-cann
       target: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:v0.3-cann
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
