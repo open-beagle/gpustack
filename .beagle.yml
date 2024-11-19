@@ -68,7 +68,7 @@ steps:
       - name: docker
         path: /var/run/docker.sock
     settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3-py310-kernel910b
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1
       dockerfile: .beagle/cann.dockerfile
       repo: wod/gpustack
       version: "v0.3.3-cann"
