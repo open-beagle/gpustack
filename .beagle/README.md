@@ -23,6 +23,20 @@ docker tag gpustack/gpustack:0.3.2 registry.cn-qingdao.aliyuncs.com/wod/gpustack
 docker push registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.3.2
 ```
 
+## base images
+
+```bash
+# cuda
+docker pull nvidia/cuda:12.5.1-runtime-ubuntu22.04 && \
+docker tag nvidia/cuda:12.5.1-runtime-ubuntu22.04 registry.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04 && \
+docker push registry.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04
+
+# cann
+docker pull ascendai/cann:ubuntu-python3.10-cann8.0.rc3.beta1 && \
+docker tag ascendai/cann:ubuntu-python3.10-cann8.0.rc3.beta1 registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1 && \
+docker push registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1
+```
+
 ## deploy
 
 ```bash
@@ -83,6 +97,27 @@ docker run -it --rm \
   -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
   bash .beagle/build.sh
+
+docker run -it --rm \
+  -v $PWD/:/go/src/github.com/open-beagle/gpustack \
+  -w /go/src/github.com/open-beagle/gpustack \
+  -e DEBIAN_FRONTEND=noninteractive \
+  registry.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04 \
+  bash
+
+  apt-get update && apt-get install -y \
+    git \
+    curl \
+    wget \
+    tzdata \
+    python3 \
+    python3-pip && \
+  timedatectl set-timezone Asia/Shanghai && \
+  WHEEL_PACKAGE="$(ls /go/src/github.com/open-beagle/gpustack/dist/*.whl)[vllm]" && \
+  pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
+  pip3 install $WHEEL_PACKAGE
+
+  gpustack download-tools --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 ```
 
 ## tools
@@ -93,7 +128,7 @@ docker run -it --rm \
 rm -rf ./downloads/gpustack/
 
 # llama-box
-export LLAMA_BOX_VERSION=v0.0.73 && \
+export LLAMA_BOX_VERSION=v0.0.79 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip \
@@ -125,10 +160,10 @@ mc cp -r ./downloads/gpustack/ aliyun/vscode/gpustack/
 ### amd64 cuda 12.4
 
 ```bash
-rm -rf ./downloads/gpustack/
+rm -rf ./downloads/gpustack/ && mkdir -p ./downloads/gpustack
 
 # llama-box
-export LLAMA_BOX_VERSION=v0.0.73 && \
+export LLAMA_BOX_VERSION=v0.0.79 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-amd64-cuda-12.4.zip \
