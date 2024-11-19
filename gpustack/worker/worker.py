@@ -2,6 +2,7 @@ import asyncio
 import os
 import logging
 import socket
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -11,6 +12,7 @@ from pathlib import Path
 
 from gpustack.config import Config
 from gpustack.schemas.workers import SystemReserved, WorkerUpdate
+from gpustack.utils import platform
 from gpustack.utils.network import get_first_non_loopback_ip
 from gpustack.client import ClientSet
 from gpustack.logging import setup_logging
@@ -110,11 +112,18 @@ class Worker:
 
         tools_manager = ToolsManager(
             tools_download_base_url=self._config.tools_download_base_url,
-            gpu_devices=self._config.get_gpu_devices(),
+            device=self.get_device_by_gpu_devices(),
         )
         tools_manager.prepare_tools()
 
         asyncio.run(self.start_async())
+
+    def get_device_by_gpu_devices(self) -> Optional[str]:
+        gpu_devices = self._config.get_gpu_devices()
+        if gpu_devices:
+            vendor = gpu_devices[0].vendor
+            return platform.device_from_vendor(vendor)
+        return None
 
     async def start_async(self):
         """
@@ -133,8 +142,11 @@ class Worker:
 
         # Report the worker node status to the server every 30 seconds.
         run_periodically_in_thread(self._worker_manager.sync_worker_status, 30)
-        # Start rpc server instances with restart.
-        run_periodically_in_thread(self._worker_manager.start_rpc_servers, 20, 3)
+
+        if not self._config.disable_rpc_servers:
+            # Start rpc server instances with restart.
+            run_periodically_in_thread(self._worker_manager.start_rpc_servers, 20, 3)
+
         # Monitor the processes of model instances every 60 seconds.
         run_periodically_in_thread(self._serve_manager.monitor_processes, 60)
         # Watch model instances with retry.

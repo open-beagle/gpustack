@@ -5,9 +5,9 @@ from pathlib import Path
 import shutil
 import stat
 import time
+from typing import Optional
 import zipfile
 import requests
-from gpustack.schemas.workers import GPUDevicesInfo
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils import platform
 
@@ -24,7 +24,11 @@ class ToolsManager:
     """
 
     def __init__(
-        self, tools_download_base_url: str = None, gpu_devices: GPUDevicesInfo = None
+        self,
+        tools_download_base_url: str = None,
+        device: Optional[str] = None,
+        system: Optional[str] = None,
+        arch: Optional[str] = None,
     ):
         with pkg_resources.path("gpustack.third_party", "bin") as bin_path:
             self.bin_path: Path = bin_path
@@ -38,17 +42,10 @@ class ToolsManager:
                 except Exception as e:
                     logger.warning(f"Failed to load versions.json: {e}")
 
-        self._os = platform.system()
-        self._arch = platform.arch()
-        self._device = platform.device()
+        self._os = system if system else platform.system()
+        self._arch = arch if arch else platform.arch()
+        self._device = device if device else platform.device()
         self._download_base_url = tools_download_base_url
-
-        if not self._download_base_url:
-            self._check_and_set_download_base_url()
-
-        if gpu_devices:
-            vendor = gpu_devices[0].vendor
-            self._device = platform.device_from_vendor(vendor)
 
     def _check_and_set_download_base_url(self):
         urls = [
@@ -82,8 +79,43 @@ class ToolsManager:
         self.download_gguf_parser()
         self.download_fastfetch()
 
+    def remove_cached_tools(self):
+        """
+        Remove all cached tools.
+        """
+        if os.path.exists(self.bin_path):
+            shutil.rmtree(self.bin_path)
+
+    def save_archive(self, archive_path: str):
+        """
+        Save all downloaded tools as a tar archive.
+        """
+        # Ensure the directory exists
+        target_dir = os.path.dirname(archive_path)
+        if target_dir and not os.path.exists(target_dir):
+            os.makedirs(target_dir)
+
+        # Remove extension from archive_path for make_archive. e.g., .tar.gz
+        base_name = os.path.splitext(os.path.splitext(archive_path)[0])[0]
+
+        logger.info(f"Saving dependency tools to {archive_path}")
+        shutil.make_archive(base_name, "gztar", self.bin_path)
+
+    def load_archive(self, archive_path: str):
+        """
+        Load downloaded tools from a tar archive.
+        """
+        if not os.path.isfile(archive_path):
+            raise FileNotFoundError(f"Archive file not found: {archive_path}")
+
+        if not os.path.exists(self.bin_path):
+            os.makedirs(self.bin_path)
+
+        logger.info(f"Loading dependency tools from {archive_path}")
+        shutil.unpack_archive(archive_path, self.bin_path)
+
     def download_llama_box(self):
-        version = "v0.0.73"
+        version = "v0.0.79"
         llama_box_dir = self.bin_path.joinpath("llama-box")
         llama_box_tmp_dir = llama_box_dir.joinpath(llama_box_dir, "tmp")
 
@@ -107,10 +139,10 @@ class ToolsManager:
         tmp_file = os.path.join(
             llama_box_tmp_dir, f"llama-box-{version}-{platform_name}.zip"
         )
-        url = f"{self._download_base_url}/gpustack/llama-box/releases/download/{version}/llama-box-{platform_name}.zip"
+        url_path = f"gpustack/llama-box/releases/download/{version}/llama-box-{platform_name}.zip"
 
         logger.info(f"downloading llama-box-{platform_name} '{version}'")
-        self._download_file(url, tmp_file)
+        self._download_file(url_path, tmp_file)
         self._extract_file(tmp_file, llama_box_tmp_dir)
 
         shutil.copy(llama_box_tmp_dir.joinpath(file_name), target_file)
@@ -134,6 +166,8 @@ class ToolsManager:
             platform_name = "darwin-amd64-avx2"
         elif self._os == "linux" and self._arch == "amd64" and self._device == "cuda":
             platform_name = "linux-amd64-cuda-12.4"
+        elif self._os == "linux" and self._arch == "amd64" and self._device == "musa":
+            platform_name = "linux-amd64-musa-rc3.1"
         elif self._os == "linux" and self._arch == "amd64" and self._device == "npu":
             platform_name = "linux-amd64-cann-8.0"
         elif self._os == "linux" and self._arch == "arm64" and self._device == "npu":
@@ -174,10 +208,10 @@ class ToolsManager:
             return
 
         platform_name = self._get_gguf_parser_platform_name()
-        url = f"{self._download_base_url}/gpustack/gguf-parser-go/releases/download/{version}/gguf-parser-{platform_name}{suffix}"
+        url_path = f"gpustack/gguf-parser-go/releases/download/{version}/gguf-parser-{platform_name}{suffix}"
 
         logger.info(f"downloading gguf-parser-{platform_name} '{version}'")
-        self._download_file(url, target_file)
+        self._download_file(url_path, target_file)
 
         if self._os != "windows":
             st = os.stat(target_file)
@@ -228,9 +262,9 @@ class ToolsManager:
             shutil.rmtree(fastfetch_tmp_dir)
         os.makedirs(fastfetch_tmp_dir, exist_ok=True)
 
-        url = f"{self._download_base_url}/gpustack/fastfetch/releases/download/{version}/fastfetch-{platform_name}.zip"
+        url_path = f"gpustack/fastfetch/releases/download/{version}/fastfetch-{platform_name}.zip"
 
-        self._download_file(url, tmp_file)
+        self._download_file(url_path, tmp_file)
         self._extract_file(tmp_file, fastfetch_tmp_dir)
 
         extracted_fastfetch = fastfetch_tmp_dir.joinpath(
@@ -286,8 +320,12 @@ class ToolsManager:
 
         return platform_name
 
-    def _download_file(self, url, target_path):
-        """Download a file from the specified URL and save it to the target path."""
+    def _download_file(self, url_path: str, target_path: str):
+        """Download a file from the URL to the target path."""
+        if not self._download_base_url:
+            self._check_and_set_download_base_url()
+
+        url = f"{self._download_base_url}/{url_path}"
         max_retries = 5
         retries = 0
         while retries < max_retries:

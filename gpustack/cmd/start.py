@@ -93,7 +93,7 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
     group.add_argument(
         "--database-url",
         type=str,
-        help=argparse.SUPPRESS,
+        help="URL of the database. Example: postgresql://user:password@hostname:port/db_name.",
         default=get_gpustack_env("DATABASE_URL"),
     )
     group.add_argument(
@@ -170,6 +170,14 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         "--disable-metrics",
         action=OptionalBoolAction,
         help="Disable metrics.",
+        default=get_gpustack_env_bool(
+            "DISABLE_METRICS",
+        ),
+    )
+    group.add_argument(
+        "--disable-rpc-servers",
+        action=OptionalBoolAction,
+        help="Disable RPC servers.",
         default=get_gpustack_env_bool(
             "DISABLE_METRICS",
         ),
@@ -314,6 +322,7 @@ def set_worker_options(args, config_data: dict):
         "worker_name",
         "worker_port",
         "disable_metrics",
+        "disable_rpc_servers",
         "metrics_port",
         "log_dir",
         "system_reserved",

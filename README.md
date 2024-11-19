@@ -53,7 +53,7 @@ Invoke-Expression (Invoke-WebRequest -Uri "https://get.gpustack.ai" -UseBasicPar
 
 ### Other Installation Methods
 
-For manual installation, docker installation or detailed configuration options, please refer to the [Installation Documentation](https://docs.gpustack.ai/installation/manual-installation/).
+For manual installation, docker installation or detailed configuration options, please refer to the [Installation Documentation](https://docs.gpustack.ai/latest/installation/installation-script/).
 
 ## Getting Started
 
@@ -121,12 +121,12 @@ curl http://myserver/v1-openai/chat/completions \
 - [x] Apple Metal
 - [x] NVIDIA CUDA
 - [x] Ascend CANN
+- [x] Moore Threads MUSA
 
 We plan to support the following accelerators in future releases.
 
 - [ ] AMD ROCm
 - [ ] Intel oneAPI
-- [ ] MTHREADS MUSA
 - [ ] Qualcomm AI Engine
 
 ## Supported Models

@@ -10,6 +10,7 @@ from dataclasses_json import dataclass_json
 
 from gpustack.config.config import get_global_config
 from gpustack.schemas.models import Model, ModelInstance, SourceEnum
+from gpustack.utils.command import find_parameter
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils.hub import match_hugging_face_files, match_model_scope_file_paths
 from gpustack.utils import platform
@@ -86,8 +87,6 @@ async def _gguf_parser_command(
     )
     execuable_command = [
         command_path,
-        "--ctx-size",
-        "8192",
         "--in-max-ctx-size",
         "--skip-tokenizer",
         "--skip-architecture",
@@ -97,6 +96,13 @@ async def _gguf_parser_command(
         "--no-mmap",
         "--json",
     ]
+
+    ctx_size = find_parameter(model.backend_parameters, ["ctx-size", "c"])
+    if ctx_size is None:
+        ctx_size = "8192"
+
+    execuable_command.append("--ctx-size")
+    execuable_command.append(ctx_size)
 
     cache_dir = kwargs.get("cache_dir")
     if cache_dir:
@@ -115,9 +121,14 @@ async def _gguf_parser_command(
 
     tensor_split = kwargs.get("tensor_split")
     if tensor_split:
-        tensor_split_str = ",".join(
-            [str(int(i / (1024 * 1024))) for i in tensor_split]
-        )  # convert to MiB to prevent overflow
+        if all(i < 1024 * 1024 for i in tensor_split):
+            # user provided
+            tensor_split_str = ",".join([str(i) for i in tensor_split])
+        else:
+            # computed by the system, convert to MiB to prevent overflow
+            tensor_split_str = ",".join(
+                [str(int(i / (1024 * 1024))) for i in tensor_split]
+            )
         execuable_command.append("--tensor-split")
         execuable_command.append(tensor_split_str)
 
@@ -207,6 +218,7 @@ async def _gguf_parser_command_args_from_source(  # noqa: C901
         SourceEnum.OLLAMA_LIBRARY,
         SourceEnum.HUGGING_FACE,
         SourceEnum.MODEL_SCOPE,
+        SourceEnum.LOCAL_PATH,
     ]:
         raise ValueError(f"Unsupported source: {model.source}")
 
@@ -244,7 +256,9 @@ async def _gguf_parser_command_args_from_source(  # noqa: C901
                 ),
                 timeout=fetch_file_timeout_in_seconds,
             )
-        return ["-ms-repo", model.model_scope_model_id, "-ms-file", file_path]
+            return ["-ms-repo", model.model_scope_model_id, "-ms-file", file_path]
+        elif model.source == SourceEnum.LOCAL_PATH:
+            return ["--path", model.local_path]
     except asyncio.TimeoutError:
         raise Exception(f"Timeout when getting the file for model {model.name}")
     except Exception as e:

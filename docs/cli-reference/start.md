@@ -32,6 +32,7 @@ gpustack start [OPTIONS]
 | `--port` value                      | `80`                                   | Port to bind the server to.                                                                                                                         |
 | `--disable-worker`                  | `False`                                | Disable embedded worker.                                                                                                                            |
 | `--bootstrap-password` value        | Auto-generated.                        | Initial password for the default admin user.                                                                                                        |
+| `--database-url` value              | `sqlite:///<data-dir>/database.db`     | URL of the database. Example: postgresql://user:password@hostname:port/db_name                                                                      |
 | `--ssl-keyfile` value               |                                        | Path to the SSL key file.                                                                                                                           |
 | `--ssl-certfile` value              |                                        | Path to the SSL certificate file.                                                                                                                   |
 | `--force-auth-localhost`            | `False`                                | Force authentication for requests originating from localhost (127.0.0.1).When set to True, all requests from localhost will require authentication. |
@@ -45,6 +46,7 @@ gpustack start [OPTIONS]
 | `-s` value, `--server-url` value    |                                        | Server to connect to.                                                                                                                                                                                                                             |
 | `--worker-ip` value                 |                                        | IP address of the worker node. Auto-detected by default.                                                                                                                                                                                          |
 | `--disable-metrics`                 | `False`                                | Disable metrics.                                                                                                                                                                                                                                  |
+| `--disable-rpc-servers`             | `False`                                | Disable RPC servers.                                                                                                                                                                                                                              |
 | `--metrics-port` value              | `10151`                                | Port to expose metrics.                                                                                                                                                                                                                           |
 | `--worker-port` value               | `10150`                                | Port to bind the worker to. Use a consistent value for all workers.                                                                                                                                                                               |
 | `--log-dir` value                   |                                        | Directory to store logs.                                                                                                                                                                                                                          |
@@ -66,6 +68,7 @@ token: mytoken
 host: 0.0.0.0
 port: 80
 disable_worker: false
+database_url: postgresql://user:password@hostname:port/db_name
 ssl_keyfile: /path/to/keyfile
 ssl_certfile: /path/to/certfile
 force_auth_localhost: false
@@ -77,6 +80,7 @@ disable_update_check: false
 server_url: http://myserver
 worker_ip: 192.168.1.101
 disable_metrics: false
+disable_rpc_servers: false
 metrics_port: 10151
 worker_port: 10150
 log_dir: /path/to/log_dir
