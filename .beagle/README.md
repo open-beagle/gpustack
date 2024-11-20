@@ -32,9 +32,9 @@ docker tag nvidia/cuda:12.5.1-runtime-ubuntu22.04 registry.cn-qingdao.aliyuncs.c
 docker push registry.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04
 
 # cann
-docker pull --platform=linux/arm64 ascendai/cann:ubuntu-python3.10-cann8.0.rc3.beta1 && \
-docker tag ascendai/cann:ubuntu-python3.10-cann8.0.rc3.beta1 registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1 && \
-docker push registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1
+docker pull --platform=linux/arm64 ascendai/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10 && \
+docker tag ascendai/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10 registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10 && \
+docker push registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10
 ```
 
 ## deploy
@@ -118,12 +118,12 @@ docker run -it --rm \
 
   gpustack download-tools --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
-docker pull registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1 && \
+docker pull registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10 && \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
   -e DEBIAN_FRONTEND=noninteractive \
-  registry.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1 \
+  registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10 \
   bash
 
   apt-get update && apt-get install -y \

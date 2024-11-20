@@ -68,7 +68,7 @@ steps:
       - name: docker
         path: /var/run/docker.sock
     settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:ubuntu-python3.10-cann8.0.rc3.beta1
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10
       dockerfile: .beagle/cann.dockerfile
       repo: wod/gpustack
       version: "v0.3.3-cann"
@@ -79,6 +79,70 @@ steps:
       registry_password:
         from_secret: REGISTRY_PASSWORD_ALIYUN
 
+---
+kind: pipeline
+name: docker
+
+trigger:
+  branch:
+    - dev-arm64
+
+volumes:
+  - name: docker
+    host:
+      path: /var/run/docker.sock
+
+workspace:
+  path: /go/src/github.com/open-beagle/gpustack
+
+clone:
+  disable: true
+
+steps:
+  - name: s3-cache
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-s3-cache:1.0
+    settings:
+      restore: true
+      mount:
+        - ./.git
+        - ./.venv
+      endpoint: https://cache.ali.wodcloud.com
+      access_key:
+        from_secret: S3_ACCESS_KEY_ALIYUN
+      secret_key:
+        from_secret: S3_SECRET_KEY_ALIYUN
+
+  - name: fetch
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-git:1.0
+    settings:
+      proxy:
+        from_secret: SOCKS5_PROXY
+
+  - name: python
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
+    environment:
+      VERSION: v0.3.3
+      POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
+    commands:
+      - bash .beagle/build.sh
+
+  - name: docker-cann
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+    settings:
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10
+      dockerfile: .beagle/cann.dockerfile
+      repo: wod/gpustack
+      version: "v0.3.3-cann"
+      args: "TARGETOS=linux,TARGETARCH=arm64"
+      registry: registry-vpc.cn-qingdao.aliyuncs.com
+      registry_user:
+        from_secret: REGISTRY_USER_ALIYUN
+      registry_password:
+        from_secret: REGISTRY_PASSWORD_ALIYUN
+        
 ---
 kind: pipeline
 name: harbor
