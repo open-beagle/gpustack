@@ -81,7 +81,7 @@ steps:
 
 ---
 kind: pipeline
-name: docker
+name: docker-arm64
 
 trigger:
   branch:
