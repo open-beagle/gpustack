@@ -7,16 +7,6 @@ ARG VERSION=v0.3.2
 
 LABEL maintainer=$AUTHOR version=$VERSION
 
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y \
-    git \
-    curl \
-    wget \
-    tzdata \
-    python3 \
-    python3-pip \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY dist/*.whl /tmp/
 
 RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
