@@ -48,6 +48,8 @@ class Config(BaseSettings):
         metrics_port: Port to expose metrics on.
         worker_port: Port to bind the worker to.
         log_dir: Directory to store logs.
+        bin_dir: Directory to store additional binaries, e.g., versioned backend executables.
+        pipx_path: Path to the pipx executable, used to install versioned backends.
     """
 
     # Common options
@@ -83,6 +85,8 @@ class Config(BaseSettings):
     metrics_port: int = 10151
     log_dir: Optional[str] = None
     resources: Optional[dict] = None
+    bin_dir: Optional[str] = None
+    pipx_path: Optional[str] = None
 
     def __init__(self, **values):
         super().__init__(**values)
@@ -93,6 +97,9 @@ class Config(BaseSettings):
 
         if self.cache_dir is None:
             self.cache_dir = os.path.join(self.data_dir, "cache")
+
+        if self.bin_dir is None:
+            self.bin_dir = os.path.join(self.data_dir, "bin")
 
         if self.log_dir is None:
             self.log_dir = os.path.join(self.data_dir, "log")
@@ -232,7 +239,7 @@ class Config(BaseSettings):
             token = secrets.token_hex(16)
             os.makedirs(self.data_dir, exist_ok=True)
             with open(token_path, "w") as file:
-                file.write(token)
+                file.write(token + "\n")
 
         self.token = token
 

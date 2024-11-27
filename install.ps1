@@ -18,7 +18,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$INSTALL_PACKAGE_SPEC = if ($env:INSTALL_PACKAGE_SPEC) { $env:INSTALL_PACKAGE_SPEC } else { "gpustack" }
+$INSTALL_PACKAGE_SPEC = if ($env:INSTALL_PACKAGE_SPEC) { $env:INSTALL_PACKAGE_SPEC } else { "gpustack[audio]" }
 $INSTALL_PRE_RELEASE = if ($env:INSTALL_PRE_RELEASE) { $env:INSTALL_PRE_RELEASE } else { 0 }
 $INSTALL_INDEX_URL = if ($env:INSTALL_INDEX_URL) { $env:INSTALL_INDEX_URL } else { "" }
 
@@ -381,6 +381,12 @@ function Install-GPUStack {
             throw "failed to install $INSTALL_PACKAGE_SPEC."
         }
 
+        # Workaround for issue #581
+        pipx inject gpustack pydantic==2.9.2 --force
+        if ($LASTEXITCODE -ne 0) {
+            throw "failed to run pipx inject."
+        }
+
         pipx ensurepath
         if ($LASTEXITCODE -ne 0) {
             throw "failed to run pipx ensurepath."
@@ -465,9 +471,24 @@ function Setup-GPUStackService {
 
         $gpustackLogDirectoryPath = Join-Path -Path $gpustackDirectoryPath -ChildPath "log"
         $gpustackLogPath = Join-Path -Path $gpustackLogDirectoryPath -ChildPath "gpustack.log"
+        $gpustackEnvPath = Join-Path -Path $gpustackDirectoryPath -ChildPath "gpustack.env"
 
         $null = New-Item -Path $gpustackDirectoryPath -ItemType "Directory" -ErrorAction SilentlyContinue -Force
         $null = New-Item -Path $gpustackLogDirectoryPath -ItemType "Directory" -ErrorAction SilentlyContinue -Force
+
+        # Load additional environment variables from gpustack.env file.
+        $additionalEnvVars = @()
+        if (Test-Path $gpustackEnvPath) {
+            Log-Info "Loading environment variables from $gpustackEnvPath..."
+            $envFileContent = Get-Content -Path $gpustackEnvPath -ErrorAction Stop
+            foreach ($line in $envFileContent) {
+                if ($line -match '^\s*#' -or $line -match '^\s*$') { continue }  # Skip comments and empty lines.
+                $additionalEnvVars += $line.Trim()
+            }
+        }
+
+        # Merge additional environment variables with the existing ones, separated by space.
+        $finalEnvList = @($envListString) + $additionalEnvVars -join " "
 
         $null = nssm install $serviceName $exePath
         if ($LASTEXITCODE -ne 0) {
@@ -486,7 +507,7 @@ function Setup-GPUStackService {
             "nssm set $serviceName AppExit Default Restart",
             "nssm set $serviceName AppStdout $gpustackLogPath",
             "nssm set $serviceName AppStderr $gpustackLogPath",
-            "nssm set $serviceName AppEnvironmentExtra $envListString"
+            "nssm set $serviceName AppEnvironmentExtra $finalEnvList"
         )
 
         foreach ($cmd in $commands) {

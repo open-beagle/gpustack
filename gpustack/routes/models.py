@@ -1,4 +1,5 @@
 import math
+from typing import Union
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
@@ -6,9 +7,11 @@ from gpustack.api.exceptions import (
     AlreadyExistsException,
     InternalServerErrorException,
     NotFoundException,
+    BadRequestException,
 )
 from gpustack.schemas.common import Pagination
-from gpustack.schemas.models import ModelInstance, ModelInstancesPublic
+from gpustack.schemas.models import ModelInstance, ModelInstancesPublic, is_audio_model
+from gpustack.schemas.workers import VendorEnum, Worker
 from gpustack.server.deps import ListParamsDep, SessionDep
 from gpustack.schemas.models import (
     Model,
@@ -76,11 +79,36 @@ async def get_model_instances(session: SessionDep, id: int, params: ListParamsDe
     return ModelInstancesPublic(items=instances, pagination=pagination)
 
 
+async def validate_model_in(
+    session: SessionDep, model_in: Union[ModelCreate, ModelUpdate]
+):
+    if model_in.gpu_selector is not None:
+        worker = await Worker.one_by_field(
+            session, "name", model_in.gpu_selector.worker_name
+        )
+        if not worker:
+            raise BadRequestException(
+                message=f"Worker {model_in.gpu_selector.worker_name} not found"
+            )
+
+        if is_audio_model(model_in):
+            for worker_gpu in worker.status.gpu_devices:
+                if (
+                    worker_gpu.index == model_in.gpu_selector.gpu_index
+                    and worker_gpu.vendor != VendorEnum.NVIDIA.value
+                ):
+                    raise BadRequestException(
+                        "Audio models are supported for running on NVIDIA GPUs and CPUs"
+                    )
+
+
 @router.post("", response_model=ModelPublic)
 async def create_model(session: SessionDep, model_in: ModelCreate):
     existing = await Model.one_by_field(session, "name", model_in.name)
     if existing:
         raise AlreadyExistsException(message=f"Model f{model_in.name} already exists")
+
+    await validate_model_in(session, model_in)
 
     try:
         model = await Model.create(session, model_in)
@@ -95,6 +123,8 @@ async def update_model(session: SessionDep, id: int, model_in: ModelUpdate):
     model = await Model.one_by_id(session, id)
     if not model:
         raise NotFoundException(message="Model not found")
+
+    await validate_model_in(session, model_in)
 
     try:
         await model.update(session, model_in)

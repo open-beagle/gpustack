@@ -8,6 +8,9 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+from gpustack.policies.candidate_selectors.vox_box_resource_fit_selector import (
+    VoxBoxResourceFitSelector,
+)
 from gpustack.policies.scorers.placement_scorer import PlacementScorer
 from gpustack.config.config import Config
 from gpustack.policies.base import (
@@ -25,15 +28,17 @@ from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
 )
 from gpustack.scheduler.queue import AsyncUniqueQueue
 from gpustack.policies.worker_filters.status_filter import StatusFilter
-from gpustack.schemas.workers import Worker, WorkerStateEnum
+from gpustack.schemas.workers import Worker
 from gpustack.schemas.models import (
     BackendEnum,
     DistributedServers,
     Model,
     ModelInstance,
     ModelInstanceStateEnum,
+    SourceEnum,
     get_backend,
     is_gguf_model,
+    is_audio_model,
 )
 from gpustack.server.bus import EventType
 from gpustack.server.db import get_engine
@@ -129,8 +134,17 @@ class Scheduler:
                     instance.state_message = "Evaluating resource requirements"
                     await instance.update(session)
 
+                if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(
+                    model.local_path
+                ):
+                    # The local path model is not accessible from the server, skip evaluation.
+                    await self._queue.put(instance)
+                    return
+
                 if is_gguf_model(model):
                     await self._evaluate_gguf_model(session, model, instance)
+                elif is_audio_model(model):
+                    pass
                 else:
                     await self._evaluate_pretrained_config(session, model)
 
@@ -168,6 +182,10 @@ class Scheduler:
         ):
             should_update = True
             model.embedding_only = True
+
+        if task_output.resource_claim_estimate.imageOnly and not model.image_only:
+            should_update = True
+            model.image_only = True
 
         if task_output.resource_claim_estimate.reranking and not model.reranker:
             should_update = True
@@ -293,6 +311,8 @@ class Scheduler:
                 candidates_selector = GGUFResourceFitSelector(
                     model, instance, self._cache_dir
                 )
+            elif is_audio_model(model):
+                candidates_selector = VoxBoxResourceFitSelector(model, instance)
             else:
                 candidates_selector = VLLMResourceFitSelector(model, instance)
 
@@ -326,9 +346,9 @@ class Scheduler:
         state_message = ""
 
         async with AsyncSession(self._engine) as session:
-            workers = await Worker.all_by_field(session, "state", WorkerStateEnum.READY)
+            workers = await Worker.all(session)
             if len(workers) == 0:
-                state_message = "No ready workers"
+                state_message = "No available workers"
 
             model = await Model.one_by_id(session, instance.model_id)
             if model is None:

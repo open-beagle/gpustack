@@ -1,6 +1,7 @@
 import asyncio
 from enum import Enum
 import logging
+import os
 from pathlib import Path
 import subprocess
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from dataclasses_json import dataclass_json
 
 from gpustack.config.config import get_global_config
 from gpustack.schemas.models import Model, ModelInstance, SourceEnum
-from gpustack.utils.command import find_parameter
+from gpustack.utils.command import find_bool_parameter, find_parameter
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils.hub import match_hugging_face_files, match_model_scope_file_paths
 from gpustack.utils import platform
@@ -30,27 +31,28 @@ class GPUOffloadEnum(str, Enum):
 class layerMemoryEstimate:
     uma: int
     nonuma: int
-    handleLayers: Optional[int]
+    handleLayers: Optional[int] = None
 
 
 @dataclass_json
 @dataclass
 class memoryEstimate:
-    offloadLayers: int
     fullOffloaded: bool
     ram: layerMemoryEstimate
     vrams: List[layerMemoryEstimate]
+    offloadLayers: Optional[int] = None  # Not available for diffusion models
 
 
 @dataclass_json
 @dataclass
 class estimate:
     items: List[memoryEstimate]
-    contextSize: int
     architecture: str
-    embeddingOnly: bool
-    distributable: bool
-    reranking: bool
+    embeddingOnly: bool = False
+    imageOnly: bool = False
+    distributable: bool = False
+    reranking: bool = False
+    contextSize: Optional[int] = None
 
 
 @dataclass_json
@@ -75,7 +77,28 @@ class ModelInstanceResourceClaim:
         return False
 
 
-async def _gguf_parser_command(
+def _get_empty_estimate(n_gpu: int = 1) -> estimate:
+    empty_layer_memory_estimate = layerMemoryEstimate(
+        uma=0, nonuma=0, handleLayers=None
+    )
+    memory_estimate = memoryEstimate(
+        offloadLayers=0,
+        fullOffloaded=False,
+        ram=empty_layer_memory_estimate,
+        vrams=[empty_layer_memory_estimate for _ in range(n_gpu)],
+    )
+    return estimate(
+        items=[memory_estimate],
+        contextSize=0,
+        architecture="",
+        embeddingOnly=False,
+        imageOnly=False,
+        distributable=False,
+        reranking=False,
+    )
+
+
+async def _gguf_parser_command(  # noqa: C901
     model: Model, offload: GPUOffloadEnum = GPUOffloadEnum.Full, **kwargs
 ):
     command = "gguf-parser"
@@ -103,6 +126,18 @@ async def _gguf_parser_command(
 
     execuable_command.append("--ctx-size")
     execuable_command.append(ctx_size)
+
+    image_no_text_encoder_model_offload = find_bool_parameter(
+        model.backend_parameters, ["image-no-text-encoder-model-offload"]
+    )
+    if image_no_text_encoder_model_offload:
+        execuable_command.append("--image-no-text-encoder-model-offload")
+
+    image_no_vae_model_offload = find_bool_parameter(
+        model.backend_parameters, ["image-no-vae-model-offload"]
+    )
+    if image_no_vae_model_offload:
+        execuable_command.append("--image-no-vae-model-offload")
 
     cache_dir = kwargs.get("cache_dir")
     if cache_dir:
@@ -156,12 +191,24 @@ async def calculate_model_resource_claim(
         model: Model to calculate the resource claim for.
     """
 
+    if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(model.local_path):
+        # Skip the calculation if the model is not available, policies like spread strategy still apply.
+        # TODO Support user provided resource claim for better scheduling.
+        estimate = _get_empty_estimate()
+        tensor_split = kwargs.get("tensor_split")
+        if tensor_split:
+            estimate = _get_empty_estimate(n_gpu=len(tensor_split))
+        return ModelInstanceResourceClaim(model_instance, estimate)
+
     logger.info(f"Calculating resource claim for model instance {model_instance.name}")
 
     command = await _gguf_parser_command(model, offload, **kwargs)
     try:
         process = await asyncio.create_subprocess_exec(
-            *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            *command,
+            env=os.environ.copy(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
 
         stdout, stderr = await process.communicate()

@@ -4,17 +4,19 @@ import logging
 import time
 from typing import Type, Union
 from fastapi import Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from jwt import DecodeError, ExpiredSignatureError
 from starlette.middleware.base import BaseHTTPMiddleware
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types import Completion, CompletionUsage
 from openai.types.images_response import ImagesResponse
+from openai.types.audio.transcription_create_response import TranscriptionCreateResponse
 from openai.types.create_embedding_response import (
     CreateEmbeddingResponse,
     Usage as EmbeddingUsage,
 )
 from gpustack.routes.rerank import RerankResponse, RerankUsage
+from gpustack.schemas.images import ImageGenerationChunk
 from gpustack.schemas.model_usage import ModelUsage, OperationEnum
 from gpustack.schemas.models import Model
 from gpustack.schemas.users import User
@@ -59,6 +61,20 @@ class ModelUsageMiddleware(BaseHTTPMiddleware):
                     ImagesResponse,
                     OperationEnum.IMAGE_GENERATION,
                 )
+            elif request.url.path == "/v1-openai/audio/speech":
+                return await process_request(
+                    request,
+                    response,
+                    FileResponse,
+                    OperationEnum.AUDIO_SPEECH,
+                )
+            elif request.url.path == "/v1-openai/audio/transcriptions":
+                return await process_request(
+                    request,
+                    response,
+                    TranscriptionCreateResponse,
+                    OperationEnum.AUDIO_TRANSCRIPTION,
+                )
             elif request.url.path == "/v1/rerank":
                 return await process_request(
                     request,
@@ -80,6 +96,8 @@ async def process_request(
             CreateEmbeddingResponse,
             RerankResponse,
             ImagesResponse,
+            FileResponse,
+            TranscriptionCreateResponse,
         ]
     ],
     operation: OperationEnum,
@@ -88,17 +106,24 @@ async def process_request(
     if stream:
         if response_class == ChatCompletion:
             response_class = ChatCompletionChunk
+        if response_class == ImagesResponse:
+            response_class = ImageGenerationChunk
         return await handle_streaming_response(
             request, response, response_class, operation
         )
     else:
         response_body = b"".join([chunk async for chunk in response.body_iterator])
         try:
-            response_dict = json.loads(response_body)
-            response_instance = response_class(**response_dict)
             usage = None
-            if hasattr(response_instance, "usage"):
-                usage = response_instance.usage
+            if (
+                response.headers.get("content-type")
+                .lower()
+                .startswith("application/json")
+            ):
+                response_dict = json.loads(response_body)
+                response_instance = response_class(**response_dict)
+                if hasattr(response_instance, "usage"):
+                    usage = response_instance.usage
 
             await record_model_usage(request, usage, operation)
         except Exception as e:
@@ -114,7 +139,7 @@ async def record_model_usage(
     operation: OperationEnum,
 ):
     prompt_tokens, total_tokens, completion_tokens = 0, 0, 0
-    if usage:
+    if usage and hasattr(usage, 'prompt_tokens'):
         prompt_tokens = usage.prompt_tokens
         total_tokens = usage.total_tokens
         completion_tokens = getattr(
@@ -149,7 +174,7 @@ async def record_model_usage(
 async def handle_streaming_response(
     request: Request,
     response: StreamingResponse,
-    response_class: Type[Union[ChatCompletionChunk, Completion]],
+    response_class: Type[Union[ChatCompletionChunk, Completion, ImageGenerationChunk]],
     operation: OperationEnum,
 ):
     async def streaming_generator():
@@ -180,29 +205,36 @@ async def process_chunk(
     for line in lines[:-1]:
         data = line.split('data: ')[-1]
         if data.startswith('[DONE]'):
+            yield "data: [DONE]\n\n".encode("utf-8")
             continue
 
-        response_dict = json.loads(data.strip())
+        response_dict = None
+        try:
+            response_dict = json.loads(data.strip())
+        except Exception as e:
+            raise e
         response_chunk = response_class(**response_dict)
 
         if is_usage_chunk(response_chunk):
             await record_model_usage(request, response_chunk.usage, operation)
 
-        # Fill rate metrics. These are extended info not included in OAI APIs.
-        # llama-box provides them out-of-the-box. Align with other backends here.
-        # vLLM streams a chunk with empty choices between [DONE] and the one with finish_reason.
-        if should_add_metrics(response_chunk, response_dict):
-            add_metrics(response_dict, request, response_chunk)
+            # Fill rate metrics. These are extended info not included in OAI APIs.
+            # llama-box provides them out-of-the-box. Align with other backends here.
+            if should_add_metrics(response_dict):
+                add_metrics(response_dict, request, response_chunk)
 
         yield f"data: {json.dumps(response_dict, separators=(',', ':'))}\n\n".encode(
             "utf-8"
         )
 
 
-def should_add_metrics(response_chunk, response_dict):
-    return (
-        is_usage_chunk(response_chunk) or len(response_chunk.choices) == 0
-    ) and 'tokens_per_second' not in response_dict['usage']
+def should_add_metrics(response_dict):
+    if not isinstance(response_dict, dict):
+        return False
+
+    usage = response_dict.get('usage', {})
+
+    return 'prompt_tokens' in usage and 'tokens_per_second' not in usage
 
 
 def add_metrics(response_dict, request, response_chunk):
@@ -257,14 +289,16 @@ class RefreshTokenMiddleware(BaseHTTPMiddleware):
         return response
 
 
-def is_usage_chunk(chunk: Union[ChatCompletionChunk, Completion]) -> bool:
-    choices = chunk.choices
+def is_usage_chunk(
+    chunk: Union[ChatCompletionChunk, Completion, ImageGenerationChunk]
+) -> bool:
+    choices = getattr(chunk, "choices", None)
 
-    if not choices:
-        return False
+    if not choices and chunk.usage:
+        return True
 
-    for choice in choices:
-        if choice.finish_reason is not None:
+    for choice in choices or []:
+        if choice.finish_reason is not None and chunk.usage:
             return True
 
     return False

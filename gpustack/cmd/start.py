@@ -64,6 +64,18 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         default=get_gpustack_env("CACHE_DIR"),
     )
     group.add_argument(
+        "--bin-dir",
+        type=str,
+        help="Directory to store additional binaries, e.g., versioned backend executables.",
+        default=get_gpustack_env("BIN_DIR"),
+    )
+    group.add_argument(
+        "--pipx-path",
+        type=str,
+        help="Path to the pipx executable, used to install versioned backends.",
+        default=get_gpustack_env("PIPX_PATH"),
+    )
+    group.add_argument(
         "-t",
         "--token",
         type=str,
@@ -224,6 +236,8 @@ def run(args: argparse.Namespace):
     try:
         cfg = parse_args(args)
         setup_logging(cfg.debug)
+        debug_env_info()
+
         if cfg.server_url:
             run_worker(cfg)
         else:
@@ -288,6 +302,8 @@ def set_common_options(args, config_data: dict):
         "debug",
         "data_dir",
         "cache_dir",
+        "bin_dir",
+        "pipx_path",
         "token",
         "huggingface_token",
     ]
@@ -344,3 +360,9 @@ def get_gpustack_env_bool(env_var: str) -> Optional[bool]:
     if env_value is not None:
         return env_value.lower() in ["true", "True"]
     return None
+
+
+def debug_env_info():
+    hf_endpoint = os.getenv("HF_ENDPOINT")
+    if hf_endpoint:
+        logger.debug(f"Using HF_ENDPOINT: {hf_endpoint}")

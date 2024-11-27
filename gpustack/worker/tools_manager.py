@@ -4,10 +4,13 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import time
 from typing import Optional
 import zipfile
 import requests
+from gpustack.schemas.models import BackendEnum
+from gpustack.utils.command import get_versioned_command
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils import platform
 
@@ -26,13 +29,15 @@ class ToolsManager:
     def __init__(
         self,
         tools_download_base_url: str = None,
+        bin_dir: Optional[str] = None,
+        pipx_path: Optional[str] = None,
         device: Optional[str] = None,
         system: Optional[str] = None,
         arch: Optional[str] = None,
     ):
-        with pkg_resources.path("gpustack.third_party", "bin") as bin_path:
-            self.bin_path: Path = bin_path
-            self.versions_file = bin_path.joinpath("versions.json")
+        with pkg_resources.path("gpustack.third_party", "bin") as third_party_bin_path:
+            self.third_party_bin_path: Path = third_party_bin_path
+            self.versions_file = third_party_bin_path.joinpath("versions.json")
 
             self._current_tools_version = {}
             if os.path.exists(self.versions_file):
@@ -46,6 +51,8 @@ class ToolsManager:
         self._arch = arch if arch else platform.arch()
         self._device = device if device else platform.device()
         self._download_base_url = tools_download_base_url
+        self._bin_dir = bin_dir
+        self._pipx_path = pipx_path
 
     def _check_and_set_download_base_url(self):
         urls = [
@@ -83,8 +90,8 @@ class ToolsManager:
         """
         Remove all cached tools.
         """
-        if os.path.exists(self.bin_path):
-            shutil.rmtree(self.bin_path)
+        if os.path.exists(self.third_party_bin_path):
+            shutil.rmtree(self.third_party_bin_path)
 
     def save_archive(self, archive_path: str):
         """
@@ -99,7 +106,7 @@ class ToolsManager:
         base_name = os.path.splitext(os.path.splitext(archive_path)[0])[0]
 
         logger.info(f"Saving dependency tools to {archive_path}")
-        shutil.make_archive(base_name, "gztar", self.bin_path)
+        shutil.make_archive(base_name, "gztar", self.third_party_bin_path)
 
     def load_archive(self, archive_path: str):
         """
@@ -108,55 +115,184 @@ class ToolsManager:
         if not os.path.isfile(archive_path):
             raise FileNotFoundError(f"Archive file not found: {archive_path}")
 
-        if not os.path.exists(self.bin_path):
-            os.makedirs(self.bin_path)
+        if not os.path.exists(self.third_party_bin_path):
+            os.makedirs(self.third_party_bin_path)
 
         logger.info(f"Loading dependency tools from {archive_path}")
-        shutil.unpack_archive(archive_path, self.bin_path)
+        shutil.unpack_archive(archive_path, self.third_party_bin_path)
+
+    def prepare_versioned_backend(self, backend: str, version: str):
+        if backend == BackendEnum.LLAMA_BOX:
+            self.install_versioned_llama_box(version)
+        elif backend == BackendEnum.VLLM:
+            self.install_versioned_vllm(version)
+        elif backend == BackendEnum.VOX_BOX:
+            self.install_versioned_package_by_pipx("vox-box", version)
+        else:
+            raise NotImplementedError(
+                f"Auto-installation for versioned {backend} is not supported. Please install it manually."
+            )
 
     def download_llama_box(self):
-        version = "v0.0.79"
-        llama_box_dir = self.bin_path.joinpath("llama-box")
-        llama_box_tmp_dir = llama_box_dir.joinpath(llama_box_dir, "tmp")
+        version = "v0.0.83"
+        target_dir = self.third_party_bin_path / "llama-box"
+        file_name = "llama-box.exe" if self._os == "windows" else "llama-box"
+        target_file = target_dir / file_name
 
-        file_name = "llama-box"
-        if self._os == "windows":
-            file_name += ".exe"
-
-        target_file = llama_box_dir.joinpath(file_name)
         if (
-            os.path.isfile(target_file)
+            target_file.is_file()
             and self._current_tools_version.get(file_name) == version
         ):
             logger.debug(f"{file_name} already exists, skipping download")
             return
 
-        platform_name = self._get_llama_box_platform_name()
+        self._download_llama_box(version, target_dir, file_name)
+
+        # Update versions.json
+        self._update_versions_file(file_name, version)
+
+    def install_versioned_llama_box(self, version: str):
+        target_dir = Path(self._bin_dir)
+        file_name = get_versioned_command(
+            "llama-box.exe" if self._os == "windows" else "llama-box", version
+        )
+
+        target_file = target_dir / file_name
+        if target_file.is_file():
+            logger.debug(f"{file_name} already exists, skipping download")
+            return
+
+        self._download_llama_box(version, target_dir, file_name)
+
+    def install_versioned_vllm(self, version: str):
+        system = platform.system()
+        arch = platform.arch()
+        device = platform.device()
+
+        if system != "linux" or arch != "amd64":
+            target_path = Path(self._bin_dir) / get_versioned_command("vllm", version)
+            raise Exception(
+                f"Auto-installation for versioned vLLM is only supported on amd64 Linux. Please install vLLM manually and link it to {target_path}."
+            )
+        elif device != "cuda":
+            raise Exception(
+                f"Auto-installation for versioned vLLM is only supported on CUDA devices. Please install vLLM manually and link it to {target_path}."
+            )
+
+        self.install_versioned_package_by_pipx("vllm", version)
+
+    def install_versioned_package_by_pipx(self, package: str, version: str):
+        """
+        Install a versioned package using pipx.
+
+        :param package: The name of the package to install.
+        :param version: The version of the package to install.
+        """
+        target_path = Path(self._bin_dir) / get_versioned_command(package, version)
+        if target_path.exists():
+            logger.debug(f"{package} {version} already exists, skipping installation")
+            return
+
+        pipx_path = shutil.which("pipx")
+        if self._pipx_path:
+            pipx_path = self._pipx_path
+
+        if not pipx_path:
+            raise Exception(
+                f"pipx is required to install versioned {package} but not found in system PATH. "
+                "Please install pipx first or provide the path to pipx using the server option `--pipx-path`. "
+                f"Alternatively, you can install {package} manually and link it to {target_path}."
+            )
+
+        pipx_bin_path = self._get_pipx_bin_dir(pipx_path)
+        if not pipx_bin_path:
+            raise Exception(
+                "Failed to determine pipx binary directory. Ensure pipx is correctly installed."
+            )
+
+        suffix = f"_{version}"
+        install_command = [
+            pipx_path,
+            "install",
+            "-vv",
+            "--force",
+            "--suffix",
+            suffix,
+            f"{package}=={version}",
+        ]
+
+        try:
+            logger.info(f"Installing {package} {version} using pipx")
+            subprocess.run(install_command, check=True, text=True)
+
+            installed_bin_path = pipx_bin_path / f"{package}{suffix}"
+            if not installed_bin_path.exists():
+                raise Exception(
+                    f"Installation succeeded, but executable not found at {installed_bin_path}"
+                )
+
+            # Create a symlink to the installed binary
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.symlink_to(installed_bin_path)
+
+            print(
+                f"{package} {version} successfully installed and linked to {target_path}"
+            )
+        except subprocess.CalledProcessError as e:
+            raise Exception(
+                f"Failed to install {package} {version} using pipx: {e}"
+            ) from e
+        except Exception as e:
+            raise Exception(f"An error occurred: {e}") from e
+
+    def _get_pipx_bin_dir(self, pipx_path: str) -> Path:
+        """
+        Use `pipx environment --value PIPX_BIN_DIR` to get the directory where pipx installs executables.
+        """
+        try:
+            result = subprocess.run(
+                [pipx_path, "environment", "--value", "PIPX_BIN_DIR"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            pipx_bin_dir = result.stdout.strip()
+            if pipx_bin_dir:
+                return Path(pipx_bin_dir)
+        except subprocess.CalledProcessError as e:
+            raise Exception(
+                f"Failed to execute 'pipx environment --value PIPX_BIN_DIR': {e}"
+            )
+
+    def _download_llama_box(
+        self, version: str, target_dir: Path, target_file_name: str
+    ):
+        llama_box_tmp_dir = target_dir.joinpath("tmp-llama-box")
+
+        # Clean temporary directory if it exists
         if os.path.exists(llama_box_tmp_dir):
             shutil.rmtree(llama_box_tmp_dir)
         os.makedirs(llama_box_tmp_dir, exist_ok=True)
 
-        tmp_file = os.path.join(
-            llama_box_tmp_dir, f"llama-box-{version}-{platform_name}.zip"
-        )
+        platform_name = self._get_llama_box_platform_name()
+        tmp_file = llama_box_tmp_dir / f"llama-box-{version}-{platform_name}.zip"
         url_path = f"gpustack/llama-box/releases/download/{version}/llama-box-{platform_name}.zip"
 
-        logger.info(f"downloading llama-box-{platform_name} '{version}'")
+        logger.info(f"Downloading llama-box-{platform_name} '{version}'")
         self._download_file(url_path, tmp_file)
         self._extract_file(tmp_file, llama_box_tmp_dir)
 
-        shutil.copy(llama_box_tmp_dir.joinpath(file_name), target_file)
+        file_name = "llama-box.exe" if self._os == "windows" else "llama-box"
+        target_file = target_dir / target_file_name
+        shutil.copy(llama_box_tmp_dir / file_name, target_file)
 
+        # Make the file executable (non-Windows only)
         if self._os != "windows":
             st = os.stat(target_file)
             os.chmod(target_file, st.st_mode | stat.S_IEXEC)
 
-        # Clean up.
-        if os.path.exists(llama_box_tmp_dir):
-            shutil.rmtree(llama_box_tmp_dir)
-
-        # Update versions.json
-        self._update_versions_file(file_name, version)
+        # Clean up temporary directory
+        shutil.rmtree(llama_box_tmp_dir)
 
     def _get_llama_box_platform_name(self) -> str:  # noqa C901
         platform_name = ""
@@ -190,8 +326,8 @@ class ToolsManager:
         return platform_name
 
     def download_gguf_parser(self):
-        version = "v0.12.0"
-        gguf_parser_dir = self.bin_path.joinpath("gguf-parser")
+        version = "v0.13.1"
+        gguf_parser_dir = self.third_party_bin_path.joinpath("gguf-parser")
         os.makedirs(gguf_parser_dir, exist_ok=True)
 
         file_name = "gguf-parser"
@@ -239,7 +375,7 @@ class ToolsManager:
 
     def download_fastfetch(self):
         version = "2.25.0.1"
-        fastfetch_dir = self.bin_path.joinpath("fastfetch")
+        fastfetch_dir = self.third_party_bin_path.joinpath("fastfetch")
         fastfetch_tmp_dir = fastfetch_dir.joinpath("tmp")
 
         platform_name = self._get_fastfetch_platform_name()
