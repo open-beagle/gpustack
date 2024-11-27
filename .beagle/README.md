@@ -143,14 +143,14 @@ docker run -it --rm \
 rm -rf ./downloads/gpustack/
 
 # llama-box
-export LLAMA_BOX_VERSION=v0.0.79 && \
+export LLAMA_BOX_VERSION=v0.0.83 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip \
   -fL https://github.com/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip
 
 # gguf-parser-go
-export GGUF_PARSER_GO_VERSION=v0.12.0 && \
+export GGUF_PARSER_GO_VERSION=v0.13.1 && \
 mkdir -p ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-arm64 \
@@ -178,14 +178,14 @@ mc cp -r ./downloads/gpustack/ aliyun/vscode/gpustack/
 rm -rf ./downloads/gpustack/ && mkdir -p ./downloads/gpustack
 
 # llama-box
-export LLAMA_BOX_VERSION=v0.0.79 && \
+export LLAMA_BOX_VERSION=v0.0.83 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-amd64-cuda-12.4.zip \
   -fL https://github.com/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-amd64-cuda-12.4.zip
 
 # gguf-parser-go
-export GGUF_PARSER_GO_VERSION=v0.12.0 && \
+export GGUF_PARSER_GO_VERSION=v0.13.1 && \
 mkdir -p ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-amd64 \
