@@ -32,8 +32,9 @@ logger = logging.getLogger(__name__)
 
 
 class HfDownloader:
-    _registry_url = "https://huggingface.co"
-
+    # _registry_url = "https://huggingface.co"
+    _registry_url = "https://hf-mirror.com"
+    
     @classmethod
     def get_model_file_size(
         cls, model_instance: ModelInstance, token: Optional[str]
