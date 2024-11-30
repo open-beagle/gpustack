@@ -40,7 +40,7 @@ steps:
   - name: python
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
     environment:
-      VERSION: v0.3.3
+      VERSION: v0.3.4
       POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
     commands:
       - bash .beagle/build.sh
@@ -54,7 +54,7 @@ steps:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04
       dockerfile: .beagle/cuda.dockerfile
       repo: wod/gpustack
-      version: "v0.3.3-cuda"
+      version: "v0.3.4-cuda"
       args: "TARGETOS=linux,TARGETARCH=amd64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -71,7 +71,7 @@ steps:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10
       dockerfile: .beagle/cann.dockerfile
       repo: wod/gpustack
-      version: "v0.3.3-cann"
+      version: "v0.3.4-cann"
       args: "TARGETOS=linux,TARGETARCH=arm64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -121,7 +121,7 @@ steps:
   - name: python
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
     environment:
-      VERSION: v0.3.3
+      VERSION: v0.3.4
       POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
     commands:
       - bash .beagle/build.sh
@@ -135,7 +135,7 @@ steps:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.alpha003-py310
       dockerfile: .beagle/cann.dockerfile
       repo: wod/gpustack
-      version: "v0.3.3-cann8.0.RC3.alpha003"
+      version: "v0.3.4-cann8.0.RC3.alpha003"
       args: "TARGETOS=linux,TARGETARCH=arm64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -152,7 +152,7 @@ steps:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.alpha003-kernel910b-py310
       dockerfile: .beagle/cann.dockerfile
       repo: wod/gpustack
-      version: "v0.3.3-cann8.0.RC3.alpha003-kernel910b"
+      version: "v0.3.4-cann8.0.RC3.alpha003-kernel910b"
       args: "TARGETOS=linux,TARGETARCH=arm64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -202,7 +202,7 @@ steps:
   - name: python
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
     environment:
-      VERSION: v0.3.3
+      VERSION: v0.3.4
       POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
     commands:
       - bash .beagle/build.sh
@@ -216,7 +216,7 @@ steps:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.beta1-kernel910b-py310
       dockerfile: .beagle/cann.dockerfile
       repo: wod/gpustack
-      version: "v0.3.3-cann-8.0.RC3.beta1"
+      version: "v0.3.4-cann-8.0.RC3.beta1"
       args: "TARGETOS=linux,TARGETARCH=arm64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
