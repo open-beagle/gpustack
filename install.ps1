@@ -18,9 +18,10 @@
 
 $ErrorActionPreference = "Stop"
 
-$INSTALL_PACKAGE_SPEC = if ($env:INSTALL_PACKAGE_SPEC) { $env:INSTALL_PACKAGE_SPEC } else { "gpustack" }
+$INSTALL_PACKAGE_SPEC = if ($env:INSTALL_PACKAGE_SPEC) { $env:INSTALL_PACKAGE_SPEC } else { "gpustack[audio]" }
 $INSTALL_PRE_RELEASE = if ($env:INSTALL_PRE_RELEASE) { $env:INSTALL_PRE_RELEASE } else { 0 }
 $INSTALL_INDEX_URL = if ($env:INSTALL_INDEX_URL) { $env:INSTALL_INDEX_URL } else { "" }
+$INSTALL_SKIP_POST_CHECK = if ($env:INSTALL_SKIP_POST_CHECK) { $env:INSTALL_SKIP_POST_CHECK } else { 0 }
 
 $global:ACTION = "Install"
 
@@ -381,6 +382,12 @@ function Install-GPUStack {
             throw "failed to install $INSTALL_PACKAGE_SPEC."
         }
 
+        # Workaround for issue #581
+        pipx inject gpustack pydantic==2.9.2 --force
+        if ($LASTEXITCODE -ne 0) {
+            throw "failed to run pipx inject."
+        }
+
         pipx ensurepath
         if ($LASTEXITCODE -ne 0) {
             throw "failed to run pipx ensurepath."
@@ -465,9 +472,24 @@ function Setup-GPUStackService {
 
         $gpustackLogDirectoryPath = Join-Path -Path $gpustackDirectoryPath -ChildPath "log"
         $gpustackLogPath = Join-Path -Path $gpustackLogDirectoryPath -ChildPath "gpustack.log"
+        $gpustackEnvPath = Join-Path -Path $gpustackDirectoryPath -ChildPath "gpustack.env"
 
         $null = New-Item -Path $gpustackDirectoryPath -ItemType "Directory" -ErrorAction SilentlyContinue -Force
         $null = New-Item -Path $gpustackLogDirectoryPath -ItemType "Directory" -ErrorAction SilentlyContinue -Force
+
+        # Load additional environment variables from gpustack.env file.
+        $additionalEnvVars = @()
+        if (Test-Path $gpustackEnvPath) {
+            Log-Info "Loading environment variables from $gpustackEnvPath..."
+            $envFileContent = Get-Content -Path $gpustackEnvPath -ErrorAction Stop
+            foreach ($line in $envFileContent) {
+                if ($line -match '^\s*#' -or $line -match '^\s*$') { continue }  # Skip comments and empty lines.
+                $additionalEnvVars += $line.Trim()
+            }
+        }
+
+        # Merge additional environment variables with the existing ones, separated by space.
+        $finalEnvList = @($envListString) + $additionalEnvVars -join " "
 
         $null = nssm install $serviceName $exePath
         if ($LASTEXITCODE -ne 0) {
@@ -486,7 +508,7 @@ function Setup-GPUStackService {
             "nssm set $serviceName AppExit Default Restart",
             "nssm set $serviceName AppStdout $gpustackLogPath",
             "nssm set $serviceName AppStderr $gpustackLogPath",
-            "nssm set $serviceName AppEnvironmentExtra $envListString"
+            "nssm set $serviceName AppEnvironmentExtra $finalEnvList"
         )
 
         foreach ($cmd in $commands) {
@@ -522,6 +544,51 @@ function Setup-GPUStackService {
     }
 }
 
+function Check-GPUStackService {
+    param (
+        [int]$Retries = 3,
+        [int]$Interval = 2
+    )
+
+    if ($INSTALL_SKIP_POST_CHECK -eq 1) {
+        return
+    }
+
+    $serviceName = "GPUStack"
+    $appDataPath = $env:APPDATA
+    $gpustackDirectoryName = "gpustack"
+    $gpustackLogPath = Join-Path -Path (Join-Path -Path $appDataPath -ChildPath $gpustackDirectoryName) -ChildPath "log/gpustack.log"
+
+    Log-Info "Waiting for the service to initialize..."
+    Start-Sleep -s 10
+
+    for ($i = 1; $i -le $Retries; $i++) {
+        $status = nssm status $serviceName
+        if ($status -eq 'SERVICE_RUNNING') {
+            # Check abnormal exit from  nssm event logs
+            $events = Get-EventLog -LogName Application -Source nssm -Newest 20 | Where-Object { $_.TimeGenerated -ge (Get-Date).AddSeconds(-30) }
+            $hasError = $false
+
+            foreach ($event in $events) {
+                if ($event.Message -match "$serviceName" -and $event.Message -match "exit code") {
+                    $hasError = $true
+                    break
+                }
+            }
+
+            if ($hasError) {
+                throw "GPUStack service is running but exited abnormally. Please check logs at: $gpustackLogPath for details."
+            }
+
+            return
+        }
+
+        Log-Info "Service not ready, retrying in $Interval seconds ($i/$Retries)..."
+        Start-Sleep -s $Interval
+    }
+
+    throw "GPUStack service failed to start. Please check the logs at: $gpustackLogPath for details."
+}
 
 function Create-UninstallScript {
     $gpustackDirectoryName = "gpustack"
@@ -694,6 +761,7 @@ try {
     Create-UninstallScript
     $argResult = Get-Arg @args
     Setup-GPUStackService -argListString $argResult[0] -envListString $argResult[1]
+    Check-GPUStackService
     Print-Complete-Message @args
 }
 catch {

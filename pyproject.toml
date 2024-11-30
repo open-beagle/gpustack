@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "gpustack"
-version = "0.0.0"
+version = "v0.0.0"
 description = "GPUStack"
 authors = ["GPUStack Authors <contact@gpustack.ai>"]
 readme = "README.md"
@@ -10,6 +10,7 @@ include = ["*/third_party/config/**/*","*/ui/**/*"]
 python = "^3.10"
 fastapi = "^0.115.0"
 sqlmodel = "^0.0.18"
+pydantic = ">=2.9.0,<2.10.0"
 pydantic-settings = "^2.2.1"
 setproctitle = "^1.3.3"
 inflection = "^0.5.1"
@@ -21,18 +22,17 @@ colorama = "^0.4.6"
 psutil = "^5.9.8"
 requests = "^2.32.3"
 huggingface-hub = "^0.23.3"
-attrs = "^23.2.0"
+attrs = "^24.2.0"
 aiosqlite = "^0.20.0"
 sqlalchemy = {extras = ["asyncio"], version = "^2.0.30"}
 pyjwt = "^2.8.0"
 argon2-cffi = "^23.1.0"
-python-multipart = "^0.0.9"
+python-multipart = "^0.0.17"
 dataclasses-json = "^0.6.7"
 apscheduler = "^3.10.4"
 asyncpg = "^0.29.0"
 httpx = {extras = ["socks"], version = "^0.27.0"}
 alembic = "^1.13.2"
-shellcheck-py = "^0.10.0.1"
 importlib-resources = "^6.4.0"
 pytest-asyncio = "^0.23.7"
 truststore = "^0.9.1"
@@ -41,13 +41,16 @@ tzdata = "^2024.1"
 modelscope = "^1.19.0"
 vllm = {version = "^0.6.1", optional = true}
 mistral_common = {version = "^1.4.3", optional = true, extras = ["opencv"]}
-uvicorn = "^0.30.6"
+uvicorn = "^0.32.0"
 transformers = "^4.44.2"
 fastapi-cdn-host = "^0.8.0"
 wmi = { version="^1.5.1", markers = "platform_system == 'Windows'" }
 pywin32 = { version="^308", markers = "platform_system == 'Windows'" }
 packaging = "^24.1"
 psycopg2-binary = "^2.9.10"
+vox-box = {version = "^0.0.5", optional = true}
+
+tenacity = "^9.0.0"
 [tool.poetry.group.dev.dependencies]
 coverage = {extras = ["toml"], version = "^7.5.1"}
 flake8 = "^7.0.0"
@@ -60,6 +63,7 @@ deptry = "^0.16.1"
 pre-commit = "^3.7.1"
 mkdocs = "^1.6.0"
 mkdocs-material = "^9.5.27"
+shellcheck-py = "^0.10.0.1"
 twine = "^5.1.1"
 mike = "^2.1.3"
 mkdocs-glightbox = "^0.4.0"
@@ -79,6 +83,8 @@ force-exclude = '''
 
 [tool.poetry.extras]
 vllm = ["vllm", "mistral_common"]
+audio = ["vox-box"]
+all = ["vllm", "mistral_common", "vox-box"]
 
 [tool.poetry.scripts]
 gpustack = "gpustack.main:main"

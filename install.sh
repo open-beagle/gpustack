@@ -19,14 +19,22 @@ set -o noglob
 #     It supports PYPI package names, git URLs, and local paths.
 #
 #   - INSTALL_PRE_RELEASE
-#     If set to true will install pre-release packages.
+#     If set to 1 will install pre-release packages.
 #
 #   - INSTALL_INDEX_URL
 #     Base URL of the Python Package Index.
+#
+#   - INSTALL_SKIP_POST_CHECK
+#     If set to 1 will skip the post installation check.
+#
+#   - INSTALL_SKIP_BUILD_DEPENDENCIES
+#     If set to 1 will skip the build dependencies.
 
 INSTALL_PACKAGE_SPEC="${INSTALL_PACKAGE_SPEC:-}"
 INSTALL_PRE_RELEASE="${INSTALL_PRE_RELEASE:-0}"
 INSTALL_INDEX_URL="${INSTALL_INDEX_URL:-}"
+INSTALL_SKIP_POST_CHECK="${INSTALL_SKIP_POST_CHECK:-0}"
+INSTALL_SKIP_BUILD_DEPENDENCIES="${INSTALL_SKIP_BUILD_DEPENDENCIES:-0}"
 
 # --- helper functions for logs ---
 info()
@@ -264,6 +272,15 @@ install_dependencies() {
           fi
       fi
   fi
+
+  if [ "$INSTALL_SKIP_BUILD_DEPENDENCIES" != "1" ] && [ "$OS" = "macos" ]; then
+    if ! command -v brew > /dev/null 2>&1; then
+      fatal "Homebrew is required but missing. Please install Homebrew."
+    elif ! brew list openfst > /dev/null 2>&1; then
+      # audio dependency library
+      brew install openfst
+    fi
+  fi
 }
 
 
@@ -321,6 +338,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
+EnvironmentFile=-/etc/default/%N
 ExecStart=$(which gpustack) start $_args
 Restart=always
 StandardOutput=append:/var/log/gpustack.log
@@ -338,6 +356,22 @@ EOF
 # Function to setup launchd for macOS
 setup_launchd() {
   info "Setting up GPUStack as a service using launchd."
+
+  # Load environment variables from /etc/default/gpustack if exists
+  ENV_FILE="/etc/default/gpustack"
+  if [ -f "$ENV_FILE" ]; then
+    info "Loading environment variables from $ENV_FILE"
+    ENV_VARS=""
+    while IFS='=' read -r key value; do
+      case "$key" in
+        \#*|"") continue ;;  # Skip comments and empty lines
+      esac
+      # Strip surrounding quotes if present
+      value=$(echo "$value" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+      ENV_VARS="$ENV_VARS    <key>$key</key><string>$value</string>\n"
+    done < "$ENV_FILE"
+  fi
+
   $SUDO tee /Library/LaunchDaemons/ai.gpustack.plist > /dev/null <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -357,9 +391,26 @@ EOF
 
   $SUDO tee -a /Library/LaunchDaemons/ai.gpustack.plist > /dev/null <<EOF
   </array>
+EOF
+
+  # Add EnvironmentVariables section if ENV_VARS is not empty
+  if [ -n "$ENV_VARS" ]; then
+    $SUDO tee -a /Library/LaunchDaemons/ai.gpustack.plist > /dev/null <<EOF
+  <key>EnvironmentVariables</key>
+  <dict>
+EOF
+    printf "%b" "$ENV_VARS" | $SUDO tee -a /Library/LaunchDaemons/ai.gpustack.plist > /dev/null
+    $SUDO tee -a /Library/LaunchDaemons/ai.gpustack.plist > /dev/null <<EOF
+  </dict>
+EOF
+  fi
+
+  $SUDO tee -a /Library/LaunchDaemons/ai.gpustack.plist > /dev/null <<EOF
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
+  <true/>
+  <key>EnableTransactions</key>
   <true/>
   <key>StandardOutPath</key>
   <string>/var/log/gpustack.log</string>
@@ -407,11 +458,64 @@ setup_and_start() {
   fi
 }
 
+# Helper function to check service status
+is_service_running() {
+  if [ "$OS" = "macos" ]; then
+    # Get service info
+    SERVICE_INFO=$($SUDO launchctl print system/ai.gpustack 2>/dev/null)
+    # shellcheck disable=SC2181
+    if [ $? -ne 0 ]; then
+      return 1
+    fi
+
+    # Extract service details
+    LAST_EXIT_STATUS=$(echo "$SERVICE_INFO" | grep "last exit code =" | awk -F "= " '{print $2}' | xargs)
+    IS_RUNNING=$(echo "$SERVICE_INFO" | grep "state = running")
+
+    # Evaluate service health
+    if [ -n "$IS_RUNNING" ]; then
+      if [ "$LAST_EXIT_STATUS" = "0" ] || [ "$LAST_EXIT_STATUS" = "(never exited)" ]; then
+        return 0
+      else
+        return 1
+      fi
+    else
+      return 1
+    fi
+
+  else
+    $SUDO systemctl is-active --quiet gpustack.service
+  fi
+}
+
+# Function to check service status
+check_service() {
+  if [ "$INSTALL_SKIP_POST_CHECK" -eq 1 ]; then
+    return 0
+  fi
+  info "Waiting for the service to initialize..."
+  sleep 10
+  info "Running post-install checks..."
+
+  retries=3
+  for i in $(seq 1 $retries); do
+    if is_service_running; then
+      info "GPUStack service is running."
+      return 0
+    fi
+    info "Service not ready, retrying in 2 seconds ($i/$retries)..."
+    sleep 2
+  done
+
+  fatal "GPUStack service failed to start. Please check the logs at /var/log/gpustack.log for details."
+}
+
 # Function to create uninstall script
 create_uninstall_script() {
   $SUDO mkdir -p /var/lib/gpustack
   $SUDO tee /var/lib/gpustack/uninstall.sh > /dev/null <<EOF
 #!/bin/bash
+set -e
 export PYTHONPATH="$PYTHONPATH"
 export PIPX_HOME=$(pipx environment --value PIPX_HOME)
 export PIPX_BIN_DIR=$(pipx environment --value PIPX_BIN_DIR)
@@ -450,10 +554,10 @@ install_gpustack() {
     install_args="--index-url $INSTALL_INDEX_URL $install_args"
   fi
 
-  default_package_spec="gpustack"
+  default_package_spec="gpustack[audio]"
   if [ "$OS" != "macos" ] && [ "$(uname -m)" = "x86_64" ] && [ "$DEVICE" = "cuda" ]; then
     # Install optional vLLM dependencies on amd64 Linux
-    default_package_spec="gpustack[vllm]"
+    default_package_spec="gpustack[all]"
   fi
 
   if [ -z "$INSTALL_PACKAGE_SPEC" ]; then
@@ -462,6 +566,18 @@ install_gpustack() {
 
   # shellcheck disable=SC2090,SC2086
   pipx install --force --verbose $install_args "$INSTALL_PACKAGE_SPEC"
+  # Workaround for issue #581
+  pipx inject gpustack pydantic==2.9.2 --force > /dev/null 2>&1
+
+  # audio dependencies for macOS
+  if [ "$INSTALL_SKIP_BUILD_DEPENDENCIES" != "1" ] && [ "$OS" = "macos" ]; then
+    CPLUS_INCLUDE_PATH="$(brew --prefix openfst)/include"
+    export CPLUS_INCLUDE_PATH
+    LIBRARY_PATH="$(brew --prefix openfst)/lib"
+    export LIBRARY_PATH
+    pipx inject gpustack pynini
+    pipx inject gpustack wetextprocessing
+  fi
 }
 
 # Main install process
@@ -476,5 +592,6 @@ install_gpustack() {
   create_uninstall_script
   disable_service
   setup_and_start "$@"
+  check_service
   print_complete_message "$@"
 }

@@ -6,15 +6,16 @@ import signal
 import time
 from typing import Dict
 import logging
-from contextlib import redirect_stdout, redirect_stderr
 
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
+from gpustack.logging import merged_stderr_stdout, stdout_redirected
 from gpustack.utils import network
 from gpustack.utils.process import terminate_process_tree
 from gpustack.utils.signal import signal_handler
 from gpustack.worker.backends.llama_box import LlamaBoxServer
+from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.vllm import VLLMServer
 from gpustack.client import ClientSet
 from gpustack.schemas.models import (
@@ -100,6 +101,8 @@ class ServeManager:
 
     def _start_serve_process(self, mi: ModelInstance):
         log_file_path = f"{self._serve_log_dir}/{mi.id}.log"
+        if os.path.exists(log_file_path):
+            os.remove(log_file_path)
 
         try:
             if mi.port is None:
@@ -157,12 +160,15 @@ class ServeManager:
         )
         model = clientset.models.get(mi.model_id)
         backend = get_backend(model)
+
         with open(log_file_path, "w", buffering=1, encoding="utf-8") as log_file:
-            with redirect_stdout(log_file), redirect_stderr(log_file):
+            with stdout_redirected(log_file), merged_stderr_stdout():
                 if backend == BackendEnum.LLAMA_BOX:
                     LlamaBoxServer(clientset, mi, cfg).start()
                 elif backend == BackendEnum.VLLM:
                     VLLMServer(clientset, mi, cfg).start()
+                elif backend == BackendEnum.VOX_BOX:
+                    VoxBoxServer(clientset, mi, cfg).start()
                 else:
                     raise ValueError(f"Unsupported backend {backend}")
 

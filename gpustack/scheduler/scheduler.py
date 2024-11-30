@@ -8,6 +8,9 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+from gpustack.policies.candidate_selectors.vox_box_resource_fit_selector import (
+    VoxBoxResourceFitSelector,
+)
 from gpustack.policies.scorers.placement_scorer import PlacementScorer
 from gpustack.config.config import Config
 from gpustack.policies.base import (
@@ -25,15 +28,17 @@ from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
 )
 from gpustack.scheduler.queue import AsyncUniqueQueue
 from gpustack.policies.worker_filters.status_filter import StatusFilter
-from gpustack.schemas.workers import Worker, WorkerStateEnum
+from gpustack.schemas.workers import Worker
 from gpustack.schemas.models import (
     BackendEnum,
     DistributedServers,
     Model,
     ModelInstance,
     ModelInstanceStateEnum,
+    SourceEnum,
     get_backend,
     is_gguf_model,
+    is_audio_model,
 )
 from gpustack.server.bus import EventType
 from gpustack.server.db import get_engine
@@ -63,6 +68,9 @@ class Scheduler:
         if self._config.cache_dir is not None:
             self._cache_dir = os.path.join(self._config.cache_dir, "gguf-parser")
             os.makedirs(self._cache_dir, exist_ok=True)
+
+            self._vox_box_cache_dir = os.path.join(self._config.cache_dir, "vox-box")
+            os.makedirs(self._vox_box_cache_dir, exist_ok=True)
 
     async def start(self):
         """
@@ -129,8 +137,17 @@ class Scheduler:
                     instance.state_message = "Evaluating resource requirements"
                     await instance.update(session)
 
+                if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(
+                    model.local_path
+                ):
+                    # The local path model is not accessible from the server, skip evaluation.
+                    await self._queue.put(instance)
+                    return
+
                 if is_gguf_model(model):
                     await self._evaluate_gguf_model(session, model, instance)
+                elif is_audio_model(model):
+                    await self._evaluate_audio_model(session, model)
                 else:
                     await self._evaluate_pretrained_config(session, model)
 
@@ -168,6 +185,10 @@ class Scheduler:
         ):
             should_update = True
             model.embedding_only = True
+
+        if task_output.resource_claim_estimate.imageOnly and not model.image_only:
+            should_update = True
+            model.image_only = True
 
         if task_output.resource_claim_estimate.reranking and not model.reranker:
             should_update = True
@@ -215,6 +236,47 @@ class Scheduler:
             model.embedding_only = True
 
         if should_update:
+            await model.update(session)
+
+    async def _evaluate_audio_model(
+        self,
+        session: AsyncSession,
+        model: Model,
+    ):
+        try:
+            from vox_box.elstimator.estimate import estimate_model
+            from vox_box.config import Config as VoxBoxConfig
+        except ImportError:
+            raise Exception("vox_box is not installed.")
+
+        cfg = VoxBoxConfig()
+        cfg.cache_dir = self._vox_box_cache_dir
+        cfg.model = model.local_path
+        cfg.huggingface_repo_id = model.huggingface_repo_id
+        cfg.model_scope_model_id = model.model_scope_model_id
+
+        try:
+            timeout_in_seconds = 15
+            model_dict = await asyncio.wait_for(
+                asyncio.to_thread(estimate_model, cfg),
+                timeout=timeout_in_seconds,
+            )
+        except Exception as e:
+            logger.error(f"Failed to estimate model {model.name}: {e}")
+            return
+
+        supported = model_dict.get("supported", False)
+        if not supported:
+            logger.error(f"Model {model.name} is not supported.")
+            return
+
+        task_type = model_dict.get("task_type")
+        if task_type == "tts":
+            model.text_to_speech = True
+        elif task_type == "stt":
+            model.speech_to_text = True
+
+        if model.text_to_speech or model.speech_to_text:
             await model.update(session)
 
     def _should_schedule(self, instance: ModelInstance) -> bool:
@@ -293,6 +355,10 @@ class Scheduler:
                 candidates_selector = GGUFResourceFitSelector(
                     model, instance, self._cache_dir
                 )
+            elif is_audio_model(model):
+                candidates_selector = VoxBoxResourceFitSelector(
+                    self._config, model, instance, self._vox_box_cache_dir
+                )
             else:
                 candidates_selector = VLLMResourceFitSelector(model, instance)
 
@@ -326,9 +392,9 @@ class Scheduler:
         state_message = ""
 
         async with AsyncSession(self._engine) as session:
-            workers = await Worker.all_by_field(session, "state", WorkerStateEnum.READY)
+            workers = await Worker.all(session)
             if len(workers) == 0:
-                state_message = "No ready workers"
+                state_message = "No available workers"
 
             model = await Model.one_by_id(session, instance.model_id)
             if model is None:

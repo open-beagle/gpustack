@@ -31,3 +31,24 @@ def find_parameter(parameters: List[str], param_names: List[str]) -> Optional[st
                 if i + 1 < len(parameters):
                     return parameters[i + 1]
     return None
+
+
+def find_bool_parameter(parameters: List[str], param_names: List[str]) -> bool:
+    """
+    Find specified boolean parameter by name from the parameters.
+    Return True if the parameter is set, otherwise return False.
+    """
+    for i, param in enumerate(parameters):
+        if param.lstrip('-') in param_names:
+            return True
+    return False
+
+
+def get_versioned_command(command_name: str, version: str) -> str:
+    """
+    Get the versioned command name.
+    """
+    if command_name.endswith(".exe"):
+        return f"{command_name[:-4]}_{version}.exe"
+
+    return f"{command_name}_{version}"
