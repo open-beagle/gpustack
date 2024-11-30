@@ -69,7 +69,7 @@ steps:
         path: /var/run/docker.sock
     settings:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10
-      dockerfile: .beagle/cann.dockerfile
+      dockerfile: .beagle/cann-ubuntu22.04.dockerfile
       repo: wod/gpustack
       version: "v0.3.4-cann"
       args: "TARGETOS=linux,TARGETARCH=arm64"

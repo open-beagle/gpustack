@@ -114,12 +114,12 @@ docker run -it --rm \
 
   gpustack download-tools --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
-docker pull registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.beta1-kernel910b && \
+docker pull registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10 && \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
   -e DEBIAN_FRONTEND=noninteractive \
-  registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.beta1-kernel910b \
+  registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10 \
   bash
 
   WHEEL_PACKAGE="$(ls /go/src/github.com/open-beagle/gpustack/dist/*.whl)" && \
