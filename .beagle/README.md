@@ -9,8 +9,7 @@ git remote add upstream git@github.com:gpustack/gpustack.git
 
 git fetch upstream
 
-# 0.4.0rc1
-git merge upstream/main
+git merge v0.4.1
 ```
 
 ## images
@@ -18,9 +17,9 @@ git merge upstream/main
 <https://hub.docker.com/r/gpustack/gpustack>
 
 ```bash
-docker pull gpustack/gpustack:0.3.2 && \
-docker tag gpustack/gpustack:0.3.2 registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.3.2 && \
-docker push registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.3.2
+docker pull gpustack/gpustack:0.4.1 && \
+docker tag gpustack/gpustack:0.4.1 registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.4.1 && \
+docker push registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.4.1
 ```
 
 ## base images
@@ -43,7 +42,7 @@ docker push registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu2
 # default user admin
 docker run -d --gpus all -p 6080:80 --ipc=host --shm-size=2g --name gpustack \
   -v /data/gpustack:/var/lib/gpustack \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.5-cuda \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda \
   --bootstrap-password 'beagle!@#123'
 
 docker rm -f gpustack && rm -rf /data/gpustack
@@ -52,7 +51,7 @@ docker rm -f gpustack && rm -rf /data/gpustack
 docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /data/gpustack:/var/lib/gpustack \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.5-cuda \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda \
   --server-url http://myserver --token mytoken \
   --worker-ip <host-ip>
 ```
@@ -66,9 +65,8 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack
   -v /data/gpustack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.5-cann \
-  --bootstrap-password 'beagle!@#123' --port 6080 \
-  --worker-ip <host-ip> --worker-name <host-name>
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cann \
+  --bootstrap-password 'beagle!@#123'
 
 docker rm -f gpustack && rm -rf /data/gpustack
 
@@ -78,7 +76,7 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   -v /usr/share/hwdata:/usr/share/hwdata \
   -v /data/gpustack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.5-cann \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cann \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> --worker-name <host-name>
 ```
@@ -90,7 +88,7 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
-  -e VERSION=v0.3.5 \
+  -e VERSION=v0.4.1 \
   -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
   bash .beagle/build.sh
@@ -137,6 +135,7 @@ docker run -it --rm \
 ### aarch64 cann
 
 ```bash
+# gpustack/worker/tools_manager.py
 rm -rf ./downloads/gpustack/
 
 # llama-box
@@ -172,6 +171,7 @@ mc cp -r ./downloads/gpustack/ aliyun/vscode/gpustack/
 ### amd64 cuda 12.4
 
 ```bash
+# gpustack/worker/tools_manager.py
 rm -rf ./downloads/gpustack/ && mkdir -p ./downloads/gpustack
 
 # llama-box
