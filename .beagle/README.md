@@ -66,7 +66,10 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cann \
-  --bootstrap-password 'beagle!@#123'
+  --bootstrap-password 'beagle!@#123' \
+  --port 6080 \
+  --worker-ip <host-ip> \
+  --worker-name <host-name>
 
 docker rm -f gpustack && rm -rf /data/gpustack
 
@@ -139,6 +142,7 @@ docker run -it --rm \
 rm -rf ./downloads/gpustack/
 
 # llama-box
+# https://github.com/gpustack/llama-box/releases
 export LLAMA_BOX_VERSION=v0.0.103 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
@@ -153,6 +157,7 @@ curl -x $SOCKS5_PROXY_LOCAL \
   -fL https://github.com/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-arm64
 
 # fastfetch
+# https://github.com/gpustack/fastfetch/releases
 export FASTFETCH_VERSION=2.25.0.1 && \
 mkdir -p ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
@@ -175,6 +180,7 @@ mc cp -r ./downloads/gpustack/ aliyun/vscode/gpustack/
 rm -rf ./downloads/gpustack/ && mkdir -p ./downloads/gpustack
 
 # llama-box
+# https://github.com/gpustack/llama-box/releases
 export LLAMA_BOX_VERSION=v0.0.103 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
@@ -182,6 +188,7 @@ curl -x $SOCKS5_PROXY_LOCAL \
   -fL https://github.com/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-amd64-cuda-12.4.zip
 
 # gguf-parser-go
+# https://github.com/gpustack/gguf-parser-go
 export GGUF_PARSER_GO_VERSION=v0.13.8 && \
 mkdir -p ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
@@ -189,6 +196,7 @@ curl -x $SOCKS5_PROXY_LOCAL \
   -fL https://github.com/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-amd64
 
 # fastfetch
+# https://github.com/gpustack/fastfetch/releases
 export FASTFETCH_VERSION=2.25.0.1 && \
 mkdir -p ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
