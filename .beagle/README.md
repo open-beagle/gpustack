@@ -43,7 +43,7 @@ docker push registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu2
 # default user admin
 docker run -d --gpus all -p 6080:80 --ipc=host --shm-size=2g --name gpustack \
   -v /data/gpustack:/var/lib/gpustack \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.4-cuda \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.5-cuda \
   --bootstrap-password 'beagle!@#123'
 
 docker rm -f gpustack && rm -rf /data/gpustack
@@ -52,7 +52,7 @@ docker rm -f gpustack && rm -rf /data/gpustack
 docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /data/gpustack:/var/lib/gpustack \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.4-cuda \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.5-cuda \
   --server-url http://myserver --token mytoken \
   --worker-ip <host-ip>
 ```
@@ -61,13 +61,14 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
 
 ```bash
 # default user admin
-docker run -d -p 6080:80 --privileged --ipc=host --shm-size=2g --name gpustack \
+docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack \
   -v /usr/share/hwdata:/usr/share/hwdata \
   -v /data/gpustack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.4-cann \
-  --bootstrap-password 'beagle!@#123'
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.5-cann \
+  --bootstrap-password 'beagle!@#123' --port 6080 \
+  --worker-ip <host-ip> --worker-name <host-name>
 
 docker rm -f gpustack && rm -rf /data/gpustack
 
@@ -77,9 +78,9 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   -v /usr/share/hwdata:/usr/share/hwdata \
   -v /data/gpustack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.4-cann \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.3.5-cann \
   --server-url http://myserver:6080 --token mytoken \
-  --worker-ip <host-ip>
+  --worker-ip <host-ip> --worker-name <host-name>
 ```
 
 ## build
@@ -89,7 +90,7 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
-  -e VERSION=v0.3.4 \
+  -e VERSION=v0.3.5 \
   -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
   bash .beagle/build.sh
@@ -139,14 +140,14 @@ docker run -it --rm \
 rm -rf ./downloads/gpustack/
 
 # llama-box
-export LLAMA_BOX_VERSION=v0.0.85 && \
+export LLAMA_BOX_VERSION=v0.0.103 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip \
   -fL https://github.com/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip
 
 # gguf-parser-go
-export GGUF_PARSER_GO_VERSION=v0.13.2 && \
+export GGUF_PARSER_GO_VERSION=v0.13.8 && \
 mkdir -p ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-arm64 \
@@ -174,14 +175,14 @@ mc cp -r ./downloads/gpustack/ aliyun/vscode/gpustack/
 rm -rf ./downloads/gpustack/ && mkdir -p ./downloads/gpustack
 
 # llama-box
-export LLAMA_BOX_VERSION=v0.0.85 && \
+export LLAMA_BOX_VERSION=v0.0.103 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-amd64-cuda-12.4.zip \
   -fL https://github.com/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-amd64-cuda-12.4.zip
 
 # gguf-parser-go
-export GGUF_PARSER_GO_VERSION=v0.13.2 && \
+export GGUF_PARSER_GO_VERSION=v0.13.8 && \
 mkdir -p ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-amd64 \
