@@ -60,13 +60,16 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
 
 ```bash
 # default user admin
-docker run -d -p 6080:80 --privileged --ipc=host --shm-size=2g --name gpustack \
+docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack \
   -v /usr/share/hwdata:/usr/share/hwdata \
   -v /data/gpustack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cann \
-  --bootstrap-password 'beagle!@#123'
+  --bootstrap-password 'beagle!@#123' \
+  --port 6080 \
+  --worker-ip <host-ip> \
+  --worker-name <host-name>
 
 docker rm -f gpustack && rm -rf /data/gpustack
 
@@ -78,7 +81,8 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cann \
   --server-url http://myserver:6080 --token mytoken \
-  --worker-ip <host-ip>
+  --worker-ip <host-ip> \
+  --worker-name <host-name>
 ```
 
 ## build
@@ -139,20 +143,22 @@ docker run -it --rm \
 rm -rf ./downloads/gpustack/
 
 # llama-box
-export LLAMA_BOX_VERSION=v0.0.93 && \
+# https://github.com/gpustack/llama-box/releases
+export LLAMA_BOX_VERSION=v0.0.103 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip \
   -fL https://github.com/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-arm64-cann-8.0.zip
 
 # gguf-parser-go
-export GGUF_PARSER_GO_VERSION=v0.13.5 && \
+export GGUF_PARSER_GO_VERSION=v0.13.8 && \
 mkdir -p ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-arm64 \
   -fL https://github.com/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-arm64
 
 # fastfetch
+# https://github.com/gpustack/fastfetch/releases
 export FASTFETCH_VERSION=2.25.0.1 && \
 mkdir -p ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
@@ -175,20 +181,23 @@ mc cp -r ./downloads/gpustack/ aliyun/vscode/gpustack/
 rm -rf ./downloads/gpustack/ && mkdir -p ./downloads/gpustack
 
 # llama-box
-export LLAMA_BOX_VERSION=v0.0.93 && \
+# https://github.com/gpustack/llama-box/releases
+export LLAMA_BOX_VERSION=v0.0.103 && \
 mkdir -p ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-amd64-cuda-12.4.zip \
   -fL https://github.com/gpustack/llama-box/releases/download/${LLAMA_BOX_VERSION}/llama-box-linux-amd64-cuda-12.4.zip
 
 # gguf-parser-go
-export GGUF_PARSER_GO_VERSION=v0.13.5 && \
+# https://github.com/gpustack/gguf-parser-go
+export GGUF_PARSER_GO_VERSION=v0.13.8 && \
 mkdir -p ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
   -o ./downloads/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-amd64 \
   -fL https://github.com/gpustack/gguf-parser-go/releases/download/${GGUF_PARSER_GO_VERSION}/gguf-parser-linux-amd64
 
 # fastfetch
+# https://github.com/gpustack/fastfetch/releases
 export FASTFETCH_VERSION=2.25.0.1 && \
 mkdir -p ./downloads/gpustack/fastfetch/releases/download/${FASTFETCH_VERSION} && \
 curl -x $SOCKS5_PROXY_LOCAL \
