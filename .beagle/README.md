@@ -40,10 +40,13 @@ docker push registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu2
 
 ```bash
 # default user admin
-docker run -d --gpus all -p 6080:80 --ipc=host --shm-size=2g --name gpustack \
+docker run -d --gpus all -p 6080:6080 --ipc=host --shm-size=2g --name gpustack \
   -v /data/gpustack:/var/lib/gpustack \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda \
-  --bootstrap-password 'beagle!@#123'
+  --bootstrap-password 'beagle!@#123' \
+  --port 6080 \
+  --worker-ip <host-ip> \
+  --worker-name <host-name>
 
 docker rm -f gpustack && rm -rf /data/gpustack
 
@@ -52,8 +55,9 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /data/gpustack:/var/lib/gpustack \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda \
-  --server-url http://myserver --token mytoken \
-  --worker-ip <host-ip>
+  --server-url http://myserver:6080 --token mytoken \
+  --worker-ip <host-ip> \
+  --worker-name <host-name>
 ```
 
 ## deployNPU
@@ -132,6 +136,11 @@ docker run -it --rm \
   gpustack download-tools \
     --arch arm64 --device npu \
     --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
+
+curl -sSL https://install.python-poetry.org | python3 -
+poetry install
+
+python3 gpustack/main.py start --bootstrap-password='beagle!@#123' --port=6080 --worker-ip=127.0.0.1 --worker-name=WSL-Debian --data-dir=$HOME/gpustack --tools-download-base-url=https://cache.ali.wodcloud.com/vscode
 ```
 
 ## tools
