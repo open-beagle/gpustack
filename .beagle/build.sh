@@ -11,7 +11,7 @@ if ! [ -e $PWD/.venv/bin/activate ]; then
   source $PWD/.venv/bin/activate
 fi
 
-if $(git diff --quiet gpustack/logginglocal.py); then
+if $(git diff --quiet gpustack/cmd/download_tools.py); then
   git apply .beagle/v0.4.1-logginglocal.patch
 fi
 
