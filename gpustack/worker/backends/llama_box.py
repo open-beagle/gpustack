@@ -64,13 +64,14 @@ class LlamaBoxServer(InferenceServer):
             "--model",
             self._model_path,
             "--no-mmap",
+            "--no-warmup",
         ]
 
         if self._model.reranker:
             arguments.append("--rerank")
 
         if self._model.image_only:
-            arguments.append("--images")
+            arguments.extend(["--images", "--image-vae-tiling"])
 
         if rpc_servers:
             rpc_servers_argument = ",".join(rpc_servers)

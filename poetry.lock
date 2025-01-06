@@ -4142,6 +4142,7 @@ description = "Nvidia JIT LTO Library"
 optional = true
 python-versions = ">=3"
 files = [
+    {file = "nvidia_nvjitlink_cu12-12.4.127-py3-none-manylinux2014_aarch64.whl", hash = "sha256:4abe7fef64914ccfa909bc2ba39739670ecc9e820c83ccc7a6ed414122599b83"},
     {file = "nvidia_nvjitlink_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl", hash = "sha256:06b3b9b25bf3f8af351d664978ca26a16d2c5127dbd53c0497e28d1fb9611d57"},
     {file = "nvidia_nvjitlink_cu12-12.4.127-py3-none-win_amd64.whl", hash = "sha256:fd9020c501d27d135f983c6d3e244b197a7ccad769e34df53a42e276b0e25fa1"},
 ]
@@ -7828,14 +7829,14 @@ video = ["decord"]
 
 [[package]]
 name = "vox-box"
-version = "0.0.5"
+version = "0.0.9"
 description = "Vox box"
 optional = true
 python-versions = "<4.0,>=3.10"
 files = [
-    {file = "vox_box-0.0.5-py3-none-manylinux2014_aarch64.whl", hash = "sha256:689aa7a146bf9d65befa03527c42d4122325db083e524b5d4022dab577ff067d"},
-    {file = "vox_box-0.0.5-py3-none-manylinux2014_x86_64.whl", hash = "sha256:e489ba979bada5629491bc8ced1aaf4c25b19d470afc03e1ae13beacd72acb1b"},
-    {file = "vox_box-0.0.5.tar.gz", hash = "sha256:2b6cb17700376c6ddceef82251bf33de273ef38f0359b681b964ba9b9a19eff5"},
+    {file = "vox_box-0.0.9-py3-none-manylinux2014_aarch64.whl", hash = "sha256:1f27d8fdac83441015972b39b1ffa1df09cae69b632b745a250c788a774b6468"},
+    {file = "vox_box-0.0.9-py3-none-manylinux2014_x86_64.whl", hash = "sha256:27aeb6d236ad29983462679e3ba4e97b73cd3022dda38fe96c9518feebad5136"},
+    {file = "vox_box-0.0.9.tar.gz", hash = "sha256:d8333937fd5cabaae25ce1fa20e1d2e74a2a3e807eed3681f53e0c68b30f472c"},
 ]
 
 [package.dependencies]
@@ -7901,8 +7902,8 @@ openai-whisper = ">=20240930,<20240931"
 optimum = ">=1.23.3,<2.0.0"
 pipx = ">=1.7.1,<2.0.0"
 pyarrow = ">=18.0.0,<19.0.0"
-pynini = {version = "2.1.6", markers = "platform_system == \"Linux\""}
-python-multipart = ">=0.0.17,<0.0.18"
+pynini = {version = "2.1.6", markers = "platform_system == \"Linux\" and platform_machine == \"x86_64\""}
+python-multipart = ">=0.0.17,<0.0.19"
 rich = ">=13.9.4,<14.0.0"
 scipy = ">=1.14.1,<2.0.0"
 tn = ">=0.0.4,<0.0.5"
@@ -7911,7 +7912,7 @@ torchaudio = ">=2.5.1,<3.0.0"
 transformers = ">=4.46.3,<5.0.0"
 twine = ">=5.1.1,<6.0.0"
 uvicorn = ">=0.32.0,<0.33.0"
-wetextprocessing = {version = "1.0.4.1", markers = "platform_system == \"Linux\""}
+wetextprocessing = {version = "1.0.4.1", markers = "platform_system == \"Linux\" and platform_machine == \"x86_64\""}
 wget = ">=3.2,<4.0"
 
 [[package]]
@@ -8465,4 +8466,4 @@ vllm = ["mistral_common", "vllm"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.10"
-content-hash = "e715e8aa42329c4ae25891813fdaf28e17561fbc6946a025466de9ef617d214f"
+content-hash = "7bf0f4d5ffe894d15b653a947f88eee29aeeae97f958b689380bfad32419511c"

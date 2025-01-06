@@ -18,7 +18,7 @@ Running the installation script will:
 
 ### Linux and macOS
 
-For example, to upgrade GPUStack to the latest version on a Linux system and MacOS:
+For example, to upgrade GPUStack to the latest version on a Linux system and macOS:
 
 ```bash
 curl -sfL https://get.gpustack.ai | <EXISTING_INSTALL_ENV> sh -s - <EXISTING_GPUSTACK_ARGS>
@@ -46,6 +46,18 @@ $env:INSTALL_PACKAGE_SPEC = gpustack==x.y.z
 $env:<EXISTING_INSTALL_ENV> = <EXISTING_INSTALL_ENV_VALUE>
 Invoke-Expression "& { $((Invoke-WebRequest -Uri 'https://get.gpustack.ai' -UseBasicParsing).Content) } <EXISTING_GPUSTACK_ARGS>"
 ```
+
+## Docker Upgrade
+
+If you installed GPUStack using Docker, upgrade to the a new version by pulling the Docker image with the desired version tag.
+
+For example:
+
+```bash
+docker pull gpustack/gpustack:vX.Y.Z
+```
+
+Then restart the GPUStack service with the new image.
 
 ## Manual Upgrade
 

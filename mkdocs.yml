@@ -62,29 +62,40 @@ nav:
   - Overview: overview.md
   - Quickstart: quickstart.md
   - Installation:
+      - Installation Requirements: installation/installation-requirements.md
       - Installation Script: installation/installation-script.md
-      - Manual Installation: installation/manual-installation.md
       - Docker Installation: installation/docker-installation.md
+      - Manual Installation: installation/manual-installation.md
       - Air-Gapped Installation: installation/air-gapped-installation.md
       - Uninstallation: installation/uninstallation.md
   - Upgrade: upgrade.md
   - User Guide:
-      - Playground: user-guide/playground.md
+      - Playground:
+          - Playgound: user-guide/playground/index.md
+          - Chat: user-guide/playground/chat.md
+          - Image: user-guide/playground/image.md
+          - Audio: user-guide/playground/audio.md
+          - Embedding: user-guide/playground/embedding.md
+          - Rerank: user-guide/playground/rerank.md
       - Model Management: user-guide/model-management.md
       - API Key Management: user-guide/api-key-management.md
       - User Management: user-guide/user-management.md
       - Inference Backends: user-guide/inference-backends.md
+      - Pinned Backend Versions: user-guide/pinned-backend-versions.md
       - OpenAI Compatible APIs: user-guide/openai-compatible-apis.md
+      - Image Generation APIs: user-guide/image-generation-apis.md
       - Rerank API: user-guide/rerank-api.md
   - Tutorials:
       - Setting Up a Multi-node GPUStack Cluster: tutorials/setting-up-a-multi-node-gpustack-cluster.md
       - Performing Distributed Inference Across Workers: tutorials/performing-distributed-inference-across-workers.md
       - Using Vision Language Models: tutorials/using-vision-language-models.md
+      - Using Image Generation Models: tutorials/using-image-generation-models.md
+      - Using Audio Models: tutorials/using-audio-models.md
+      - Using Reranker Models: tutorials/using-reranker-models.md
       - Inference on CPUs: tutorials/inference-on-cpus.md
       - Running Inference with Ascend NPUs: tutorials/running-inference-with-ascend-npus.md
       - Running on Copilot+ PCs with Snapdragon X: tutorials/running-on-copilot-plus-pcs-with-snapdragon-x.md
       - Creating Text Embeddings: tutorials/creating-text-embeddings.md
-      - Using Reranker Models: tutorials/using-reranker-models.md
       - Inference with Function Calling: tutorials/inference-with-function-calling.md
       - Running Inference with Moore Threads GPUs: tutorials/running-inference-with-moorethreads-gpus.md
   - Architecture: architecture.md

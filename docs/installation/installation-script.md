@@ -1,6 +1,6 @@
 # Installation Script
 
-## Linux and MacOS
+## Linux and macOS
 
 You can use the installation script available at `https://get.gpustack.ai` to install GPUStack as a service on systemd and launchd based systems.
 
@@ -27,6 +27,9 @@ curl -sfL https://get.gpustack.ai | INSTALL_INDEX_URL=https://pypi.tuna.tsinghua
 
 # Install a custom wheel package other than releases form pypi.org.
 curl -sfL https://get.gpustack.ai | INSTALL_PACKAGE_SPEC=https://repo.mycompany.com/my-gpustack.whl sh -s -
+
+# Install a specific version with extra audio dependencies.
+curl -sfL https://get.gpustack.ai | INSTALL_PACKAGE_SPEC=gpustack[audio]==0.4.0 sh -s -
 ```
 
 ## Windows
@@ -62,6 +65,10 @@ Invoke-Expression (Invoke-WebRequest -Uri "https://get.gpustack.ai" -UseBasicPar
 # Install a custom wheel package other than releases form pypi.org.
 $env:INSTALL_PACKAGE_SPEC = "https://repo.mycompany.com/my-gpustack.whl"
 Invoke-Expression (Invoke-WebRequest -Uri "https://get.gpustack.ai" -UseBasicParsing).Content
+
+# Install a specific version with extra audio dependencies.
+$env:INSTALL_PACKAGE_SPEC = "gpustack[audio]==0.4.0"
+Invoke-Expression (Invoke-WebRequest -Uri "https://get.gpustack.ai" -UseBasicParsing).Content
 ```
 
 !!! warning
@@ -70,18 +77,17 @@ Invoke-Expression (Invoke-WebRequest -Uri "https://get.gpustack.ai" -UseBasicPar
 
 ## Available Environment Variables for the Installation Script
 
-| Name                      | Default    | Description                                                                                                                                                     |
-| ------------------------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `INSTALL_INDEX_URL`       | (empty)    | Base URL of the Python Package Index.                                                                                                                           |
-| `INSTALL_PACKAGE_SPEC`    | `gpustack` | The package spec to install. It supports PYPI package names, URLs, and local paths. See https://pip.pypa.io/en/stable/cli/pip_install/#pip-install for details. |
-| `INSTALL_PRE_RELEASE`     | (empty)    | If set to 1, pre-release packages will be installed.                                                                                                            |
-| `INSTALL_SKIP_POST_CHECK` | (empty)    | If set to 1, the installation script will skip the post-installation check.                                                                                     |
+| Name                      | Default                              | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `INSTALL_INDEX_URL`       | (empty)                              | Base URL of the Python Package Index.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `INSTALL_PACKAGE_SPEC`    | `gpustack[all]` or `gpustack[audio]` | The package spec to install. The install script will automatically decide based on the platform. It supports PYPI package names, URLs, and local paths. See the [pip install documentation](https://pip.pypa.io/en/stable/cli/pip_install/#pip-install) for details. <ul><li>`gpustack[all]`: With all inference backends: llama-box, vllm, vox-box.</li><li>`gpustack[vllm]`: With inference backends: llama-box, vllm.</li><li>`gpustack[audio]`: With inference backends: llama-box, vox-box.</li></ul> |
+| `INSTALL_SKIP_POST_CHECK` | (empty)                              | If set to 1, the installation script will skip the post-installation check.                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 ## Set Environment Variables for the GPUStack Service
 
 You can set environment variables for the GPUStack service in an environment file located at:
 
-- **Linux and MacOS**: `/etc/default/gpustack`
+- **Linux and macOS**: `/etc/default/gpustack`
 - **Windows**: `$env:APPDATA\gpustack\gpustack.env`
 
 The following is an example of the content of the file:
@@ -93,7 +99,7 @@ HF_ENDPOINT="https://my-hf-endpoint"
 
 !!!note
 
-    Unlike Systemd, Launchd and Windows services do not natively support reading environment variables from a file. Configuration via the environment file is implemented by the installation script. It reads the file and applies the variables to the service configuration. After modifying the environment file on Windows and MacOS, you need to re-run the installation script to apply changes to the GPUStack service.
+    Unlike Systemd, Launchd and Windows services do not natively support reading environment variables from a file. Configuration via the environment file is implemented by the installation script. It reads the file and applies the variables to the service configuration. After modifying the environment file on Windows and macOS, you need to re-run the installation script to apply changes to the GPUStack service.
 
 ## Available CLI Flags
 
@@ -109,7 +115,7 @@ To form a cluster, you can add GPUStack workers on additional nodes. Install GPU
 
 Examples are as follows:
 
-### Linux or MacOS:
+### Linux or macOS
 
 ```shell
 curl -sfL https://get.gpustack.ai | sh -s - --server-url http://myserver --token mytoken
@@ -121,7 +127,7 @@ In the default setup, you can run the following on the server node to get the to
 cat /var/lib/gpustack/token
 ```
 
-### Windows:
+### Windows
 
 ```powershell
 Invoke-Expression "& { $((Invoke-WebRequest -Uri 'https://get.gpustack.ai' -UseBasicParsing).Content) } -- --server-url http://myserver --token mytoken"

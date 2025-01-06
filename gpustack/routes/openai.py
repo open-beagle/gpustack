@@ -15,6 +15,7 @@ from gpustack.api.exceptions import (
     OpenAIAPIError,
     OpenAIAPIErrorResponse,
     ServiceUnavailableException,
+    GatewayTimeoutException,
 )
 from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack.http_proxy.load_balancer import LoadBalancer
@@ -48,6 +49,11 @@ async def embeddings(session: SessionDep, request: Request):
 @aliasable_router.post("/images/generations")
 async def images_generations(session: SessionDep, request: Request):
     return await proxy_request_by_model(request, session, "images/generations")
+
+
+@aliasable_router.post("/images/edits")
+async def images_edits(session: SessionDep, request: Request):
+    return await proxy_request_by_model(request, session, "images/edits")
 
 
 @aliasable_router.post("/audio/speech")
@@ -133,9 +139,20 @@ async def proxy_request_by_model(request: Request, session: SessionDep, endpoint
             return await handle_standard_request(
                 request, url, body_json, form_data, form_files
             )
+    except httpx.TimeoutException as e:
+        error_message = f"Request to {url} timed out"
+        if str(e):
+            error_message += f": {e}"
+        raise GatewayTimeoutException(
+            message=error_message,
+            is_openai_exception=True,
+        )
     except Exception as e:
+        error_message = "An unexpected error occurred"
+        if str(e):
+            error_message += f": {e}"
         raise ServiceUnavailableException(
-            message=f"An unexpected error occurred: {e}",
+            message=error_message,
             is_openai_exception=True,
         )
 
@@ -208,7 +225,7 @@ async def get_model(session: SessionDep, model_name: Optional[str]):
 async def handle_streaming_request(
     request: Request, url: str, body_json: Optional[dict]
 ):
-    timeout = 120
+    timeout = 300
     headers = filter_headers(request.headers)
 
     if body_json and "stream_options" not in body_json:
@@ -236,15 +253,15 @@ async def handle_streaming_request(
                         else:
                             chunk += "\n"
                             yield chunk, resp.headers, resp.status_code
-        except httpx.RequestError:
+        except httpx.ConnectError as e:
             error_response = OpenAIAPIErrorResponse(
                 error=OpenAIAPIError(
-                    message="Service unavailable. Please retry your requests after a brief wait.",
+                    message=f"Service unavailable. Please retry your requests after a brief wait. Original error: {e}",
                     code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     type="ServiceUnavailable",
                 ),
             )
-            yield error_response.model_dump_json(), status.HTTP_503_SERVICE_UNAVAILABLE
+            yield error_response.model_dump_json(), {}, status.HTTP_503_SERVICE_UNAVAILABLE
         except Exception as e:
             error_response = OpenAIAPIErrorResponse(
                 error=OpenAIAPIError(
@@ -253,7 +270,7 @@ async def handle_streaming_request(
                     type="InternalServerError",
                 ),
             )
-            yield error_response.model_dump_json(), status.HTTP_500_INTERNAL_SERVER_ERROR
+            yield error_response.model_dump_json(), {}, status.HTTP_500_INTERNAL_SERVER_ERROR
 
     return StreamingResponseWithStatusCode(
         stream_generator(), media_type="text/event-stream"
@@ -267,7 +284,7 @@ async def handle_standard_request(
     form_data: Optional[dict],
     form_files: Optional[list],
 ):
-    timeout = 120
+    timeout = 600
     headers = filter_headers(request.headers)
 
     async with httpx.AsyncClient() as client:

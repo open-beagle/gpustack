@@ -31,19 +31,32 @@ Run the following commands in an online environment:
 # On Windows (PowerShell):
 # $PACKAGE_SPEC = "gpustack"
 
-# Optional: To include vLLM dependencies or install a specific version
-# PACKAGE_SPEC="gpustack[vllm]"
+# Optional: To include extra dependencies (vllm, audio, all) or install a specific version
+# PACKAGE_SPEC="gpustack[all]"
 # PACKAGE_SPEC="gpustack==0.4.0"
 PACKAGE_SPEC="gpustack"
 
 # Download all required packages
-pip download $PACKAGE_SPEC --only-binary=:all: -d gpustack_offline_packages
+pip wheel $PACKAGE_SPEC -w gpustack_offline_packages
 
 # Install GPUStack to access its CLI
 pip install gpustack
 
 # Download dependency tools and save them as an archive
 gpustack download-tools --save-archive gpustack_offline_tools.tar.gz
+```
+
+Optional: Additional Dependencies for macOS.
+
+```bash
+# Deploying the speech-to-text CosyVoice model on macOS requires additional dependencies.
+brew install openfst
+CPLUS_INCLUDE_PATH=$(brew --prefix openfst)/include
+LIBRARY_PATH=$(brew --prefix openfst)/lib
+
+AUDIO_DEPENDENCY_PACKAGE_SPEC="wetextprocessing"
+pip wheel $AUDIO_DEPENDENCY_PACKAGE_SPEC -w gpustack_audio_dependency_offline_packages
+mv gpustack_audio_dependency_offline_packages/* gpustack_offline_packages/ && rm -rf gpustack_audio_dependency_offline_packages
 ```
 
 !!!note
@@ -67,6 +80,15 @@ pip install --no-index --find-links=gpustack_offline_packages gpustack
 
 # Load and apply the pre-downloaded tools archive
 gpustack download-tools --load-archive gpustack_offline_tools.tar.gz
+```
+
+Optional: Additional Dependencies for macOS.
+
+```bash
+# Install the additional dependencies for speech-to-text CosyVoice model on macOS.
+brew install openfst
+
+pip install --no-index --find-links=gpustack_offline_packages wetextprocessing
 ```
 
 Now you can run GPUStack by following the instructions in the [Manual Installation](manual-installation.md#run-gpustack) guide.

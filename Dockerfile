@@ -1,6 +1,6 @@
 ARG CUDA_VERSION=12.4.1
 
-FROM nvidia/cuda:$CUDA_VERSION-runtime-ubuntu22.04
+FROM nvidia/cuda:$CUDA_VERSION-cudnn-runtime-ubuntu22.04
 
 ARG TARGETPLATFORM
 ENV DEBIAN_FRONTEND=noninteractive
@@ -20,9 +20,9 @@ RUN cd /workspace/gpustack && \
 
 RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
     # Install vllm dependencies for x86_64
-    WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[vllm]"; \
+    WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[all]"; \
     else  \
-    WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)"; \
+    WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[audio]"; \
     fi && \
     pip install $WHEEL_PACKAGE &&\
     pip cache purge && \

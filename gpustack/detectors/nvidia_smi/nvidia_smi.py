@@ -18,6 +18,9 @@ class NvidiaSMI(GPUDetector):
     def gather_gpu_info(self) -> GPUDevicesInfo:
         command = self._command_gather_gpu()
         results = self._run_command(command)
+        if results is None:
+            return []
+
         return self.decode_gpu_devices(results)
 
     def decode_gpu_devices(self, result) -> GPUDevicesInfo:  # noqa: C901
@@ -65,11 +68,18 @@ class NvidiaSMI(GPUDetector):
         return devices
 
     def _run_command(self, command):
+        result = None
         try:
             result = subprocess.run(
-                command, capture_output=True, text=True, check=True, encoding="utf-8"
+                command, capture_output=True, text=True, encoding="utf-8"
             )
+
+            if result is None or result.stdout is None:
+                return None
+
             output = result.stdout
+            if "no devices" in output.lower():
+                return None
 
             if result.returncode != 0:
                 raise Exception(f"Unexpected return code: {result.returncode}")
@@ -79,10 +89,10 @@ class NvidiaSMI(GPUDetector):
 
             return output
         except Exception as e:
-            raise Exception(
-                f"Failed to execute {command}: {e},"
-                f" stdout: {result.stdout}, stderr: {result.stderr}"
-            )
+            error_message = f"Failed to execute {command}: {e}"
+            if result:
+                error_message += f", stdout: {result.stdout}, stderr: {result.stderr}"
+            raise Exception(error_message)
 
     def _command_gather_gpu(self):
         executable_command = [

@@ -13,7 +13,7 @@ def setup_draw_cmd(subparsers: argparse._SubParsersAction):
     parser.add_argument(
         "model",
         type=str,
-        help="The model to use for image generation. This can be either a GPUStack model name or a Hugging Face GGUF model reference (e.g., 'hf.co/gpustack/stable-diffusion-v3-5-large-turbo-GGUF').",
+        help="The model to use for image generation. This can be either a GPUStack model name or a Hugging Face GGUF model reference (e.g., 'hf.co/gpustack/stable-diffusion-v3-5-large-turbo-GGUF:stable-diffusion-v3-5-large-turbo-Q4_0.gguf').",
     )
     parser.add_argument(
         "prompt",
@@ -77,6 +77,8 @@ def run(args):
     try:
         cfg = parse_arguments(args)
         DrawCLIClient(cfg).run()
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
         print(e)
         sys.exit(1)
