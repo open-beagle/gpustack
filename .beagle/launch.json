@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python Debugger: Current File",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceRoot}/gpustack/main.py",
+      "console": "integratedTerminal",
+      "env": {
+        "PYTHONPATH": "${workspaceRoot}/.venv"
+      },
+      "args": [
+        "start",
+        "--bootstrap-password='beagle!@#123'",
+        "--port=6080",
+        "--worker-ip=127.0.0.1",
+        "--worker-name=WSL-Debian",
+        "--data-dir=${env:HOME}/gpustack",
+        "--tools-download-base-url=https://cache.ali.wodcloud.com/vscode"
+      ],
+      "cwd": "${workspaceRoot}"
+    }
+  ]
+}

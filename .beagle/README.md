@@ -139,7 +139,16 @@ docker run -it --rm \
 curl -sSL https://install.python-poetry.org | python3 -
 poetry install
 
-python3 gpustack/main.py start --bootstrap-password='beagle!@#123' --port=6080 --worker-ip=127.0.0.1 --worker-name=WSL-Debian --data-dir=$HOME/gpustack --tools-download-base-url=https://cache.ali.wodcloud.com/vscode
+python3 \
+  gpustack/main.py start \
+  --bootstrap-password='beagle!@#123' \
+  --port=6080 \
+  --worker-ip=127.0.0.1 \
+  --worker-name=WSL-Debian \
+  --data-dir=${HOME}/gpustack \
+  --tools-download-base-url=https://cache.ali.wodcloud.com/vscode
+
+git apply .beagle/v0.4.1-logginglocal.patch
 ```
 
 ## tools
