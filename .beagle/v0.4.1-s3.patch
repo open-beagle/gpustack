@@ -1,13 +1,13 @@
-From 74fc07f136fad62125cb1aca17d5a6a0545d1471 Mon Sep 17 00:00:00 2001
-From: gaoshiyao <gaoshiyao@wodcloud.com>
-Date: Tue, 7 Jan 2025 16:20:16 +0800
+From ca62049233ff14d67ad8241477329b78a10f0487 Mon Sep 17 00:00:00 2001
+From: root <root@Gsy>
+Date: Tue, 7 Jan 2025 22:15:32 +0800
 Subject: [PATCH] v0.4.1-s3.patch
 
 ---
- gpustack/cmd/start.py            | 28 +++++++++++++++++
+ gpustack/cmd/start.py            | 28 ++++++++++++++++++
  gpustack/config/config.py        |  4 +++
- gpustack/worker/backends/base.py | 53 ++++++++++++++++++++++++++++++--
- 3 files changed, 83 insertions(+), 2 deletions(-)
+ gpustack/worker/backends/base.py | 51 ++++++++++++++++++++++++++++++--
+ 3 files changed, 81 insertions(+), 2 deletions(-)
 
 diff --git a/gpustack/cmd/start.py b/gpustack/cmd/start.py
 index d594d60..ec9b64f 100644
@@ -71,7 +71,7 @@ index 6b49d8b..8c852cf 100644
      def __init__(self, **values):
          super().__init__(**values)
 diff --git a/gpustack/worker/backends/base.py b/gpustack/worker/backends/base.py
-index e5e8d19..13c6b0f 100644
+index e5e8d19..e7af5f3 100644
 --- a/gpustack/worker/backends/base.py
 +++ b/gpustack/worker/backends/base.py
 @@ -6,6 +6,7 @@ import threading
@@ -95,7 +95,7 @@ index e5e8d19..13c6b0f 100644
  
  ACCELERATOR_VENDOR_TO_ENV_NAME = {
      VendorEnum.NVIDIA: "CUDA_VISIBLE_DEVICES",
-@@ -94,7 +99,42 @@ def download_model(
+@@ -94,7 +99,40 @@ def download_model(
              cache_dir=os.path.join(cache_dir, "model_scope"),
          )
      elif mi.source == SourceEnum.LOCAL_PATH:
@@ -104,8 +104,6 @@ index e5e8d19..13c6b0f 100644
 +            # example s3://beagle_wind/maas-public/datamodel/51c63609-faf4-446a-a2cf-47dd8d1a3e97/v1
 +            base_path = mi.local_path.removeprefix("s3://")
 +            file_path = os.path.join(cache_dir , base_path)
-+            if not os.path.exists(file_path):
-+                os.makedirs(file_path)
 +            bucket_name = base_path.split("/")[1]
 +            object_path = base_path.removeprefix("beagle_wind/"+bucket_name+"/")
 +            try:
@@ -139,7 +137,7 @@ index e5e8d19..13c6b0f 100644
  
  
  def get_model_file_size(mi: ModelInstance, cfg: Config) -> Optional[int]:
-@@ -149,7 +189,7 @@ class InferenceServer(ABC):
+@@ -149,7 +187,7 @@ class InferenceServer(ABC):
          # for download progress update frequency control
          self._last_download_update_time = time.time()
          self.hijack_tqdm_progress()
@@ -148,7 +146,7 @@ index e5e8d19..13c6b0f 100644
          self._clientset = clientset
          self._model_instance = mi
          self._config = cfg
-@@ -322,6 +362,15 @@ class InferenceServer(ABC):
+@@ -322,6 +360,15 @@ class InferenceServer(ABC):
              # TODO: support more.
              return None
  
