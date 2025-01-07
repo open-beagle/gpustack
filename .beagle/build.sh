@@ -10,6 +10,10 @@ if ! [ -e $PWD/.venv/bin/activate ]; then
   source $PWD/.venv/bin/activate
 fi
 
+if $(git diff --quiet pyproject.toml); then
+  git apply .beagle/v0.4.1-s3-project.patch
+fi
+
 if $(git diff --quiet gpustack/worker/backends/base.py); then
   git apply .beagle/v0.4.1-s3.patch
 fi
@@ -20,5 +24,6 @@ fi
 
 make build
 
+git apply -R .beagle/v0.4.1-s3-project.patch
 git apply -R .beagle/v0.4.1-s3.patch
 git apply -R .beagle/v0.4.1-logginglocal.patch

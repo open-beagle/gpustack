@@ -8,7 +8,7 @@
       "program": "${workspaceRoot}/gpustack/main.py",
       "console": "integratedTerminal",
       "env": {
-        "PYTHONPATH": "${workspaceRoot}/.venv"
+        "PYTHONPATH": "${workspaceRoot}/.venv",
       },
       "args": [
         "start",
@@ -17,7 +17,10 @@
         "--worker-ip=127.0.0.1",
         "--worker-name=WSL-Debian",
         "--data-dir=${env:HOME}/gpustack",
-        "--tools-download-base-url=https://cache.ali.wodcloud.com/vscode"
+        "--tools-download-base-url=https://cache.ali.wodcloud.com/vscode",
+        "--worker-s3-host=your_s3_host",
+        "--worker-s3-access-key=your_access_key",
+        "--worker-s3-secret-key=your_secret_key"
       ],
       "cwd": "${workspaceRoot}"
     }

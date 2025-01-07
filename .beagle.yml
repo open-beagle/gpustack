@@ -44,6 +44,7 @@ steps:
       POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
     commands:
       - bash .beagle/build.sh
+      - git apply .beagle/v0.4.1-s3-project.patch
 
   - name: docker-cuda
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
@@ -124,7 +125,9 @@ steps:
       VERSION: v0.4.1
       POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
     commands:
+    commands:
       - bash .beagle/build.sh
+      - git apply .beagle/v0.4.1-s3-project.patch
 
   - name: docker-cann-kernel
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0

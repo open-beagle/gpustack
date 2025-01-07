@@ -43,9 +43,11 @@ docker push registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu2
 docker run -d --gpus all -p 6080:6080 --ipc=host --shm-size=2g --name gpustack \
   -v /data/gpustack:/var/lib/gpustack \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda \
-  --bootstrap-password 'beagle!@#123' \
-  --port 6080 \
-  --worker-name <host-name>
+  --bootstrap-password 'beagle!@#123' --port 6080 \
+  --worker-name <host-name> \
+  --worker-s3-host=your_s3_host \
+  --worker-s3-access-key=your_access_key \
+  --worker-s3-secret-key=your_secret_key
 
 docker rm -f gpustack && rm -rf /data/gpustack
 
@@ -56,7 +58,10 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
-  --worker-name <host-name>
+  --worker-name <host-name> \
+  --worker-s3-host=your_s3_host \
+  --worker-s3-access-key=your_access_key \
+  --worker-s3-secret-key=your_secret_key
 ```
 
 ## deployNPU
@@ -69,9 +74,11 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cann \
-  --bootstrap-password 'beagle!@#123' \
-  --port 6080 \
-  --worker-name <host-name>
+  --bootstrap-password 'beagle!@#123' --port 6080 \
+  --worker-name <host-name> \
+  --worker-s3-host=your_s3_host \
+  --worker-s3-access-key=your_access_key \
+  --worker-s3-secret-key=your_secret_key
 
 docker rm -f gpustack && rm -rf /data/gpustack
 
@@ -83,7 +90,11 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cann \
   --server-url http://myserver:6080 --token mytoken \
-  --worker-ip <host-ip> --worker-name <host-name>
+  --worker-ip <host-ip> \
+  --worker-name <host-name> \
+  --worker-s3-host=your_s3_host \
+  --worker-s3-access-key=your_access_key \
+  --worker-s3-secret-key=your_secret_key
 ```
 
 ## build
@@ -135,6 +146,8 @@ docker run -it --rm \
     --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
 curl -sSL https://install.python-poetry.org | python3 -
+
+poetry config repositories.pypi-mirror https://pypi.tuna.tsinghua.edu.cn/simple
 poetry install
 
 python3 \
@@ -147,6 +160,25 @@ python3 \
   --tools-download-base-url=https://cache.ali.wodcloud.com/vscode
 
 git apply .beagle/v0.4.1-logginglocal.patch
+```
+
+## s3 patch add minio
+
+```bash
+# add minio to pyproject.toml
+minio = "^7.2.14"
+
+# add s3 to launch.json
+"S3_URL": "https://cache.wodcloud.com/vscode",
+"S3_ACCESS_KEY": "your_access_key",
+"S3_SECRET_KEY": "your_secret_key"
+
+# install poetry
+curl -sSL https://install.python-poetry.org | python3 -
+
+# install minio
+poetry add minio
+poetry lock --no-update
 ```
 
 ## tools

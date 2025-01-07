@@ -18,22 +18,22 @@ index 36aadcf..089d4bc 100644
          default=get_gpustack_env("TOOLS_DOWNLOAD_BASE_URL"),
      )
 +    group.add_argument(
-+        "--s3-url",
++        "--worker-s3-host",
 +        type=str,
-+        help="URL to s3.",
-+        default=get_gpustack_env("S3_URL"),
++        help="HOST to s3.",
++        default=get_gpustack_env("WORKER_S3_HOST"),
 +    )
 +    group.add_argument(
-+        "--s3-access-key",
++        "--worker-s3-access-key",
 +        type=str,
 +        help="AccessKey to s3.",
-+        default=get_gpustack_env("S3_ACCESS_KEY"),
++        default=get_gpustack_env("WORKER_S3_ACCESS_KEY"),
 +    )
 +    group.add_argument(
-+        "--s3-secret-key",
++        "--worker-s3-secret-key",
 +        type=str,
 +        help="SecretKey to s3.",
-+        default=get_gpustack_env("S3_SECRET_KEY"),
++        default=get_gpustack_env("WORKER_S3_SECRET_KEY"),
 +    )
  
      parser_server.set_defaults(func=run)
@@ -42,7 +42,7 @@ index 36aadcf..089d4bc 100644
          "pipx_path",
          "token",
          "huggingface_token",
-+        "s3_url",
++        "s3_host",
 +        "s3_access_key",
 +        "s3_secret_key",
      ]
@@ -56,7 +56,7 @@ index 6b49d8b..0f0b0ce 100644
      resources: Optional[dict] = None
      bin_dir: Optional[str] = None
      pipx_path: Optional[str] = None
-+    s3_url: Optional[str] = ""
++    s3_host: Optional[str] = ""
 +    s3_access_key: Optional[str] = ""
 +    s3_secret_key: Optional[str] = ""
  
@@ -124,7 +124,7 @@ index e5e8d19..0570c5a 100644
 +    def init_s3_client(self, cfg):
 +        global s3Client  # 声明使用全局变量
 +        s3Client = Minio(
-+            cfg.s3_url,
++            cfg.s3_host,
 +            access_key=cfg.s3_access_key,
 +            secret_key=cfg.s3_secret_key,
 +            secure=True,
