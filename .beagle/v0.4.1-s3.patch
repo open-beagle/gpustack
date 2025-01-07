@@ -1,16 +1,19 @@
-From ca62049233ff14d67ad8241477329b78a10f0487 Mon Sep 17 00:00:00 2001
-From: root <root@Gsy>
-Date: Tue, 7 Jan 2025 22:15:32 +0800
-Subject: [PATCH] v0.4.1-s3.patch
+From d30527d2eb6d527c2cecda09a9807939facc67f0 Mon Sep 17 00:00:00 2001
+From: shucheng <shucheng@bd-apaas.com>
+Date: Wed, 8 Jan 2025 02:46:29 +0800
+Subject: [PATCH] v0.4.1-s3
 
 ---
- gpustack/cmd/start.py            | 28 ++++++++++++++++++
- gpustack/config/config.py        |  4 +++
- gpustack/worker/backends/base.py | 51 ++++++++++++++++++++++++++++++--
- 3 files changed, 81 insertions(+), 2 deletions(-)
+ gpustack/cmd/start.py            |  28 +++++
+ gpustack/config/config.py        |   4 +
+ gpustack/scheduler/calculator.py |  35 +++++-
+ gpustack/worker/backends/base.py |  29 ++++-
+ gpustack/worker/downloader_s3.py | 177 +++++++++++++++++++++++++++++++
+ 5 files changed, 269 insertions(+), 4 deletions(-)
+ create mode 100644 gpustack/worker/downloader_s3.py
 
 diff --git a/gpustack/cmd/start.py b/gpustack/cmd/start.py
-index d594d60..ec9b64f 100644
+index d594d60..d56e9c2 100644
 --- a/gpustack/cmd/start.py
 +++ b/gpustack/cmd/start.py
 @@ -228,6 +228,30 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
@@ -39,7 +42,7 @@ index d594d60..ec9b64f 100644
 +        "--worker-s3-ssl",
 +        action=OptionalBoolAction,
 +        help="SecretKey to s3.",
-+        default=get_gpustack_env_bool("WORKER_S3_SSL"),
++        default=get_gpustack_env_bool("WORKER_S3_SSL") or False,
 +    )
  
      parser_server.set_defaults(func=run)
@@ -70,8 +73,61 @@ index 6b49d8b..8c852cf 100644
  
      def __init__(self, **values):
          super().__init__(**values)
+diff --git a/gpustack/scheduler/calculator.py b/gpustack/scheduler/calculator.py
+index fdaf469..7ba0f39 100644
+--- a/gpustack/scheduler/calculator.py
++++ b/gpustack/scheduler/calculator.py
+@@ -241,7 +241,25 @@ async def calculate_model_resource_claim(
+         model: Model to calculate the resource claim for.
+     """
+ 
+-    if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(model.local_path):
++    # 获取cache_dir的父目录
++    cache_dir = kwargs.get("cache_dir")
++    if cache_dir:
++        cache_dir = os.path.dirname(cache_dir)  # 获取上一级目录
++    cache_path = model.local_path
++    if model.source == SourceEnum.LOCAL_PATH and model.local_path.startswith(
++        "s3://beagle_wind/"
++    ):
++        # 构建本地缓存路径
++        if cache_dir:
++            cache_path = os.path.join(
++                cache_dir,
++                "beagle",
++                model.local_path.removeprefix(
++                    "s3://beagle_wind/maas-public/datamodel/"
++                ),
++            )
++
++    if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(cache_path):
+         # Skip the calculation if the model is not available, policies like spread strategy still apply.
+         # TODO Support user provided resource claim for better scheduling.
+         estimate = _get_empty_estimate()
+@@ -355,7 +373,20 @@ async def _gguf_parser_command_args_from_source(  # noqa: C901
+             )
+             return ["-ms-repo", model.model_scope_model_id, "-ms-file", file_path]
+         elif model.source == SourceEnum.LOCAL_PATH:
+-            return ["--path", model.local_path]
++            # 获取cache_dir的父目录
++            cache_dir = kwargs.get("cache_dir")
++            cache_path = model.local_path
++            if cache_dir:
++                cache_dir = os.path.dirname(cache_dir)  # 获取上一级目录
++            if cache_dir and model.local_path.startswith("s3://beagle_wind/"):
++                cache_path = os.path.join(
++                    cache_dir,
++                    "beagle",
++                    model.local_path.removeprefix(
++                        "s3://beagle_wind/maas-public/datamodel/"
++                    ),
++                )
++            return ["--path", cache_path]
+     except asyncio.TimeoutError:
+         raise Exception(f"Timeout when getting the file for model {model.name}")
+     except Exception as e:
 diff --git a/gpustack/worker/backends/base.py b/gpustack/worker/backends/base.py
-index e5e8d19..e7af5f3 100644
+index e5e8d19..bb7bf85 100644
 --- a/gpustack/worker/backends/base.py
 +++ b/gpustack/worker/backends/base.py
 @@ -6,6 +6,7 @@ import threading
@@ -82,86 +138,262 @@ index e5e8d19..e7af5f3 100644
  
  from gpustack.client.generated_clientset import ClientSet
  from gpustack.config.config import Config
-@@ -26,8 +27,12 @@ from gpustack.worker.downloaders import (
+@@ -25,9 +26,14 @@ from gpustack.worker.downloaders import (
+     OllamaLibraryDownloader,
  )
  from gpustack.worker.tools_manager import ToolsManager
- 
++from gpustack.worker.downloader_s3 import S3Downloader
++
 +from minio import Minio
 +from minio.error import S3Error
-+
+ 
  logger = logging.getLogger(__name__)
  lock = threading.Lock()
-+s3Client = None
++s3Downloader = None
  
  ACCELERATOR_VENDOR_TO_ENV_NAME = {
      VendorEnum.NVIDIA: "CUDA_VISIBLE_DEVICES",
-@@ -94,7 +99,40 @@ def download_model(
+@@ -94,7 +100,11 @@ def download_model(
              cache_dir=os.path.join(cache_dir, "model_scope"),
          )
      elif mi.source == SourceEnum.LOCAL_PATH:
 -        return mi.local_path
 +        if 's3://beagle_wind' in mi.local_path:
 +            # example s3://beagle_wind/maas-public/datamodel/51c63609-faf4-446a-a2cf-47dd8d1a3e97/v1
-+            base_path = mi.local_path.removeprefix("s3://")
-+            file_path = os.path.join(cache_dir , base_path)
-+            bucket_name = base_path.split("/")[1]
-+            object_path = base_path.removeprefix("beagle_wind/"+bucket_name+"/")
-+            try:
-+                objects = s3Client.list_objects(bucket_name, prefix=object_path, recursive=True)
-+                for obj in objects:
-+                    local_file_path = os.path.join(cache_dir, "beagle_wind", obj.bucket_name, obj.object_name)
-+                    downloaded_size = 0
-+                    stat = os.stat(local_file_path) if os.path.exists(local_file_path) else None
-+                    if stat:
-+                        downloaded_size = stat.st_size
-+                    part_size = 1024 * 1024 * 10
-+                    start_byte = downloaded_size
-+                    while True:
-+                        if start_byte >= obj.size:
-+                            break
-+                        data = s3Client.get_object(bucket_name, obj.object_name, offset=start_byte, length=part_size).read()
-+                        if os.path.exists(local_file_path):
-+                            with open(local_file_path, 'ab') as f:
-+                                f.write(data)
-+                        else:
-+                            Path(local_file_path).parent.mkdir(parents=True, exist_ok=True)
-+                            with open(local_file_path, 'wb') as f:
-+                                f.write(data)
-+                        start_byte += part_size
-+                    print(f"Downloaded {obj.bucket_name} {obj.object_name}")
-+            except S3Error as e:
-+                print(f"Error occurred: {e}")
-+            return file_path
++            return s3Downloader.download(mi.local_path)
 +        else:
 +            return mi.local_path
  
  
  def get_model_file_size(mi: ModelInstance, cfg: Config) -> Optional[int]:
-@@ -149,7 +187,7 @@ class InferenceServer(ABC):
+@@ -107,6 +117,10 @@ def get_model_file_size(mi: ModelInstance, cfg: Config) -> Optional[int]:
+         return ModelScopeDownloader.get_model_file_size(
+             model_instance=mi,
+         )
++    elif mi.source == SourceEnum.LOCAL_PATH and 's3://beagle_wind' in mi.local_path:
++        return s3Downloader.get_model_file_size(
++            model_instance=mi,
++        )
+ 
+     return None
+ 
+@@ -141,6 +155,8 @@ class InferenceServer(ABC):
+     ):
+         setup_logging(debug=cfg.debug)
+ 
++        self.init_s3_client(cfg)
++
+         model_file_size = get_model_file_size(mi, cfg)
+         if model_file_size:
+             logger.debug(f"Model file size: {model_file_size}")
+@@ -149,7 +165,6 @@ class InferenceServer(ABC):
          # for download progress update frequency control
          self._last_download_update_time = time.time()
          self.hijack_tqdm_progress()
 -
-+        self.init_s3_client(cfg)
          self._clientset = clientset
          self._model_instance = mi
          self._config = cfg
-@@ -322,6 +360,15 @@ class InferenceServer(ABC):
+@@ -322,6 +337,16 @@ class InferenceServer(ABC):
              # TODO: support more.
              return None
  
 +    def init_s3_client(self, cfg):
-+        global s3Client  # 声明使用全局变量
-+        s3Client = Minio(
++        global s3Downloader
++        s3Downloader = S3Downloader(
 +            cfg.worker_s3_host,
 +            access_key=cfg.worker_s3_access_key,
 +            secret_key=cfg.worker_s3_secret_key,
-+            secure=cfg.worker_s3_ssl,
++            ssl=cfg.worker_s3_ssl,
++            cache_dir=os.path.join(cfg.cache_dir, "beagle"),
 +        )
 +
  
  def get_env_name_by_vendor(vendor: str) -> str:
      env_name = next(
+diff --git a/gpustack/worker/downloader_s3.py b/gpustack/worker/downloader_s3.py
+new file mode 100644
+index 0000000..ecf6901
+--- /dev/null
++++ b/gpustack/worker/downloader_s3.py
+@@ -0,0 +1,177 @@
++import os
++import logging
++from pathlib import Path
++from typing import Optional
++from minio import Minio
++from minio.error import S3Error
++from filelock import FileLock
++from tqdm import tqdm
++
++from gpustack.schemas.models import (
++    ModelInstance,
++)
++
++logger = logging.getLogger(__name__)
++
++
++class S3Downloader:
++    _default_cache_dir = "/var/lib/gpustack/cache/beagle"
++
++    def __init__(
++        self,
++        host: str,
++        access_key: str,
++        secret_key: str,
++        ssl: bool = True,
++        cache_dir: Optional[str] = None,
++    ):
++        self._s3_client = Minio(
++            host, access_key=access_key, secret_key=secret_key, secure=ssl
++        )
++        self._cache_dir = cache_dir or self._default_cache_dir
++
++    def download(
++        self,
++        s3_path: str,
++        cache_dir: Optional[str] = None,
++    ) -> str:
++        """从S3下载模型文件
++
++        Args:
++            s3_path: S3路径,格式为s3://bucket/path/to/model
++            cache_dir: 本地缓存目录
++
++        Returns:
++            下载后的本地文件路径
++        """
++        if not s3_path.startswith("s3://beagle_wind/"):
++            return s3_path
++
++        # 解析S3路径
++        # s3://beagle_wind/maas-public/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/v1/qwen2.5-3b-instruct-q8_0.gguf
++        base_path = s3_path.removeprefix("s3://beagle_wind/")
++        bucket_name = base_path.split("/")[0]
++        object_prefix = "/".join(base_path.split("/")[1:-1])  # 去掉最后的文件名部分
++        filename = base_path.split("/")[-1]  # 获取文件名
++
++        # 准备本地缓存路径
++        local_cache = cache_dir or self._cache_dir
++        local_path = os.path.join(
++            local_cache, s3_path.removeprefix("s3://beagle_wind/maas-public/datamodel/")
++        )
++        local_dir = os.path.dirname(local_path)  # 获取local_path的父目录
++        if not os.path.exists(local_dir):  # 创建父目录
++            os.makedirs(local_dir)
++
++        # 使用文件锁避免并发下载
++        lock_filename = local_dir + ".lock"
++        logger.debug("获取文件锁")
++
++        with FileLock(lock_filename):
++            try:
++                # 列出所有对象
++                objects = self._s3_client.list_objects(
++                    bucket_name, prefix=object_prefix, recursive=True
++                )
++
++                # 下载每个对象
++                for obj in objects:
++                    self._download_object(
++                        bucket_name=bucket_name,
++                        object_name=obj.object_name,
++                        local_path=os.path.join(
++                            local_cache, obj.object_name.removeprefix("datamodel/")
++                        ),
++                        total_size=obj.size,
++                    )
++
++                logger.debug(f"已下载 {bucket_name}/{object_prefix}")
++                return local_path
++
++            except S3Error as e:
++                logger.error(f"S3下载错误: {e}")
++                raise
++
++    def _download_object(
++        self, bucket_name: str, object_name: str, local_path: str, total_size: int
++    ):
++        """分片下载单个S3对象"""
++        downloaded_size = 0
++        if os.path.exists(local_path):
++            downloaded_size = os.path.getsize(local_path)
++
++        if downloaded_size >= total_size:
++            logger.debug(f"文件 {object_name} 已存在,跳过下载")
++            return
++
++        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
++
++        # 如果是新下载，先清空文件
++        if downloaded_size == 0:
++            open(local_path, 'wb').close()
++
++        part_size = 10 * 1024 * 1024  # 10MB
++        start_byte = downloaded_size
++
++        with tqdm(
++            total=total_size,
++            initial=downloaded_size,
++            desc=object_name,
++            unit='B',
++            unit_scale=True,
++        ) as pbar:
++            while start_byte < total_size:
++                response = self._s3_client.get_object(
++                    bucket_name,
++                    object_name,
++                    offset=start_byte,
++                    length=min(part_size, total_size - start_byte),
++                )
++
++                data = response.read()
++
++                # 始终使用追加模式
++                with open(local_path, "ab") as f:
++                    f.write(data)
++
++                chunk_size = len(data)
++                start_byte += chunk_size
++                pbar.update(chunk_size)
++
++    def get_model_file_size(self, model_instance: ModelInstance) -> int:
++        """获取S3上模型文件的总大小
++
++        Args:
++            model_instance: 模型实例对象
++
++        Returns:
++            文件总大小(字节)
++
++        Raises:
++            S3Error: 当S3操作失败时抛出
++        """
++        if not model_instance.local_path.startswith("s3://beagle_wind/"):
++            return None
++
++        try:
++            # 解析S3路径
++            base_path = model_instance.local_path.removeprefix("s3://beagle_wind/")
++            bucket_name = base_path.split("/")[0]
++            object_prefix = "/".join(base_path.split("/")[1:-1])  # 去掉最后的文件名部分
++
++            # 列出所有对象
++            objects = self._s3_client.list_objects(
++                bucket_name, prefix=object_prefix, recursive=True
++            )
++
++            # 计算所有对象的总大小
++            total_size = sum(obj.size for obj in objects)
++
++            logger.debug(
++                f"S3路径 {model_instance.local_path} 的总大小: {total_size} 字节"
++            )
++            return total_size
++
++        except S3Error as e:
++            logger.error(f"获取S3文件大小失败: {e}")
++            raise
 -- 
-2.34.1
+2.39.2
 

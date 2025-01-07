@@ -181,6 +181,16 @@ poetry add minio
 poetry lock --no-update
 ```
 
+## clean cache
+
+```bash
+bash .beagle/build.sh
+
+sudo rm -rf .venv gpustack/ui dist
+
+sudo rm -rf .git/hooks
+```
+
 ## tools
 
 ### aarch64 cann

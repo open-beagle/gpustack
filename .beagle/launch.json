@@ -20,7 +20,8 @@
         "--tools-download-base-url=https://cache.ali.wodcloud.com/vscode",
         "--worker-s3-host=your_s3_host",
         "--worker-s3-access-key=your_access_key",
-        "--worker-s3-secret-key=your_secret_key"
+        "--worker-s3-secret-key=your_secret_key",
+        "--worker-s3-ssl"
       ],
       "cwd": "${workspaceRoot}"
     }
