@@ -1,7 +1,7 @@
-From d0cf0f44c0fd88bf5beb298b644ef498266e0f9c Mon Sep 17 00:00:00 2001
-From: shucheng <shucheng@bd-apaas.com>
-Date: Tue, 7 Jan 2025 13:39:34 +0800
-Subject: [PATCH] v0.4.1 s3 project
+From ad71aa2f9dcb5c04f53146a61fb404cfc022a378 Mon Sep 17 00:00:00 2001
+From: gaoshiyao <gaoshiyao@wodcloud.com>
+Date: Tue, 7 Jan 2025 15:31:05 +0800
+Subject: [PATCH] v0.4.1-s3-project.patch
 
 ---
  poetry.lock    | 23 +++++++++++++++++++++--
@@ -73,5 +73,5 @@ index e94d1ce..3b9436b 100644
  tenacity = "^9.0.0"
  [tool.poetry.group.dev.dependencies]
 -- 
-2.39.5
+2.34.1
 

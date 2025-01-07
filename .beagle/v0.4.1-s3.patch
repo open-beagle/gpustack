@@ -1,19 +1,19 @@
-From c5b099918e3c46e4b6342402f199c24a03e65fdb Mon Sep 17 00:00:00 2001
+From 5f3795d075edd7f20ce3066645b882970661194c Mon Sep 17 00:00:00 2001
 From: gaoshiyao <gaoshiyao@wodcloud.com>
-Date: Fri, 3 Jan 2025 15:19:55 +0800
-Subject: [PATCH] s3
+Date: Tue, 7 Jan 2025 15:31:30 +0800
+Subject: [PATCH] v0.4.1-s3.patch
 
 ---
- gpustack/cmd/start.py            | 21 ++++++++++++++++++
- gpustack/config/config.py        |  3 +++
- gpustack/worker/backends/base.py | 37 ++++++++++++++++++++++++++++++--
- 3 files changed, 59 insertions(+), 2 deletions(-)
+ gpustack/cmd/start.py            | 28 +++++++++++++++++
+ gpustack/config/config.py        |  4 +++
+ gpustack/worker/backends/base.py | 52 ++++++++++++++++++++++++++++++--
+ 3 files changed, 82 insertions(+), 2 deletions(-)
 
 diff --git a/gpustack/cmd/start.py b/gpustack/cmd/start.py
-index 36aadcf..089d4bc 100644
+index d594d60..ec9b64f 100644
 --- a/gpustack/cmd/start.py
 +++ b/gpustack/cmd/start.py
-@@ -228,6 +228,24 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
+@@ -228,6 +228,30 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
          help="Base URL to download dependency tools.",
          default=get_gpustack_env("TOOLS_DOWNLOAD_BASE_URL"),
      )
@@ -35,38 +35,54 @@ index 36aadcf..089d4bc 100644
 +        help="SecretKey to s3.",
 +        default=get_gpustack_env("WORKER_S3_SECRET_KEY"),
 +    )
++    group.add_argument(
++        "--worker-s3-ssl",
++        action=OptionalBoolAction,
++        help="SecretKey to s3.",
++        default=get_gpustack_env_bool("WORKER_S3_SSL"),
++    )
  
      parser_server.set_defaults(func=run)
  
-@@ -306,6 +324,9 @@ def set_common_options(args, config_data: dict):
+@@ -314,6 +338,10 @@ def set_common_options(args, config_data: dict):
          "pipx_path",
          "token",
          "huggingface_token",
-+        "s3_host",
-+        "s3_access_key",
-+        "s3_secret_key",
++        "worker_s3_host",
++        "worker_s3_access_key",
++        "worker_s3_secret_key",
++        "worker_s3_ssl",
      ]
  
      for option in options:
 diff --git a/gpustack/config/config.py b/gpustack/config/config.py
-index 6b49d8b..0f0b0ce 100644
+index 6b49d8b..8c852cf 100644
 --- a/gpustack/config/config.py
 +++ b/gpustack/config/config.py
-@@ -87,6 +87,9 @@ class Config(BaseSettings):
+@@ -87,6 +87,10 @@ class Config(BaseSettings):
      resources: Optional[dict] = None
      bin_dir: Optional[str] = None
      pipx_path: Optional[str] = None
-+    s3_host: Optional[str] = ""
-+    s3_access_key: Optional[str] = ""
-+    s3_secret_key: Optional[str] = ""
++    worker_s3_host: Optional[str] = ""
++    worker_s3_access_key: Optional[str] = ""
++    worker_s3_secret_key: Optional[str] = ""
++    worker_s3_ssl: bool = False
  
      def __init__(self, **values):
          super().__init__(**values)
 diff --git a/gpustack/worker/backends/base.py b/gpustack/worker/backends/base.py
-index e5e8d19..0570c5a 100644
+index e5e8d19..c218bac 100644
 --- a/gpustack/worker/backends/base.py
 +++ b/gpustack/worker/backends/base.py
-@@ -26,8 +26,12 @@ from gpustack.worker.downloaders import (
+@@ -6,6 +6,7 @@ import threading
+ import time
+ from typing import List, Optional
+ from abc import ABC, abstractmethod
++from pathlib import Path
+ 
+ from gpustack.client.generated_clientset import ClientSet
+ from gpustack.config.config import Config
+@@ -26,8 +27,12 @@ from gpustack.worker.downloaders import (
  )
  from gpustack.worker.tools_manager import ToolsManager
  
@@ -79,28 +95,42 @@ index e5e8d19..0570c5a 100644
  
  ACCELERATOR_VENDOR_TO_ENV_NAME = {
      VendorEnum.NVIDIA: "CUDA_VISIBLE_DEVICES",
-@@ -94,7 +98,27 @@ def download_model(
+@@ -94,7 +99,41 @@ def download_model(
              cache_dir=os.path.join(cache_dir, "model_scope"),
          )
      elif mi.source == SourceEnum.LOCAL_PATH:
 -        return mi.local_path
-+        if 'beagle_wind' in mi.local_path:
-+            parts = mi.local_path.split('/')
-+            bucket_name = parts[6]
-+            object_path = '/'.join(parts[7:])
-+            if not os.path.exists(mi.local_path):
-+                os.makedirs(mi.local_path)
++        if 's3://beagle_wind' in mi.local_path:
++            # example s3://beagle_wind/maas-public/datamodel/51c63609-faf4-446a-a2cf-47dd8d1a3e97/v1
++            base_path = mi.local_path.removeprefix("s3://")
++            file_path = os.path.join(cache_dir , base_path)
++            if not os.path.exists(file_path):
++                os.makedirs(file_path)
++            bucket_name = base_path.split("/")[1]
++            object_path = base_path.removeprefix("beagle_wind/"+bucket_name+"/")
 +            try:
-+                objects = s3Client.list_objects(
-+                    bucket_name, prefix=object_path, recursive=True
-+                )
++                objects = s3Client.list_objects(bucket_name, prefix=object_path, recursive=True)
 +                for obj in objects:
-+                    local_file_path = os.path.join(
-+                        mi.local_path, obj.object_name[len(object_path) :].lstrip('/')
-+                    )
-+                    os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-+                    s3Client.fget_object(bucket_name, obj.object_name, local_file_path)
-+                    print(f"Downloaded '{obj.object_name}' to '{local_file_path}'")
++                    local_file_path = os.path.join(cache_dir, "beagle_wind", obj.bucket_name, obj.object_name)
++                    downloaded_size = 0
++                    stat = os.stat(local_file_path) if os.path.exists(local_file_path) else None
++                    if stat:
++                        downloaded_size = stat.st_size
++                    part_size = 1024 * 1024 * 10
++                    start_byte = downloaded_size
++                    while True:
++                        if start_byte >= obj.size:
++                            break
++                        data = s3Client.get_object(bucket_name, obj.object_name, offset=start_byte, length=part_size).read()
++                        if os.path.exists(local_file_path):
++                            with open(local_file_path, 'ab') as f:
++                                f.write(data)
++                        else:
++                            Path(local_file_path).parent.mkdir(parents=True, exist_ok=True)
++                            with open(local_file_path, 'wb') as f:
++                                f.write(data)
++                        start_byte += part_size
++                    print(f"Downloaded {obj.bucket_name} {obj.object_name}")
 +            except S3Error as e:
 +                print(f"Error occurred: {e}")
 +        else:
@@ -108,7 +138,7 @@ index e5e8d19..0570c5a 100644
  
  
  def get_model_file_size(mi: ModelInstance, cfg: Config) -> Optional[int]:
-@@ -149,7 +173,7 @@ class InferenceServer(ABC):
+@@ -149,7 +188,7 @@ class InferenceServer(ABC):
          # for download progress update frequency control
          self._last_download_update_time = time.time()
          self.hijack_tqdm_progress()
@@ -117,17 +147,17 @@ index e5e8d19..0570c5a 100644
          self._clientset = clientset
          self._model_instance = mi
          self._config = cfg
-@@ -322,6 +346,15 @@ class InferenceServer(ABC):
+@@ -322,6 +361,15 @@ class InferenceServer(ABC):
              # TODO: support more.
              return None
  
 +    def init_s3_client(self, cfg):
 +        global s3Client  # 声明使用全局变量
 +        s3Client = Minio(
-+            cfg.s3_host,
-+            access_key=cfg.s3_access_key,
-+            secret_key=cfg.s3_secret_key,
-+            secure=True,
++            cfg.worker_s3_host,
++            access_key=cfg.worker_s3_access_key,
++            secret_key=cfg.worker_s3_secret_key,
++            secure=cfg.worker_s3_ssl,
 +        )
 +
  
@@ -135,3 +165,4 @@ index e5e8d19..0570c5a 100644
      env_name = next(
 -- 
 2.34.1
+
