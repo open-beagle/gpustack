@@ -45,7 +45,6 @@ docker run -d --gpus all -p 6080:6080 --ipc=host --shm-size=2g --name gpustack \
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda \
   --bootstrap-password 'beagle!@#123' \
   --port 6080 \
-  --worker-ip <host-ip> \
   --worker-name <host-name>
 
 docker rm -f gpustack && rm -rf /data/gpustack
@@ -72,7 +71,6 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack
   registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cann \
   --bootstrap-password 'beagle!@#123' \
   --port 6080 \
-  --worker-ip <host-ip> \
   --worker-name <host-name>
 
 docker rm -f gpustack && rm -rf /data/gpustack
