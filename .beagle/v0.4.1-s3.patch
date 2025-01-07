@@ -133,6 +133,7 @@ index e5e8d19..c218bac 100644
 +                    print(f"Downloaded {obj.bucket_name} {obj.object_name}")
 +            except S3Error as e:
 +                print(f"Error occurred: {e}")
++            return file_path
 +        else:
 +            return mi.local_path
  
