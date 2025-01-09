@@ -1,21 +1,69 @@
-From d30527d2eb6d527c2cecda09a9807939facc67f0 Mon Sep 17 00:00:00 2001
+From b40d6095a357b2a3fe3f7444a967f28874059bdb Mon Sep 17 00:00:00 2001
 From: shucheng <shucheng@bd-apaas.com>
-Date: Wed, 8 Jan 2025 02:46:29 +0800
+Date: Thu, 9 Jan 2025 19:20:06 +0800
 Subject: [PATCH] v0.4.1-s3
 
 ---
- gpustack/cmd/start.py            |  28 +++++
+ gpustack/cmd/start.py            |  40 +++++--
  gpustack/config/config.py        |   4 +
  gpustack/scheduler/calculator.py |  35 +++++-
  gpustack/worker/backends/base.py |  29 ++++-
  gpustack/worker/downloader_s3.py | 177 +++++++++++++++++++++++++++++++
- 5 files changed, 269 insertions(+), 4 deletions(-)
+ 5 files changed, 275 insertions(+), 10 deletions(-)
  create mode 100644 gpustack/worker/downloader_s3.py
 
 diff --git a/gpustack/cmd/start.py b/gpustack/cmd/start.py
-index d594d60..d56e9c2 100644
+index d594d60..c4b0ecc 100644
 --- a/gpustack/cmd/start.py
 +++ b/gpustack/cmd/start.py
+@@ -80,7 +80,7 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
+         "--token",
+         type=str,
+         help="Shared secret used to add a worker.",
+-        default=get_gpustack_env("TOKEN"),
++        default=get_gpustack_env("STACK_TOKEN"),
+     )
+     group.add_argument(
+         "--huggingface-token",
+@@ -94,25 +94,25 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
+         "--host",
+         type=str,
+         help="Host to bind the server to.",
+-        default=get_gpustack_env("HOST"),
++        default=get_gpustack_env("STACK_HOST"),
+     )
+     group.add_argument(
+         "--port",
+         type=int,
+         help="Port to bind the server to.",
+-        default=get_gpustack_env("PORT"),
++        default=get_gpustack_env("STACK_PORT"),
+     )
+     group.add_argument(
+         "--database-url",
+         type=str,
+         help="URL of the database. Example: postgresql://user:password@hostname:port/db_name.",
+-        default=get_gpustack_env("DATABASE_URL"),
++        default=get_gpustack_env("STACK_DATABASE_URL"),
+     )
+     group.add_argument(
+         "--disable-worker",
+         action=OptionalBoolAction,
+         help="Disable embedded worker.",
+-        default=get_gpustack_env_bool("DISABLE_WORKER"),
++        default=get_gpustack_env_bool("STACK_DISABLE_WORKER"),
+     )
+     group.add_argument(
+         "--bootstrap-password",
+@@ -164,7 +164,7 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
+         "--server-url",
+         type=str,
+         help="Server to connect to.",
+-        default=get_gpustack_env("SERVER_URL"),
++        default=get_gpustack_env("STACK_SERVER_URL"),
+     )
+     group.add_argument(
+         "--worker-ip",
 @@ -228,6 +228,30 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
          help="Base URL to download dependency tools.",
          default=get_gpustack_env("TOOLS_DOWNLOAD_BASE_URL"),
@@ -395,5 +443,5 @@ index 0000000..ecf6901
 +            logger.error(f"获取S3文件大小失败: {e}")
 +            raise
 -- 
-2.39.2
+2.39.5
 

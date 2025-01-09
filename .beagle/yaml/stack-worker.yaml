@@ -1,0 +1,65 @@
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: beagle-stack-worker
+  namespace: beagle-devops
+  labels:
+    app: worker
+    powerby: bd-wind-stack
+    owner: sc
+spec:
+  selector:
+    matchLabels:
+      app: worker
+      powerby: bd-wind-stack
+      owner: sc
+  template:
+    metadata:
+      labels:
+        app: worker
+        powerby: bd-wind-stack
+        owner: sc
+    spec:
+      volumes:
+        - name: data
+          hostPath:
+            path: /data/beagle-devops/beagle-stack-worker
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - worker
+                  - key: powerby
+                    operator: In
+                    values:
+                      - bd-wind-stack
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: stack
+          image: "registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda"
+          imagePullPolicy: Always
+          args:
+            - '--server-url "http://beagle-stack-admin:6080"'
+            - '--token "0a38bb95851662d4765cf6a53053bc24"'
+            - '--worker-s3-host "minio-cps.wodcloud.com"'
+            - '--worker-s3-access-key "beagleadmin"'
+            - '--worker-s3-secret-key "H76cPmwvH7vJ"'
+            - '--worker-s3-ssl'
+          env:
+            - name: WORKER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/gpustack
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"

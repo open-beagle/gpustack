@@ -1,0 +1,99 @@
+---
+apiVersion: bcc.bd-apaas.com/v1alpha1
+kind: IngressRoute
+metadata:
+  name: beagle-stack-admin
+  namespace: beagle-devops
+  labels:
+    app: admin
+    powerby: bd-wind-stack
+    owner: sc
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`stack.wodcloud.com`)
+      services:
+        - name: beagle-stack-admin
+          port: 6080
+  tls: {}
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: beagle-stack-admin
+  namespace: beagle-devops
+  labels:
+    app: admin
+    powerby: bd-wind-stack
+    owner: sc
+spec:
+  ports:
+    - name: http-admin
+      protocol: TCP
+      port: 6080
+      targetPort: 6080
+  type: ClusterIP
+  selector:
+    app: admin
+    powerby: bd-wind-stack
+    owner: sc
+---
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: beagle-stack-admin-data
+  namespace: beagle-devops
+  labels:
+    app: admin
+    powerby: bd-wind-stack
+    owner: sc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: nfs-beagle-devops
+  volumeMode: Filesystem
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: beagle-stack-admin
+  namespace: beagle-devops
+  labels:
+    app: admin
+    powerby: bd-wind-stack
+    owner: sc
+spec:
+  selector:
+    matchLabels:
+      app: admin
+      powerby: bd-wind-stack
+      owner: sc
+  template:
+    metadata:
+      labels:
+        app: admin
+        powerby: bd-wind-stack
+        owner: sc
+    spec:
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: beagle-stack-admin-data
+      containers:
+        - name: stack
+          image: "registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda"
+          imagePullPolicy: Always
+          args:
+            - --bootstrap-password
+            - 'beagle!@#123'
+            - --port
+            - '6080'
+            - '--disable-worker'
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/gpustack
