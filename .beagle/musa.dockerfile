@@ -16,9 +16,9 @@ RUN apt-get update && apt-get install -y \
     tzdata \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install /dist/*.whl && \
+RUN pip install /tmp/*.whl && \
     pip cache purge && \
-    rm -rf /dist
+    rm -rf /tmp/*.whl
 
 RUN gpustack download-tools \
   --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
