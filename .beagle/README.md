@@ -97,6 +97,37 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   --worker-s3-secret-key=your_secret_key
 ```
 
+## deployMthreads
+
+```bash
+# default user admin
+docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack \
+  -v /data/gpustack/data:/var/lib/gpustack \
+  -e MTHREADS_VISIBLE_DEVICES=0-7 \
+  -e TZ=Asia/Shanghai \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-musa \
+  --bootstrap-password 'beagle!@#123' --port 6080 \
+  --worker-name <host-name> \
+  --worker-s3-host=your_s3_host \
+  --worker-s3-access-key=your_access_key \
+  --worker-s3-secret-key=your_secret_key
+
+docker rm -f gpustack && rm -rf /data/gpustack
+
+# start worker node
+docker run -d --ipc=host --shm-size=2g --name gpustack \
+  -p 10150:10150 -p 40000-41024:40000-41024 \
+  -v /data/gpustack/data:/var/lib/gpustack \
+  -e MTHREADS_VISIBLE_DEVICES=0-7 \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-musa \
+  --server-url http://myserver:6080 --token mytoken \
+  --worker-ip <host-ip> \
+  --worker-name <host-name> \
+  --worker-s3-host=your_s3_host \
+  --worker-s3-access-key=your_access_key \
+  --worker-s3-secret-key=your_secret_key
+```
+
 ## build
 
 ```bash
