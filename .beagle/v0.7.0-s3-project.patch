@@ -84,14 +84,15 @@ index 43639e1..f5689a2 100644
      """
  
 -    if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(model.local_path):
-+    # 鑾峰彇cache_dir鐨勭埗鐩綍
++    # 获取cache_dir的父目录
 +    cache_dir = kwargs.get("cache_dir")
 +    if cache_dir:
-+        cache_dir = os.path.dirname(cache_dir)  # 鑾峰彇涓婁竴绾х洰褰?+    cache_path = model.local_path
++        cache_dir = os.path.dirname(cache_dir)  # 获取上一级目录
++    cache_path = model.local_path
 +    if model.source == SourceEnum.LOCAL_PATH and model.local_path.startswith(
 +        "s3://beagle_wind/"
 +    ):
-+        # 鏋勫缓鏈湴缂撳瓨璺緞
++        # 构建本地缓存路径
 +        if cache_dir:
 +            cache_path = os.path.join(
 +                cache_dir,
@@ -1029,7 +1030,7 @@ index 0811bea..abe084f 100644
      {file = "fastapi_cdn_host-0.8.4-py3-none-any.whl", hash = "sha256:4f2668a0726bfaa20feafa93bc174249265a44df51d3995b9bc147c943013010"},
      {file = "fastapi_cdn_host-0.8.4.tar.gz", hash = "sha256:8e955d1974d861ba13586b2ab01af4b6c040e41593b29f14d07efa980453904b"},
 @@ -2097,6 +2220,8 @@ version = "0.0.8"
- description = "Run and manage FastAPI apps from the command line with FastAPI CLI. 馃殌"
+ description = "Run and manage FastAPI apps from the command line with FastAPI CLI. 🚀"
  optional = true
  python-versions = ">=3.8"
 +groups = ["main"]
@@ -1038,7 +1039,7 @@ index 0811bea..abe084f 100644
      {file = "fastapi_cli-0.0.8-py3-none-any.whl", hash = "sha256:0ea95d882c85b9219a75a65ab27e8da17dac02873e456850fa0a726e96e985eb"},
      {file = "fastapi_cli-0.0.8.tar.gz", hash = "sha256:2360f2989b1ab4a3d7fc8b3a0b20e8288680d8af2e31de7c38309934d7f8a0ee"},
 @@ -2118,6 +2243,8 @@ version = "0.1.4"
- description = "Deploy and manage FastAPI Cloud apps from the command line 馃殌"
+ description = "Deploy and manage FastAPI Cloud apps from the command line 🚀"
  optional = true
  python-versions = ">=3.8"
 +groups = ["main"]
@@ -1905,7 +1906,7 @@ index 0811bea..abe084f 100644
      {file = "mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8"},
      {file = "mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba"},
 @@ -4270,6 +4520,7 @@ version = "1.3.4"
- description = "A deep merge function for 馃悕."
+ description = "A deep merge function for 🐍."
  optional = false
  python-versions = ">=3.6"
 +groups = ["dev"]
