@@ -16,6 +16,8 @@
     You can add additional workers to form a GPUStack cluster by running the command on worker nodes.
 #>
 
+# Script updated at: 2025-04-24T06:27:59Z
+
 $ErrorActionPreference = "Stop"
 
 $INSTALL_PACKAGE_SPEC = if ($env:INSTALL_PACKAGE_SPEC) { $env:INSTALL_PACKAGE_SPEC } else { "gpustack[audio]" }
@@ -129,6 +131,60 @@ function Get-Arg-Value {
     return ""
 }
 
+# Function to check if a port is available
+function Check-PortAvailability {
+    param([int]$Port)
+
+    $connection = Get-NetTCPConnection -LocalPort $Port -LocalAddress '0.0.0.0' -State 'Listen' -ErrorAction SilentlyContinue
+
+    if ($connection) {
+        return $false  # Port is in use
+    }
+    else {
+        return $true   # Port is available
+    }
+}
+
+# Function to check if the server and worker ports are available
+function Check-Port {
+    param (
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$ScriptArgs
+    )
+    if (Get-Command gpustack -ErrorAction SilentlyContinue) {
+        # skip on upgrade
+        return
+    }
+
+    $configFile = Get-Arg-Value -ArgName "config-file" @ScriptArgs
+    if ($configFile) {
+        return
+    }
+
+    $serverPort = Get-Arg-Value -ArgName "port" @ScriptArgs
+    $workerPort = Get-Arg-Value -ArgName "worker-port" @ScriptArgs
+    $sslEnabled = Get-Arg-Value -ArgName "ssl-keyfile" @ScriptArgs
+
+    if (-not $serverPort) {
+        $serverPort = 80
+        if ($sslEnabled) {
+            $serverPort = 443
+        }
+    }
+
+    if (-not $workerPort) {
+        $workerPort = 10150
+    }
+
+    if (-not (Check-PortAvailability -Port $serverPort)) {
+        throw "Server port $serverPort is already in use! Please specify a different port by using --port <YOUR_PORT>."
+    }
+
+    if (-not (Check-PortAvailability -Port $workerPort)) {
+        throw "Worker port $workerPort is already in use! Please specify a different port by using --worker-port <YOUR_PORT>."
+    }
+}
+
 # Function to print completion message.
 function Print-Complete-Message {
     param (
@@ -136,7 +192,7 @@ function Print-Complete-Message {
         [string[]]$ScriptArgs
     )
     $usageHint = ""
-    $pathHint = ""
+    $firewallHint = ""
     if ($ACTION -eq "Install") {
         $dataDir = Get-Arg-Value -ArgName "data-dir" @ScriptArgs
         if ([string]::IsNullOrEmpty($dataDir)) {
@@ -177,11 +233,11 @@ function Print-Complete-Message {
 
             $usageHint = "`n`nGPUStack UI is available at ${serverUrl}.`nDefault username is 'admin'.`n${passwordHint}`n"
         }
-        $pathHint = "CLI 'gpustack' is available from the command line."
+        $firewallHint = "Note: The Windows firewall may be enabled, and you may need to add rules to allow access."
     }
 
 
-    Write-Host "$ACTION complete. ${usageHint}${pathHint}"
+    Write-Host "$ACTION complete. ${usageHint}${firewallHint}"
 }
 
 function Refresh-ChocolateyProfile {
@@ -236,8 +292,10 @@ function Install-Python {
 
     $needInstallPython = $true
     $PYTHON_VERSION = $null
+    $CURRENT_VERSION = $null
     if (Get-Command python -ErrorAction SilentlyContinue) {
         $PYTHON_VERSION = python -c 'import sys; print(sys.version_info.major * 10 + sys.version_info.minor)'
+        $CURRENT_VERSION = python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
         $pythonSource = $(Get-Command python).Source
         $isDirty = (($null -eq $PYTHON_VERSION) -or ($PYTHON_VERSION -eq "")) -and ($pythonSource -match "WindowsApps")
 
@@ -246,8 +304,8 @@ function Install-Python {
             Remove-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\python.exe" -ErrorAction SilentlyContinue
             Remove-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\python3.exe" -ErrorAction SilentlyContinue
         }
-        elseif ($PYTHON_VERSION -lt 40) {
-            throw "Python version is $PYTHON_VERSION, which is less than 3.10. Please upgrade Python to at least version 3.10."
+        elseif ($PYTHON_VERSION -lt 40 -or $PYTHON_VERSION -ge 43) {
+            throw "Python version $CURRENT_VERSION is not supported. Please use Python 3.10, 3.11, or 3.12."
         }
         else {
             $needInstallPython = $false
@@ -276,11 +334,6 @@ function Install-Python {
                 throw "failed to install pipx."
             }
 
-            pipx ensurepath
-            if ($LASTEXITCODE -ne 0) {
-                throw "failed to run pipx ensurepath."
-            }
-
             Log-Info "Pipx installed successfully."
         }
         catch {
@@ -289,6 +342,11 @@ function Install-Python {
     }
     else {
         Log-Info "Pipx already installed."
+    }
+
+    pipx ensurepath --force
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to run pipx ensurepath."
     }
 }
 
@@ -345,14 +403,23 @@ function Install-GPUStack {
         if (Test-Path $pipxSharedConfigPath) {
             $configContent = Get-Content -Path (Join-Path -Path $pipxSharedEnv -ChildPath "pyvenv.cfg")
             $homeValue = ""
+            $executableValue = ""
             foreach ($line in $configContent) {
                 if ($line.StartsWith("home =")) {
                     $homeValue = $line.Split("=")[1].Trim()
-                    break
+                }
+
+                if ($line.StartsWith("executable =")) {
+                    $executableValue = $line.Split("=")[1].Trim()
                 }
             }
-            if (-not (Test-Path -Path $homeValue)) {
-                Log-Warn "Current pipx config is invalid with isn't exist python path $homeValue, try to refresh shared environment..."
+
+            if ([string]::IsNullOrEmpty($executableValue)) {
+                $executableValue = Join-Path $homeValue "python.exe"
+            }
+
+            if (-not (Test-Path -Path $homeValue) -or -not (Test-Path -Path $executableValue)) {
+                Log-Warn "Current pipx config is invalid with non-existent paths: home path $homeValue or executable path $executableValue. Trying to refresh shared environment."
                 python -m venv --clear $pipxSharedEnv
                 if ($LASTEXITCODE -ne 0) {
                     throw "failed to refresh virtual environment."
@@ -377,12 +444,6 @@ function Install-GPUStack {
             throw "failed to install $INSTALL_PACKAGE_SPEC."
         }
 
-        # Workaround for issue #581
-        pipx inject gpustack pydantic==2.9.2 --force
-        if ($LASTEXITCODE -ne 0) {
-            throw "failed to run pipx inject."
-        }
-
         pipx ensurepath
         if ($LASTEXITCODE -ne 0) {
             throw "failed to run pipx ensurepath."
@@ -405,7 +466,7 @@ function Install-GPUStack {
             Log-Info "Path already contains $pipEnv"
         }
 
-        Log-Info "$ACTION GPUStack success."
+        Log-Info "$ACTION GPUStack successfully."
     }
     catch {
         throw "Failed to $ACTION GPUStack: `"$($_.Exception.Message)`""
@@ -421,7 +482,7 @@ function Stop-GPUStackService {
             Log-Info "Stopping existing ${serviceName} service..."
             $result = nssm stop $serviceName confirm
             if ($LASTEXITCODE -eq 0) {
-                Log-Info "Stopped existing ${serviceName} success"
+                Log-Info "Stopped existing ${serviceName} successfully"
             }
             else {
                 Log-Warn "Failed to stop existing ${serviceName} service: `"$($result)`""
@@ -429,7 +490,7 @@ function Stop-GPUStackService {
 
             $result = nssm remove $serviceName confirm
             if ($LASTEXITCODE -eq 0) {
-                Log-Info "Removed existing ${serviceName} success"
+                Log-Info "Removed existing ${serviceName} successfully"
             }
             else {
                 Log-Warn "Failed to remove existing ${serviceName} service: `"$($result)`""
@@ -561,11 +622,11 @@ function Check-GPUStackService {
         $status = nssm status $serviceName
         if ($status -eq 'SERVICE_RUNNING') {
             # Check abnormal exit from  nssm event logs
-            $events = Get-EventLog -LogName Application -Source nssm -Newest 20 | Where-Object { $_.TimeGenerated -ge (Get-Date).AddSeconds(-30) }
+            $appEvents = Get-EventLog -LogName Application -Source nssm -Newest 20 | Where-Object { $_.TimeGenerated -ge (Get-Date).AddSeconds(-30) }
             $hasError = $false
 
-            foreach ($event in $events) {
-                if ($event.Message -match "$serviceName" -and $event.Message -match "exit code") {
+            foreach ($appEvent in $appEvents) {
+                if ($appEvent.Message -match "$serviceName" -and $appEvent.Message -match "exit code") {
                     $hasError = $true
                     break
                 }
@@ -665,7 +726,7 @@ function Uninstall-GPUStack {
                 Log-Info "Stopping existing ${serviceName} service..."
                 $result = nssm stop $serviceName confirm
                 if ($LASTEXITCODE -eq 0) {
-                    Log-Info "Stopped ${serviceName} success"
+                    Log-Info "Stopped ${serviceName} successfully"
                 }
                 else {
                     Log-Warn "Failed to stop existing ${serviceName} service: `"$($result)`""
@@ -673,7 +734,7 @@ function Uninstall-GPUStack {
 
                 $result = nssm remove $serviceName confirm
                 if ($LASTEXITCODE -eq 0) {
-                    Log-Info "Removed ${serviceName} success"
+                    Log-Info "Removed ${serviceName} successfully"
                 }
                 else {
                     Log-Warn "Failed to remove existing ${serviceName} service: `"$($result)`""
@@ -696,7 +757,7 @@ function Uninstall-GPUStack {
         $pipxPackages = pipx list
         if ($pipxPackages -like '*gpustack*') {
             pipx uninstall gpustack
-            Log-Info "Uninstalled package ${packageName} success."
+            Log-Info "Uninstalled package ${packageName} successfully."
         }
         else {
             Log-Info "Package ${packageName} is not installed."
@@ -749,6 +810,7 @@ try {
     Check-AdminPrivilege
     Check-OS
     Check-CUDA
+    Check-Port @args
     Install-Chocolatey
     Install-Python
     Install-NSSM

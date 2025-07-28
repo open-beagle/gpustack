@@ -1,9 +1,10 @@
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 import importlib
 import json
 import logging
 import math
-from typing import Any, AsyncGenerator, List, Optional, Union, overload, Tuple
+from typing import Any, AsyncGenerator, Callable, List, Optional, Union, Tuple
 
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import func
@@ -92,7 +93,12 @@ class ActiveRecordMixin:
         return result.all()
 
     @classmethod
-    async def all_by_fields(cls, session: AsyncSession, fields: dict):
+    async def all_by_fields(
+        cls,
+        session: AsyncSession,
+        fields: dict = {},
+        extra_conditions: Optional[List] = None,
+    ):
         """
         Return all objects with the given fields and values.
         Return an empty list if not found.
@@ -101,6 +107,10 @@ class ActiveRecordMixin:
         statement = select(cls)
         for key, value in fields.items():
             statement = statement.where(getattr(cls, key) == value)
+
+        if extra_conditions:
+            statement = statement.where(and_(*extra_conditions))
+
         result = await session.exec(statement)
         return result.all()
 
@@ -110,6 +120,7 @@ class ActiveRecordMixin:
         session: AsyncSession,
         fields: Optional[dict] = None,
         fuzzy_fields: Optional[dict] = None,
+        extra_conditions: Optional[List] = None,
         page: int = 1,
         per_page: int = 100,
         order_by: Optional[List[Tuple[str, str]]] = None,
@@ -140,10 +151,13 @@ class ActiveRecordMixin:
 
         if fuzzy_fields:
             fuzzy_conditions = [
-                col(getattr(cls, key)).like(f"%{value}%")
+                func.lower(getattr(cls, key)).like(f"%{str(value).lower()}%")
                 for key, value in fuzzy_fields.items()
             ]
             statement = statement.where(or_(*fuzzy_conditions))
+
+        if extra_conditions:
+            statement = statement.where(and_(*extra_conditions))
 
         if not order_by:
             order_by = [("created_at", "desc")]
@@ -171,6 +185,9 @@ class ActiveRecordMixin:
                 for key, value in fuzzy_fields.items()
             ]
             count_statement = count_statement.where(or_(*fuzzy_conditions))
+
+        if extra_conditions:
+            count_statement = count_statement.where(and_(*extra_conditions))
 
         count = (await session.exec(count_statement)).one()
         total_page = math.ceil(count / per_page)
@@ -332,75 +349,90 @@ class ActiveRecordMixin:
         except Exception as e:
             logger.error(f"Failed to publish event: {e}")
 
-    @overload
     @classmethod
-    async def subscribe(
-        cls, session_or_engine: AsyncEngine
-    ) -> AsyncGenerator[Event, None]: ...
-
-    @overload
-    @classmethod
-    async def subscribe(
-        cls, session_or_engine: AsyncEngine
-    ) -> AsyncGenerator[Event, None]: ...
-
-    @classmethod
-    async def subscribe(
-        cls, session_or_engine: Union[AsyncSession, AsyncEngine]
-    ) -> AsyncGenerator[Event, None]:
-        if isinstance(session_or_engine, AsyncSession):
-            items = await cls.all(session_or_engine)
+    async def subscribe(cls, engine: AsyncEngine) -> AsyncGenerator[Event, None]:
+        async with AsyncSession(engine) as session:
+            items = await cls.all(session)
             for item in items:
                 yield Event(type=EventType.CREATED, data=item)
-            await session_or_engine.close()
-        elif isinstance(session_or_engine, AsyncEngine):
-            async with AsyncSession(session_or_engine) as session:
-                items = await cls.all(session)
-                for item in items:
-                    yield Event(type=EventType.CREATED, data=item)
-        else:
-            raise ValueError("Invalid session or engine.")
 
         subscriber = event_bus.subscribe(cls.__name__.lower())
+        heartbeat_interval = timedelta(seconds=15)
+        last_event_time = datetime.now(timezone.utc)
 
         try:
             while True:
-                event = await subscriber.receive()
-                yield event
+                try:
+                    event = await asyncio.wait_for(
+                        subscriber.receive(), timeout=heartbeat_interval.total_seconds()
+                    )
+                    yield event
+                except asyncio.TimeoutError:
+                    if (
+                        datetime.now(timezone.utc) - last_event_time
+                        >= heartbeat_interval
+                    ):
+                        yield Event(type=EventType.HEARTBEAT, data=None)
+                        last_event_time = datetime.now(timezone.utc)
         finally:
             event_bus.unsubscribe(cls.__name__.lower(), subscriber)
 
     @classmethod
     async def streaming(
         cls,
-        session: AsyncSession,
+        engine: AsyncEngine,
         fields: Optional[dict] = None,
         fuzzy_fields: Optional[dict] = None,
+        filter_func: Optional[Callable[[Any], bool]] = None,
     ) -> AsyncGenerator[str, None]:
-        async for event in cls.subscribe(session):
-            skip_event = False
+        """Stream events matching the given criteria as JSON strings."""
+        try:
+            async for event in cls.subscribe(engine):
+                if event.type == EventType.HEARTBEAT:
+                    yield "\n\n"
+                    continue
 
-            # Check fields using AND condition
-            for key, value in (fields or {}).items():
-                if getattr(event.data, key) != value:
-                    skip_event = True
-                    break
-            if skip_event:
-                continue
+                if not cls._match_fields(event, fields):
+                    continue
 
-            # Check fuzzy_fields using OR condition
-            fuzzy_match = False
-            for key, value in (fuzzy_fields or {}).items():
-                if value in str(getattr(event.data, key, "")):
-                    fuzzy_match = True
-                    break
-            if fuzzy_fields and not fuzzy_match:
-                continue
+                if not cls._match_fuzzy_fields(event, fuzzy_fields):
+                    continue
 
-            # Convert the current instance to the corresponding Public class if exists
-            class_module = importlib.import_module(cls.__module__)
-            public_class = getattr(class_module, f"{cls.__name__}Public", None)
-            if public_class:
-                event.data = public_class.model_validate(event.data)
+                if filter_func and not filter_func(event.data):
+                    continue
 
-            yield json.dumps(jsonable_encoder(event), separators=(",", ":")) + "\n\n"
+                event.data = cls._convert_to_public_class(event.data)
+                yield cls._format_event(event)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in streaming {cls.__name__}: {e}")
+
+    @classmethod
+    def _match_fields(cls, event: Any, fields: Optional[dict]) -> bool:
+        """Match fields using AND condition."""
+        for key, value in (fields or {}).items():
+            if getattr(event.data, key, None) != value:
+                return False
+        return True
+
+    @classmethod
+    def _match_fuzzy_fields(cls, event: Any, fuzzy_fields: Optional[dict]) -> bool:
+        """Match fuzzy fields using OR condition."""
+        for key, value in (fuzzy_fields or {}).items():
+            attr_value = str(getattr(event.data, key, "")).lower()
+            if str(value).lower() in attr_value:
+                return True
+        return not fuzzy_fields
+
+    @classmethod
+    def _convert_to_public_class(cls, data: Any) -> Any:
+        """Convert the instance to the corresponding Public class if it exists."""
+        class_module = importlib.import_module(cls.__module__)
+        public_class = getattr(class_module, f"{cls.__name__}Public", None)
+        return public_class.model_validate(data) if public_class else data
+
+    @staticmethod
+    def _format_event(event: Any) -> str:
+        """Format the event as a JSON string."""
+        return json.dumps(jsonable_encoder(event), separators=(",", ":")) + "\n\n"

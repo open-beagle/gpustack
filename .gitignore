@@ -149,9 +149,13 @@ __pycache__/
 # vscode
 .vscode
 
+# IDEA
+.idea
+
 # GPUStack related
 */third_party/bin
 */ui/
+*.ma
 
 # macOS
 .DS_Store

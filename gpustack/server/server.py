@@ -1,24 +1,30 @@
 import asyncio
 from multiprocessing import Process
 import os
+import re
 from typing import List
 import uvicorn
 import logging
+from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel.ext.asyncio.session import AsyncSession
 from gpustack.logging import setup_logging
 from gpustack.schemas.users import User
 from gpustack.security import JWTManager, generate_secure_password, get_secret_hash
-from gpustack.server.app import app
+from gpustack.server.app import create_app
 from gpustack.config import Config
+from gpustack.server.catalog import init_model_catalog
 from gpustack.server.controllers import (
     ModelController,
+    ModelFileController,
     ModelInstanceController,
     WorkerController,
 )
 from gpustack.server.db import get_engine, init_db
 from gpustack.scheduler.scheduler import Scheduler
+from gpustack.ray.manager import RayManager
 from gpustack.server.system_load import SystemLoadCollector
 from gpustack.server.update_check import UpdateChecker
+from gpustack.server.usage_buffer import flush_usage_to_db
 from gpustack.server.worker_syncer import WorkerSyncer
 from gpustack.utils.process import add_signal_handlers_in_loop
 
@@ -32,10 +38,14 @@ class Server:
             sub_processes = []
         self._config: Config = config
         self._sub_processes = sub_processes
+        self._async_tasks = []
 
     @property
     def all_processes(self):
         return self._sub_processes
+
+    def _create_async_task(self, coro):
+        self._async_tasks.append(asyncio.create_task(coro))
 
     @property
     def config(self):
@@ -49,12 +59,16 @@ class Server:
         self._run_migrations()
         await self._prepare_data()
 
+        init_model_catalog(self._config.model_catalog_file)
+
         self._start_sub_processes()
         self._start_scheduler()
         self._start_controllers()
         self._start_system_load_collector()
         self._start_worker_syncer()
         self._start_update_checker()
+        self._start_model_usage_flusher()
+        self._start_ray()
 
         port = 80
         if self._config.port:
@@ -67,8 +81,17 @@ class Server:
 
         jwt_manager = JWTManager(self._config.jwt_secret_key)
         # Start FastAPI server
+        app = create_app(self._config)
         app.state.server_config = self._config
         app.state.jwt_manager = jwt_manager
+        if self._config.enable_cors:
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=self._config.allow_origins,
+                allow_credentials=self._config.allow_credentials,
+                allow_methods=self._config.allow_methods,
+                allow_headers=self._config.allow_headers,
+            )
         config = uvicorn.Config(
             app,
             host=host,
@@ -83,8 +106,9 @@ class Server:
 
         logger.info(f"Serving on {config.host}:{config.port}.")
         server = uvicorn.Server(config)
+        self._create_async_task(server.serve())
 
-        await server.serve()
+        await asyncio.gather(*self._async_tasks)
 
     def _run_migrations(self):
         logger.info("Running database migration.")
@@ -102,8 +126,17 @@ class Server:
         alembic_cfg.set_main_option(
             "script_location", os.path.join(pkg_path, "migrations")
         )
-        alembic_cfg.set_main_option("sqlalchemy.url", self._config.database_url)
-        command.upgrade(alembic_cfg, "head")
+
+        db_url = self._config.database_url
+        # Use the pymysql driver to execute migrations to avoid compatibility issues between asynchronous drivers and Alembic.
+        if db_url.startswith("mysql://"):
+            db_url = re.sub(r'^mysql://', 'mysql+pymysql://', db_url)
+        db_url_escaped = db_url.replace("%", "%%")
+        alembic_cfg.set_main_option("sqlalchemy.url", db_url_escaped)
+        try:
+            command.upgrade(alembic_cfg, "head")
+        except Exception as e:
+            raise RuntimeError(f"Database migration failed: {e}") from e
         logger.info("Database migration completed.")
 
     async def _prepare_data(self):
@@ -119,42 +152,59 @@ class Server:
 
     def _start_scheduler(self):
         scheduler = Scheduler(self._config)
-        asyncio.create_task(scheduler.start())
+        self._create_async_task(scheduler.start())
 
         logger.debug("Scheduler started.")
 
     def _start_controllers(self):
         model_controller = ModelController(self._config)
-        asyncio.create_task(model_controller.start())
+        self._create_async_task(model_controller.start())
 
         model_instance_controller = ModelInstanceController(self._config)
-        asyncio.create_task(model_instance_controller.start())
+        self._create_async_task(model_instance_controller.start())
 
         worker_controller = WorkerController()
-        asyncio.create_task(worker_controller.start())
+        self._create_async_task(worker_controller.start())
+
+        model_file_controller = ModelFileController()
+        self._create_async_task(model_file_controller.start())
 
         logger.debug("Controllers started.")
 
     def _start_system_load_collector(self):
         collector = SystemLoadCollector()
-        asyncio.create_task(collector.start())
+        self._create_async_task(collector.start())
 
         logger.debug("System load collector started.")
 
     def _start_worker_syncer(self):
         worker_syncer = WorkerSyncer()
-        asyncio.create_task(worker_syncer.start())
+        self._create_async_task(worker_syncer.start())
 
         logger.debug("Worker syncer started.")
+
+    def _start_model_usage_flusher(self):
+        self._create_async_task(flush_usage_to_db())
+
+        logger.debug("Model usage flusher started.")
 
     def _start_update_checker(self):
         if self._config.disable_update_check:
             return
 
         update_checker = UpdateChecker(update_check_url=self._config.update_check_url)
-        asyncio.create_task(update_checker.start())
+        self._create_async_task(update_checker.start())
 
         logger.debug("Update checker started.")
+
+    def _start_ray(self):
+        if not self._config.enable_ray:
+            return
+
+        ray_manager = RayManager(
+            cfg=self._config, head=True, pure_head=self._config.disable_worker
+        )
+        self._create_async_task(ray_manager.start())
 
     def _start_sub_processes(self):
         for process in self._sub_processes:

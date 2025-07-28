@@ -1,5 +1,5 @@
 import logging
-from typing import List
+from typing import List, Optional
 from gpustack.policies.base import (
     Allocatable,
     Allocated,
@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 
 async def get_worker_allocatable_resource(  # noqa: C901
-    engine: AsyncEngine, worker: Worker
+    engine: AsyncEngine,
+    worker: Worker,
 ) -> Allocatable:
     """
     Get the worker with the latest allocatable resources.
@@ -38,12 +39,19 @@ async def get_worker_allocatable_resource(  # noqa: C901
 
         if (
             model_instance.distributed_servers
-            and model_instance.distributed_servers.rpc_servers
+            and model_instance.distributed_servers.subordinate_workers
         ):
-            for rpc_server in model_instance.distributed_servers.rpc_servers:
-                if rpc_server.computed_resource_claim:
+            for (
+                subordinate_worker
+            ) in model_instance.distributed_servers.subordinate_workers:
+                if subordinate_worker.worker_id != worker.id:
+                    continue
+
+                if subordinate_worker.computed_resource_claim:
                     # rpc server only consider the vram
-                    update_allocated_vram(allocated, rpc_server.computed_resource_claim)
+                    update_allocated_vram(
+                        allocated, subordinate_worker.computed_resource_claim
+                    )
 
     allocatable = Allocatable(ram=0, vram={})
     if worker.status.gpu_devices:
@@ -75,7 +83,7 @@ async def get_worker_allocatable_resource(  # noqa: C901
         )
 
         # For UMA, we need to set the gpu memory to the minimum of
-        # the caculated with max allow gpu memory and the allocatable memory.
+        # the calculated with max allow gpu memory and the allocatable memory.
         if allocatable.vram:
             allocatable.vram[0] = min(allocatable.ram, allocatable.vram[0])
 
@@ -96,3 +104,19 @@ async def get_worker_model_instances(
             session, "worker_id", worker.id
         )
         return model_instances
+
+
+class ListMessageBuilder:
+    def __init__(self, messages: Optional[str | List[str]]):
+        if not messages:
+            self._messages = []
+        self._messages = messages if isinstance(messages, list) else [messages]
+
+    def append(self, message: str):
+        self._messages.append(message)
+
+    def extend(self, message: List[str]):
+        self._messages.extend(message)
+
+    def __str__(self) -> str:
+        return "\n".join([f"- {line}" for line in self._messages])

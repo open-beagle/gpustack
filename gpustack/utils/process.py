@@ -34,8 +34,8 @@ def add_signal_handlers_in_loop():
         )
 
 
-async def shutdown_event_loop(signal=None, loop=None):
-    logger.debug(f"Received signal: {signal}. Shutting down gracefully...")
+async def shutdown_event_loop(sig=None, loop=None):
+    logger.debug(f"Received signal: {sig}. Shutting down gracefully...")
 
     threading_stop_event.set()
 
@@ -49,10 +49,10 @@ async def shutdown_event_loop(signal=None, loop=None):
     except asyncio.CancelledError:
         pass
 
-    handle_termination_signal(signal=signal)
+    handle_termination_signal(sig=sig)
 
 
-def handle_termination_signal(signal=None, frame=None):
+def handle_termination_signal(sig=None, frame=None):
     """
     Terminate the current process and all its children.
     """
@@ -88,19 +88,21 @@ def terminate_processes(processes):
     Terminates a list of processes, attempting graceful termination first,
     then forcibly killing remaining ones if necessary.
     """
-    for proc in processes:
+    for process in processes:
         try:
-            proc.terminate()
+            process.terminate()
         except psutil.NoSuchProcess:
             continue
 
     # Wait for processes to terminate and kill if still alive
-    _, alive = psutil.wait_procs(processes, timeout=3)
-    for proc in alive:
-        try:
-            proc.kill()
-        except psutil.NoSuchProcess:
-            continue
+    _, alive_processes = psutil.wait_procs(processes, timeout=3)
+    while alive_processes:
+        for process in alive_processes:
+            try:
+                process.kill()
+            except psutil.NoSuchProcess:
+                continue
+        _, alive_processes = psutil.wait_procs(alive_processes, timeout=1)
 
 
 def terminate_process(process):
@@ -117,5 +119,6 @@ def terminate_process(process):
         except psutil.TimeoutExpired:
             try:
                 process.kill()
-            except psutil.NoSuchProcess:
+                process.wait(timeout=1)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
                 pass

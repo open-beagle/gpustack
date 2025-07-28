@@ -39,6 +39,9 @@ def http_exception_factory(
 AlreadyExistsException = http_exception_factory(
     status.HTTP_409_CONFLICT, "AlreadyExists", "Already exists"
 )
+ConflictException = http_exception_factory(
+    status.HTTP_409_CONFLICT, "Conflict", "Conflict with existing resource"
+)
 NotFoundException = http_exception_factory(
     status.HTTP_404_NOT_FOUND, "NotFound", "Not found"
 )
@@ -103,6 +106,9 @@ def raise_if_response_error(response: httpx.Response):  # noqa: C901
     if response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
         raise ServiceUnavailableException(error.message)
 
+    if response.status_code == status.HTTP_504_GATEWAY_TIMEOUT:
+        raise GatewayTimeoutException(error.message)
+
     raise HTTPException(error.code, error.reason, error.message)
 
 
@@ -153,7 +159,9 @@ def register_handlers(app: FastAPI):
         return JSONResponse(
             status_code=exc.status_code,
             content=ErrorResponse(
-                code=exc.status_code, reason=exc.reason, message=exc.message
+                code=exc.status_code,
+                reason=exc.reason,
+                message=exc.message,
             ).model_dump(),
         )
 
@@ -178,7 +186,6 @@ def register_handlers(app: FastAPI):
         message = f"{len(exc.errors())} validation errors:\n"
         for err in exc.errors():
             message += f"  {err}\n"
-
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content=ErrorResponse(

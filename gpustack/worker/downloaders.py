@@ -1,12 +1,11 @@
-import fnmatch
 import platform
 import time
 import logging
 import os
 import re
-from filelock import FileLock
+from filelock import SoftFileLock
 import requests
-from typing import Literal, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 from pathlib import Path
 from tqdm import tqdm
 from tqdm.contrib.concurrent import thread_map
@@ -25,10 +24,85 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
-from gpustack.schemas.models import ModelInstance
-from gpustack.utils.hub import match_hugging_face_files, match_model_scope_file_paths
+from gpustack.schemas.models import Model, ModelSource, SourceEnum, get_mmproj_filename
+from gpustack.utils import file
+from gpustack.utils.hub import (
+    match_hugging_face_files,
+    match_model_scope_file_paths,
+    FileEntry,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def download_model(
+    model: ModelSource,
+    local_dir: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    ollama_library_base_url: Optional[str] = None,
+    huggingface_token: Optional[str] = None,
+) -> List[str]:
+    if model.source == SourceEnum.HUGGING_FACE:
+        return HfDownloader.download(
+            repo_id=model.huggingface_repo_id,
+            filename=model.huggingface_filename,
+            extra_filename=get_mmproj_filename(model),
+            token=huggingface_token,
+            local_dir=local_dir,
+            cache_dir=os.path.join(cache_dir, "huggingface"),
+        )
+    elif model.source == SourceEnum.OLLAMA_LIBRARY:
+        ollama_downloader = OllamaLibraryDownloader(
+            registry_url=ollama_library_base_url
+        )
+        return ollama_downloader.download(
+            model_name=model.ollama_library_model_name,
+            local_dir=local_dir,
+            cache_dir=os.path.join(cache_dir, "ollama"),
+        )
+    elif model.source == SourceEnum.MODEL_SCOPE:
+        return ModelScopeDownloader.download(
+            model_id=model.model_scope_model_id,
+            file_path=model.model_scope_file_path,
+            extra_file_path=get_mmproj_filename(model),
+            local_dir=local_dir,
+            cache_dir=os.path.join(cache_dir, "model_scope"),
+        )
+    elif model.source == SourceEnum.LOCAL_PATH:
+        return file.get_sharded_file_paths(model.local_path)
+
+
+def get_model_file_info(
+    model: Model,
+    huggingface_token: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    ollama_library_base_url: Optional[str] = None,
+) -> List[FileEntry]:
+    if model.source == SourceEnum.HUGGING_FACE:
+        return HfDownloader.get_model_file_info(
+            model=model,
+            token=huggingface_token,
+        )
+    elif model.source == SourceEnum.MODEL_SCOPE:
+        return ModelScopeDownloader.get_model_file_info(
+            model=model,
+        )
+    elif model.source == SourceEnum.OLLAMA_LIBRARY:
+        ollama_downloader = OllamaLibraryDownloader(
+            registry_url=ollama_library_base_url
+        )
+        return ollama_downloader.get_model_file_info(
+            model_name=model.ollama_library_model_name,
+            cache_dir=os.path.join(cache_dir, "ollama"),
+        )
+    elif model.source == SourceEnum.LOCAL_PATH:
+        sharded_or_original_file_paths = file.get_sharded_file_paths(model.local_path)
+        file_list = [
+            FileEntry(f, file.getsize(f)) for f in sharded_or_original_file_paths
+        ]
+        return file_list
+
+    raise ValueError(f"Unsupported model source: {model.source}")
 
 
 class HfDownloader:
@@ -36,39 +110,24 @@ class HfDownloader:
     _registry_url = "https://hf-mirror.com"
     
     @classmethod
-    def get_file_size(cls, repo_id: str, filename: str, token: Optional[str]) -> int:
+    def get_model_file_info(cls, model: Model, token: Optional[str]) -> List[FileEntry]:
+
         api = HfApi(token=token)
-        repo_info = api.repo_info(repo_id, files_metadata=True)
-        total_size = sum(
-            sibling.size
-            for sibling in repo_info.siblings
-            if (not filename or fnmatch.fnmatch(sibling.rfilename, filename))
-            and sibling.size is not None
-        )
-
-        return total_size
-
-    @classmethod
-    def get_model_file_size(
-        cls, model_instance: ModelInstance, token: Optional[str]
-    ) -> int:
-        return HfDownloader.get_file_size(
-            model_instance.huggingface_repo_id,
-            model_instance.huggingface_filename,
-            token,
-        )
+        repo_info = api.repo_info(model.huggingface_repo_id, files_metadata=True)
+        file_list = [FileEntry(f.rfilename, f.size) for f in repo_info.siblings]
+        return file_list
 
     @classmethod
     def download(
         cls,
         repo_id: str,
         filename: Optional[str],
+        extra_filename: Optional[str],
         token: Optional[str] = None,
         local_dir: Optional[Union[str, os.PathLike[str]]] = None,
-        local_dir_use_symlinks: Union[bool, Literal["auto"]] = "auto",
         cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
         max_workers: int = 8,
-    ) -> str:
+    ) -> List[str]:
         """Download a model from the Hugging Face Hub.
 
         Args:
@@ -87,21 +146,32 @@ class HfDownloader:
                 Defaults to 8.
 
         Returns:
-            The path to the downloaded model.
+            The paths to the downloaded model files.
         """
 
-        if filename is not None:
-            return cls.download_file(
-                repo_id, filename, token, local_dir, local_dir_use_symlinks, cache_dir
-            )
+        group_or_owner, name = model_id_to_group_owner_name(repo_id)
+        lock_filename = os.path.join(cache_dir, group_or_owner, f"{name}.lock")
 
-        return snapshot_download(
-            repo_id=repo_id,
-            token=token,
-            local_dir=local_dir,
-            local_dir_use_symlinks=local_dir_use_symlinks,
-            cache_dir=cache_dir,
-        )
+        if local_dir is None:
+            local_dir = os.path.join(cache_dir, group_or_owner, name)
+
+        logger.info(f"Retrieving file lock: {lock_filename}")
+        with SoftFileLock(lock_filename):
+            if filename:
+                return cls.download_file(
+                    repo_id=repo_id,
+                    filename=filename,
+                    token=token,
+                    local_dir=local_dir,
+                    extra_filename=extra_filename,
+                )
+
+            snapshot_download(
+                repo_id=repo_id,
+                token=token,
+                local_dir=local_dir,
+            )
+            return [local_dir]
 
     @classmethod
     def download_file(
@@ -110,10 +180,9 @@ class HfDownloader:
         filename: Optional[str],
         token: Optional[str] = None,
         local_dir: Optional[Union[str, os.PathLike[str]]] = None,
-        local_dir_use_symlinks: Union[bool, Literal["auto"]] = "auto",
-        cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
         max_workers: int = 8,
-    ) -> str:
+        extra_filename: Optional[str] = None,
+    ) -> List[str]:
         """Download a model from the Hugging Face Hub.
         Args:
             repo_id: The model repo id.
@@ -125,30 +194,33 @@ class HfDownloader:
             The path to the downloaded model.
         """
 
-        matching_files = match_hugging_face_files(repo_id, filename)
+        matching_files = match_hugging_face_files(
+            repo_id, filename, extra_filename, token
+        )
 
         if len(matching_files) == 0:
             raise ValueError(f"No file found in {repo_id} that match {filename}")
 
         logger.info(f"Downloading model {repo_id}/{filename}")
 
-        subfolder, first_filename = (
-            str(Path(matching_files[0]).parent),
-            Path(matching_files[0]).name,
+        subfolder = (
+            None
+            if (subfolder := str(Path(matching_files[0]).parent)) == "."
+            else subfolder
         )
 
         unfolder_matching_files = [Path(file).name for file in matching_files]
+        downloaded_files = []
 
         def _inner_hf_hub_download(repo_file: str):
-            return hf_hub_download(
+            downloaded_file = hf_hub_download(
                 repo_id=repo_id,
                 filename=repo_file,
                 token=token,
                 subfolder=subfolder,
                 local_dir=local_dir,
-                local_dir_use_symlinks=local_dir_use_symlinks,
-                cache_dir=cache_dir,
             )
+            downloaded_files.append(downloaded_file)
 
         thread_map(
             _inner_hf_hub_download,
@@ -157,24 +229,8 @@ class HfDownloader:
             max_workers=max_workers,
         )
 
-        # Get local path of the model file.
-        # For split files, get the first one. llama-box will handle the rest.
-        if local_dir is None:
-            model_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=first_filename,
-                token=token,
-                subfolder=subfolder,
-                local_dir=local_dir,
-                local_dir_use_symlinks=local_dir_use_symlinks,
-                cache_dir=cache_dir,
-                local_files_only=True,
-            )
-        else:
-            model_path = os.path.join(local_dir, first_filename)
-
         logger.info(f"Downloaded model {repo_id}/{filename}")
-        return model_path
+        return sorted(downloaded_files)
 
     def __call__(self):
         return self.download()
@@ -191,10 +247,10 @@ class OllamaLibraryDownloader:
     _user_agent = f"ollama/0.3.3 ({platform.machine()} {platform.system()}) Go/1.22.0"
 
     def __init__(
-        self, registry_url: Optional[str] = None, cache_dir: Optional[str] = None
+        self,
+        registry_url: Optional[str] = "https://registry.ollama.ai",
     ):
-        if registry_url is not None:
-            self._registry_url = registry_url
+        self._registry_url = registry_url
 
     def download_blob(
         self, url: str, registry_token: str, filename: str, _nb_retries: int = 5
@@ -252,7 +308,12 @@ class OllamaLibraryDownloader:
                 )
         os.rename(temp_filename, filename)
 
-    def download(self, model_name: str, cache_dir: Optional[str] = None) -> str:
+    def download(
+        self,
+        model_name: str,
+        local_dir: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+    ) -> List[str]:
         sanitized_filename = re.sub(r"[^a-zA-Z0-9]", "_", model_name)
 
         if cache_dir is None:
@@ -261,15 +322,20 @@ class OllamaLibraryDownloader:
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir)
 
-        # Check if the model is already downloaded
-        model_path = os.path.join(cache_dir, sanitized_filename)
+        if local_dir and not os.path.exists(local_dir):
+            os.makedirs(local_dir)
 
+        model_dir = local_dir
+        if local_dir is None:
+            model_dir = cache_dir
+
+        model_path = os.path.join(model_dir, sanitized_filename)
         lock_filename = model_path + ".lock"
 
-        logger.info("Retriving file lock")
-        with FileLock(lock_filename):
+        logger.info(f"Retrieving file lock: {lock_filename}")
+        with SoftFileLock(lock_filename):
             if os.path.exists(model_path):
-                return model_path
+                return [model_path]
 
             logger.info(f"Downloading model {model_name}")
             blob_url, registry_token = self.model_url(
@@ -279,7 +345,26 @@ class OllamaLibraryDownloader:
                 self.download_blob(blob_url, registry_token, model_path)
 
             logger.info(f"Downloaded model {model_name}")
-            return model_path
+            return [model_path]
+
+    def get_model_file_info(
+        self, model_name: str, cache_dir: Optional[str] = None
+    ) -> List[FileEntry]:
+
+        if cache_dir is None:
+            cache_dir = self._default_cache_dir
+
+        blob_url, registry_token = self.model_url(
+            model_name=model_name, cache_dir=cache_dir
+        )
+        if blob_url is not None:
+            response = requests.head(
+                blob_url, headers={_header_authorization: registry_token}
+            )
+            if response.status_code == 200:
+                return [FileEntry(model_name, int(response.headers["content-length"]))]
+
+        return []
 
     def model_url(self, model_name: str, cache_dir: Optional[str] = None) -> str:
         repo, tag = self.parse_model_name(model_name)
@@ -459,35 +544,21 @@ class OllamaLibraryDownloader:
 class ModelScopeDownloader:
 
     @classmethod
-    def get_file_size(
-        cls,
-        model_id: str,
-        file_path: Optional[str],
-    ) -> int:
+    def get_model_file_info(cls, model: Model) -> List[FileEntry]:
         api = HubApi()
-        repo_files = api.get_model_files(model_id, recursive=True)
-        total_size = sum(
-            sibling.get("Size")
-            for sibling in repo_files
-            if (not file_path or fnmatch.fnmatch(sibling.get("Path", ""), file_path))
-            and "Size" in sibling
-        )
-
-        return total_size
-
-    @classmethod
-    def get_model_file_size(cls, model_instance: ModelInstance) -> int:
-        return ModelScopeDownloader.get_file_size(
-            model_instance.model_scope_model_id, model_instance.model_scope_file_path
-        )
+        repo_files = api.get_model_files(model.model_scope_model_id, recursive=True)
+        file_list = [FileEntry(f.get("Path"), f.get("Size")) for f in repo_files]
+        return file_list
 
     @classmethod
     def download(
         cls,
         model_id: str,
         file_path: Optional[str],
+        extra_file_path: Optional[str],
+        local_dir: Optional[Union[str, os.PathLike[str]]] = None,
         cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
-    ) -> str:
+    ) -> List[str]:
         """Download a model from Model Scope.
 
         Args:
@@ -503,26 +574,31 @@ class ModelScopeDownloader:
         """
 
         group_or_owner, name = model_id_to_group_owner_name(model_id)
-        name = name.replace('.', '___')
         lock_filename = os.path.join(cache_dir, group_or_owner, f"{name}.lock")
 
-        logger.info("Retriving file lock")
-        with FileLock(lock_filename):
-            if file_path is not None:
-                matching_files = match_model_scope_file_paths(model_id, file_path)
+        if local_dir is None:
+            local_dir = os.path.join(cache_dir, group_or_owner, name)
+
+        logger.info(f"Retrieving file lock: {lock_filename}")
+        with SoftFileLock(lock_filename):
+            if file_path:
+                matching_files = match_model_scope_file_paths(
+                    model_id, file_path, extra_file_path
+                )
                 if len(matching_files) == 0:
                     raise ValueError(
                         f"No file found in {model_id} that match {file_path}"
                     )
 
-                model_path = modelscope_snapshot_download(
+                model_dir = modelscope_snapshot_download(
                     model_id=model_id,
-                    cache_dir=cache_dir,
-                    allow_patterns=file_path,
+                    local_dir=local_dir,
+                    allow_patterns=matching_files,
                 )
-                return os.path.join(model_path, matching_files[0])
+                return [os.path.join(model_dir, file) for file in matching_files]
 
-            return modelscope_snapshot_download(
+            modelscope_snapshot_download(
                 model_id=model_id,
-                cache_dir=cache_dir,
+                local_dir=local_dir,
             )
+            return [local_dir]

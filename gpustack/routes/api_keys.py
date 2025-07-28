@@ -9,15 +9,20 @@ from gpustack.api.exceptions import (
     NotFoundException,
 )
 from gpustack.security import API_KEY_PREFIX, get_secret_hash
-from gpustack.server.deps import CurrentUserDep, ListParamsDep, SessionDep
+from gpustack.server.deps import CurrentUserDep, ListParamsDep, SessionDep, EngineDep
 from gpustack.schemas.api_keys import ApiKey, ApiKeyCreate, ApiKeyPublic, ApiKeysPublic
+from gpustack.server.services import APIKeyService
 
 router = APIRouter()
 
 
 @router.get("", response_model=ApiKeysPublic)
 async def get_api_keys(
-    session: SessionDep, user: CurrentUserDep, params: ListParamsDep, search: str = None
+    engine: EngineDep,
+    session: SessionDep,
+    user: CurrentUserDep,
+    params: ListParamsDep,
+    search: str = None,
 ):
     fields = {"user_id": user.id}
 
@@ -27,7 +32,7 @@ async def get_api_keys(
 
     if params.watch:
         return StreamingResponse(
-            ApiKey.streaming(session, fields=fields, fuzzy_fields=fuzzy_fields),
+            ApiKey.streaming(engine, fields=fields, fuzzy_fields=fuzzy_fields),
             media_type="text/event-stream",
         )
 
@@ -88,6 +93,6 @@ async def delete_api_key(session: SessionDep, user: CurrentUserDep, id: int):
         raise NotFoundException(message="Api key not found")
 
     try:
-        await api_key.delete(session)
+        await APIKeyService(session).delete(api_key)
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to delete api key: {e}")

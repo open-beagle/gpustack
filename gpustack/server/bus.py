@@ -10,6 +10,7 @@ class EventType(Enum):
     UPDATED = 2
     DELETED = 3
     UNKNOWN = 4
+    HEARTBEAT = 5
 
 
 @dataclass
@@ -30,7 +31,7 @@ def event_decoder(obj):
 
 class Subscriber:
     def __init__(self):
-        self.queue = asyncio.Queue()
+        self.queue = asyncio.Queue(maxsize=256)
 
     async def enqueue(self, event: Event):
         await self.queue.put(event)

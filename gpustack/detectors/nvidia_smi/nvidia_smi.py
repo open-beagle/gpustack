@@ -1,6 +1,6 @@
 import csv
 import subprocess
-from gpustack.detectors.base import GPUDetector
+from gpustack.detectors.base import GPUDetectExepction, GPUDetector
 from gpustack.schemas.workers import (
     GPUCoreInfo,
     GPUDeviceInfo,
@@ -8,7 +8,10 @@ from gpustack.schemas.workers import (
     MemoryInfo,
     VendorEnum,
 )
+from gpustack.utils import platform
 from gpustack.utils.command import is_command_available
+from gpustack.utils.convert import safe_float, safe_int
+from gpustack.utils.envs import is_docker_env
 
 
 class NvidiaSMI(GPUDetector):
@@ -39,15 +42,22 @@ class NvidiaSMI(GPUDetector):
             index, name, memory_total, memory_used, utilization_gpu, temperature_gpu = (
                 row
             )
+
+            index = safe_int(index)
+            name = name.strip()
             # Convert MiB to bytes
-            memory_total = int(memory_total.split()[0]) * 1024 * 1024
+            memory_total = safe_int(memory_total.split()[0]) * 1024 * 1024
             # Convert MiB to bytes
-            memory_used = int(memory_used.split()[0]) * 1024 * 1024
-            utilization_gpu = float(utilization_gpu.split()[0])  # Remove the '%' sign
-            temperature_gpu = float(temperature_gpu)
+            memory_used = safe_int(memory_used.split()[0]) * 1024 * 1024
+            utilization_gpu = safe_float(
+                utilization_gpu.split()[0]
+            )  # Remove the '%' sign
+            temperature_gpu = safe_float(temperature_gpu)
 
             device = GPUDeviceInfo(
-                index=int(index),
+                index=index,
+                device_index=index,
+                device_chip_index=0,
                 name=name,
                 vendor=VendorEnum.NVIDIA.value,
                 memory=MemoryInfo(
@@ -63,6 +73,7 @@ class NvidiaSMI(GPUDetector):
                     total=0,  # Total cores information is not provided by nvidia-smi
                 ),
                 temperature=temperature_gpu,
+                type=platform.DeviceTypeEnum.CUDA.value,
             )
             devices.append(device)
         return devices
@@ -81,6 +92,12 @@ class NvidiaSMI(GPUDetector):
             if "no devices" in output.lower():
                 return None
 
+            if "Failed to initialize NVML: Unknown Error" in output and is_docker_env():
+                raise GPUDetectExepction(
+                    f"Error: {output}"
+                    "Please ensure nvidia-smi is working properly. It may be caused by a known issue with the NVIDIA Container Toolkit, which can be mitigated by disabling systemd cgroup management in Docker. More info: <a href=\"https://docs.gpustack.ai/0.6/installation/nvidia-cuda/online-installation/?h=native.cgroupdriver=cgroupfs#prerequisites_1\">Disabling Systemd Cgroup Management in Docker</a>"
+                )
+
             if result.returncode != 0:
                 raise Exception(f"Unexpected return code: {result.returncode}")
 
@@ -88,6 +105,8 @@ class NvidiaSMI(GPUDetector):
                 raise Exception(f"Output is empty, return code: {result.returncode}")
 
             return output
+        except GPUDetectExepction as e:
+            raise e
         except Exception as e:
             error_message = f"Failed to execute {command}: {e}"
             if result:

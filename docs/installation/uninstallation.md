@@ -1,6 +1,32 @@
 # Uninstallation
 
-## Uninstallation Script
+## Docker
+
+If you install GPUStack using Docker, the followings are example commands to uninstall GPUStack. You can modify according to your setup:
+
+```bash
+# Remove the container
+docker rm -f gpustack
+# Remove the data volume
+docker volume rm gpustack-data
+```
+
+## pip
+
+If you install GPUStack using pip, the followings are example commands to uninstall GPUStack. You can modify according to your setup:
+
+```bash
+# Stop and remove the service
+systemctl stop gpustack.service
+rm -f /etc/systemd/system/gpustack.service
+systemctl daemon-reload
+# Uninstall the CLI
+pip uninstall gpustack
+# Remove the data directory
+rm -rf /var/lib/gpustack
+```
+
+## Script
 
 !!! warning
 
@@ -8,33 +34,22 @@
 
 If you installed GPUStack using the installation script, a script to uninstall GPUStack was generated during installation.
 
-### Linux or macOS
-
 Run the following command to uninstall GPUStack:
 
-```bash
-sudo /var/lib/gpustack/uninstall.sh
-```
+=== "Linux"
 
-### Windows
+    ```bash
+    sudo /var/lib/gpustack/uninstall.sh
+    ```
 
-Run the following command in PowerShell to uninstall GPUStack:
+=== "macOS"
 
-```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force; & "$env:APPDATA\gpustack\uninstall.ps1"
-```
+    ```bash
+    sudo /var/lib/gpustack/uninstall.sh
+    ```
 
-## Manual Uninstallation
+=== "Windows"
 
-If you install GPUStack manually, the followings are example commands to uninstall GPUStack. You can modify according to your setup:
-
-```bash
-# Stop and remove the service.
-systemctl stop gpustack.service
-rm /etc/systemd/system/gpustack.service
-systemctl daemon-reload
-# Uninstall the CLI.
-pip uninstall gpustack
-# Remove the data directory.
-rm -rf /var/lib/gpustack
-```
+    ```powershell
+    Set-ExecutionPolicy Bypass -Scope Process -Force; & "$env:APPDATA\gpustack\uninstall.ps1"
+    ```

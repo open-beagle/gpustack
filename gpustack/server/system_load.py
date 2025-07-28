@@ -14,8 +14,16 @@ def compute_avg_cpu_memory_utilization_rate(
     workers: list[Worker],
 ) -> Tuple[float, float]:
     count = len(workers)
-    cpu_sum_value = sum(worker.status.cpu.utilization_rate for worker in workers)
-    memory_sum_value = sum(worker.status.memory.utilization_rate for worker in workers)
+    cpu_sum_value = sum(
+        worker.status.cpu.utilization_rate
+        for worker in workers
+        if worker.status.cpu.utilization_rate
+    )
+    memory_sum_value = sum(
+        worker.status.memory.utilization_rate
+        for worker in workers
+        if worker.status.memory.utilization_rate
+    )
 
     if count == 0:
         return 0, 0
@@ -84,4 +92,4 @@ class SystemLoadCollector:
                     system_load = compute_system_load(workers)
                     await SystemLoad.create(session, system_load)
             except Exception as e:
-                logger.error(f"failed to collect system load: {e}")
+                logger.error(f"Failed to collect system load: {e}")

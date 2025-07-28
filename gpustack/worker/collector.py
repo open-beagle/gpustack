@@ -1,8 +1,11 @@
 import logging
+from typing import Optional
 from gpustack.client.generated_clientset import ClientSet
+from gpustack.detectors.base import GPUDetectExepction
 from gpustack.detectors.custom.custom import Custom
 from gpustack.detectors.detector_factory import DetectorFactory
 from gpustack.policies.base import Allocated
+from gpustack.schemas.models import ComputedResourceClaim
 from gpustack.schemas.workers import (
     RPCServer,
     MountPoint,
@@ -20,31 +23,45 @@ class WorkerStatusCollector:
         self,
         worker_ip: str,
         worker_name: str,
+        worker_port: int,
         clientset: ClientSet = None,
         worker_manager=None,
         gpu_devices=None,
+        system_info=None,
     ):
         self._worker_name = worker_name
         self._hostname = socket.gethostname()
         self._worker_ip = worker_ip
+        self._worker_port = worker_port
         self._clientset = clientset
         self._worker_manager = worker_manager
+        if self._worker_manager:
+            self._worker_uuid = self._worker_manager.get_worker_uuid()
 
-        detector_factory = (
-            DetectorFactory("custom", {"custom": Custom(gpu_devices)})
-            if gpu_devices
-            else None
-        )
-        self._detector_factory = (
-            detector_factory if detector_factory else DetectorFactory()
-        )
+        if gpu_devices and system_info:
+            self._detector_factory = DetectorFactory(
+                device="custom",
+                gpu_detectors={"custom": [Custom(gpu_devices=gpu_devices)]},
+                system_info_detector=Custom(system_info=system_info),
+            )
+        elif gpu_devices:
+            self._detector_factory = DetectorFactory(
+                device="custom",
+                gpu_detectors={"custom": [Custom(gpu_devices=gpu_devices)]},
+            )
+        elif system_info:
+            self._detector_factory = DetectorFactory(
+                system_info_detector=Custom(system_info=system_info)
+            )
+        else:
+            self._detector_factory = DetectorFactory()
 
     """A class for collecting worker status information."""
 
-    def collect(self) -> Worker:  # noqa: C901
+    def collect(self, initial: bool = False) -> Worker:  # noqa: C901
         """Collect worker status information."""
         status = WorkerStatus()
-
+        state_message = None
         try:
             system_info = self._detector_factory.detect_system_info()
             status.cpu = system_info.cpu
@@ -57,12 +74,14 @@ class WorkerStatusCollector:
         except Exception as e:
             logger.error(f"Failed to detect system info: {e}")
 
-        try:
-            gpu_devices = self._detector_factory.detect_gpus()
-            status.gpu_devices = gpu_devices
-        except Exception as e:
-            logger.error(f"Failed to detect GPU devices: {e}")
-
+        if not initial:
+            try:
+                gpu_devices = self._detector_factory.detect_gpus()
+                status.gpu_devices = gpu_devices
+            except GPUDetectExepction as e:
+                state_message = str(e)
+            except Exception as e:
+                logger.error(f"Failed to detect GPU devices: {e}")
         self._inject_unified_memory(status)
         self._inject_computed_filesystem_usage(status)
         self._inject_allocated_resource(status)
@@ -76,12 +95,21 @@ class WorkerStatusCollector:
                 )
             status.rpc_servers = rps_server
 
+        state = (
+            WorkerStateEnum.NOT_READY
+            if initial or state_message
+            else WorkerStateEnum.READY
+        )
+
         return Worker(
             name=self._worker_name,
             hostname=self._hostname,
             ip=self._worker_ip,
-            state=WorkerStateEnum.READY,
+            port=self._worker_port,
+            state=state,
             status=status,
+            state_message=state_message,
+            worker_uuid=self._worker_uuid if self._worker_manager else None,
         )
 
     def _inject_unified_memory(self, status: WorkerStatus):
@@ -127,27 +155,51 @@ class WorkerStatusCollector:
         try:
             model_instances = self._clientset.model_instances.list()
             for model_instance in model_instances.items:
-                if model_instance.worker_ip != self._worker_ip:
+                if (
+                    model_instance.distributed_servers
+                    and model_instance.distributed_servers.subordinate_workers
+                ):
+                    for (
+                        subworker
+                    ) in model_instance.distributed_servers.subordinate_workers:
+                        if subworker.worker_name != self._worker_name:
+                            continue
+
+                        aggregate_computed_resource_claim_allocated(
+                            allocated, subworker.computed_resource_claim
+                        )
+
+                if model_instance.worker_name != self._worker_name:
                     continue
 
-                if model_instance.computed_resource_claim is None:
-                    continue
-
-                ram = model_instance.computed_resource_claim.ram or 0
-                vram = model_instance.computed_resource_claim.vram or {}
-
-                allocated.ram += ram
-                if model_instance.gpu_indexes is not None:
-                    for gpu_index in model_instance.gpu_indexes:
-                        allocated.vram[gpu_index] = (
-                            allocated.vram.get(gpu_index) or 0
-                        ) + (vram.get(gpu_index) or 0)
+                aggregate_computed_resource_claim_allocated(
+                    allocated, model_instance.computed_resource_claim
+                )
 
             # inject allocated resources
             if status.memory is not None:
                 status.memory.allocated = allocated.ram
             if status.gpu_devices is not None:
-                for ag, agv in allocated.vram.items():
-                    status.gpu_devices[ag].memory.allocated = agv
+                for i, device in enumerate(status.gpu_devices):
+                    if device.index in allocated.vram:
+                        status.gpu_devices[i].memory.allocated = allocated.vram[
+                            device.index
+                        ]
+                    else:
+                        status.gpu_devices[i].memory.allocated = 0
         except Exception as e:
             logger.error(f"Failed to inject allocated resources: {e}")
+
+
+def aggregate_computed_resource_claim_allocated(
+    allocated: Allocated, computed_resource_claim: Optional[ComputedResourceClaim]
+):
+    """Aggregate allocated resources from a ComputedResourceClaim into Allocated."""
+    if computed_resource_claim is None:
+        return
+
+    if computed_resource_claim.ram:
+        allocated.ram += computed_resource_claim.ram
+
+    for gpu_index, vram in (computed_resource_claim.vram or {}).items():
+        allocated.vram[gpu_index] = (allocated.vram.get(gpu_index) or 0) + vram

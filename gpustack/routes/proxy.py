@@ -1,6 +1,7 @@
 import os
+from urllib.parse import urlparse
+import aiohttp
 from fastapi.responses import JSONResponse
-import httpx
 import logging
 
 from fastapi import APIRouter, Request, Response
@@ -9,6 +10,7 @@ from gpustack.api.exceptions import (
     BadRequestException,
     ForbiddenException,
 )
+from gpustack.config.config import get_global_config
 
 router = APIRouter()
 
@@ -38,47 +40,80 @@ HEADER_SKIPPED = [
 ]
 HF_ENDPOINT = os.getenv("HF_ENDPOINT")
 
-timeout = httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=10.0)
+timeout = aiohttp.ClientTimeout(
+    connect=15.0,
+    sock_read=60.0,
+    sock_connect=10.0,
+)
 
 
 @router.api_route("", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy(request: Request, url: str):
-    if not url:
-        raise BadRequestException(message="Missing 'url' query parameter")
 
-    if not any(url.startswith(domain) for domain in ALLOWED_SITES):
-        raise ForbiddenException(message="This domain is not allowed")
-
-    if request.method not in ["GET", "POST", "PUT", "DELETE"]:
-        raise BadRequestException(message="Method not allowed")
+    validate_http_method(request.method)
+    validate_url(url)
 
     url = replace_hf_endpoint(url)
 
-    forwarded_headers = process_headers(request.headers)
+    forwarded_headers = process_headers(request.headers, url)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            data = (
-                await request.body()
-                if request.method in ["POST", "PUT", "DELETE"]
-                else None
-            )
-            response = await client.request(
-                request.method, url, headers=forwarded_headers, data=data
-            )
+    try:
+        data = (
+            await request.body()
+            if request.method in ["POST", "PUT", "DELETE"]
+            else None
+        )
 
-            return Response(
-                status_code=response.status_code,
-                content=response.content,
-                headers=response.headers,
-                media_type=response.headers.get("Content-Type"),
-            )
-        except Exception as e:
-            return JSONResponse(
-                status_code=500,
-                content={"detail": str(e)},
-                media_type="application/json",
-            )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(
+                method=request.method,
+                url=url,
+                headers=forwarded_headers,
+                data=data,
+            ) as resp:
+                content = await resp.read()
+                headers = dict(resp.headers)
+                return Response(
+                    status_code=resp.status,
+                    content=content,
+                    headers=headers,
+                    media_type=headers.get("Content-Type"),
+                )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": str(e)},
+            media_type="application/json",
+        )
+
+
+def validate_http_method(method: str):
+    allowed_methods = ["GET", "POST", "PUT", "DELETE"]
+    if method not in allowed_methods:
+        raise BadRequestException(message=f"HTTP method '{method}' is not allowed")
+
+
+def validate_url(url: str):
+    if not url:
+        raise BadRequestException(message="Missing 'url' query parameter")
+
+    try:
+        parsed_url = urlparse(url)
+    except Exception:
+        raise BadRequestException(message="Invalid 'url' query parameter")
+
+    if not parsed_url.netloc or not parsed_url.scheme:
+        raise BadRequestException(message="Invalid 'url' query parameter")
+
+    for allowed_site in ALLOWED_SITES:
+        parsed_allowed_site_url = urlparse(allowed_site)
+        if (
+            parsed_url.netloc == parsed_allowed_site_url.netloc
+            and parsed_url.scheme == parsed_allowed_site_url.scheme
+        ):
+            return
+
+    raise ForbiddenException(message="This site is not allowed")
 
 
 def replace_hf_endpoint(url: str) -> str:
@@ -90,7 +125,7 @@ def replace_hf_endpoint(url: str) -> str:
     return url
 
 
-def process_headers(headers):
+def process_headers(headers, url: str):
     processed_headers = {}
     for key, value in headers.items():
         if key.lower() in HEADER_SKIPPED:
@@ -105,5 +140,11 @@ def process_headers(headers):
             processed_headers[key] = "identity"
         else:
             processed_headers[key] = value
+
+    global_config = get_global_config()
+    if global_config.huggingface_token and (
+        url.startswith("https://huggingface.co") or HF_ENDPOINT
+    ):
+        processed_headers["Authorization"] = f"Bearer {global_config.huggingface_token}"
 
     return processed_headers

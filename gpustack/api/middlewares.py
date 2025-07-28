@@ -3,29 +3,32 @@ import json
 import logging
 import time
 from typing import Type, Union
-from fastapi import Request, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Request, Response, status
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from jwt import DecodeError, ExpiredSignatureError
 from starlette.middleware.base import BaseHTTPMiddleware
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
-from openai.types import Completion, CompletionUsage
-from openai.types.images_response import ImagesResponse
+from openai.types import CompletionUsage
 from openai.types.audio.transcription_create_response import (
     Transcription,
 )
 from openai.types.create_embedding_response import (
-    CreateEmbeddingResponse,
     Usage as EmbeddingUsage,
 )
+from gpustack.api.exceptions import ErrorResponse
 from gpustack.routes.rerank import RerankResponse, RerankUsage
-from gpustack.schemas.images import ImageGenerationChunk
+from gpustack.schemas.images import ImageGenerationChunk, ImagesResponse
 from gpustack.schemas.model_usage import ModelUsage, OperationEnum
 from gpustack.schemas.models import Model
 from gpustack.schemas.users import User
 from gpustack.security import JWT_TOKEN_EXPIRE_MINUTES, JWTManager
-from gpustack.server.auth import SESSION_COOKIE_NAME
+from gpustack.api.auth import SESSION_COOKIE_NAME
 from gpustack.server.db import get_engine
 from sqlmodel.ext.asyncio.session import AsyncSession
+
+from gpustack.server.services import ModelUsageService
+from gpustack.api.types.openai_ext import CreateEmbeddingResponseExt, CompletionExt
+
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +36,17 @@ logger = logging.getLogger(__name__)
 class RequestTimeMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request.state.start_time = datetime.now(timezone.utc)
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as e:
+            response = JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content=ErrorResponse(
+                    code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    reason="Internal Server Error",
+                    message=f"Unexpected error occurred: {e}",
+                ).model_dump(),
+            )
         return response
 
 
@@ -41,36 +54,45 @@ class ModelUsageMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         if response.status_code == 200:
-            if request.url.path == "/v1-openai/chat/completions":
+            path = request.url.path
+            if path == "/v1-openai/chat/completions" or path == "/v1/chat/completions":
                 return await process_request(
                     request, response, ChatCompletion, OperationEnum.CHAT_COMPLETION
                 )
-            elif request.url.path == "/v1-openai/completions":
+            elif path == "/v1-openai/completions" or path == "/v1/completions":
                 return await process_request(
-                    request, response, Completion, OperationEnum.COMPLETION
+                    request, response, CompletionExt, OperationEnum.COMPLETION
                 )
-            elif request.url.path == "/v1-openai/embeddings":
+            elif path == "/v1-openai/embeddings" or path == "/v1/embeddings":
                 return await process_request(
                     request,
                     response,
-                    CreateEmbeddingResponse,
+                    CreateEmbeddingResponseExt,
                     OperationEnum.EMBEDDING,
                 )
-            elif request.url.path == "/v1-openai/images/generations":
+            elif (
+                path == "/v1-openai/images/generations"
+                or path == "/v1/images/generations"
+                or path == "/v1-openai/images/edits"
+                or path == "/v1/images/edits"
+            ):
                 return await process_request(
                     request,
                     response,
                     ImagesResponse,
                     OperationEnum.IMAGE_GENERATION,
                 )
-            elif request.url.path == "/v1-openai/audio/speech":
+            elif path == "/v1-openai/audio/speech" or path == "/v1/audio/speech":
                 return await process_request(
                     request,
                     response,
                     FileResponse,
                     OperationEnum.AUDIO_SPEECH,
                 )
-            elif request.url.path == "/v1-openai/audio/transcriptions":
+            elif (
+                path == "/v1-openai/audio/transcriptions"
+                or path == "/v1/audio/transcriptions"
+            ):
                 return await process_request(
                     request,
                     response,
@@ -94,8 +116,8 @@ async def process_request(
     response_class: Type[
         Union[
             ChatCompletion,
-            Completion,
-            CreateEmbeddingResponse,
+            CompletionExt,
+            CreateEmbeddingResponseExt,
             RerankResponse,
             ImagesResponse,
             FileResponse,
@@ -140,13 +162,12 @@ async def record_model_usage(
     usage: Union[CompletionUsage, EmbeddingUsage, RerankUsage, None],
     operation: OperationEnum,
 ):
-    prompt_tokens, total_tokens, completion_tokens = 0, 0, 0
-    if usage and hasattr(usage, 'prompt_tokens'):
-        prompt_tokens = usage.prompt_tokens
-        total_tokens = usage.total_tokens
-        completion_tokens = getattr(
-            usage, 'completion_tokens', total_tokens - prompt_tokens
-        )
+    total_tokens = getattr(usage, 'total_tokens', 0) or 0
+    prompt_tokens = getattr(usage, 'prompt_tokens', total_tokens) or total_tokens
+    completion_tokens = (
+        getattr(usage, 'completion_tokens', total_tokens - prompt_tokens)
+        or total_tokens - prompt_tokens
+    )
 
     user: User = request.state.user
     model: Model = request.state.model
@@ -163,20 +184,22 @@ async def record_model_usage(
         request_count=1,
     )
     async with AsyncSession(get_engine()) as session:
-        current_model_usage = await ModelUsage.one_by_fields(session, fields)
+        model_usage_service = ModelUsageService(session)
+        current_model_usage = await model_usage_service.get_by_fields(fields)
         if current_model_usage:
-            current_model_usage.completion_token_count += completion_tokens
-            current_model_usage.prompt_token_count += prompt_tokens
-            current_model_usage.request_count += 1
-            await current_model_usage.update(session)
+            await model_usage_service.update(
+                current_model_usage, completion_tokens, prompt_tokens
+            )
         else:
-            await ModelUsage.create(session, model_usage)
+            await model_usage_service.create(model_usage)
 
 
 async def handle_streaming_response(
     request: Request,
     response: StreamingResponse,
-    response_class: Type[Union[ChatCompletionChunk, Completion, ImageGenerationChunk]],
+    response_class: Type[
+        Union[ChatCompletionChunk, CompletionExt, ImageGenerationChunk]
+    ],
     operation: OperationEnum,
 ):
     async def streaming_generator():
@@ -190,7 +213,7 @@ async def handle_streaming_response(
                 logger.error(f"Error processing streaming response: {e}")
                 yield chunk
 
-    return StreamingResponse(streaming_generator(), headers=dict(response.headers))
+    return StreamingResponse(streaming_generator(), headers=response.headers)
 
 
 async def process_chunk(
@@ -205,29 +228,37 @@ async def process_chunk(
     # each chunk may contain multiple data lines
     lines = chunk.decode("utf-8").split("\n\n")
     for line in lines[:-1]:
+        if not line.startswith('data: '):
+            # skip non-data SSE messages
+            yield f"{line}\n\n".encode("utf-8")
+            continue
+
         data = line.split('data: ')[-1]
         if data.startswith('[DONE]'):
             yield "data: [DONE]\n\n".encode("utf-8")
             continue
 
-        response_dict = None
-        try:
-            response_dict = json.loads(data.strip())
-        except Exception as e:
-            raise e
-        response_chunk = response_class(**response_dict)
+        if '"usage":' in data:
+            response_dict = None
+            try:
+                response_dict = json.loads(data.strip())
+            except Exception as e:
+                raise e
+            response_chunk = response_class(**response_dict)
 
-        if is_usage_chunk(response_chunk):
-            await record_model_usage(request, response_chunk.usage, operation)
+            if is_usage_chunk(response_chunk):
+                await record_model_usage(request, response_chunk.usage, operation)
 
-            # Fill rate metrics. These are extended info not included in OAI APIs.
-            # llama-box provides them out-of-the-box. Align with other backends here.
-            if should_add_metrics(response_dict):
-                add_metrics(response_dict, request, response_chunk)
+                # Fill rate metrics. These are extended info not included in OAI APIs.
+                # llama-box provides them out-of-the-box. Align with other backends here.
+                if should_add_metrics(response_dict):
+                    add_metrics(response_dict, request, response_chunk)
 
-        yield f"data: {json.dumps(response_dict, separators=(',', ':'))}\n\n".encode(
-            "utf-8"
-        )
+            yield f"data: {json.dumps(response_dict, separators=(',', ':'))}\n\n".encode(
+                "utf-8"
+            )
+        else:
+            yield f"{line}\n\n".encode("utf-8")
 
 
 def should_add_metrics(response_dict):
@@ -292,7 +323,7 @@ class RefreshTokenMiddleware(BaseHTTPMiddleware):
 
 
 def is_usage_chunk(
-    chunk: Union[ChatCompletionChunk, Completion, ImageGenerationChunk]
+    chunk: Union[ChatCompletionChunk, CompletionExt, ImageGenerationChunk],
 ) -> bool:
     choices = getattr(chunk, "choices", None)
 

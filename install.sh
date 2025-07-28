@@ -1,4 +1,5 @@
 #!/bin/sh
+# Script updated at: 2025-04-24T06:27:59Z
 set -e
 set -o noglob
 
@@ -26,11 +27,22 @@ set -o noglob
 #
 #   - INSTALL_SKIP_BUILD_DEPENDENCIES
 #     If set to 1 will skip the build dependencies.
+#
+#   - INSTALL_SKIP_IOGPU_WIRED_LIMIT
+#     If set to 1 will skip setting the GPU wired memory limit on macOS.
+#
+#   - INSTALL_IOGPU_WIRED_LIMIT_MB
+#     This sets the maximum amount of wired memory that the GPU can allocate on macOS.
 
 INSTALL_PACKAGE_SPEC="${INSTALL_PACKAGE_SPEC:-}"
 INSTALL_INDEX_URL="${INSTALL_INDEX_URL:-}"
 INSTALL_SKIP_POST_CHECK="${INSTALL_SKIP_POST_CHECK:-0}"
-INSTALL_SKIP_BUILD_DEPENDENCIES="${INSTALL_SKIP_BUILD_DEPENDENCIES:-0}"
+INSTALL_SKIP_BUILD_DEPENDENCIES="${INSTALL_SKIP_BUILD_DEPENDENCIES:-1}"
+INSTALL_SKIP_IOGPU_WIRED_LIMIT="${INSTALL_SKIP_IOGPU_WIRED_LIMIT:-}"
+INSTALL_IOGPU_WIRED_LIMIT_MB="${INSTALL_IOGPU_WIRED_LIMIT_MB:-}"
+
+BREW_APP_OPENFST_NAME="openfst"
+BREW_APP_OPENFST_VERSION="1.8.3"
 
 # --- helper functions for logs ---
 info()
@@ -74,11 +86,14 @@ get_param_value() {
     echo ""
 }
 
+check_command() {
+  command -v "$1" > /dev/null 2>&1
+}
+
 ACTION="Install"
 print_complete_message()
 {
     usage_hint=""
-    path_hint=""
     if [ "$ACTION" = "Install" ]; then
         data_dir=$(get_param_value "data-dir" "$@")
         if [ -z "$data_dir" ]; then
@@ -111,16 +126,14 @@ print_complete_message()
             password_hint=""
             bootstrap_password=$(get_param_value "bootstrap-password" "$@")
             if [ -z "$bootstrap_password" ]; then
-                password_hint="To get the default password, run 'cat $data_dir/initial_admin_password'.\n"
+                password_hint="To get the default password, run 'cat $data_dir/initial_admin_password'."
             fi
 
             usage_hint="\n\nGPUStack UI is available at $server_url.\nDefault username is 'admin'.\n${password_hint}\n"
         fi
 
-
-        path_hint="CLI \"gpustack\" is available from the command line. (You may need to open a new terminal or re-login for the PATH changes to take effect.)"
     fi
-    info "$ACTION complete. ${usage_hint}${path_hint}"
+    info "$ACTION complete. ${usage_hint}"
 }
 
 # --- fatal if no systemd or launchd ---
@@ -138,7 +151,7 @@ verify_system() {
 SUDO=
 check_root() {
   if [ "$(id -u)" -ne 0 ]; then
-    if command -v sudo >/dev/null 2>&1; then
+    if check_command "sudo"; then
       info "running as non-root, will use sudo for installation."
       SUDO="sudo"
     else
@@ -162,40 +175,117 @@ detect_os() {
 
 # Function to detect the OS and package manager
 detect_device() {
-  if command -v nvidia-smi > /dev/null 2>&1; then
-    if ! command -v nvcc > /dev/null 2>&1 && ! ($SUDO ldconfig -p | grep -q libcudart) && ! ls /usr/local/cuda >/dev/null 2>&1; then
+  if check_command "nvidia-smi"; then
+    if ! check_command "nvcc" && ! ($SUDO ldconfig -p | grep -q libcudart) && ! ls /usr/local/cuda >/dev/null 2>&1; then
       warn "NVIDIA GPU detected but CUDA is not installed. Please install CUDA."
     fi
     DEVICE="cuda"
+    # Create a symlink for nvidia-smi to allow root users in WSL to detect GPU information.
+    if [ -f "/usr/lib/wsl/lib/nvidia-smi" ] && [ ! -e "/usr/local/bin/nvidia-smi" ]; then
+      $SUDO ln -s /usr/lib/wsl/lib/nvidia-smi /usr/local/bin/nvidia-smi
+    fi
   fi
 
-  if command -v mthreads-gmi > /dev/null 2>&1; then
-    if ! command -v mcc > /dev/null 2>&1 && ! ($SUDO ldconfig -p | grep -q libmusart) && ! ls /usr/local/musa >/dev/null 2>&1 && ! ls /opt/musa >/dev/null 2>&1; then
+  if check_command "mthreads-gmi"; then
+    if ! check_command "mcc" && ! ($SUDO ldconfig -p | grep -q libmusart) && ! ls /usr/local/musa >/dev/null 2>&1 && ! ls /opt/musa >/dev/null 2>&1; then
       warn "Moore Threads GPU detected but MUSA is not installed. Please install MUSA."
     fi
     DEVICE="musa"
   fi
 }
 
+# Function to check if a port is available
+check_port() {
+  port=$1
+  if $SUDO lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+# Function to check if the server and worker ports are available
+check_ports() {
+  if check_command "gpustack"; then
+    # skip on upgrade
+    return
+  fi
+
+  config_file=$(get_param_value "config-file" "$@")
+  if [ -n "$config_file" ]; then
+    return
+  fi
+
+  server_port=$(get_param_value "port" "$@")
+  worker_port=$(get_param_value "worker-port" "$@")
+  ssl_enabled=$(get_param_value "ssl-keyfile" "$@")
+
+  if [ -z "$server_port" ]; then
+    server_port="80"
+    if [ -n "$ssl_enabled" ]; then
+      server_port="443"
+    fi
+  fi
+
+  if [ -z "$worker_port" ]; then
+    worker_port="10150"
+  fi
+
+  if ! check_port "$server_port"; then
+    fatal "Server port $server_port is already in use! Please specify a different port by using --port <YOUR_PORT>."
+  fi
+
+  if ! check_port "$worker_port"; then
+    fatal "Worker port $worker_port is already in use! Please specify a different port by using --worker-port <YOUR_PORT>."
+  fi
+}
+
+# Function to reset wired_limit_mb
+check_and_reset_wired_limit_mb() {
+  if [ "$INSTALL_SKIP_IOGPU_WIRED_LIMIT" = "1" ] || [ "$OS" != "macos" ]; then
+    return
+  fi
+  if [ -n "$INSTALL_IOGPU_WIRED_LIMIT_MB" ] ; then
+    # Manually set the value of the wired_limit_mb parameter
+    $SUDO sysctl -w iogpu.wired_limit_mb="$INSTALL_IOGPU_WIRED_LIMIT_MB"
+    warn "This operation carries risks. Please proceed only if you fully understand the iogpu.wired_limit_mb."
+  else
+    # Automatically set the most appropriate wired_limit_mb value in macos
+    TOTAL_MEM_MB=$(($(sysctl -n hw.memsize) / 1024 / 1024))
+    # Calculate 85% and TOTAL_MEM_GB-5GB in MB
+    EIGHTY_FIVE_PERCENT=$((TOTAL_MEM_MB * 85 / 100))
+    MINUS_5GB=$((TOTAL_MEM_MB - 5120))
+    # Set WIRED_LIMIT_MB to higher value
+    if [ "$EIGHTY_FIVE_PERCENT" -gt "$MINUS_5GB" ]; then
+      WIRED_LIMIT_MB="$EIGHTY_FIVE_PERCENT"
+    else
+      WIRED_LIMIT_MB="$MINUS_5GB"
+    fi
+    info "Total memory: $TOTAL_MEM_MB MB, Maximum limit (iogpu.wired_limit_mb): $WIRED_LIMIT_MB MB"
+    # Apply the values with sysctl
+    $SUDO sysctl -w iogpu.wired_limit_mb="$WIRED_LIMIT_MB"
+  fi
+}
+
 # Function to check and install Python tools
 PYTHONPATH=""
 check_python_tools() {
-  if ! command -v python3 > /dev/null 2>&1; then
+  if ! check_command "python3"; then
     info "Python3 could not be found. Attempting to install..."
     if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
       $SUDO apt update && $SUDO DEBIAN_FRONTEND=noninteractive apt install -y python3
     elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "rocky" ] ; then
       $SUDO yum install -y python3
     elif [ "$OS" = "macos" ]; then
-      brew install python
+      brew install python@3.12
     else
       fatal "Unsupported OS for automatic Python installation. Please install Python3 manually."
     fi
   fi
 
   PYTHON_VERSION=$(python3 -c "import sys; print(sys.version_info.major * 10 + sys.version_info.minor)")
-  if [ "$PYTHON_VERSION" -lt 40 ]; then
-    fatal "Python version is less than 3.10. Please upgrade Python to at least version 3.10."
+  CURRENT_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+  if [ "$PYTHON_VERSION" -lt 40 ] || [ "$PYTHON_VERSION" -ge 43 ]; then
+    fatal "Python version $CURRENT_VERSION is not supported. Please use Python 3.10, 3.11, or 3.12."
   fi
 
   PYTHON_STDLIB_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['stdlib'])")
@@ -215,21 +305,30 @@ check_python_tools() {
       fi
     fi
 
-    if ! command -v pip3 > /dev/null 2>&1; then
+    if ! check_command "pip3"; then
       info "Pip3 could not be found. Attempting to ensure pip..."
-      python3 -m ensurepip --upgrade
+      if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+        if python3 -m ensurepip 2>&1 | grep -q "ensurepip is disabled"; then
+            $SUDO apt update && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
+        else
+            python3 -m ensurepip --upgrade
+        fi
+      else
+        python3 -m ensurepip --upgrade
+      fi
     fi
 
-    PIP_PYTHON_VERSION=$(pip3 -V | grep -Eo 'python [0-9]+\.[0-9]+' | head -n 1 | awk '{print $2}' | awk -F. '{print $1 * 10 + $2}')
+    PIP_PYTHON_VERSION_READABLE=$(pip3 -V | grep -Eo 'python [0-9]+\.[0-9]+' | head -n 1 | awk '{print $2}')
+    PIP_PYTHON_VERSION=$(echo "$PIP_PYTHON_VERSION_READABLE" | awk -F. '{print $1 * 10 + $2}')
     if [ "$PIP_PYTHON_VERSION" -lt 40 ]; then
-      fatal "Python version for pip3 is less than 3.10. Please upgrade pip3 to be associated with at least Python 3.10."
+      fatal "Python version for pip3 is $PIP_PYTHON_VERSION_READABLE which is not supported. Please use Python 3.10, 3.11, or 3.12."
     fi
   fi
 
+  USER_BASE_BIN=$(python3 -m site --user-base || true)/bin
+  export PATH="$USER_BASE_BIN:$PATH"
 
-  PYTHONPATH=$(python3 -c 'import site, sys; print(":".join(sys.path + [site.getusersitepackages()]))')
-
-  if ! command -v pipx > /dev/null 2>&1; then
+  if ! check_command "pipx"; then
     info "Pipx could not be found. Attempting to install..."
     if [ -z "$PYTHON_EXTERNALLY_MANAGED" ]; then
       pip3 install pipx
@@ -242,39 +341,102 @@ check_python_tools() {
     else
       fatal "Unsupported OS for automatic pipx installation. Please install pipx manually."
     fi
-    USER_BASE_BIN=$(python3 -m site --user-base)/bin
-    export PATH="$USER_BASE_BIN:$PATH"
-    pipx ensurepath --force
 
-    PIPX_BIN_DIR=$(pipx environment --value PIPX_BIN_DIR)
-    export PATH="$PIPX_BIN_DIR:$PATH"
+    # In case pipx installation causes python3 PATH changes (e.g., brew link), re-evaluate once.
+    check_python_tools
   fi
+
+  pipx ensurepath --force
+  PIPX_BIN_DIR=$(pipx environment --value PIPX_BIN_DIR)
+  export PATH="$PIPX_BIN_DIR:$PATH"
+}
+
+# Function to install a specific version of a Homebrew application
+brew_install_with_version() {
+  BREW_APP_NAME="$1"
+  BREW_APP_VERSION="$2"
+  BREW_APP_NAME_WITH_VERSION="$BREW_APP_NAME@$BREW_APP_VERSION"
+  TAP_NAME="$USER/local-$BREW_APP_NAME-$BREW_APP_VERSION"
+  
+  # Check current installed versions
+  info "Checking installed versions of $BREW_APP_NAME."
+  INSTALLED_VERSIONS=$(brew list --versions | grep "$BREW_APP_NAME" || true)
+  INSTALLED_VERSION_COUNT=$(brew list --versions | grep -c "$BREW_APP_NAME" || true)
+
+  if [ -n "$INSTALLED_VERSIONS" ]; then
+    # Check if the target version is already installed
+    if echo "$INSTALLED_VERSIONS" | grep -q "$BREW_APP_VERSION"; then
+      if [ "$INSTALLED_VERSION_COUNT" -eq 1 ]; then
+        info "$BREW_APP_NAME $BREW_APP_VERSION is already installed."
+        return 0
+      elif [ "$INSTALLED_VERSION_COUNT" -gt 1 ]; then
+        SINGLE_LINE_INSTALLED_VERSIONS=$(echo "$INSTALLED_VERSIONS" | tr '\n' ' ')
+        info "Installed $BREW_APP_NAME versions: $SINGLE_LINE_INSTALLED_VERSIONS"
+        info "Multiple versions of $BREW_APP_NAME are installed, relink the target version."
+        echo "$INSTALLED_VERSIONS" | awk '{print $1}' | while read -r installed_version; do
+            brew unlink "$installed_version"
+        done
+
+        NEED_VERSION=$(echo "$INSTALLED_VERSIONS" | grep "$BREW_APP_VERSION" | cut -d ' ' -f 1)
+        brew link --overwrite "$NEED_VERSION"
+        return 0
+      fi
+    fi
+  fi
+
+  # Create a new Homebrew tap
+  if brew tap-info "$TAP_NAME" 2>/dev/null | grep -q "Installed"; then
+      info "Tap $TAP_NAME already exists. Skipping tap creation."
+  else
+      info "Creating a new tap: $TAP_NAME..."
+      if ! brew tap-new "$TAP_NAME"; then
+          fatal "Failed to create the tap $TAP_NAME."
+      fi
+  fi
+
+  # Extract the history version of the app
+  info "Extracting $BREW_APP_NAME version $BREW_APP_VERSION."
+  brew tap homebrew/core --force
+  brew extract --force --version="$BREW_APP_VERSION" "$BREW_APP_NAME" "$TAP_NAME"
+
+  # Install the specific version of the application
+  info "Unlinking before install $BREW_APP_NAME."
+  echo "$INSTALLED_VERSIONS" | awk '{print $1}' | while read -r installed_version; do
+    brew unlink "$installed_version" 2>/dev/null || true
+  done
+
+  info "Installing $BREW_APP_NAME version $BREW_APP_VERSION."
+  if ! brew install "$TAP_NAME/$BREW_APP_NAME_WITH_VERSION"; then
+      fatal "Failed to install $BREW_APP_NAME version $BREW_APP_VERSION."
+  fi
+
+  info "Installed and linked $BREW_APP_NAME version $BREW_APP_VERSION."
 }
 
 # Function to install dependencies
 install_dependencies() {
-  DEPENDENCIES="curl sudo"
+  DEPENDENCIES="curl sudo lsof"
   for dep in $DEPENDENCIES; do
-    if ! command -v "$dep" > /dev/null 2>&1; then
+    if ! check_command "$dep"; then
       fatal "$dep is required but missing. Please install $dep."
     fi
   done
 
   # check SeLinux dependency
-  if command -v getenforce > /dev/null 2>&1; then
+  if check_command "getenforce"; then
       if [ "Disabled" != "$(getenforce)" ]; then
-          if ! command -v semanage > /dev/null 2>&1; then
+          if ! check_command "semanage"; then
               fatal "semanage is required while SeLinux enabled but missing. Please install the appropriate package for your OS (e.g., policycoreutils-python-utils for Rocky/RHEL/Ubuntu/Debian)."
           fi
       fi
   fi
 
   if [ "$INSTALL_SKIP_BUILD_DEPENDENCIES" != "1" ] && [ "$OS" = "macos" ]; then
-    if ! command -v brew > /dev/null 2>&1; then
+    if ! check_command "brew"; then
       fatal "Homebrew is required but missing. Please install Homebrew."
-    elif ! brew list openfst > /dev/null 2>&1; then
+    else
       # audio dependency library
-      brew install openfst
+      brew_install_with_version "$BREW_APP_OPENFST_NAME" "$BREW_APP_OPENFST_VERSION"
     fi
   fi
 }
@@ -302,7 +464,7 @@ setup_selinux_permissions() {
 # Function to setup systemd for Linux
 setup_systemd() {
   # setup permissions
-  if command -v getenforce > /dev/null 2>&1; then
+  if check_command "getenforce"; then
       if [ "Disabled" != "$(getenforce)" ]; then
           info "Setting up SeLinux permissions for Python3."
           PYTHON3_BIN_PATH=$(which python3)
@@ -336,6 +498,7 @@ After=network-online.target
 [Service]
 EnvironmentFile=-/etc/default/%N
 ExecStart=$(which gpustack) start $_args
+LimitNOFILE=65535
 Restart=always
 StandardOutput=append:/var/log/gpustack.log
 StandardError=append:/var/log/gpustack.log
@@ -512,6 +675,13 @@ check_service() {
 
 # Function to create uninstall script
 create_uninstall_script() {
+  PYTHON_BIN="python3"
+  PIPX_PYTHON_PATH=$(pipx environment --value PIPX_DEFAULT_PYTHON)
+  if [ -n "$PIPX_PYTHON_PATH" ]; then
+    PYTHON_BIN="$PIPX_PYTHON_PATH"
+  fi
+  PYTHONPATH=$("$PYTHON_BIN" -c 'import site, sys; print(":".join(sys.path + [site.getusersitepackages()]))')
+
   $SUDO mkdir -p /var/lib/gpustack
   $SUDO tee /var/lib/gpustack/uninstall.sh > /dev/null <<EOF
 #!/bin/bash
@@ -537,7 +707,7 @@ EOF
 
 # Function to install GPUStack using pipx
 install_gpustack() {
-  if command -v gpustack > /dev/null 2>&1; then
+  if check_command "gpustack"; then
     ACTION="Upgrade"
     info "GPUStack is already installed. Upgrading..."
   else
@@ -560,18 +730,18 @@ install_gpustack() {
   fi
 
   # shellcheck disable=SC2090,SC2086
-  pipx install --force --verbose $install_args "$INSTALL_PACKAGE_SPEC"
-  # Workaround for issue #581
-  pipx inject gpustack pydantic==2.9.2 --force > /dev/null 2>&1
+  pipx install --force --verbose $install_args --python "$(which python3)" "$INSTALL_PACKAGE_SPEC"
 
   # audio dependencies for macOS
   if [ "$INSTALL_SKIP_BUILD_DEPENDENCIES" != "1" ] && [ "$OS" = "macos" ]; then
-    CPLUS_INCLUDE_PATH="$(brew --prefix openfst)/include"
+    # Check current installed versions
+    NEED_VERSION=$(brew list --versions | grep "$BREW_APP_OPENFST_NAME" | grep "$BREW_APP_OPENFST_VERSION" | cut -d ' ' -f 1 || true)
+    CPLUS_INCLUDE_PATH="$(brew --prefix "$NEED_VERSION")/include"
     export CPLUS_INCLUDE_PATH
-    LIBRARY_PATH="$(brew --prefix openfst)/lib"
+    LIBRARY_PATH="$(brew --prefix "$NEED_VERSION")/lib"
     export LIBRARY_PATH
-    pipx inject gpustack pynini
-    pipx inject gpustack wetextprocessing
+    pipx inject gpustack pynini==2.1.6
+    pipx inject gpustack wetextprocessing==1.0.4.1
   fi
 }
 
@@ -583,6 +753,8 @@ install_gpustack() {
   verify_system
   install_dependencies
   check_python_tools
+  check_ports "$@"
+  check_and_reset_wired_limit_mb "$@"
   install_gpustack
   create_uninstall_script
   disable_service

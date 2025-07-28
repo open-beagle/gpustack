@@ -6,7 +6,10 @@ from gpustack.routes import (
     dashboard,
     debug,
     gpu_devices,
+    model_evaluations,
+    model_files,
     model_instances,
+    model_sets,
     probes,
     proxy,
     update,
@@ -19,7 +22,7 @@ from gpustack.routes import (
 
 from gpustack.api.exceptions import error_responses, openai_api_error_responses
 from gpustack.routes import rerank
-from gpustack.server.auth import get_admin_user, get_current_user
+from gpustack.api.auth import get_admin_user, get_current_user
 
 
 api_router = APIRouter(responses=error_responses)
@@ -41,6 +44,15 @@ v1_admin_router.include_router(models.router, prefix="/models", tags=["Models"])
 v1_admin_router.include_router(workers.router, prefix="/workers", tags=["Workers"])
 v1_admin_router.include_router(
     model_instances.router, prefix="/model-instances", tags=["Model Instances"]
+)
+v1_admin_router.include_router(
+    model_sets.router, prefix="/model-sets", tags=["Model Sets"]
+)
+v1_admin_router.include_router(
+    model_files.router, prefix="/model-files", tags=["Model Files"]
+)
+v1_admin_router.include_router(
+    model_evaluations.router, prefix="/model-evaluations", tags=["Model Evaluations"]
 )
 v1_admin_router.include_router(
     gpu_devices.router, prefix="/gpu-devices", tags=["GPU Devices"]

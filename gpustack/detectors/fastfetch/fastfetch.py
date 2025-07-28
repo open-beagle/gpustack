@@ -2,7 +2,7 @@ import json
 import logging
 import platform
 import subprocess
-from gpustack.detectors.base import GPUDetector
+from gpustack.detectors.base import GPUDetector, SystemInfoDetector
 from gpustack.schemas.workers import (
     CPUInfo,
     GPUCoreInfo,
@@ -18,11 +18,12 @@ from gpustack.schemas.workers import (
     VendorEnum,
 )
 from gpustack.utils.compat_importlib import pkg_resources
+from gpustack.utils.platform import device_type_from_vendor
 
 logger = logging.getLogger(__name__)
 
 
-class Fastfetch(GPUDetector):
+class Fastfetch(GPUDetector, SystemInfoDetector):
     def is_available(self) -> bool:
         try:
             self._run_command(self._command_version(), parse_output=False)
@@ -205,17 +206,21 @@ class Fastfetch(GPUDetector):
             vendor = next(
                 (v for v in vendor_all_values if v.lower() in vendor.lower()), vendor
             )
+            device = device_type_from_vendor(vender)
 
             # Append.
             devices.append(
                 GPUDeviceInfo(
+                    index=index,
+                    device_index=index,
+                    device_chip_index=0,
                     name=name,
                     uuid=self._get_value(value, "uuid"),
                     vendor=vendor,
-                    index=index,
                     core=core,
                     memory=memory,
                     temperature=self._get_value(value, "temperature"),
+                    type=device,
                 )
             )
 

@@ -1,7 +1,8 @@
+import asyncio
 import json
 from typing import Any, Callable, Dict, Optional
 
-from pydantic import BaseModel
+import httpx
 from gpustack.api.exceptions import raise_if_response_error
 from gpustack.server.bus import Event
 from gpustack.schemas import *
@@ -22,7 +23,7 @@ class WorkerClient:
 
     def watch(
         self,
-        callback: Callable[[Event], None],
+        callback: Optional[Callable[[Event], None]] = None,
         stop_condition: Optional[Callable[[Event], bool]] = None,
         params: Optional[Dict[str, Any]] = None,
     ):
@@ -41,9 +42,44 @@ class WorkerClient:
                 if line:
                     event_data = json.loads(line)
                     event = Event(**event_data)
-                    callback(event)
+                    if callback:
+                        callback(event)
                     if stop_condition(event):
                         break
+
+    async def awatch(
+        self,
+        callback: Optional[Callable[[Event], None]] = None,
+        stop_condition: Optional[Callable[[Event], bool]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ):
+        if params is None:
+            params = {}
+        params["watch"] = "true"
+
+        if stop_condition is None:
+            stop_condition = lambda event: False
+
+        async with self._client.get_async_httpx_client().stream(
+            "GET",
+            self._url,
+            params=params,
+            timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
+        ) as response:
+            raise_if_response_error(response)
+            lines = response.aiter_lines()
+            while True:
+                try:
+                    line = await asyncio.wait_for(lines.__anext__(), timeout=45)
+                    if line:
+                        event_data = json.loads(line)
+                        event = Event(**event_data)
+                        if callback:
+                            callback(event)
+                        if stop_condition(event):
+                            break
+                except asyncio.TimeoutError:
+                    raise Exception("watch timeout")
 
     def get(self, id: int) -> WorkerPublic:
         response = self._client.get_httpx_client().get(f"{self._url}/{id}")
@@ -52,14 +88,18 @@ class WorkerClient:
 
     def create(self, model_create: WorkerCreate):
         response = self._client.get_httpx_client().post(
-            self._url, json=model_create.model_dump()
+            self._url,
+            content=model_create.model_dump_json(),
+            headers={"Content-Type": "application/json"},
         )
         raise_if_response_error(response)
         return WorkerPublic.model_validate(response.json())
 
     def update(self, id: int, model_update: WorkerUpdate):
         response = self._client.get_httpx_client().put(
-            f"{self._url}/{id}", json=model_update.model_dump()
+            f"{self._url}/{id}",
+            content=model_update.model_dump_json(),
+            headers={"Content-Type": "application/json"},
         )
         raise_if_response_error(response)
         return WorkerPublic.model_validate(response.json())

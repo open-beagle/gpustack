@@ -12,9 +12,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "${ROOT_DIR}/hack/lib/init.sh"
 
 function download_deps() {
-  pip install poetry==1.7.1 pre-commit==3.7.1
+  pip install poetry==1.8.3
   poetry install
-  pre-commit install
+  if [[ "${POETRY_ONLY:-false}" == "false" ]]; then
+    pip install pre-commit==3.7.1
+    pre-commit install
+  fi
 }
 
 function download_ui() {
@@ -22,14 +25,17 @@ function download_ui() {
   local ui_path="${ROOT_DIR}/gpustack/ui"
   local tmp_ui_path="${ui_path}/tmp"
   local tag="latest"
-  # local tag="${1}"
+
+  if [[ "${GIT_VERSION}" != "v0.0.0" ]]; then
+    tag="${GIT_VERSION}"
+  fi
 
   rm -rf "${ui_path}"
   mkdir -p "${tmp_ui_path}/ui"
 
-  gpustack::log::info "downloading ui assets"
+  gpustack::log::info "downloading '${tag}' UI assets"
 
-  if ! curl --retry 3 --retry-all-errors --retry-delay 3 -sSfL "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/${tag}.tar.gz" 2>/dev/null |
+  if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/${tag}.tar.gz" 2>/dev/null |
     tar -xzf - --directory "${tmp_ui_path}/ui" 2>/dev/null; then
 
     if [[ "${tag:-}" =~ ^v([0-9]+)\.([0-9]+)(\.[0-9]+)?(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
@@ -37,7 +43,7 @@ function download_ui() {
     fi
 
     gpustack::log::warn "failed to download '${tag}' ui archive, fallback to '${default_tag}' ui archive"
-    if ! curl --retry 3 --retry-all-errors --retry-delay 3 -sSfL "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/${default_tag}.tar.gz" |
+    if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/${default_tag}.tar.gz" |
       tar -xzf - --directory "${tmp_ui_path}/ui" 2>/dev/null; then
       gpustack::log::fatal "failed to download '${default_tag}' ui archive"
     fi
@@ -63,6 +69,15 @@ function download_ui() {
   rm -rf "${tmp_ui_path}"
 }
 
+# Copy extra static files to ui including catalog icons
+function copy_extra_static() {
+  local extra_static_path="${ROOT_DIR}/static"
+  local ui_static_path="${ROOT_DIR}/gpustack/ui/static"
+  if [ -d "${extra_static_path}" ]; then
+    cp -a "${extra_static_path}/." "${ui_static_path}"
+  fi
+}
+
 #
 # main
 #
@@ -70,4 +85,5 @@ function download_ui() {
 gpustack::log::info "+++ DEPENDENCIES +++"
 download_deps
 download_ui
+copy_extra_static
 gpustack::log::info "--- DEPENDENCIES ---"

@@ -9,7 +9,7 @@ GPUStack supports running on ARM64 Windows, enabling use on Snapdragon X-based C
 ## Prerequisites
 
 - A Copilot+ PC with Snapdragon X. In this tutorial, we use the Dell XPS 13 9345.
-- Install **AMD64** Python 3.10 or above. [See details](../overview.md#supported-architectures)
+- Install **AMD64** Python (version 3.10 to 3.12). [See details](../installation/installation-requirements.md#supported-architectures)
 
 ## Installing GPUStack
 
@@ -25,15 +25,15 @@ After installation, follow the on-screen instructions to obtain credentials and 
 
 ## Deploying a Model
 
-1. Navigate to the `Models` page in the GPUStack UI.
-2. Click on the `Deploy Model` button and select `Ollama Library` from the dropdown.
-3. Enter `llama3.2` in the `Name` field.
-4. Select `llama3.2` from the `Ollama Model` dropdown.
+1. Navigate to the `Deployments` page in the GPUStack UI.
+2. Click on the `Deploy Model` button and select `Hugging Face` from the dropdown.
+3. Enable the `GGUF` checkbox to filter models by GGUF format.
+4. Use the search bar in the top left to search for the model name `Qwen/Qwen2.5-0.5B-Instruct-GGUF`.
 5. Click `Save` to deploy the model.
 
-Once deployed, you can monitor the model's status on the `Models` page.
+Once deployed, you can monitor the model deployment's status on the `Deployments` page.
 
-![llama3.2](../assets/tutorials/running-on-copilot-plus-pcs-with-snapdragon-x/llama3.2.png)
+![llama3.2](../assets/tutorials/running-on-copilot-plus-pcs-with-snapdragon-x/qwen2.5.png)
 
 ## Running Inference
 

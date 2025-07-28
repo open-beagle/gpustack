@@ -4,16 +4,20 @@ on:
   push:
     branches:
       - main
+      - "v*-dev"
     paths:
       - "install.ps1"
       - ".github/workflows/install-script-windows.yml"
   pull_request:
     branches:
       - main
+      - "v*-dev"
     paths:
       - "install.ps1"
       - ".github/workflows/install-script-windows.yml"
   workflow_dispatch: {}
+  schedule:
+    - cron: "0 0 * * *" # every day at 00:00 UTC
 
 jobs:
   windows-amd64-build:
@@ -72,7 +76,7 @@ jobs:
           $env:INSTALL_PACKAGE_SPEC = [System.IO.Path]::Combine("dist", $env:whlPackageName)   
           Write-Host "INSTALL_PACKAGE_SPEC: $env:INSTALL_PACKAGE_SPEC"   
           Write-Host "AppData $env:APPDATA"
-          
+
           # Use port 8080 since 80 is occupied by the System
           ./install.ps1 -ServerPort 8080
 
@@ -98,8 +102,7 @@ jobs:
                   Start-Sleep -Seconds $retryDelaySeconds
               }
           }
-        
+
           if ($responseCode -ne 200) {
               Write-Host "All retry attempts failed. Last error: $lastError"
           }
-      

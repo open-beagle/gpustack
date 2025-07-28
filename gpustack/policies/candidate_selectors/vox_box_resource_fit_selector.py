@@ -1,8 +1,10 @@
 from abc import ABC, abstractmethod
 import asyncio
 from gpustack.config.config import Config
+from gpustack.utils.convert import safe_int
 from gpustack.utils.file import get_local_file_size_in_byte
-from gpustack.worker.backends.base import get_file_size as get_remote_file_size
+from gpustack.utils.gpu import parse_gpu_id
+from gpustack.utils.hub import get_model_weight_size
 from typing import Dict, List
 import os
 import logging
@@ -17,7 +19,6 @@ from gpustack.policies.utils import (
 from gpustack.schemas.models import (
     ComputedResourceClaim,
     Model,
-    ModelInstance,
 )
 from gpustack.schemas.workers import VendorEnum, Worker
 
@@ -34,19 +35,32 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
         self,
         config: Config,
         model: Model,
-        model_instance: ModelInstance,
         cache_dir: str,
     ):
         self._cfg = config
         self._engine = get_engine()
         self._model = model
-        self._model_instance = model_instance
-        self._cache_dir = cache_dir
+        self._cache_dir = os.path.join(cache_dir, "vox-box")
+        self._messages = []
 
         self._gpu_ram_claim = 0
         self._gpu_vram_claim = 0
         self._cpu_ram_claim = 0
         self._required_os = None
+        self._selected_gpu_worker = None
+        self._selected_gpu_index = None
+
+        if self._model.gpu_selector and self._model.gpu_selector.gpu_ids:
+            valid, match = parse_gpu_id(self._model.gpu_selector.gpu_ids[0])
+            if valid:
+                self._selected_gpu_worker = match.get("worker_name")
+                self._selected_gpu_index = safe_int(match.get("gpu_index"))
+
+    def _set_messages(self):
+        self._messages = ["No workers meet the resource requirements."]
+
+    def get_messages(self) -> List[str]:
+        return self._messages
 
     async def select_candidates(
         self, workers: List[Worker]
@@ -69,7 +83,7 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
             self._required_os = resource_claim.get("os", None)
 
             logger.info(
-                f"Calculated resource claim for model instance {self._model_instance.name}, "
+                f"Calculated resource claim for model {self._model.readable_source}, "
                 f"gpu vram claim: {self._gpu_vram_claim}, gpu ram claim: {self._gpu_ram_claim}, cpu ram claim: {self._cpu_ram_claim}"
             )
 
@@ -80,13 +94,14 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
 
         for candidate_func in candidate_functions:
             logger.debug(
-                f"model {self._model.name}, filter candidates with resource fit selector: {candidate_func.__name__}, instance {self._model_instance.name}"
+                f"model {self._model.readable_source}, filter candidates with resource fit selector: {candidate_func.__name__}"
             )
 
             candidates = await candidate_func(workers)
             if candidates:
                 return candidates
 
+        self._set_messages()
         return []
 
     async def find_single_worker_single_gpu_candidates(
@@ -114,6 +129,10 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
         Find single worker single gpu candidates for the model instance with worker.
         requires: worker.status.gpu_devices is not None
         """
+
+        if self._selected_gpu_worker and worker.name != self._selected_gpu_worker:
+            return []
+
         candidates = []
 
         if (
@@ -131,6 +150,12 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
 
         if worker.status.gpu_devices:
             for _, gpu in enumerate(worker.status.gpu_devices):
+                if (
+                    self._selected_gpu_index is not None
+                    and gpu.index != self._selected_gpu_index
+                ):
+                    continue
+
                 if gpu.vendor != VendorEnum.NVIDIA.value:
                     continue
 
@@ -205,10 +230,14 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
 
 def estimate_model_resource(cfg: Config, model: Model, cache_dir: str) -> dict:
     try:
-        from vox_box.elstimator.estimate import estimate_model
+        from vox_box.estimator.estimate import estimate_model
         from vox_box.config import Config as VoxBoxConfig
     except ImportError:
         raise Exception("vox_box is not installed.")
+
+    if model.local_path is not None and not os.path.exists(model.local_path):
+        logger.debug(f"Model {model.name} local path {model.local_path} does not exist")
+        return
 
     box_cfg = VoxBoxConfig()
     box_cfg.cache_dir = cache_dir
@@ -222,6 +251,10 @@ def estimate_model_resource(cfg: Config, model: Model, cache_dir: str) -> dict:
         logger.error(f"Failed to estimate model {model.name}: {e}")
         return
 
+    if model_dict is None:
+        logger.debug(f"model_dict is empty after estimate model {model.name}")
+        return
+
     framework = model_dict.get("backend_framework", "")
     if framework == "":
         logger.error(f"Unsupported audio model {model.name}")
@@ -230,6 +263,7 @@ def estimate_model_resource(cfg: Config, model: Model, cache_dir: str) -> dict:
     framework_mapping = {
         "Bark": Bark,
         "CosyVoice": CosyVoice,
+        "Dia": Dia,
         "FasterWhisper": FasterWhisper,
         "FunASR": FunASR,
     }
@@ -350,6 +384,17 @@ class CosyVoice(BaseModelResourceEstimator):
         }
 
 
+class Dia(BaseModelResourceEstimator):
+    def get_required_resource(self) -> Dict:
+        # The required resource values used here are based on test estimates
+        # and may not accurately reflect actual requirements. Adjustments might be
+        # necessary based on real-world scenarios in feature.
+        return {
+            "cuda": {"vram": 10 * Gib, "ram": 1 * Gib},
+            "cpu": {"ram": 10 * Gib},
+        }
+
+
 class FunASR(BaseModelResourceEstimator):
     def get_required_resource(self) -> Dict:
         # TODO: Update the resource requirements based on the test.
@@ -365,13 +410,7 @@ def get_model_resource_requirement_from_file_size(
             os.path.join(model.local_path, file_path)
         )
     else:
-        file_size_in_byte = get_remote_file_size(
-            model.huggingface_repo_id,
-            file_path,
-            model.model_scope_model_id,
-            file_path,
-            cfg.huggingface_token,
-        )
+        file_size_in_byte = get_model_weight_size(model, cfg.huggingface_token)
     for size, resource in resource_requirements.items():
         if file_size_in_byte <= size:
             return resource

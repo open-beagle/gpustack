@@ -2,7 +2,9 @@ name: PR Checking
 
 on:
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - "v*-dev"
     paths-ignore:
       - "mkdocs.yml"
       - "docs/**"
@@ -19,7 +21,7 @@ jobs:
 
     strategy:
       matrix:
-        python-version: ["3.11"]
+        python-version: ["3.12"]
         os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +52,7 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        python-version: ["3.11"]
+        python-version: ["3.12"]
 
     steps:
       - uses: actions/checkout@v4

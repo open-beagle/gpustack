@@ -1,4 +1,5 @@
 from gpustack.schemas.models import (
+    CategoryEnum,
     Model,
     ModelInstance,
     ModelInstanceStateEnum,
@@ -32,7 +33,9 @@ def new_model(
     id,
     name,
     replicas=1,
-    ollama_library_model_name="llama3:8b",
+    ollama_library_model_name=None,
+    huggingface_repo_id=None,
+    model_scope_model_id=None,
     placement_strategy=PlacementStrategyEnum.BINPACK,
     distributable=True,
     **kargs,
@@ -42,16 +45,34 @@ def new_model(
     distributed_inference_across_workers = kargs.get(
         "distributed_inference_across_workers", True
     )
+    gpu_selector = kargs.get("gpu_selector", None)
+    backend_parameters = kargs.get("backend_parameters")
+    categories = kargs.get("categories", [CategoryEnum.LLM])
+
+    source = SourceEnum.OLLAMA_LIBRARY
+    huggingface_filename = None
+    if huggingface_repo_id is not None:
+        source = SourceEnum.HUGGING_FACE
+        huggingface_filename = kargs.get("huggingface_filename")
+    if model_scope_model_id is not None:
+        source = SourceEnum.MODEL_SCOPE
+
     return Model(
         id=id,
         name=name,
         replicas=replicas,
         ready_replicas=0,
-        source=SourceEnum.OLLAMA_LIBRARY,
+        source=source,
         ollama_library_model_name=ollama_library_model_name,
+        huggingface_repo_id=huggingface_repo_id,
+        huggingface_filename=huggingface_filename,
+        model_scope_model_id=model_scope_model_id,
         distributable=distributable,
         placement_strategy=placement_strategy,
         worker_selector=worker_selector,
         cpu_offloading=cpu_offloading,
         distributed_inference_across_workers=distributed_inference_across_workers,
+        gpu_selector=gpu_selector,
+        backend_parameters=backend_parameters,
+        categories=categories,
     )
