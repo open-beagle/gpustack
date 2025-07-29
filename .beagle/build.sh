@@ -5,9 +5,6 @@ pip config set global.index-url https://mirrors.aliyun.com/pypi/simple
 
 set -ex
 
-ls $PWD/.venv
-du -sh $PWD/.venv
-
 if ! [ -e $PWD/.venv/bin/activate ]; then
   python3 -m venv $PWD/.venv
   source $PWD/.venv/bin/activate
