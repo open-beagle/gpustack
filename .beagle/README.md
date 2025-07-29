@@ -9,7 +9,7 @@ git remote add upstream git@github.com:gpustack/gpustack.git
 
 git fetch upstream
 
-git merge v0.4.1
+git merge v0.7.0
 ```
 
 ## images
@@ -17,9 +17,9 @@ git merge v0.4.1
 <https://hub.docker.com/r/gpustack/gpustack>
 
 ```bash
-docker pull gpustack/gpustack:0.4.1 && \
-docker tag gpustack/gpustack:0.4.1 registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.4.1 && \
-docker push registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.4.1
+docker pull gpustack/gpustack:0.7.0 && \
+docker tag gpustack/gpustack:0.7.0 registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.7.0 && \
+docker push registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.7.0
 ```
 
 ## base images
@@ -42,7 +42,7 @@ docker push registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu2
 # default user admin
 docker run -d --gpus all -p 6080:6080 --ipc=host --shm-size=2g --name gpustack \
   -v /data/gpustack:/var/lib/gpustack \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-cuda \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
@@ -55,7 +55,7 @@ docker rm -f gpustack && rm -rf /data/gpustack
 docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /data/gpustack:/var/lib/gpustack \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-cuda \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -73,7 +73,7 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack
   -v /data/gpustack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cann \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-cann \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
@@ -88,7 +88,7 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   -v /usr/share/hwdata:/usr/share/hwdata \
   -v /data/gpustack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cann \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-cann \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -105,7 +105,7 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack
   -v /data/gpustack/data:/var/lib/gpustack \
   -e MTHREADS_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-musa \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-musa \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
@@ -119,7 +119,7 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /data/gpustack/data:/var/lib/gpustack \
   -e MTHREADS_VISIBLE_DEVICES=0-7 \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-musa \
+  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-musa \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -135,7 +135,7 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
-  -e VERSION=v0.4.1 \
+  -e VERSION=v0.7.0 \
   -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
   bash .beagle/build.sh
@@ -190,7 +190,7 @@ python3 \
   --data-dir=${HOME}/gpustack \
   --tools-download-base-url=https://cache.ali.wodcloud.com/vscode
 
-git apply .beagle/v0.4.1-logginglocal.patch
+git apply .beagle/v0.7.0-logginglocal.patch
 ```
 
 ## s3 patch add minio

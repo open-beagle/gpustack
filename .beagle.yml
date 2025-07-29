@@ -45,23 +45,6 @@ steps:
     commands:
       - bash .beagle/build.sh
 
-  - name: docker-musa
-    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-    volumes:
-      - name: docker
-        path: /var/run/docker.sock
-    settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/musa:rc4.2.0-runtime-ubuntu-amd64
-      dockerfile: .beagle/musa.dockerfile
-      repo: wod/gpustack
-      version: "v0.7.0-musa"
-      args: "TARGETOS=linux,TARGETARCH=amd64"
-      registry: registry-vpc.cn-qingdao.aliyuncs.com
-      registry_user:
-        from_secret: REGISTRY_USER_ALIYUN
-      registry_password:
-        from_secret: REGISTRY_PASSWORD_ALIYUN
-
   - name: docker-cuda
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
     volumes:
@@ -90,6 +73,23 @@ steps:
       repo: wod/gpustack
       version: "v0.7.0-cann"
       args: "TARGETOS=linux,TARGETARCH=arm64"
+      registry: registry-vpc.cn-qingdao.aliyuncs.com
+      registry_user:
+        from_secret: REGISTRY_USER_ALIYUN
+      registry_password:
+        from_secret: REGISTRY_PASSWORD_ALIYUN
+
+  - name: docker-musa
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+    settings:
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/musa:rc4.2.0-runtime-ubuntu-amd64
+      dockerfile: .beagle/musa.dockerfile
+      repo: wod/gpustack
+      version: "v0.7.0-musa"
+      args: "TARGETOS=linux,TARGETARCH=amd64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
         from_secret: REGISTRY_USER_ALIYUN

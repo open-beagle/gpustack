@@ -16,7 +16,7 @@ RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
   pip3 cache purge
 
 RUN gpustack download-tools \
-  --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode' \
+  # --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode' \
   --arch arm64 --device npu
 
 ENTRYPOINT [ "gpustack", "start" ]
