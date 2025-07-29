@@ -7,9 +7,8 @@ set -ex
 
 if ! [ -e $PWD/.venv/bin/activate ]; then
   python3 -m venv $PWD/.venv
+  source $PWD/.venv/bin/activate
 fi
-
-source $PWD/.venv/bin/activate
 
 if $(git diff --quiet pyproject.toml); then
   git apply .beagle/v0.7.0-s3-project.patch
