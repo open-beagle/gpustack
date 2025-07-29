@@ -1,18 +1,21 @@
-diff --git a/Dockerfile.musa b/Dockerfile.musa
-index 4c1b530..a8e1451 100644
---- a/Dockerfile.musa
-+++ b/Dockerfile.musa
-@@ -1,7 +1,7 @@
- ARG UBUNTU_VERSION=22.04
--ARG MUSA_VERSION=rc4.0.1
--ARG BASE_MUSA_DEV_CONTAINER=mthreads/musa:${MUSA_VERSION}-mudnn-devel-ubuntu${UBUNTU_VERSION}
--ARG BASE_MUSA_RUN_CONTAINER=mthreads/musa:${MUSA_VERSION}-mudnn-runtime-ubuntu${UBUNTU_VERSION}
-+ARG MUSA_VERSION=rc4.2.0
-+ARG BASE_MUSA_DEV_CONTAINER=mthreads/musa:${MUSA_VERSION}-devel-ubuntu${UBUNTU_VERSION}-amd64
-+ARG BASE_MUSA_RUN_CONTAINER=mthreads/musa:${MUSA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}-amd64
- 
- FROM ${BASE_MUSA_DEV_CONTAINER} AS build
- 
+From 0b38b7e5fc7701f8ddda036621bf73c41a8e8441 Mon Sep 17 00:00:00 2001
+From: gaoshiyao <gaoshiyao@bd-apaas.com>
+Date: Tue, 29 Jul 2025 10:52:58 +0800
+Subject: [PATCH] v0.7.0-s3-project.patch
+
+---
+ gpustack/cmd/start.py                 |  28 +
+ gpustack/config/config.py             |   5 +
+ gpustack/scheduler/calculator.py      |  20 +-
+ gpustack/worker/backends/base.py      |  15 +
+ gpustack/worker/downloader_s3.py      | 187 +++++++
+ gpustack/worker/downloaders.py        |  31 +-
+ gpustack/worker/model_file_manager.py |   2 +
+ poetry.lock                           | 768 +++++++++++++++++++++++---
+ pyproject.toml                        |   1 +
+ 9 files changed, 963 insertions(+), 94 deletions(-)
+ create mode 100644 gpustack/worker/downloader_s3.py
+
 diff --git a/gpustack/cmd/start.py b/gpustack/cmd/start.py
 index 3d3a38c..3ae7511 100644
 --- a/gpustack/cmd/start.py
@@ -76,10 +79,10 @@ index 884f665..b141c90 100644
          super().__init__(**values)
  
 diff --git a/gpustack/scheduler/calculator.py b/gpustack/scheduler/calculator.py
-index 43639e1..f5689a2 100644
+index c013cdb..862a193 100644
 --- a/gpustack/scheduler/calculator.py
 +++ b/gpustack/scheduler/calculator.py
-@@ -593,7 +593,25 @@ async def calculate_model_resource_claim(
+@@ -631,7 +631,25 @@ async def calculate_model_resource_claim(
          kwargs: Additional arguments to pass to the GGUF parser.
      """
  
@@ -146,8 +149,201 @@ index 42c292e..fcf2ce9 100644
  
      def _until_model_instance_starting(self):
          self._clientset.model_instances.watch(
+diff --git a/gpustack/worker/downloader_s3.py b/gpustack/worker/downloader_s3.py
+new file mode 100644
+index 0000000..2ea5383
+--- /dev/null
++++ b/gpustack/worker/downloader_s3.py
+@@ -0,0 +1,187 @@
++import os
++import logging
++from pathlib import Path
++from typing import List, Optional
++from minio import Minio
++from minio.error import S3Error
++from filelock import FileLock
++from tqdm import tqdm
++
++from gpustack.schemas.models import (
++    ModelInstance,
++)
++from gpustack.utils.hub import (
++    FileEntry,
++)
++
++logger = logging.getLogger(__name__)
++
++
++class S3Downloader:
++    _default_cache_dir = "/var/lib/gpustack/cache/beagle"
++
++    def __init__(
++        self,
++        host: str,
++        access_key: str,
++        secret_key: str,
++        ssl: bool = True,
++        cache_dir: Optional[str] = None,
++    ):
++        self._s3_client = Minio(
++            host, access_key=access_key, secret_key=secret_key, secure=ssl
++        )
++        self._cache_dir = cache_dir or self._default_cache_dir
++
++    def download(
++        self,
++        s3_path: str,
++        cache_dir: Optional[str] = None,
++    ) -> str:
++        """从S3下载模型文件
++
++        Args:
++            s3_path: S3路径,格式为s3://bucket/path/to/model
++            cache_dir: 本地缓存目录
++
++        Returns:
++            下载后的本地文件路径
++        """
++        if not s3_path.startswith("s3://beagle_wind/"):
++            return s3_path
++
++        # 解析S3路径
++        # s3://beagle_wind/maas-public/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/v1/qwen2.5-3b-instruct-q8_0.gguf
++        base_path = s3_path.removeprefix("s3://beagle_wind/")
++        bucket_name = base_path.split("/")[0]
++        object_prefix = "/".join(base_path.split("/")[1:-1])  # 去掉最后的文件名部分
++        filename = base_path.split("/")[-1]  # 获取文件名
++
++        # 准备本地缓存路径
++        local_cache = cache_dir or self._cache_dir
++        local_path = os.path.join(
++            local_cache, s3_path.removeprefix("s3://beagle_wind/maas-public/datamodel/")
++        )
++        local_dir = os.path.dirname(local_path)  # 获取local_path的父目录
++        if not os.path.exists(local_dir):  # 创建父目录
++            os.makedirs(local_dir)
++
++        # 使用文件锁避免并发下载
++        lock_filename = local_dir + ".lock"
++        logger.debug("获取文件锁")
++
++        with FileLock(lock_filename):
++            try:
++                # 列出所有对象
++                objects = self._s3_client.list_objects(
++                    bucket_name, prefix=object_prefix, recursive=True
++                )
++
++                # 下载每个对象
++                for obj in objects:
++                    self._download_object(
++                        bucket_name=bucket_name,
++                        object_name=obj.object_name,
++                        local_path=os.path.join(
++                            local_cache, obj.object_name.removeprefix("datamodel/")
++                        ),
++                        total_size=obj.size,
++                    )
++
++                logger.debug(f"已下载 {bucket_name}/{object_prefix}")
++                return local_path
++
++            except S3Error as e:
++                logger.error(f"S3下载错误: {e}")
++                raise
++
++    def _download_object(
++        self, bucket_name: str, object_name: str, local_path: str, total_size: int
++    ):
++        """分片下载单个S3对象"""
++        downloaded_size = 0
++        if os.path.exists(local_path):
++            downloaded_size = os.path.getsize(local_path)
++
++        if downloaded_size >= total_size:
++            logger.debug(f"文件 {object_name} 已存在,跳过下载")
++            return
++
++        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
++
++        # 如果是新下载，先清空文件
++        if downloaded_size == 0:
++            open(local_path, 'wb').close()
++
++        part_size = 10 * 1024 * 1024  # 10MB
++        start_byte = downloaded_size
++
++        with tqdm(
++            total=total_size,
++            initial=downloaded_size,
++            desc=object_name,
++            unit='B',
++            unit_scale=True,
++        ) as pbar:
++            while start_byte < total_size:
++                response = self._s3_client.get_object(
++                    bucket_name,
++                    object_name,
++                    offset=start_byte,
++                    length=min(part_size, total_size - start_byte),
++                )
++
++                data = response.read()
++
++                # 始终使用追加模式
++                with open(local_path, "ab") as f:
++                    f.write(data)
++
++                chunk_size = len(data)
++                start_byte += chunk_size
++                pbar.update(chunk_size)
++
++    def get_model_file_size(self, model_instance: ModelInstance) -> List[FileEntry]:
++        """获取S3上模型文件的总大小
++
++        Args:
++            model_instance: 模型实例对象
++
++        Returns:
++            文件总大小(字节)
++
++        Raises:
++            S3Error: 当S3操作失败时抛出
++        """
++        if not model_instance.local_path.startswith("s3://beagle_wind/"):
++            return None
++
++        try:
++            # 解析S3路径
++            base_path = model_instance.local_path.removeprefix("s3://beagle_wind/")
++            bucket_name = base_path.split("/")[0]
++            object_prefix = "/".join(base_path.split("/")[1:-1])  # 去掉最后的文件名部分
++
++            # 列出所有对象
++            objects = self._s3_client.list_objects(
++                bucket_name, prefix=object_prefix, recursive=True
++            )
++            # 准备本地缓存路径
++            local_cache = self._cache_dir
++            file_list = [
++            FileEntry(os.path.join(
++                            local_cache, f.object_name.removeprefix("datamodel/")
++                        ), f.size) for f in objects
++            ]
++            # 计算所有对象的总大小
++            total_size = sum(obj.size for obj in objects)
++
++            logger.debug(
++                f"S3路径 {model_instance.local_path} 的总大小: {total_size} 字节"
++            )
++            return file_list
++
++        except S3Error as e:
++            logger.error(f"获取S3文件大小失败: {e}")
++            raise
++
 diff --git a/gpustack/worker/downloaders.py b/gpustack/worker/downloaders.py
-index fecb747..90855e3 100644
+index f934944..b1e9d7c 100644
 --- a/gpustack/worker/downloaders.py
 +++ b/gpustack/worker/downloaders.py
 @@ -31,8 +31,25 @@ from gpustack.utils.hub import (
@@ -3957,3 +4153,6 @@ index f504013..de57839 100644
  
  tenacity = "^9.0.0"
  aiocache = "^0.12.3"
+-- 
+2.43.0
+

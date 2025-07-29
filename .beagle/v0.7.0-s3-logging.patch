@@ -1,0 +1,157 @@
+From 06f0e57694177e7c9f3a64f96c06d6e9504adb36 Mon Sep 17 00:00:00 2001
+From: gaoshiyao <gaoshiyao@bd-apaas.com>
+Date: Tue, 29 Jul 2025 10:54:46 +0800
+Subject: [PATCH] v0.7.0-s3-logging.patch
+
+---
+ gpustack/cmd/download_tools.py                                  | 2 +-
+ gpustack/cmd/start.py                                           | 2 +-
+ gpustack/detectors/npu_smi/npu_smi.py                           | 2 +-
+ gpustack/{logging.py => logginglocal.py}                        | 0
+ gpustack/server/server.py                                       | 2 +-
+ gpustack/worker/backends/base.py                                | 2 +-
+ gpustack/worker/exporter.py                                     | 2 +-
+ gpustack/worker/model_file_manager.py                           | 2 +-
+ gpustack/worker/serve_manager.py                                | 2 +-
+ gpustack/worker/worker.py                                       | 2 +-
+ .../gguf/test_slow_gguf_resource_fit_selector.py                | 2 +-
+ 11 files changed, 10 insertions(+), 10 deletions(-)
+ rename gpustack/{logging.py => logginglocal.py} (100%)
+
+diff --git a/gpustack/cmd/download_tools.py b/gpustack/cmd/download_tools.py
+index 3b0967d..180773c 100644
+--- a/gpustack/cmd/download_tools.py
++++ b/gpustack/cmd/download_tools.py
+@@ -3,7 +3,7 @@ import logging
+ import sys
+ 
+ from gpustack.cmd.start import get_gpustack_env
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.worker.tools_manager import ToolsManager
+ 
+ logger = logging.getLogger(__name__)
+diff --git a/gpustack/cmd/start.py b/gpustack/cmd/start.py
+index 3ae7511..645923c 100644
+--- a/gpustack/cmd/start.py
++++ b/gpustack/cmd/start.py
+@@ -11,7 +11,7 @@ import yaml
+ 
+ from gpustack import __version__, __git_commit__
+ from gpustack.config.config import set_global_config
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.utils.envs import get_gpustack_env, get_gpustack_env_bool
+ from gpustack.worker.worker import Worker
+ from gpustack.config import Config
+diff --git a/gpustack/detectors/npu_smi/npu_smi.py b/gpustack/detectors/npu_smi/npu_smi.py
+index 4ceac83..14cc2c8 100644
+--- a/gpustack/detectors/npu_smi/npu_smi.py
++++ b/gpustack/detectors/npu_smi/npu_smi.py
+@@ -13,7 +13,7 @@ from gpustack.schemas.workers import (
+ from gpustack.utils import platform
+ from gpustack.utils.command import is_command_available
+ from gpustack.utils.convert import safe_float, safe_int
+-import gpustack.logging as glogging
++import gpustack.logginglocal as glogging
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/gpustack/logging.py b/gpustack/logginglocal.py
+similarity index 100%
+rename from gpustack/logging.py
+rename to gpustack/logginglocal.py
+diff --git a/gpustack/server/server.py b/gpustack/server/server.py
+index 281dfe3..9bfaef0 100644
+--- a/gpustack/server/server.py
++++ b/gpustack/server/server.py
+@@ -7,7 +7,7 @@ import uvicorn
+ import logging
+ from fastapi.middleware.cors import CORSMiddleware
+ from sqlmodel.ext.asyncio.session import AsyncSession
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.schemas.users import User
+ from gpustack.security import JWTManager, generate_secure_password, get_secret_hash
+ from gpustack.server.app import create_app
+diff --git a/gpustack/worker/backends/base.py b/gpustack/worker/backends/base.py
+index fcf2ce9..6b1bfb5 100644
+--- a/gpustack/worker/backends/base.py
++++ b/gpustack/worker/backends/base.py
+@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
+ 
+ from gpustack.client.generated_clientset import ClientSet
+ from gpustack.config.config import Config, set_global_config, get_global_config
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.schemas.models import (
+     BackendEnum,
+     ModelInstance,
+diff --git a/gpustack/worker/exporter.py b/gpustack/worker/exporter.py
+index 584b419..f354852 100755
+--- a/gpustack/worker/exporter.py
++++ b/gpustack/worker/exporter.py
+@@ -3,7 +3,7 @@ from prometheus_client import make_asgi_app, REGISTRY
+ from prometheus_client.core import GaugeMetricFamily, InfoMetricFamily
+ from gpustack.client.generated_clientset import ClientSet
+ from gpustack.config.config import Config
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.worker.collector import WorkerStatusCollector
+ import uvicorn
+ import logging
+diff --git a/gpustack/worker/model_file_manager.py b/gpustack/worker/model_file_manager.py
+index 1d4b2ad..09ecdbd 100644
+--- a/gpustack/worker/model_file_manager.py
++++ b/gpustack/worker/model_file_manager.py
+@@ -16,7 +16,7 @@ from huggingface_hub.utils import build_hf_headers
+ 
+ from gpustack.api.exceptions import NotFoundException
+ from gpustack.config.config import Config
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.schemas.model_files import ModelFile, ModelFileUpdate, ModelFileStateEnum
+ from gpustack.client import ClientSet
+ from gpustack.schemas.models import SourceEnum
+diff --git a/gpustack/worker/serve_manager.py b/gpustack/worker/serve_manager.py
+index d6fcbc3..e5c08ce 100644
+--- a/gpustack/worker/serve_manager.py
++++ b/gpustack/worker/serve_manager.py
+@@ -10,7 +10,7 @@ import logging
+ 
+ from gpustack.api.exceptions import NotFoundException
+ from gpustack.config.config import Config
+-from gpustack.logging import (
++from gpustack.logginglocal import (
+     RedirectStdoutStderr,
+ )
+ from gpustack.utils import network, platform
+diff --git a/gpustack/worker/worker.py b/gpustack/worker/worker.py
+index 7a4635e..c216fc4 100755
+--- a/gpustack/worker/worker.py
++++ b/gpustack/worker/worker.py
+@@ -23,7 +23,7 @@ from gpustack.ray.manager import RayManager
+ from gpustack.utils import platform
+ from gpustack.utils.network import get_first_non_loopback_ip
+ from gpustack.client import ClientSet
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.utils.process import add_signal_handlers_in_loop
+ from gpustack.utils.system_check import check_glibc_version
+ from gpustack.utils.task import run_periodically_in_thread
+diff --git a/tests/policies/candidate_selectors/gguf/test_slow_gguf_resource_fit_selector.py b/tests/policies/candidate_selectors/gguf/test_slow_gguf_resource_fit_selector.py
+index e8cbd53..2666ccb 100644
+--- a/tests/policies/candidate_selectors/gguf/test_slow_gguf_resource_fit_selector.py
++++ b/tests/policies/candidate_selectors/gguf/test_slow_gguf_resource_fit_selector.py
+@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
+ import uuid
+ import pytest
+ from gpustack.config.config import Config, set_global_config
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.policies.scorers.placement_scorer import PlacementScorer
+ from gpustack.policies.candidate_selectors import GGUFResourceFitSelector
+ 
+-- 
+2.43.0
+
