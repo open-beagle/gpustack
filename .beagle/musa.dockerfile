@@ -20,7 +20,6 @@ RUN pip install /tmp/*.whl && \
     pip cache purge && \
     rm -rf /tmp/*.whl
 
-RUN gpustack download-tools \
-  --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
+RUN gpustack download-tools
 
 ENTRYPOINT [ "gpustack", "start" ]
