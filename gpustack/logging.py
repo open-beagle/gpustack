@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import logging
+import os
 import sys
 
 
@@ -71,11 +72,6 @@ def trace(self, message, *args, **kwargs):
     if self.isEnabledFor(TRACE_LEVEL):
         self._log(TRACE_LEVEL, message, args, **kwargs)
 
-    def __enter__(self):
-        self.original_stdout = sys.stdout
-        self.original_stderr = sys.stderr
-        sys.stdout = self.target
-        sys.stderr = self.target
 
 class RedirectStdoutStderr:
     def __init__(self, target):
