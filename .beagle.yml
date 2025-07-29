@@ -38,7 +38,7 @@ steps:
         from_secret: SOCKS5_PROXY
 
   - name: python
-    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
+    image: registry.cn-qingdao.aliyuncs.com/wod/python:3.12.3-amd64
     environment:
       VERSION: v0.7.0
       POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
