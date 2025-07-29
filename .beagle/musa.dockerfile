@@ -1,4 +1,4 @@
-ARG BASE=registry.cn-guangzhou.aliyuncs.com/cloud-ysf/musa:rc4.2.0-runtime-ubuntu-amd64
+ARG BASE=registry.cn-qingdao.aliyuncs.com/wod/musa:rc4.2.0-runtime-ubuntu-amd64
 
 FROM $BASE
 
@@ -7,7 +7,7 @@ ARG VERSION=v0.3.2
 
 LABEL maintainer=$AUTHOR version=$VERSION
 
-COPY ./dist/*.whl /tmp/
+ADD ./dist/*.whl /tmp/
 
 RUN apt-get update && apt-get install -y \
     python3 \
