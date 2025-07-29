@@ -154,7 +154,7 @@ new file mode 100644
 index 0000000..2ea5383
 --- /dev/null
 +++ b/gpustack/worker/downloader_s3.py
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,186 @@
 +import os
 +import logging
 +from pathlib import Path
@@ -341,7 +341,6 @@ index 0000000..2ea5383
 +        except S3Error as e:
 +            logger.error(f"获取S3文件大小失败: {e}")
 +            raise
-+
 diff --git a/gpustack/worker/downloaders.py b/gpustack/worker/downloaders.py
 index f934944..b1e9d7c 100644
 --- a/gpustack/worker/downloaders.py
