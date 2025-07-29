@@ -7,7 +7,7 @@ ARG VERSION=v0.3.2
 
 LABEL maintainer=$AUTHOR version=$VERSION
 
-COPY dist/*.whl /tmp/
+COPY ./dist/*.whl /tmp/
 
 RUN apt-get update && apt-get install -y \
     python3 \

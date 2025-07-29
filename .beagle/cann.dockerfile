@@ -7,7 +7,7 @@ ARG VERSION=v0.3.2
 
 LABEL maintainer=$AUTHOR version=$VERSION
 
-COPY dist/*.whl /tmp/
+COPY ./dist/*.whl /tmp/
 
 RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
   pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \

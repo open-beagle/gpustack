@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-COPY dist/*.whl /tmp/
+COPY ./dist/*.whl /tmp/
 
 RUN WHEEL_PACKAGE="$(ls /tmp/**-any.whl)[vllm]" && \
   pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \

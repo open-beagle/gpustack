@@ -7,7 +7,7 @@ ARG VERSION=v0.3.2
 
 LABEL maintainer=$AUTHOR version=$VERSION
 
-COPY dist/*.whl /tmp/
+COPY ./dist/*.whl /tmp/
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN sed -i 's/http:\/\/ports.ubuntu.com\/ubuntu-ports\//https:\/\/mirrors.tuna.tsinghua.edu.cn\/ubuntu-ports\//g' /etc/apt/sources.list && \
