@@ -1,7 +1,7 @@
 From 555f683fdb0ecef52ba1210acd67c6afb58c1791 Mon Sep 17 00:00:00 2001
 From: shucheng <shucheng@bd-apaas.com>
 Date: Sat, 11 Jan 2025 10:30:10 +0800
-Subject: [PATCH] v0.4.1-s3
+Subject: [PATCH] v0.4.2-s3
 
 ---
  gpustack/cmd/start.py            |  86 ++++++++++-----
@@ -307,7 +307,7 @@ index fdaf469..7ba0f39 100644
 +                cache_dir,
 +                "beagle",
 +                model.local_path.removeprefix(
-+                    "s3://beagle_wind/maas-public/datamodel/"
++                    "s3://beagle_wind/bd-wind/datamodel/"
 +                ),
 +            )
 +
@@ -330,7 +330,7 @@ index fdaf469..7ba0f39 100644
 +                    cache_dir,
 +                    "beagle",
 +                    model.local_path.removeprefix(
-+                        "s3://beagle_wind/maas-public/datamodel/"
++                        "s3://beagle_wind/bd-wind/datamodel/"
 +                    ),
 +                )
 +            return ["--path", cache_path]
@@ -370,7 +370,7 @@ index e5e8d19..bb7bf85 100644
      elif mi.source == SourceEnum.LOCAL_PATH:
 -        return mi.local_path
 +        if 's3://beagle_wind' in mi.local_path:
-+            # example s3://beagle_wind/maas-public/datamodel/51c63609-faf4-446a-a2cf-47dd8d1a3e97/v1
++            # example s3://beagle_wind/bd-wind/datamodel/51c63609-faf4-446a-a2cf-47dd8d1a3e97/v1
 +            return s3Downloader.download(mi.local_path)
 +        else:
 +            return mi.local_path
@@ -478,7 +478,7 @@ index 0000000..ecf6901
 +            return s3_path
 +
 +        # 解析S3路径
-+        # s3://beagle_wind/maas-public/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/v1/qwen2.5-3b-instruct-q8_0.gguf
++        # s3://beagle_wind/bd-wind/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/v1/qwen2.5-3b-instruct-q8_0.gguf
 +        base_path = s3_path.removeprefix("s3://beagle_wind/")
 +        bucket_name = base_path.split("/")[0]
 +        object_prefix = "/".join(base_path.split("/")[1:-1])  # 去掉最后的文件名部分
@@ -487,7 +487,7 @@ index 0000000..ecf6901
 +        # 准备本地缓存路径
 +        local_cache = cache_dir or self._cache_dir
 +        local_path = os.path.join(
-+            local_cache, s3_path.removeprefix("s3://beagle_wind/maas-public/datamodel/")
++            local_cache, s3_path.removeprefix("s3://beagle_wind/bd-wind/datamodel/")
 +        )
 +        local_dir = os.path.dirname(local_path)  # 获取local_path的父目录
 +        if not os.path.exists(local_dir):  # 创建父目录

@@ -1,7 +1,7 @@
 From ecc5f62946fe800d7c03ee8d915ebc48d80eca64 Mon Sep 17 00:00:00 2001
 From: shucheng <shucheng@bd-apaas.com>
 Date: Mon, 6 Jan 2025 19:14:51 +0800
-Subject: [PATCH] v0.4.1 logginglocal
+Subject: [PATCH] v0.4.2 logginglocal
 
 ---
  gpustack/cmd/download_tools.py           | 2 +-

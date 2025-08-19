@@ -41,7 +41,7 @@ spec:
               topologyKey: "kubernetes.io/hostname"
       containers:
         - name: stack
-          image: "registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda"
+          image: "registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.2-cuda"
           imagePullPolicy: Always
           args:
             - '--server-url "http://beagle-stack-admin:6080"'

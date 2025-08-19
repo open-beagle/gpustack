@@ -86,7 +86,7 @@ spec:
             claimName: beagle-stack-admin-data
       containers:
         - name: stack
-          image: "registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.1-cuda"
+          image: "registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.4.2-cuda"
           imagePullPolicy: Always
           args:
             - --bootstrap-password

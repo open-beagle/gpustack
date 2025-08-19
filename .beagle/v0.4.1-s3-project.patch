@@ -1,7 +1,7 @@
 From ad71aa2f9dcb5c04f53146a61fb404cfc022a378 Mon Sep 17 00:00:00 2001
 From: gaoshiyao <gaoshiyao@wodcloud.com>
 Date: Tue, 7 Jan 2025 15:31:05 +0800
-Subject: [PATCH] v0.4.1-s3-project.patch
+Subject: [PATCH] v0.4.2-s3-project.patch
 
 ---
  poetry.lock    | 23 +++++++++++++++++++++--
