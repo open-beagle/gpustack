@@ -13,6 +13,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run build
+        run: bash .beagle/build.sh
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -27,8 +35,10 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile.corex
+          file: .beagle/corex.dockerfile
           push: true
           platforms: linux/amd64
           tags: |
             registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-corex
+          build-args: |
+            BASE_IMAGE=gpustack/gpustack:v0.7.0-corex
