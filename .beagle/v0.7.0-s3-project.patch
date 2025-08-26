@@ -101,7 +101,7 @@ index c013cdb..862a193 100644
 +                cache_dir,
 +                "beagle",
 +                model.local_path.removeprefix(
-+                    "s3://beagle_wind/maas-public/datamodel/"
++                    "s3://beagle_wind/bd-wind/datamodel/"
 +                ),
 +            )
 +
@@ -208,7 +208,7 @@ index 0000000..2ea5383
 +            return s3_path
 +
 +        # 解析S3路径
-+        # s3://beagle_wind/maas-public/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/v1/qwen2.5-3b-instruct-q8_0.gguf
++        # s3://beagle_wind/bd-wind/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/v1/qwen2.5-3b-instruct-q8_0.gguf
 +        base_path = s3_path.removeprefix("s3://beagle_wind/")
 +        bucket_name = base_path.split("/")[0]
 +        object_prefix = "/".join(base_path.split("/")[1:-1])  # 去掉最后的文件名部分
@@ -217,7 +217,7 @@ index 0000000..2ea5383
 +        # 准备本地缓存路径
 +        local_cache = cache_dir or self._cache_dir
 +        local_path = os.path.join(
-+            local_cache, s3_path.removeprefix("s3://beagle_wind/maas-public/datamodel/")
++            local_cache, s3_path.removeprefix("s3://beagle_wind/bd-wind/datamodel/")
 +        )
 +        local_dir = os.path.dirname(local_path)  # 获取local_path的父目录
 +        if not os.path.exists(local_dir):  # 创建父目录
@@ -387,7 +387,7 @@ index f934944..b1e9d7c 100644
 +        if 's3://beagle_wind' in model.local_path:
 +            if s3Downloader is None :
 +                init_s3_client(cfg)
-+            # example s3://beagle_wind/maas-public/datamodel/51c63609-faf4-446a-a2cf-47dd8d1a3e97/v1
++            # example s3://beagle_wind/bd-wind/datamodel/51c63609-faf4-446a-a2cf-47dd8d1a3e97/v1
 +            return file.get_sharded_file_paths(s3Downloader.download(model.local_path))
 +        else:
 +            return file.get_sharded_file_paths(model.local_path)
