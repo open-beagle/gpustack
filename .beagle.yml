@@ -43,7 +43,6 @@ steps:
       VERSION: v0.7.0
       POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
     commands:
-      - pip install --no-cache-dir "numpy<2" -i $POETRY_PYPI_MIRROR_INDEX
       - bash .beagle/build.sh
 
   # - name: docker-cuda
