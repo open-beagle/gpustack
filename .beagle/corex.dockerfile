@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install "numpy<2" -i https://pypi.tuna.tsinghua.edu.cn/simple && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout=600 --retries=10 /tmp/*.whl && \
+    pip install --force-reinstall -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout=600 --retries=10 /tmp/*.whl && \
     pip cache purge && rm -rf /tmp/*.whl
 
 RUN gpustack download-tools
