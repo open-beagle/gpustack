@@ -1,7 +1,7 @@
 # Pin core runtime deps to avoid resolver upgrading to incompatible versions
 
-# Numpy ecosystem
-numpy==1.24.4
+# Numpy ecosystem (satisfy cupy<1.26 and mistral-common>=1.25)
+numpy==1.25.2
 
 # IO and datasets
 fsspec[http]==2024.9.0
@@ -9,17 +9,30 @@ fsspec[http]==2024.9.0
 # CLI stack
 click==8.1.7
 
-# Retry utils required by langchain*
-tenacity==8.5.0
+# Retry utils (prefer gpustack req >=9,<10)
+tenacity==9.0.0
 
-# OpenTelemetry
-opentelemetry-semantic-conventions==0.46b0
+# OpenTelemetry (align with sdk==1.26.0 in base)
+opentelemetry-api==1.26.0
+opentelemetry-semantic-conventions==0.47b0
 
 # Protobuf stack
 protobuf==4.25.5
 
-# Web/multipart
-python-multipart==0.0.18
+# Web/multipart (gpustack requires <0.0.18)
+python-multipart==0.0.17
 
-# Async file IO for unstructured-client
-aiofiles==24.1.0
+# Async file IO (gpustack wants <24.0.0)
+aiofiles==23.2.1
+
+# attrs (gpustack <25,>=24.2.0)
+attrs==24.2.0
+
+# setproctitle (gpustack >=1.3.3,<2)
+setproctitle==1.3.3
+
+# MinIO client required by gpustack
+minio>=7.2.14,<8.0.0
+
+# Ensure setuptools compatible with sanic 25.x
+setuptools>=70.1.0
