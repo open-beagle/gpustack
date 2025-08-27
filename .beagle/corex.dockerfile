@@ -17,8 +17,6 @@ RUN apt-get update && apt-get install -y \
     tini \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade --no-cache-dir numpy==2.2.6 -i https://mirrors.aliyun.com/pypi/simple
-
 RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout=600 --retries=10 /tmp/*.whl --force-reinstall && \
     pip cache purge && \
     rm -rf /tmp/*.whl
