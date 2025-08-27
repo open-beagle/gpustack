@@ -86,7 +86,7 @@ steps:
       - name: docker
         path: /var/run/docker.sock
     settings:
-      base: gpustack/gpustack:v0.7.0-corex
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/gpustack-base:v0.7.0-corex
       dockerfile: .beagle/corex.dockerfile
       repo: wod/gpustack
       version: "v0.7.0-corex"
