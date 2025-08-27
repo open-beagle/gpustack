@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     tini \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade --no-cache-dir numpy==2.2.6 -i $POETRY_PYPI_MIRROR_INDEX
+RUN pip install --upgrade --no-cache-dir numpy==2.2.6 -i https://mirrors.aliyun.com/pypi/simple
 
 RUN pip install /tmp/*.whl --force-reinstall && \
     pip cache purge && \
