@@ -79,6 +79,24 @@ steps:
   #     registry_password:
   #       from_secret: REGISTRY_PASSWORD_ALIYUN
 
+  # DCU
+  - name: docker-dcu
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+    settings:
+      base: registry.cn-qingdao.aliyuncs.com/wod/gpustack-base:v0.7.0-dcu
+      dockerfile: .beagle/dcu.dockerfile
+      repo: wod/gpustack
+      version: "v0.7.0-dcu"
+      args: "TARGETOS=linux,TARGETARCH=amd64"
+      registry: registry-vpc.cn-qingdao.aliyuncs.com
+      registry_user:
+        from_secret: REGISTRY_USER_ALIYUN
+      registry_password:
+        from_secret: REGISTRY_PASSWORD_ALIYUN
+
   # 天数智芯
   - name: docker-corex
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
@@ -159,7 +177,6 @@ steps:
     environment:
       VERSION: v0.7.0
       POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
-    commands:
     commands:
       - bash .beagle/build.sh
       - git apply .beagle/v0.7.0-s3-project.patch
@@ -243,7 +260,7 @@ steps:
         from_secret: REGISTRY_USER_ALIYUN
       registry_password:
         from_secret: REGISTRY_PASSWORD_ALIYUN
-        
+
 ---
 kind: pipeline
 name: harbor
@@ -288,7 +305,7 @@ steps:
         from_secret: REGISTRY_USER_ALIYUN
       registry_password:
         from_secret: REGISTRY_PASSWORD_ALIYUN
-        
+
 ---
 kind: secret
 name: SOCKS5_PROXY
