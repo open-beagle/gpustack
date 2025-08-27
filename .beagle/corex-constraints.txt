@@ -1,0 +1,25 @@
+# Pin core runtime deps to avoid resolver upgrading to incompatible versions
+
+# Numpy ecosystem
+numpy==1.24.4
+
+# IO and datasets
+fsspec[http]==2024.9.0
+
+# CLI stack
+click==8.1.7
+
+# Retry utils required by langchain*
+tenacity==8.5.0
+
+# OpenTelemetry
+opentelemetry-semantic-conventions==0.46b0
+
+# Protobuf stack
+protobuf==4.25.5
+
+# Web/multipart
+python-multipart==0.0.18
+
+# Async file IO for unstructured-client
+aiofiles==24.1.0

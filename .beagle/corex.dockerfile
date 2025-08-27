@@ -7,6 +7,7 @@ ARG VERSION=v0.7.0
 
 LABEL maintainer=$AUTHOR version=$VERSION
 COPY ./dist/*.whl /tmp/
+COPY .beagle/corex-constraints.txt /tmp/corex-constraints.txt
 
 RUN apt-get update && apt-get install -y \
     python3 \
@@ -17,10 +18,9 @@ RUN apt-get update && apt-get install -y \
     tini \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --force-reinstall -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout=600 --retries=10 /tmp/*.whl && \
-    pip cache purge && rm -rf /tmp/*.whl
-
-RUN pip uninstall -y numpy && pip install --no-cache-dir --force-reinstall "numpy<2"
+RUN pip install --no-deps --force-reinstall -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout=600 --retries=10 /tmp/*.whl && \
+    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout=600 --retries=10 --upgrade --upgrade-strategy eager -r /tmp/corex-constraints.txt && \
+    pip cache purge && rm -rf /tmp/*.whl /tmp/corex-constraints.txt
 
 RUN gpustack download-tools
 
