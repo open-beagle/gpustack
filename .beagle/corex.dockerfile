@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     tini \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install /tmp/*.whl && \
+RUN pip install /tmp/*.whl --force-reinstall && \
     pip cache purge && \
     rm -rf /tmp/*.whl
 
