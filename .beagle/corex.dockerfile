@@ -8,13 +8,19 @@ ARG VERSION=v0.7.0
 LABEL maintainer=$AUTHOR version=$VERSION
 COPY ./dist/*.whl /tmp/
 
-RUN WHEEL_PACKAGE="$(ls /tmp/**-any.whl)[vllm]" && \
-  pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
-  pip3 install $WHEEL_PACKAGE &&\
-  rm /tmp/*.whl && \
-  pip3 cache purge
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    wget \
+    tzdata \
+    iproute2 \
+    tini \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN gpustack download-tools 
-    # \ --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
+RUN pip install /tmp/*.whl && \
+    pip cache purge && \
+    rm -rf /tmp/*.whl
+
+RUN gpustack download-tools
 
 ENTRYPOINT [ "gpustack", "start" ]
