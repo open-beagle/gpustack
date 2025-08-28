@@ -25,7 +25,7 @@ RUN --mount=type=bind,target=/workspace/gpustack,rw \
     && pipx ensurepath --force \
     && WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[audio]" \
     && echo $WHEEL_PACKAGE \
-    && pipx install $WHEEL_PACKAGE \
+    && pipx install $WHEEL_PACKAGE --pip-args="--index-url https://pypi.tuna.tsinghua.edu.cn/simple" \
     && pip cache purge
 
 RUN gpustack download-tools --device dcu \
