@@ -10,12 +10,6 @@ LABEL maintainer=$AUTHOR version=$VERSION
 # 复制您编译的包文件
 COPY ./dist/*.whl /tmp/
 
-# 彻底移除原有的 gpustack 安装
-RUN if pipx list | grep -q gpustack; then pipx uninstall gpustack; fi \
-    && python3 -m pip uninstall -y gpustack || true \
-    && rm -rf /root/.local/share/pipx/venvs/gpustack \
-    && rm -rf /root/.local/pipx/venvs/gpustack
-
 # 清理 pip 缓存并重新安装
 RUN python3 -m pip install --upgrade pip \
     && python3 -m pip install pipx \
@@ -23,10 +17,11 @@ RUN python3 -m pip install --upgrade pip \
 
 # 安装您编译的 wheel 包（两种方式可选）
 # 方式1：使用 pipx 安装（推荐）
-RUN pipx install --force "/tmp/gpustack-0.0.0-py3-none-any.whl[audio]"
-
-# 方式2：或者使用 pip 直接安装到系统
-# RUN python3 -m pip install "/tmp/gpustack-0.0.0-py3-none-any.whl[audio]"
+RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
+    pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
+    pip3 install --force $WHEEL_PACKAGE  && \
+    rm /tmp/*.whl && \
+    pip3 cache purge
 
 # 下载工具并创建符号链接
 RUN gpustack download-tools --device dcu \
