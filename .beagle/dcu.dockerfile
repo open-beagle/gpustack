@@ -1,4 +1,4 @@
-ARG BASE=gpustack/gpustack:v0.7.0-dcu
+ARG BASE=image.sourcefind.cn:5000/dcu/admin/base/vllm:0.8.5-ubuntu22.04-dtk25.04.1-py3.10
 
 FROM $BASE
 
@@ -7,27 +7,28 @@ ARG VERSION=v0.7.0
 
 LABEL maintainer=$AUTHOR version=$VERSION
 
-# 复制您编译的包文件
-COPY ./dist/*.whl /tmp/
+ENV PATH="/root/.local/bin:$PATH"
+ENV DEBIAN_FRONTEND=noninteractive
 
-# 清理 pip 缓存并重新安装
-RUN python3 -m pip install --upgrade pip \
+RUN apt-get update && apt-get install -y \
+    python3-venv \
+    tzdata \
+    iproute2 \
+    iputils-ping \
+    build-essential \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=bind,target=/workspace/gpustack,rw \
+    cd /workspace/gpustack && make build \
     && python3 -m pip install pipx \
-    && pipx ensurepath --force
+    && pipx ensurepath --force \
+    && WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[audio]" \
+    && echo $WHEEL_PACKAGE \
+    && pipx install $WHEEL_PACKAGE \
+    && pip cache purge
 
-# 安装您编译的 wheel 包（两种方式可选）
-# 方式1：使用 pipx 安装（推荐）
-RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
-    pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
-    pip3 install --force $WHEEL_PACKAGE  && \
-    rm /tmp/*.whl && \
-    pip3 cache purge
-
-# 下载工具并创建符号链接
 RUN gpustack download-tools --device dcu \
-    && ln -sf $(which vllm) /root/.local/share/pipx/venvs/gpustack/bin/vllm
+    && ln -s $(which vllm) /root/.local/share/pipx/venvs/gpustack/bin/vllm
 
-# 验证安装
-RUN python3 -c "import gpustack; print(f'Successfully installed gpustack version: {gpustack.__version__}')" \
-    && echo "Installation verification:" \
-    && gpustack --version
+ENTRYPOINT [ "tini", "--", "gpustack", "start" ]
