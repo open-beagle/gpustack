@@ -13,8 +13,9 @@ RUN python3 -m pip install pipx \
     && pipx ensurepath --force \
     && WHEEL_PACKAGE="$(ls /tmp/*.whl)[audio]" \
     && echo $WHEEL_PACKAGE \
-    && pipx install --force-reinstall $WHEEL_PACKAGE \
+    && pipx install --force $WHEEL_PACKAGE \
     && pip cache purge
+
 
 RUN gpustack download-tools --device dcu \
     && ln -s $(which vllm) /root/.local/share/pipx/venvs/gpustack/bin/vllm
