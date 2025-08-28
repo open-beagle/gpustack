@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN --mount=type=bind,target=/workspace/gpustack,rw \
     cd /workspace/gpustack && make build \
-    && pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+    && pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
     && python3 -m pip install pipx \
     && pipx ensurepath --force \
     && WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[audio]" \
