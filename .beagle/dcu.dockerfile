@@ -8,8 +8,7 @@ ARG VERSION=v0.7.0
 LABEL maintainer=$AUTHOR version=$VERSION
 
 # 复制您编译的包文件
-COPY ./dist/gpustack-0.0.0-py3-none-any.whl /tmp/
-COPY ./dist/gpustack-0.0.0.tar.gz /tmp/
+COPY ./dist/*.whl /tmp/
 
 # 彻底移除原有的 gpustack 安装
 RUN if pipx list | grep -q gpustack; then pipx uninstall gpustack; fi \
