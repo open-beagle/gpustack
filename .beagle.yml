@@ -45,39 +45,39 @@ steps:
     commands:
       - bash .beagle/build.sh
 
-  # - name: docker-cuda
-  #   image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-  #   volumes:
-  #     - name: docker
-  #       path: /var/run/docker.sock
-  #   settings:
-  #     base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04
-  #     dockerfile: .beagle/cuda.dockerfile
-  #     repo: wod/gpustack
-  #     version: "v0.7.0-cuda"
-  #     args: "TARGETOS=linux,TARGETARCH=amd64"
-  #     registry: registry-vpc.cn-qingdao.aliyuncs.com
-  #     registry_user:
-  #       from_secret: REGISTRY_USER_ALIYUN
-  #     registry_password:
-  #       from_secret: REGISTRY_PASSWORD_ALIYUN
+  - name: docker-cuda
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+    settings:
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04
+      dockerfile: .beagle/cuda.dockerfile
+      repo: wod/windstack
+      version: "v0.7.0-cuda"
+      args: "TARGETOS=linux,TARGETARCH=amd64"
+      registry: registry-vpc.cn-qingdao.aliyuncs.com
+      registry_user:
+        from_secret: REGISTRY_USER_ALIYUN
+      registry_password:
+        from_secret: REGISTRY_PASSWORD_ALIYUN
 
-  # - name: docker-cann
-  #   image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-  #   volumes:
-  #     - name: docker
-  #       path: /var/run/docker.sock
-  #   settings:
-  #     base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.alpha003-kernel910b-py310
-  #     dockerfile: .beagle/cann.dockerfile
-  #     repo: wod/gpustack
-  #     version: "v0.7.0-cann"
-  #     args: "TARGETOS=linux,TARGETARCH=arm64"
-  #     registry: registry-vpc.cn-qingdao.aliyuncs.com
-  #     registry_user:
-  #       from_secret: REGISTRY_USER_ALIYUN
-  #     registry_password:
-  #       from_secret: REGISTRY_PASSWORD_ALIYUN
+  - name: docker-cann
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+    settings:
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.alpha003-kernel910b-py310
+      dockerfile: .beagle/cann.dockerfile
+      repo: wod/windstack
+      version: "v0.7.0-cann"
+      args: "TARGETOS=linux,TARGETARCH=arm64"
+      registry: registry-vpc.cn-qingdao.aliyuncs.com
+      registry_user:
+        from_secret: REGISTRY_USER_ALIYUN
+      registry_password:
+        from_secret: REGISTRY_PASSWORD_ALIYUN
 
   # DCU
   - name: docker-dcu
@@ -88,7 +88,7 @@ steps:
     settings:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/vllm:0.8.5-ubuntu22.04-dtk25.04.1-py3.10
       dockerfile: .beagle/dcu.dockerfile
-      repo: wod/gpustack
+      repo: wod/windstack
       version: "v0.7.0-dcu"
       args: "TARGETOS=linux,TARGETARCH=amd64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
@@ -106,7 +106,7 @@ steps:
     settings:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/gpustack-base:v0.7.0-corex
       dockerfile: .beagle/corex.dockerfile
-      repo: wod/gpustack
+      repo: wod/windstack
       version: "v0.7.0-corex"
       args: "TARGETOS=linux,TARGETARCH=amd64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
@@ -124,7 +124,7 @@ steps:
     settings:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/musa:rc4.2.0-runtime-ubuntu-amd64
       dockerfile: .beagle/musa.dockerfile
-      repo: wod/gpustack
+      repo: wod/windstack
       version: "v0.7.0-musa"
       args: "TARGETOS=linux,TARGETARCH=amd64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
@@ -189,7 +189,7 @@ steps:
     settings:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.alpha003-kernel910b-py310
       dockerfile: .beagle/cann.dockerfile
-      repo: wod/gpustack
+      repo: wod/windstack
       version: "v0.7.0-cann8.0.RC3.alpha003-kernel910b"
       args: "TARGETOS=linux,TARGETARCH=arm64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
@@ -252,7 +252,7 @@ steps:
     settings:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.beta1-kernel910b-py310
       dockerfile: .beagle/cann.dockerfile
-      repo: wod/gpustack
+      repo: wod/windstack
       version: "v0.7.0-cann-8.0.RC3.beta1-kernel910b"
       args: "TARGETOS=linux,TARGETARCH=arm64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
@@ -276,8 +276,8 @@ steps:
   - name: harbor-cuda
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-cuda
-      target: registry-vpc.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7-cuda
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-cuda
+      target: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7-cuda
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
         from_secret: REGISTRY_USER_ALIYUN
@@ -287,8 +287,8 @@ steps:
   - name: harbor-cann
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-cann
-      target: registry-vpc.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7-cann
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-cann
+      target: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7-cann
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
         from_secret: REGISTRY_USER_ALIYUN
@@ -298,8 +298,8 @@ steps:
   - name: harbor-musa
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-musa
-      target: registry-vpc.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7-musa
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-musa
+      target: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7-musa
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
         from_secret: REGISTRY_USER_ALIYUN

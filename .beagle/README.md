@@ -18,8 +18,8 @@ git merge v0.7.0
 
 ```bash
 docker pull gpustack/gpustack:0.7.0 && \
-docker tag gpustack/gpustack:0.7.0 registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.7.0 && \
-docker push registry.cn-qingdao.aliyuncs.com/wod/gpustack:0.7.0
+docker tag gpustack/gpustack:0.7.0 registry.cn-qingdao.aliyuncs.com/wod/windstack:0.7.0 && \
+docker push registry.cn-qingdao.aliyuncs.com/wod/windstack:0.7.0
 ```
 
 ## base images
@@ -42,20 +42,20 @@ docker push registry.cn-qingdao.aliyuncs.com/wod/cann:8.0.rc3.beta1-910b-ubuntu2
 # default user admin
 docker run -d --gpus all -p 6080:6080 --ipc=host --shm-size=2g --name gpustack \
   -v /data/gpustack:/var/lib/gpustack \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-cuda \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-cuda \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
   --worker-s3-secret-key=your_secret_key
 
-docker rm -f gpustack && rm -rf /data/gpustack
+docker rm -f windstack&& rm -rf /data/windstack
 
 # start worker node
 docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /data/gpustack:/var/lib/gpustack \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-cuda \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-cuda \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -68,27 +68,27 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
 
 ```bash
 # default user admin
-docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack \
+docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstack \
   -v /usr/share/hwdata:/usr/share/hwdata \
-  -v /data/gpustack/data:/var/lib/gpustack \
+  -v /data/windstack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-cann \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-cann \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
   --worker-s3-secret-key=your_secret_key
 
-docker rm -f gpustack && rm -rf /data/gpustack
+docker rm -f windstack&& rm -rf /data/windstack
 
 # start worker node
-docker run -d --ipc=host --shm-size=2g --name gpustack \
+docker run -d --ipc=host --shm-size=2g --name windstack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /usr/share/hwdata:/usr/share/hwdata \
-  -v /data/gpustack/data:/var/lib/gpustack \
+  -v /data/windstack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-cann \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-cann \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -97,29 +97,29 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   --worker-s3-secret-key=your_secret_key
 ```
 
-## deployMthreads
+## deployMthreads（摩尔线程）
 
 ```bash
 # default user admin
-docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name gpustack \
-  -v /data/gpustack/data:/var/lib/gpustack \
+docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstack \
+  -v /data/windstack/data:/var/lib/gpustack \
   -e MTHREADS_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-musa \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-musa \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
   --worker-s3-secret-key=your_secret_key
 
-docker rm -f gpustack && rm -rf /data/gpustack
+docker rm -f windstack&& rm -rf /data/windstack
 
 # start worker node
 docker run -d --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
-  -v /data/gpustack/data:/var/lib/gpustack \
+  -v /data/windstack/data:/var/lib/gpustack \
   -e MTHREADS_VISIBLE_DEVICES=0-7 \
-  registry.cn-qingdao.aliyuncs.com/wod/gpustack:v0.7.0-musa \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-musa \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -127,6 +127,90 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   --worker-s3-access-key=your_access_key \
   --worker-s3-secret-key=your_secret_key
 ```
+
+## deployCoreX （天数智芯）
+
+```bash
+# default user admin
+docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstack \
+  -v /data/windstack/data:/var/lib/gpustack \
+  -v /lib/modules:/lib/modules \
+  --cap-add=ALL \
+  --restart=unless-stopped \
+  -e TZ=Asia/Shanghai \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-corex \
+  --bootstrap-password 'beagle!@#123' --port 6080 \
+  --worker-name <host-name> \
+  --worker-s3-host=your_s3_host \
+  --worker-s3-access-key=your_access_key \
+  --worker-s3-secret-key=your_secret_key
+
+docker rm -f windstack&& rm -rf /data/windstack
+
+# start worker node
+docker run -d --ipc=host --shm-size=2g --name windstack \
+  -v /data/windstack/data:/var/lib/gpustack \
+  -v /lib/modules:/lib/modules \
+  --cap-add=ALL \
+  --restart=unless-stopped \
+  -e TZ=Asia/Shanghai \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-musa \
+  --server-url http://myserver:6080 --token mytoken \
+  --worker-ip <host-ip> \
+  --worker-name <host-name> \
+  --worker-s3-host=your_s3_host \
+  --worker-s3-access-key=your_access_key \
+  --worker-s3-secret-key=your_secret_key
+```
+
+
+## deployDcu
+
+```bash
+# default user admin
+docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstack \
+  --restart=unless-stopped \
+  --device=/dev/kfd \
+  --device=/dev/mkfd \
+  --device=/dev/dri \
+  -v /opt/hyhal:/opt/hyhal:ro \
+  --network=host \
+  --group-add video \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -v /data/windstack/data:/var/lib/gpustack \
+  -e TZ=Asia/Shanghai \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-musa \
+  --bootstrap-password 'beagle!@#123' --port 6080 \
+  --worker-name <host-name> \
+  --worker-s3-host=your_s3_host \
+  --worker-s3-access-key=your_access_key \
+  --worker-s3-secret-key=your_secret_key
+
+docker rm -f windstack&& rm -rf /data/windstack
+
+# start worker node
+docker run -d --ipc=host --shm-size=2g --name windstack \
+  -p 10150:10150 -p 40000-41024:40000-41024 \
+  --restart=unless-stopped \
+  --device=/dev/kfd \
+  --device=/dev/mkfd \
+  --device=/dev/dri \
+  -v /opt/hyhal:/opt/hyhal:ro \
+  --group-add video \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -v /data/windstack/data:/var/lib/gpustack \
+  -e TZ=Asia/Shanghai \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-musa \
+  --server-url http://myserver:6080 --token mytoken \
+  --worker-ip <host-ip> \
+  --worker-name <host-name> \
+  --worker-s3-host=your_s3_host \
+  --worker-s3-access-key=your_access_key \
+  --worker-s3-secret-key=your_secret_key
+```
+
 
 ## build
 
