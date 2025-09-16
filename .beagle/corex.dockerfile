@@ -15,7 +15,8 @@ RUN apt-get update && apt-get install -y \
 
 RUN pip install /dist/*.whl && \
     pip cache purge && \
-    rm -rf /dist
+    rm -rf /dist && \
+    ln -s /usr/local/corex-4.3.0/lib64/python3/dist-packages/bin/vllm /usr/local/bin/vllm
 
 RUN gpustack download-tools
 
