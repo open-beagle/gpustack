@@ -21,7 +21,8 @@ RUN apt-get update && apt-get install -y \
 COPY --from=build /workspace/gpustack/dist/*.whl /dist/
 RUN pip install /dist/*.whl && \
     pip cache purge && \
-    rm -rf /dist
+    rm -rf /dist && \
+    ln -s /usr/local/bin/vllm /usr/local/corex-4.3.0/lib64/python3/dist-packages/bin/vllm
 
 RUN gpustack download-tools
 
