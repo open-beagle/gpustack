@@ -1,13 +1,8 @@
-ARG BASE=gpustack/gpustack:v0.7.0-corex
+ARG BASE=registry.cn-qingdao.aliyuncs.com/wod/mr-bi150-4.3.0-x86-ubuntu20.04-py3.10-poc-llm-infer:v1.2.3 AS runtime
 
 FROM $BASE
 
-ARG AUTHOR=gaoshiyao@gmail.com
-ARG VERSION=v0.7.0
-
-LABEL maintainer=$AUTHOR version=$VERSION
-COPY ./dist/*.whl /tmp/
-COPY .beagle/corex-constraints.txt /tmp/corex-constraints.txt
+COPY . /workspace/gpustack
 
 RUN apt-get update && apt-get install -y \
     python3 \
@@ -18,10 +13,11 @@ RUN apt-get update && apt-get install -y \
     tini \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-deps --force-reinstall -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout=600 --retries=10 /tmp/*.whl && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout=600 --retries=10 --upgrade --upgrade-strategy eager -r /tmp/corex-constraints.txt && \
-    pip cache purge && rm -rf /tmp/*.whl /tmp/corex-constraints.txt
+COPY --from=build /workspace/gpustack/dist/*.whl /dist/
+RUN pip install /dist/*.whl && \
+    pip cache purge && \
+    rm -rf /dist
 
 RUN gpustack download-tools
 
-ENTRYPOINT [ "gpustack", "start" ]
+ENTRYPOINT [ "tini", "--", "gpustack", "start" ]

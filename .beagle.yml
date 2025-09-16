@@ -45,6 +45,24 @@ steps:
     commands:
       - bash .beagle/build.sh
 
+  # 天数智芯
+  - name: docker-corex
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+    settings:
+      base: registry.cn-qingdao.aliyuncs.com/wod/mr-bi150-4.3.0-x86-ubuntu20.04-py3.10-poc-llm-infer:v1.2.3
+      dockerfile: .beagle/corex.dockerfile
+      repo: wod/windstack
+      version: "v0.7.0-corex"
+      args: "TARGETOS=linux,TARGETARCH=amd64"
+      registry: registry-vpc.cn-qingdao.aliyuncs.com
+      registry_user:
+        from_secret: REGISTRY_USER_ALIYUN
+      registry_password:
+        from_secret: REGISTRY_PASSWORD_ALIYUN
+
   - name: docker-cuda
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
     volumes:
@@ -90,24 +108,6 @@ steps:
       dockerfile: .beagle/dcu.dockerfile
       repo: wod/windstack
       version: "v0.7.0-dcu"
-      args: "TARGETOS=linux,TARGETARCH=amd64"
-      registry: registry-vpc.cn-qingdao.aliyuncs.com
-      registry_user:
-        from_secret: REGISTRY_USER_ALIYUN
-      registry_password:
-        from_secret: REGISTRY_PASSWORD_ALIYUN
-
-  # 天数智芯
-  - name: docker-corex
-    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-    volumes:
-      - name: docker
-        path: /var/run/docker.sock
-    settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/gpustack-base:v0.7.0-corex
-      dockerfile: .beagle/corex.dockerfile
-      repo: wod/windstack
-      version: "v0.7.0-corex"
       args: "TARGETOS=linux,TARGETARCH=amd64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
