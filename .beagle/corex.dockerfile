@@ -2,7 +2,7 @@ ARG BASE=registry.cn-qingdao.aliyuncs.com/wod/mr-bi150-4.3.0-x86-ubuntu20.04-py3
 
 FROM $BASE
 
-COPY . /workspace/gpustack
+COPY ./dist/. /workspace/gpustack/dist
 
 RUN apt-get update && apt-get install -y \
     python3 \
