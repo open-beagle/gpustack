@@ -12,16 +12,17 @@
       },
       "args": [
         "start",
-        "--bootstrap-password='beagle!@#123'",
-        "--port=6080",
+        "--port=6081",
         "--worker-ip=127.0.0.1",
-        "--worker-name=WSL-Debian",
-        "--data-dir=${env:HOME}/gpustack",
-        "--tools-download-base-url=https://cache.ali.wodcloud.com/vscode",
-        "--worker-s3-host=your_s3_host",
-        "--worker-s3-access-key=your_access_key",
-        "--worker-s3-secret-key=your_secret_key",
-        "--worker-s3-ssl"
+        "--worker-name=WSL-Debian-1",
+        "--data-dir=${env:HOME}/windstack",
+        "--bootstrap-password=123456",
+        "--worker-s3-host=oss-cn-qingdao.aliyuncs.com:443",
+        "--worker-s3-access-key=",
+        "--worker-s3-secret-key=",
+        "--worker-s3-ssl",
+        "--worker-s3-use-virtual-hosted-style",
+        "--worker-s3-region="
       ],
       "cwd": "${workspaceRoot}"
     }
