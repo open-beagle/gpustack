@@ -47,7 +47,8 @@ docker run -d --gpus all -p 6080:6080 --ipc=host --shm-size=2g --name gpustack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key
+  --worker-s3-secret-key=your_secret_key \
+  --worker-s3-bucket=bd-wind
 
 docker rm -f windstack&& rm -rf /data/windstack
 
@@ -61,7 +62,8 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key
+  --worker-s3-secret-key=your_secret_key \
+  --worker-s3-bucket=bd-wind
 ```
 
 ## deployNPU
@@ -78,7 +80,8 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstac
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key
+  --worker-s3-secret-key=your_secret_key \
+  --worker-s3-bucket=bd-wind
 
 docker rm -f windstack&& rm -rf /data/windstack
 
@@ -94,7 +97,8 @@ docker run -d --ipc=host --shm-size=2g --name windstack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key
+  --worker-s3-secret-key=your_secret_key \
+  --worker-s3-bucket=bd-wind
 ```
 
 ## deployMthreads（摩尔线程）
@@ -110,7 +114,8 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstac
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key
+  --worker-s3-secret-key=your_secret_key \
+  --worker-s3-bucket=bd-wind
 
 docker rm -f windstack&& rm -rf /data/windstack
 
@@ -125,7 +130,8 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key
+  --worker-s3-secret-key=your_secret_key \
+  --worker-s3-bucket=bd-wind
 ```
 
 ## deployCoreX （天数智芯）
@@ -143,7 +149,8 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstac
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key
+  --worker-s3-secret-key=your_secret_key \
+  --worker-s3-bucket=bd-wind
 
 docker rm -f windstack&& rm -rf /data/windstack
 
@@ -160,7 +167,8 @@ docker run -d --ipc=host --shm-size=2g --name windstack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key
+  --worker-s3-secret-key=your_secret_key \
+  --worker-s3-bucket=bd-wind
 ```
 
 
@@ -185,7 +193,8 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstac
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key
+  --worker-s3-secret-key=your_secret_key \
+  --worker-s3-bucket=bd-wind
 
 docker rm -f windstack&& rm -rf /data/windstack
 
@@ -208,7 +217,8 @@ docker run -d --ipc=host --shm-size=2g --name windstack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key
+  --worker-s3-secret-key=your_secret_key \
+  --worker-s3-bucket=bd-wind
 ```
 
 

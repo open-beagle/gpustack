@@ -45,6 +45,23 @@ steps:
     commands:
       - bash .beagle/build.sh
 
+  - name: docker-cuda
+    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    volumes:
+      - name: docker
+        path: /var/run/docker.sock
+    settings:
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04
+      dockerfile: .beagle/cuda.dockerfile
+      repo: wod/windstack
+      version: "v0.7.0-cuda"
+      args: "TARGETOS=linux,TARGETARCH=amd64"
+      registry: registry-vpc.cn-qingdao.aliyuncs.com
+      registry_user:
+        from_secret: REGISTRY_USER_ALIYUN
+      registry_password:
+        from_secret: REGISTRY_PASSWORD_ALIYUN
+
   # 天数智芯
   - name: docker-corex
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
@@ -56,23 +73,6 @@ steps:
       dockerfile: .beagle/corex.dockerfile
       repo: wod/windstack
       version: "v0.7.0-corex"
-      args: "TARGETOS=linux,TARGETARCH=amd64"
-      registry: registry-vpc.cn-qingdao.aliyuncs.com
-      registry_user:
-        from_secret: REGISTRY_USER_ALIYUN
-      registry_password:
-        from_secret: REGISTRY_PASSWORD_ALIYUN
-
-  - name: docker-cuda
-    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-    volumes:
-      - name: docker
-        path: /var/run/docker.sock
-    settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04
-      dockerfile: .beagle/cuda.dockerfile
-      repo: wod/windstack
-      version: "v0.7.0-cuda"
       args: "TARGETOS=linux,TARGETARCH=amd64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
