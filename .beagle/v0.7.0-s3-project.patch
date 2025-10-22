@@ -1,10 +1,10 @@
-From 9c5230d6dab022e41857706e57809f1d61c24242 Mon Sep 17 00:00:00 2001
+From 075b98916a39d020c61edd3434f4d54d38008fb4 Mon Sep 17 00:00:00 2001
 From: gaoshiyao <gaoshiyao@bd-apaas.com>
-Date: Wed, 22 Oct 2025 15:41:45 +0800
+Date: Wed, 22 Oct 2025 16:33:26 +0800
 Subject: [PATCH] v0.7.0-s3-project.patch
 
 ---
- gpustack/cmd/start.py                 |  43 ++
+ gpustack/cmd/start.py                 |  49 ++
  gpustack/config/config.py             |   7 +
  gpustack/scheduler/calculator.py      |  18 +-
  gpustack/worker/backends/base.py      |  14 +
@@ -13,14 +13,14 @@ Subject: [PATCH] v0.7.0-s3-project.patch
  gpustack/worker/model_file_manager.py |   2 +
  poetry.lock                           | 768 +++++++++++++++++++++++---
  pyproject.toml                        |   1 +
- 9 files changed, 989 insertions(+), 94 deletions(-)
+ 9 files changed, 995 insertions(+), 94 deletions(-)
  create mode 100644 gpustack/worker/downloader_s3.py
 
 diff --git a/gpustack/cmd/start.py b/gpustack/cmd/start.py
-index 3d3a38c..7b056b3 100644
+index 3d3a38c..25a163b 100644
 --- a/gpustack/cmd/start.py
 +++ b/gpustack/cmd/start.py
-@@ -363,6 +363,43 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
+@@ -363,6 +363,49 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
          action='append',
          help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers Content-Type. Default: ["Authorization", "Content-Type"].',
      )
@@ -61,10 +61,16 @@ index 3d3a38c..7b056b3 100644
 +        help="Region to s3.",
 +        default=get_gpustack_env("STACK_WORKER_S3_REGION"),
 +    )
++    group.add_argument(
++        "--worker-s3-bucket",
++        type=str,
++        help="Bucket to s3.",
++        default=get_gpustack_env("STACK_WORKER_S3_BUCKET"),
++    )
  
      parser_server.set_defaults(func=run)
  
-@@ -461,6 +498,12 @@ def set_common_options(args, config_data: dict):
+@@ -461,6 +504,12 @@ def set_common_options(args, config_data: dict):
          "ray_args",
          "ray_node_manager_port",
          "ray_object_manager_port",
