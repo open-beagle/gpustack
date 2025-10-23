@@ -2,6 +2,7 @@
 
 git config --global --add safe.directory $PWD
 pip config set global.index-url https://mirrors.aliyun.com/pypi/simple
+export POETRY_HTTP_TIMEOUT=120  # 临时设置 poetry 超时为 120 秒
 
 set -ex
 
