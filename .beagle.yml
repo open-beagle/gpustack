@@ -4,7 +4,7 @@ name: docker
 
 trigger:
   branch:
-    - dev
+    - release-v0.4.1
 
 volumes:
   - name: docker
