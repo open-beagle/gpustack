@@ -22,8 +22,13 @@ if $(git diff --quiet gpustack/cmd/download_tools.py); then
   git apply .beagle/v0.4.1-logginglocal.patch
 fi
 
+if $(git diff --quiet gpustack/server/db.py); then
+  git apply .beagle/v0.4.1-s4-fix-dberror.patch
+fi
+
 make build
 
 git apply -R .beagle/v0.4.1-s3-project.patch
 git apply -R .beagle/v0.4.1-s3.patch
 git apply -R .beagle/v0.4.1-logginglocal.patch
+git apply -R .beagle/v0.4.1-s4-fix-dberror.patch

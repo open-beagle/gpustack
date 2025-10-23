@@ -1,0 +1,48 @@
+From 5845fe1b47e68e3d4d413abf0ec644271a7e6716 Mon Sep 17 00:00:00 2001
+From: yangshifu <yangshifu@wodcloud.com>
+Date: Thu, 23 Oct 2025 11:47:46 +0800
+Subject: [PATCH] =?UTF-8?q?fix:=E5=A4=84=E7=90=86=E6=95=B0=E6=8D=AE?=
+ =?UTF-8?q?=E5=BA=93=E8=BF=9E=E6=8E=A5=E6=B1=A0=E8=B6=85=E6=97=B6=E7=AD=89?=
+ =?UTF-8?q?=E9=97=AE=E9=A2=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ gpustack/server/db.py | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/gpustack/server/db.py b/gpustack/server/db.py
+index 1b2a253..a527e80 100644
+--- a/gpustack/server/db.py
++++ b/gpustack/server/db.py
+@@ -22,6 +22,10 @@ from gpustack.schemas.stmt import (
+ 
+ _engine = None
+ 
++DB_ECHO = os.getenv("GPUSTACK_DB_ECHO", "false").lower() == "true"
++DB_POOL_SIZE = int(os.getenv("GPUSTACK_DB_POOL_SIZE", 5))
++DB_MAX_OVERFLOW = int(os.getenv("GPUSTACK_DB_MAX_OVERFLOW", 10))
++DB_POOL_TIMEOUT = int(os.getenv("GPUSTACK_DB_POOL_TIMEOUT", 30))
+ 
+ def get_engine():
+     return _engine
+@@ -45,7 +49,14 @@ async def init_db(db_url: str):
+         else:
+             raise Exception(f"Unsupported database URL: {db_url}")
+ 
+-        _engine = create_async_engine(db_url, echo=False, connect_args=connect_args)
++        _engine = create_async_engine(
++            db_url,
++            echo=DB_ECHO,
++            pool_size=DB_POOL_SIZE,
++            max_overflow=DB_MAX_OVERFLOW,
++            pool_timeout=DB_POOL_TIMEOUT,
++            connect_args=connect_args,
++        )
+         listen_events(_engine)
+     await create_db_and_tables(_engine)
+ 
+-- 
+2.21.0.windows.1
+
