@@ -1,7 +1,11 @@
-From fd91a1c38547857e7a6444f6d027f561e3090c43 Mon Sep 17 00:00:00 2001
+From 1f573c513842c197a7187b00f03339274f21441f Mon Sep 17 00:00:00 2001
 From: gaoshiyao <gaoshiyao@bd-apaas.com>
-Date: Thu, 23 Oct 2025 18:09:06 +0800
-Subject: [PATCH] v0.7.0-s3-project
+Date: Wed, 29 Oct 2025 10:50:46 +0800
+Subject: [PATCH] =?UTF-8?q?=E4=BF=AE=E5=A4=8D=E9=80=89=E5=8D=A1=E9=97=AE?=
+ =?UTF-8?q?=E9=A2=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 ---
  gpustack/cmd/download_tools.py                |    2 +-
@@ -10,6 +14,7 @@ Subject: [PATCH] v0.7.0-s3-project
  gpustack/detectors/npu_smi/npu_smi.py         |    2 +-
  gpustack/{logging.py => logginglocal.py}      |    0
  gpustack/scheduler/calculator.py              |   18 +-
+ gpustack/scheduler/evaluator.py               |    5 +
  gpustack/server/server.py                     |    2 +-
  gpustack/worker/backends/base.py              |   16 +-
  gpustack/worker/downloader_s3.py              |  198 +
@@ -21,7 +26,7 @@ Subject: [PATCH] v0.7.0-s3-project
  poetry.lock                                   | 8203 +++++++++--------
  pyproject.toml                                |    3 +-
  .../test_slow_gguf_resource_fit_selector.py   |    2 +-
- 17 files changed, 4815 insertions(+), 3725 deletions(-)
+ 18 files changed, 4820 insertions(+), 3725 deletions(-)
  rename gpustack/{logging.py => logginglocal.py} (100%)
  create mode 100644 gpustack/worker/downloader_s3.py
 
@@ -172,6 +177,22 @@ index c013cdb..0d512d5 100644
          # Skip the calculation if the model is not available, policies like spread strategy still apply.
          # TODO Support user provided resource claim for better scheduling.
          e, a = _get_empty_estimate()
+diff --git a/gpustack/scheduler/evaluator.py b/gpustack/scheduler/evaluator.py
+index d82b2ef..415908f 100644
+--- a/gpustack/scheduler/evaluator.py
++++ b/gpustack/scheduler/evaluator.py
+@@ -266,6 +266,11 @@ async def evaluate_model_metadata(
+     model: ModelSpec,
+ ) -> Tuple[bool, List[str]]:
+     try:
++        if  model.local_path.startswith("s3://beagle_wind/"):
++            # s3://beagle_wind/bd-wind/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/q8/qwen2.5-3b-instruct-q8_0.gguf
++            # /var/lib/gpustack
++            arr = model.local_path.split("datamodel")
++            model.local_path = config.data_dir+"/cache"+"/beagle"+arr[1]
+         if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(
+             model.local_path
+         ):
 diff --git a/gpustack/server/server.py b/gpustack/server/server.py
 index 281dfe3..9bfaef0 100644
 --- a/gpustack/server/server.py
