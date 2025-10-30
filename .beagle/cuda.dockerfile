@@ -15,11 +15,13 @@ RUN apt-get update && apt-get install -y \
     tzdata \
     python3 \
     python3-pip \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY ./dist/*.whl /tmp/
 
 RUN WHEEL_PACKAGE="$(ls /tmp/**-any.whl)[vllm]" && \
+  python3 -m pip install --upgrade pip && \
   pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
   pip3 install $WHEEL_PACKAGE &&\
   rm /tmp/*.whl && \
@@ -28,4 +30,4 @@ RUN WHEEL_PACKAGE="$(ls /tmp/**-any.whl)[vllm]" && \
 RUN gpustack download-tools 
     # \ --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
-ENTRYPOINT [ "gpustack", "start" ]
+ENTRYPOINT [ "tini", "--", "gpustack", "start" ]
