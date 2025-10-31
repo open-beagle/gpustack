@@ -39,6 +39,8 @@ jobs:
           tags: |
             registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.0-cuda-raw
           platforms: linux/amd64
+          build-args: |
+            CUDA_VERSION=12.8.1
 
       - name: Image push success
         run: echo "Docker images and manifests pushed successfully to registry.cn-qingdao.aliyuncs.com/wod/windstack"
