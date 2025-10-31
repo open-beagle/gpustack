@@ -31,12 +31,8 @@ jobs:
           username: ${{ secrets.REGISTRY_USER_ALIYUN }}
           password: ${{ secrets.REGISTRY_PASSWORD_ALIYUN }}
 
-      - name: Cross Build
-        run: |
-          docker run --rm -v ${{ github.workspace }}:/go/src/github.com/open-beagle/gpustack \
-            -w /go/src/github.com/open-beagle/gpustack \
-            ghcr.io/${{ github.repository_owner }}/golang:1.24-alpine \
-            bash -c "git apply .beagle/v0.7.0-s3-project.patch"
+      - name: Apply v0.7.0-s3 project patch
+        run: git apply .beagle/v0.7.0-s3-project.patch
 
       - name: Build and push CUDA Docker image
         uses: docker/build-push-action@v5
