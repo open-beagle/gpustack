@@ -22,6 +22,7 @@ COPY ./dist/*.whl /tmp/
 
 RUN WHEEL_PACKAGE="$(ls /tmp/**-any.whl)[vllm]" && \
   python3 -m pip install --upgrade pip && \
+  pip3 install -U vllm transformers && \
   pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
   pip3 install --default-timeout=12000 $WHEEL_PACKAGE &&\
   rm /tmp/*.whl && \
