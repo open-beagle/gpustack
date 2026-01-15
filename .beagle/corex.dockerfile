@@ -1,12 +1,12 @@
-ARG BASE=registry.cn-qingdao.aliyuncs.com/wod/mr-bi150-4.3.0-x86-ubuntu20.04-py3.10-poc-llm-infer:v1.2.3 AS runtime
+ARG BASE=registry.cn-qingdao.aliyuncs.com/wod/corex:mr-bi150-4.3.0-x86-ubuntu20.04-py3.10-poc-llm-infer-v1.2.3
 
-FROM $BASE
+FROM ${BASE}
 
 COPY ./dist/*.whl /dist/
 
 RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
+    git \
+    curl \
     wget \
     tzdata \
     iproute2 \

@@ -1,0 +1,688 @@
+diff --git a/gpustack/logginglocal.py b/gpustack/logginglocal.py
+new file mode 100644
+index 00000000..e0ea3134
+--- /dev/null
++++ b/gpustack/logginglocal.py
+@@ -0,0 +1,88 @@
++from datetime import datetime, timezone
++import logging
++import os
++import sys
++
++
++# Suppress warnings from transformers
++# https://github.com/huggingface/transformers/issues/27214
++# Note: This should be set before importing transformers
++if "TRANSFORMERS_NO_ADVISORY_WARNINGS" not in os.environ:
++    os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
++
++TRACE_LEVEL = 5
++
++
++def setup_logging(debug: bool = False):
++    level = logging.DEBUG if debug else logging.INFO
++
++    logging.basicConfig(
++        level=level,
++        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
++        handlers=[logging.StreamHandler()],
++    )
++    logging.addLevelName(TRACE_LEVEL, "TRACE")
++    logging.Logger.trace = trace
++
++    logging.Formatter.formatTime = (
++        lambda self, record, datefmt=None: datetime.fromtimestamp(
++            record.created, timezone.utc
++        ).astimezone()
++    )
++
++    # Third-party loggers to disable
++    disable_logger_names = [
++        "httpcore.connection",
++        "httpcore.http11",
++        "httpcore.proxy",
++        "httpx",
++        "asyncio",
++        "aiocache.base",
++        "aiosqlite",
++        "urllib3.connectionpool",
++        "multipart.multipart",
++        "apscheduler.scheduler",
++        "apscheduler.executors.default",
++        "tzlocal",
++        "alembic.runtime.migration",
++        "python_multipart.multipart",
++        "filelock",
++        "fastapi-cdn-host",
++        "huggingface_hub.file_download",
++    ]
++
++    for logger_name in disable_logger_names:
++        logger = logging.getLogger(logger_name)
++        logger.disabled = True
++
++    # Third-party loggers to print on debug
++    debug_logger_names = [
++        "alembic.runtime.migration",
++    ]
++
++    for logger_name in debug_logger_names:
++        logger = logging.getLogger(logger_name)
++        if debug:
++            logger.setLevel(logging.DEBUG)
++        else:
++            logger.disabled = True
++
++
++def trace(self, message, *args, **kwargs):
++    if self.isEnabledFor(TRACE_LEVEL):
++        self._log(TRACE_LEVEL, message, args, **kwargs)
++
++
++class RedirectStdoutStderr:
++    def __init__(self, target):
++        self.target = target
++
++    def __enter__(self):
++        self.original_stdout = sys.stdout
++        self.original_stderr = sys.stderr
++        sys.stdout = self.target
++        sys.stderr = self.target
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        sys.stdout = self.original_stdout
++        sys.stderr = self.original_stderr
+diff --git a/gpustack/cmd/download_tools.py b/gpustack/cmd/download_tools.py
+index 3b0967d9..180773c1 100644
+--- a/gpustack/cmd/download_tools.py
++++ b/gpustack/cmd/download_tools.py
+@@ -3,7 +3,7 @@ import logging
+ import sys
+ 
+ from gpustack.cmd.start import get_gpustack_env
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.worker.tools_manager import ToolsManager
+ 
+ logger = logging.getLogger(__name__)
+diff --git a/gpustack/cmd/start.py b/gpustack/cmd/start.py
+index fc3055d6..7e4f1a71 100644
+--- a/gpustack/cmd/start.py
++++ b/gpustack/cmd/start.py
+@@ -11,7 +11,7 @@ import yaml
+ 
+ from gpustack import __version__, __git_commit__
+ from gpustack.config.config import set_global_config
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.utils.envs import get_gpustack_env, get_gpustack_env_bool
+ from gpustack.worker.worker import Worker
+ from gpustack.config import Config
+@@ -369,6 +369,43 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
+         action='append',
+         help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers Content-Type. Default: ["Authorization", "Content-Type"].',
+     )
++    group.add_argument(
++        "--worker-s3-host",
++        type=str,
++        help="HOST to s3.",
++        default=get_gpustack_env("STACK_WORKER_S3_HOST"),
++    )
++    group.add_argument(
++        "--worker-s3-access-key",
++        type=str,
++        help="AccessKey to s3.",
++        default=get_gpustack_env("STACK_WORKER_S3_ACCESS_KEY"),
++    )
++    group.add_argument(
++        "--worker-s3-secret-key",
++        type=str,
++        help="SecretKey to s3.",
++        default=get_gpustack_env("STACK_WORKER_S3_SECRET_KEY"),
++    )
++    group.add_argument(
++        "--worker-s3-ssl",
++        action=OptionalBoolAction,
++        help="SecretKey to s3.",
++        default=get_gpustack_env_bool("STACK_WORKER_S3_SSL") or False,
++    )
++    group.add_argument(
++        "--worker-s3-use-virtual-hosted-style",
++        action=OptionalBoolAction,
++        help="Use virtual hosted style to s3.",
++        default=get_gpustack_env_bool("STACK_WORKER_S3_USE_VIRTUAL_HOSTED_STYLE")
++        or False,
++    )
++    group.add_argument(
++        "--worker-s3-region",
++        type=str,
++        help="Region to s3.",
++        default=get_gpustack_env("STACK_WORKER_S3_REGION"),
++    )
+     # External authentication settings
+     group.add_argument(
+         "--external-auth-name",
+@@ -565,6 +602,12 @@ def set_common_options(args, config_data: dict):
+         "ray_args",
+         "ray_node_manager_port",
+         "ray_object_manager_port",
++        "worker_s3_host",
++        "worker_s3_access_key",
++        "worker_s3_secret_key",
++        "worker_s3_ssl",
++        "worker_s3_use_virtual_hosted_style",
++        "worker_s3_region",
+     ]
+ 
+     for option in options:
+diff --git a/gpustack/config/config.py b/gpustack/config/config.py
+index 714ad76d..24214a04 100644
+--- a/gpustack/config/config.py
++++ b/gpustack/config/config.py
+@@ -164,6 +164,13 @@ class Config(BaseSettings):
+     enable_hf_transfer: bool = False
+     enable_hf_xet: bool = False
+ 
++    worker_s3_host: Optional[str] = ""
++    worker_s3_access_key: Optional[str] = ""
++    worker_s3_secret_key: Optional[str] = ""
++    worker_s3_ssl: bool = False
++    worker_s3_use_virtual_hosted_style: bool = True
++    worker_s3_region: Optional[str] = ""
++
+     def __init__(self, **values):
+         super().__init__(**values)
+ 
+diff --git a/gpustack/detectors/npu_smi/npu_smi.py b/gpustack/detectors/npu_smi/npu_smi.py
+index 4ceac833..14cc2c85 100644
+--- a/gpustack/detectors/npu_smi/npu_smi.py
++++ b/gpustack/detectors/npu_smi/npu_smi.py
+@@ -13,7 +13,7 @@ from gpustack.schemas.workers import (
+ from gpustack.utils import platform
+ from gpustack.utils.command import is_command_available
+ from gpustack.utils.convert import safe_float, safe_int
+-import gpustack.logging as glogging
++import gpustack.logginglocal as glogging
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/gpustack/scheduler/calculator.py b/gpustack/scheduler/calculator.py
+index 88b81b11..1e20282b 100644
+--- a/gpustack/scheduler/calculator.py
++++ b/gpustack/scheduler/calculator.py
+@@ -631,7 +631,23 @@ async def calculate_model_resource_claim(
+         kwargs: Additional arguments to pass to the GGUF parser.
+     """
+ 
+-    if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(model.local_path):
++    # 获取cache_dir的父目录
++    cache_dir = kwargs.get("cache_dir")
++    if cache_dir:
++        cache_dir = os.path.dirname(cache_dir)  # 获取上一级目录
++    cache_path = model.local_path
++    if model.source == SourceEnum.LOCAL_PATH and model.local_path and model.local_path.startswith(
++        "s3://beagle_wind/"
++    ):
++        # 构建本地缓存路径
++        if cache_dir:
++            cache_path = os.path.join(
++                cache_dir,
++                "beagle",
++                model.local_path.removeprefix("s3://beagle_wind/bd-wind/datamodel/"),
++            )
++
++    if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(cache_path):
+         # Skip the calculation if the model is not available, policies like spread strategy still apply.
+         # TODO Support user provided resource claim for better scheduling.
+         e, a = _get_empty_estimate()
+diff --git a/gpustack/scheduler/evaluator.py b/gpustack/scheduler/evaluator.py
+index d82b2ef0..eb8ff8b1 100644
+--- a/gpustack/scheduler/evaluator.py
++++ b/gpustack/scheduler/evaluator.py
+@@ -266,6 +266,11 @@ async def evaluate_model_metadata(
+     model: ModelSpec,
+ ) -> Tuple[bool, List[str]]:
+     try:
++        if model.local_path and model.local_path.startswith("s3://beagle_wind/"):
++            # s3://beagle_wind/bd-wind/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/q8/qwen2.5-3b-instruct-q8_0.gguf
++            # /var/lib/gpustack
++            arr = model.local_path.split("datamodel")
++            model.local_path = config.data_dir+"/cache"+"/beagle"+arr[1]
+         if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(
+             model.local_path
+         ):
+diff --git a/gpustack/server/server.py b/gpustack/server/server.py
+index 281dfe39..9bfaef09 100644
+--- a/gpustack/server/server.py
++++ b/gpustack/server/server.py
+@@ -7,7 +7,7 @@ import uvicorn
+ import logging
+ from fastapi.middleware.cors import CORSMiddleware
+ from sqlmodel.ext.asyncio.session import AsyncSession
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.schemas.users import User
+ from gpustack.security import JWTManager, generate_secure_password, get_secret_hash
+ from gpustack.server.app import create_app
+diff --git a/gpustack/worker/backends/base.py b/gpustack/worker/backends/base.py
+index 5a35dc6d..cc3d8e93 100644
+--- a/gpustack/worker/backends/base.py
++++ b/gpustack/worker/backends/base.py
+@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
+ 
+ from gpustack.client.generated_clientset import ClientSet
+ from gpustack.config.config import Config, set_global_config, get_global_config
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.schemas.models import (
+     BackendEnum,
+     ModelInstance,
+@@ -24,9 +24,11 @@ from gpustack.utils.platform import get_cann_chip
+ from gpustack.utils.profiling import time_decorator
+ from gpustack.utils import platform, envs
+ from gpustack.worker.tools_manager import ToolsManager
++from gpustack.worker.downloader_s3 import S3Downloader
+ 
+ logger = logging.getLogger(__name__)
+ lock = threading.Lock()
++s3Downloader = None
+ 
+ _VISIBLE_DEVICES_ENV_NAME_MAPPER = {
+     VendorEnum.NVIDIA: "CUDA_VISIBLE_DEVICES",
+@@ -52,6 +54,7 @@ class InferenceServer(ABC):
+         worker_id: int,
+     ):
+         setup_logging(debug=cfg.debug)
++        self.init_s3_client(cfg)
+         set_global_config(cfg)
+ 
+         try:
+@@ -124,6 +127,18 @@ class InferenceServer(ABC):
+             exit_code = 128 + signal_number
+         sys.exit(exit_code)
+ 
++    def init_s3_client(self, cfg):
++        global s3Downloader
++        s3Downloader = S3Downloader(
++            cfg.worker_s3_host,
++            access_key=cfg.worker_s3_access_key,
++            secret_key=cfg.worker_s3_secret_key,
++            ssl=cfg.worker_s3_ssl,
++            cache_dir=os.path.join(cfg.cache_dir, "beagle"),
++            use_virtual_hosted_style=cfg.worker_s3_use_virtual_hosted_style,
++            region=cfg.worker_s3_region,
++        )
++
+     def _until_model_instance_starting(self):
+         self._clientset.model_instances.watch(
+             callback=None,
+diff --git a/gpustack/worker/downloaders.py b/gpustack/worker/downloaders.py
+index f9349445..5ce96526 100644
+--- a/gpustack/worker/downloaders.py
++++ b/gpustack/worker/downloaders.py
+@@ -31,8 +31,24 @@ from gpustack.utils.hub import (
+     match_model_scope_file_paths,
+     FileEntry,
+ )
++from gpustack.worker.downloader_s3 import S3Downloader
++from gpustack.config.config import Config
+ 
+ logger = logging.getLogger(__name__)
++s3Downloader = None
++
++
++def init_s3_client(cfg: Config):
++    global s3Downloader
++    s3Downloader = S3Downloader(
++        host=cfg.worker_s3_host,
++        access_key=cfg.worker_s3_access_key,
++        secret_key=cfg.worker_s3_secret_key,
++        ssl=cfg.worker_s3_ssl,
++        use_virtual_hosted_style=cfg.worker_s3_use_virtual_hosted_style,
++        cache_dir=os.path.join(cfg.cache_dir, "beagle"),
++        region=cfg.worker_s3_region,
++    )
+ 
+ 
+ def download_model(
+@@ -41,6 +57,7 @@ def download_model(
+     cache_dir: Optional[str] = None,
+     ollama_library_base_url: Optional[str] = None,
+     huggingface_token: Optional[str] = None,
++    cfg: Config = None,
+ ) -> List[str]:
+     if model.source == SourceEnum.HUGGING_FACE:
+         return HfDownloader.download(
+@@ -69,7 +86,13 @@ def download_model(
+             cache_dir=os.path.join(cache_dir, "model_scope"),
+         )
+     elif model.source == SourceEnum.LOCAL_PATH:
+-        return file.get_sharded_file_paths(model.local_path)
++        if model.local_path and 's3://beagle_wind' in model.local_path:
++            if s3Downloader is None:
++                init_s3_client(cfg)
++            # example s3://beagle_wind/bd-wind/datamodel/51c63609-faf4-446a-a2cf-47dd8d1a3e97/v1
++            return file.get_sharded_file_paths(s3Downloader.download(model.local_path))
++        else:
++            return file.get_sharded_file_paths(model.local_path)
+ 
+ 
+ def get_model_file_info(
+@@ -77,6 +100,7 @@ def get_model_file_info(
+     huggingface_token: Optional[str] = None,
+     cache_dir: Optional[str] = None,
+     ollama_library_base_url: Optional[str] = None,
++    cfg: Config = None,
+ ) -> List[FileEntry]:
+     if model.source == SourceEnum.HUGGING_FACE:
+         return HfDownloader.get_model_file_info(
+@@ -96,6 +120,12 @@ def get_model_file_info(
+             cache_dir=os.path.join(cache_dir, "ollama"),
+         )
+     elif model.source == SourceEnum.LOCAL_PATH:
++        if model.local_path and 's3://beagle_wind' in model.local_path:
++            if s3Downloader is None:
++                init_s3_client(cfg)
++            return s3Downloader.get_model_file_size(
++                model_instance=model,
++            )
+         sharded_or_original_file_paths = file.get_sharded_file_paths(model.local_path)
+         file_list = [
+             FileEntry(f, file.getsize(f)) for f in sharded_or_original_file_paths
+diff --git a/gpustack/worker/exporter.py b/gpustack/worker/exporter.py
+index 584b4195..f3548529 100755
+--- a/gpustack/worker/exporter.py
++++ b/gpustack/worker/exporter.py
+@@ -3,7 +3,7 @@ from prometheus_client import make_asgi_app, REGISTRY
+ from prometheus_client.core import GaugeMetricFamily, InfoMetricFamily
+ from gpustack.client.generated_clientset import ClientSet
+ from gpustack.config.config import Config
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.worker.collector import WorkerStatusCollector
+ import uvicorn
+ import logging
+diff --git a/gpustack/worker/model_file_manager.py b/gpustack/worker/model_file_manager.py
+index 887ef6f6..db6ef634 100644
+--- a/gpustack/worker/model_file_manager.py
++++ b/gpustack/worker/model_file_manager.py
+@@ -18,7 +18,7 @@ from huggingface_hub.utils import build_hf_headers
+ 
+ from gpustack.api.exceptions import NotFoundException
+ from gpustack.config.config import Config
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.schemas.model_files import ModelFile, ModelFileUpdate, ModelFileStateEnum
+ from gpustack.client import ClientSet
+ from gpustack.schemas.models import SourceEnum
+@@ -508,6 +508,7 @@ class ModelFileDownloadTask:
+             cache_dir=self._config.cache_dir,
+             ollama_library_base_url=self._config.ollama_library_base_url,
+             huggingface_token=self._config.huggingface_token,
++            cfg=self._config,
+         )
+         self._download_completed = True
+         self._update_model_file(
+@@ -709,6 +710,7 @@ class ModelFileDownloadTask:
+             huggingface_token=self._config.huggingface_token,
+             cache_dir=self._config.cache_dir,
+             ollama_library_base_url=self._config.ollama_library_base_url,
++            cfg=self._config,
+         )
+ 
+         (size, file_paths) = hub.match_file_and_calculate_size(
+diff --git a/gpustack/worker/serve_manager.py b/gpustack/worker/serve_manager.py
+index d6fcbc3f..e5c08cee 100644
+--- a/gpustack/worker/serve_manager.py
++++ b/gpustack/worker/serve_manager.py
+@@ -10,7 +10,7 @@ import logging
+ 
+ from gpustack.api.exceptions import NotFoundException
+ from gpustack.config.config import Config
+-from gpustack.logging import (
++from gpustack.logginglocal import (
+     RedirectStdoutStderr,
+ )
+ from gpustack.utils import network, platform
+diff --git a/gpustack/worker/worker.py b/gpustack/worker/worker.py
+index 3ca4e3d6..01072433 100755
+--- a/gpustack/worker/worker.py
++++ b/gpustack/worker/worker.py
+@@ -23,7 +23,7 @@ from gpustack.ray.manager import RayManager
+ from gpustack.utils import platform
+ from gpustack.utils.network import get_first_non_loopback_ip
+ from gpustack.client import ClientSet
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.utils.process import add_signal_handlers_in_loop
+ from gpustack.utils.system_check import check_glibc_version
+ from gpustack.utils.task import run_periodically_in_thread
+diff --git a/pyproject.toml b/pyproject.toml
+index ba66fcba..eb493144 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -59,6 +59,7 @@ python-json-logger = "^3.3.0"
+ hf-transfer = "^0.1.9"
+ asyncmy = "^0.2.10"
+ pymysql = "^1.1.1"
++minio = "^7.2.0"
+ 
+ pyarrow = "*"
+ pandas = "*"
+diff --git a/tests/policies/candidate_selectors/gguf/test_slow_gguf_resource_fit_selector.py b/tests/policies/candidate_selectors/gguf/test_slow_gguf_resource_fit_selector.py
+index e8cbd539..2666ccbe 100644
+--- a/tests/policies/candidate_selectors/gguf/test_slow_gguf_resource_fit_selector.py
++++ b/tests/policies/candidate_selectors/gguf/test_slow_gguf_resource_fit_selector.py
+@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
+ import uuid
+ import pytest
+ from gpustack.config.config import Config, set_global_config
+-from gpustack.logging import setup_logging
++from gpustack.logginglocal import setup_logging
+ from gpustack.policies.scorers.placement_scorer import PlacementScorer
+ from gpustack.policies.candidate_selectors import GGUFResourceFitSelector
+ 
+diff --git a/gpustack/worker/downloader_s3.py b/gpustack/worker/downloader_s3.py
+new file mode 100644
+index 00000000..a1fe8133
+--- /dev/null
++++ b/gpustack/worker/downloader_s3.py
+@@ -0,0 +1,198 @@
++import os
++import logging
++from pathlib import Path
++from typing import List, Optional
++from minio import Minio
++from minio.error import S3Error
++from filelock import FileLock
++from tqdm import tqdm
++
++from gpustack.schemas.models import (
++    ModelInstance,
++)
++from gpustack.utils.hub import (
++    FileEntry,
++)
++
++logger = logging.getLogger(__name__)
++
++
++class S3Downloader:
++    _default_cache_dir = "/var/lib/gpustack/cache/beagle"
++
++    def __init__(
++        self,
++        host: str,
++        access_key: str,
++        secret_key: str,
++        ssl: bool = False,
++        use_virtual_hosted_style: bool = True,
++        cache_dir: Optional[str] = None,
++        region: str = "",
++    ):
++        self._s3_client = Minio(
++            host,
++            access_key=access_key,
++            secret_key=secret_key,
++            secure=ssl,
++            region=region,
++        )
++        self._cache_dir = cache_dir or self._default_cache_dir
++        self.use_virtual_hosted_style = use_virtual_hosted_style
++
++    def download(
++        self,
++        s3_path: str,
++        cache_dir: Optional[str] = None,
++    ) -> str:
++        """从S3下载模型文件
++
++        Args:
++            s3_path: S3路径,格式为s3://beagle_wind/bucket/path/to/model
++            cache_dir: 本地缓存目录
++
++        Returns:
++            下载后的本地文件路径
++        """
++        if not s3_path.startswith("s3://beagle_wind/"):
++            return s3_path
++
++        # 解析S3路径
++        # s3://beagle_wind/bd-wind/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/v1/qwen2.5-3b-instruct-q8_0.gguf
++        base_path = s3_path.removeprefix("s3://beagle_wind/")
++        bucket_name = base_path.split("/")[0]
++        if self.use_virtual_hosted_style:
++            base_path = base_path.removeprefix(bucket_name)
++        object_prefix = "/".join(base_path.split("/")[1:-1])  # 去掉最后的文件名部分
++
++        # 准备本地缓存路径
++        local_cache = cache_dir or self._cache_dir
++        local_path = os.path.join(
++            local_cache, s3_path.removeprefix("s3://beagle_wind/"+bucket_name+"/datamodel/")
++        )
++        local_dir = os.path.dirname(local_path)  # 获取local_path的父目录
++        if not os.path.exists(local_dir):  # 创建父目录
++            os.makedirs(local_dir)
++
++        # 使用文件锁避免并发下载
++        lock_filename = local_dir + ".lock"
++        logger.debug("获取文件锁")
++
++        with FileLock(lock_filename):
++            try:
++                # 列出所有对象
++                objects = self._s3_client.list_objects(
++                    bucket_name, prefix=object_prefix, recursive=True
++                )
++
++                # 下载每个对象
++                for obj in objects:
++                    self._download_object(
++                        bucket_name=bucket_name,
++                        object_name=obj.object_name,
++                        local_path=os.path.join(
++                            local_cache, obj.object_name.removeprefix("datamodel/")
++                        ),
++                        total_size=obj.size,
++                    )
++
++                logger.debug(f"已下载 {bucket_name}/{object_prefix}")
++                return local_path
++
++            except S3Error as e:
++                logger.error(f"S3下载错误: {e}")
++                raise
++
++    def _download_object(
++        self, bucket_name: str, object_name: str, local_path: str, total_size: int
++    ):
++        """分片下载单个S3对象"""
++        downloaded_size = 0
++        if os.path.exists(local_path):
++            downloaded_size = os.path.getsize(local_path)
++
++        if downloaded_size >= total_size:
++            logger.debug(f"文件 {object_name} 已存在,跳过下载")
++            return
++
++        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
++
++        # 如果是新下载，先清空文件
++        if downloaded_size == 0:
++            open(local_path, 'wb').close()
++
++        part_size = 10 * 1024 * 1024  # 10MB
++        start_byte = downloaded_size
++
++        with tqdm(
++            total=total_size,
++            initial=downloaded_size,
++            desc=object_name,
++            unit='B',
++            unit_scale=True,
++        ) as pbar:
++            while start_byte < total_size:
++                response = self._s3_client.get_object(
++                    bucket_name,
++                    object_name,
++                    offset=start_byte,
++                    length=min(part_size, total_size - start_byte),
++                )
++
++                data = response.read()
++
++                # 始终使用追加模式
++                with open(local_path, "ab") as f:
++                    f.write(data)
++
++                chunk_size = len(data)
++                start_byte += chunk_size
++                pbar.update(chunk_size)
++
++    def get_model_file_size(self, model_instance: ModelInstance) -> List[FileEntry]:
++        """获取S3上模型文件的总大小
++
++        Args:
++            model_instance: 模型实例对象
++
++        Returns:
++            文件总大小(字节)
++
++        Raises:
++            S3Error: 当S3操作失败时抛出
++        """
++        if not model_instance.local_path.startswith("s3://beagle_wind/"):
++            return None
++
++        try:
++            # 解析S3路径
++            base_path = model_instance.local_path.removeprefix("s3://beagle_wind/")
++            bucket_name = base_path.split("/")[0]
++            if self.use_virtual_hosted_style:
++                base_path = base_path.removeprefix(bucket_name)
++            object_prefix = "/".join(base_path.split("/")[1:-1])  # 去掉最后的文件名部分
++
++            # 列出所有对象
++            objects = self._s3_client.list_objects(
++                bucket_name, prefix=object_prefix, recursive=True
++            )
++            # 准备本地缓存路径
++            local_cache = self._cache_dir
++            file_list = [
++                FileEntry(
++                    os.path.join(local_cache, f.object_name.removeprefix("datamodel/")),
++                    f.size,
++                )
++                for f in objects
++            ]
++            # 计算所有对象的总大小
++            total_size = sum(obj.size for obj in objects)
++
++            logger.debug(
++                f"S3路径 {model_instance.local_path} 的总大小: {total_size} 字节"
++            )
++            return file_list
++
++        except S3Error as e:
++            logger.error(f"获取S3文件大小失败: {e}")
++            raise
