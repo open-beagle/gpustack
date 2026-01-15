@@ -262,8 +262,8 @@
       replicas: 1
       backend: vllm
       backend_parameters: &qwen3_thinking_vllm_parameters
-        - --enable-reasoning
         - --reasoning-parser=deepseek_r1
+        - --max-model-len=32768
     - quantizations: ["FP8"]
       source: huggingface
       sizes: [0.6, 1.7, 4, 8, 14, 32]
@@ -299,6 +299,239 @@
       replicas: 1
       backend: vllm
       backend_parameters: *qwen3_thinking_vllm_parameters
+- name: Qwen3 Instruct 2507
+  description: Qwen3-Instruct-2507 is an updated version of the Qwen3 non-thinking mode, featuring significant improvements in general capabilities, substantial gains in long-tail knowledge coverage across multiple languages, markedly better alignment with user preferences in subjective and open-ended tasks, and enhanced long-context understanding.
+  home: https://qwenlm.github.io
+  icon: /static/catalog_icons/qwen.png
+  categories:
+    - llm
+  capabilities:
+    - context/1M
+    - tools
+  sizes: [4, 30, 235]
+  licenses:
+    - apache-2.0
+  release_date: "2025-07-21"
+  templates:
+    - quantizations:
+        - Q2_K_L
+        - Q3_K_M
+        - Q4_K_M
+        - Q5_K_M
+        - Q6_K
+        - Q8_0
+        - F16
+      sizes: [4]
+      source: huggingface
+      huggingface_repo_id: unsloth/Qwen3-4B-Instruct-2507-GGUF
+      huggingface_filename: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      cpu_offloading: true
+      distributed_inference_across_workers: true
+      backend_parameters: &qwen3_instruct_gguf_parameters
+        - --temp=0.7
+        - --top-k=20
+        - --top-p=0.8
+        - --min-p=0
+    - quantizations:
+        - Q2_K_L
+        - Q3_K_M
+        - Q4_K_M
+        - Q5_K_M
+        - Q6_K
+        - Q8_0
+        - BF16
+      sizes: [30]
+      source: huggingface
+      huggingface_repo_id: unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF
+      huggingface_filename: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      cpu_offloading: true
+      distributed_inference_across_workers: true
+      backend_parameters: *qwen3_instruct_gguf_parameters
+    - quantizations:
+        - Q2_K_L
+        - Q3_K_M
+        - Q4_K_M
+        - Q5_K_M
+        - Q6_K
+        - Q8_0
+        - BF16
+      sizes: [235]
+      source: huggingface
+      huggingface_repo_id: unsloth/Qwen3-235B-A22B-Instruct-2507-GGUF
+      huggingface_filename: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      cpu_offloading: true
+      distributed_inference_across_workers: true
+      backend_parameters: *qwen3_instruct_gguf_parameters
+    - quantizations: ["BF16"]
+      source: huggingface
+      sizes: [4]
+      huggingface_repo_id: Qwen/Qwen3-4B-Instruct-2507
+      replicas: 1
+      backend: vllm
+      backend_parameters: &qwen3_instruct_vllm_parameters
+        - --max-model-len=32768
+    - quantizations: ["BF16"]
+      source: huggingface
+      sizes: [30]
+      huggingface_repo_id: Qwen/Qwen3-30B-A3B-Instruct-2507
+      replicas: 1
+      backend: vllm
+      backend_parameters: *qwen3_instruct_vllm_parameters
+    - quantizations: ["BF16"]
+      source: huggingface
+      sizes: [235]
+      huggingface_repo_id: Qwen/Qwen3-235B-A22B-Instruct-2507
+      replicas: 1
+      backend: vllm
+      backend_parameters: *qwen3_instruct_vllm_parameters
+- name: Qwen3 Thinking 2507
+  description: Qwen3-Thinking-2507 is an updated version of the Qwen3 thinking mode, featuring significantly improved performance, markedly better general capabilities, and enhanced long-context understanding.
+  home: https://qwenlm.github.io
+  icon: /static/catalog_icons/qwen.png
+  categories:
+    - llm
+  capabilities:
+    - context/1M
+    - tools
+  sizes: [4, 30, 235]
+  licenses:
+    - apache-2.0
+  release_date: "2025-07-21"
+  templates:
+    - quantizations:
+        - Q2_K_L
+        - Q3_K_M
+        - Q4_K_M
+        - Q5_K_M
+        - Q6_K
+        - Q8_0
+        - F16
+      sizes: [4]
+      source: huggingface
+      huggingface_repo_id: unsloth/Qwen3-4B-Thinking-2507-GGUF
+      huggingface_filename: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      cpu_offloading: true
+      distributed_inference_across_workers: true
+      backend_parameters: *qwen3_thinking_gguf_parameters
+    - quantizations:
+        - Q2_K_L
+        - Q3_K_M
+        - Q4_K_M
+        - Q5_K_M
+        - Q6_K
+        - Q8_0
+        - BF16
+      sizes: [30]
+      source: huggingface
+      huggingface_repo_id: unsloth/Qwen3-30B-A3B-Thinking-2507-GGUF
+      huggingface_filename: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      cpu_offloading: true
+      distributed_inference_across_workers: true
+      backend_parameters: *qwen3_thinking_gguf_parameters
+    - quantizations:
+        - Q2_K_L
+        - Q3_K_M
+        - Q4_K_M
+        - Q5_K_M
+        - Q6_K
+        - Q8_0
+        - BF16
+      sizes: [235]
+      source: huggingface
+      huggingface_repo_id: unsloth/Qwen3-235B-A22B-Thinking-2507-GGUF
+      huggingface_filename: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      cpu_offloading: true
+      distributed_inference_across_workers: true
+      backend_parameters: *qwen3_thinking_gguf_parameters
+    - quantizations: ["BF16"]
+      source: huggingface
+      sizes: [4]
+      huggingface_repo_id: Qwen/Qwen3-4B-Thinking-2507
+      replicas: 1
+      backend: vllm
+      backend_parameters: *qwen3_thinking_vllm_parameters
+    - quantizations: ["BF16"]
+      source: huggingface
+      sizes: [30]
+      huggingface_repo_id: Qwen/Qwen3-30B-A3B-Thinking-2507
+      replicas: 1
+      backend: vllm
+      backend_parameters: *qwen3_thinking_vllm_parameters
+    - quantizations: ["BF16"]
+      source: huggingface
+      sizes: [235]
+      huggingface_repo_id: Qwen/Qwen3-235B-A22B-Thinking-2507
+      replicas: 1
+      backend: vllm
+      backend_parameters: *qwen3_thinking_vllm_parameters
+- name: Qwen3 Coder
+  description: Qwen3-Coder is a family of advanced code models available in multiple sizes, designed for a wide range of programming and AI-assisted development tasks. They deliver strong performance in agentic coding, browser-based automation, and foundational coding challenges. With native support for long contexts up to 256K tokens—extendable to 1M using Yarn—Qwen3-Coder excels at understanding and working with large codebases.
+  home: https://qwenlm.github.io
+  icon: /static/catalog_icons/qwen.png
+  categories:
+    - llm
+  capabilities:
+    - context/1M
+    - tools
+  sizes: [30, 480]
+  licenses:
+    - apache-2.0
+  release_date: "2025-07-22"
+  templates:
+    - quantizations: *default_bf16_gguf_quantizations
+      sizes: [480]
+      source: huggingface
+      huggingface_repo_id: unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF
+      huggingface_filename: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      cpu_offloading: true
+      distributed_inference_across_workers: true
+      backend_parameters: &qwen3_coder_gguf_parameters
+        - --temp=0.7
+        - --top-k=20
+        - --top-p=0.8
+        - --repeat-penalty=1.05
+        - --ctx-size=65536
+    - quantizations: *default_bf16_gguf_quantizations
+      sizes: [30]
+      source: huggingface
+      huggingface_repo_id: unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
+      huggingface_filename: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      cpu_offloading: true
+      distributed_inference_across_workers: true
+      backend_parameters: *qwen3_coder_gguf_parameters
+    - quantizations: ["BF16"]
+      source: huggingface
+      sizes: [480]
+      huggingface_repo_id: Qwen/Qwen3-Coder-480B-A35B-Instruct
+      replicas: 1
+      backend: vllm
+      backend_parameters: &qwen3_coder_vllm_parameters
+        - --max-model-len=65536
+        - --enable-auto-tool-choice
+        - --tool-call-parser=qwen3_coder
+    - quantizations: ["BF16"]
+      source: huggingface
+      sizes: [30]
+      huggingface_repo_id: Qwen/Qwen3-Coder-30B-A3B-Instruct
+      replicas: 1
+      backend: vllm
+      backend_parameters: *qwen3_coder_vllm_parameters
 - name: Qwen2.5
   description: Qwen2.5 is a family of large language models in Qwen series. Qwen2.5-instruct includes a number of instruction-tuned language models ranging from 0.5 to 72 billion parameters.
   home: https://qwenlm.github.io
@@ -472,44 +705,6 @@
       huggingface_repo_id: Qwen/QwQ-32B
       replicas: 1
       backend: vllm
-- name: Mistral
-  description: The 7B model released by Mistral AI, updated to version 0.3.
-  home: https://mistral.ai
-  icon: /static/catalog_icons/mistral.png
-  categories:
-    - llm
-  capabilities:
-    - context/32K
-    - tools
-  sizes:
-    - 7
-  licenses:
-    - apache-2.0
-  release_date: "2024-05-22"
-  templates:
-    - quantizations:
-        - Q2_K
-        - Q3_K_L
-        - Q4_K_M
-        - Q5_K_M
-        - Q6_K
-        - Q8_0
-        - f32
-      source: huggingface
-      huggingface_repo_id: bartowski/Mistral-7B-Instruct-v0.3-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
-      cpu_offloading: true
-      distributed_inference_across_workers: true
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: unsloth/mistral-7b-instruct-v0.3
-      replicas: 1
-      backend: vllm
-      backend_parameters:
-        - --enable-auto-tool-choice
-        - --tool-call-parser=mistral
 - name: Mistral Small 3.1
   description: Mistral Small 3.1 (2503) is built upon Mistral Small 3 (2501). It adds state-of-the-art vision understanding and enhances long context capabilities up to 128k tokens without compromising text performance. With 24 billion parameters, this model achieves top-tier capabilities in both text and vision tasks.
   home: https://mistral.ai
@@ -647,40 +842,6 @@
       backend_parameters:
         - --enable-auto-tool-choice
         - --tool-call-parser=mistral
-- name: Codestral
-  description: Codestral is Mistral AI's first-ever code model designed for code generation tasks. Codestral is trained on a diverse dataset of 80+ programming languages, including the most popular ones, such as Python, Java, C, C++, JavaScript, and Bash.
-  home: https://mistral.ai
-  icon: /static/catalog_icons/mistral.png
-  categories:
-    - llm
-  capabilities:
-    - context/32K
-  sizes:
-    - 22
-  licenses:
-    - mnpl
-  release_date: "2024-05-29"
-  templates:
-    - quantizations:
-        - Q2_K
-        - Q3_K_L
-        - Q4_K_M
-        - Q5_K_M
-        - Q6_K
-        - Q8_0
-        - f32
-      source: huggingface
-      huggingface_repo_id: bartowski/Codestral-22B-v0.1-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
-      cpu_offloading: true
-      distributed_inference_across_workers: true
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: mistralai/Codestral-22B-v0.1
-      replicas: 1
-      backend: vllm
 - name: Gemma3
   description: Gemma 3 models are multimodal, handling text and image input and generating text output, with open weights for both pre-trained variants and instruction-tuned variants. Gemma 3 has a large, 128K context window, multilingual support in over 140 languages, and is available in more sizes than previous versions. Gemma 3 models are well-suited for a variety of text generation and image understanding tasks, including question answering, summarization, and reasoning.
   home: https://ai.google.dev/gemma
@@ -712,38 +873,6 @@
     - quantizations: ["BF16"]
       source: huggingface
       huggingface_repo_id: unsloth/gemma-3-{size}b-it
-      replicas: 1
-      backend: vllm
-- name: Gemma2
-  description: Gemma is a family of lightweight, state-of-the-art open models from Google, built from the same research and technology used to create the Gemini models. They are text-to-text, decoder-only large language models, available in English, with open weights for both pre-trained variants and instruction-tuned variants. Gemma models are well-suited for a variety of text generation tasks, including question answering, summarization, and reasoning. Their relatively small size makes it possible to deploy them in environments with limited resources such as a laptop, desktop or your own cloud infrastructure, democratizing access to state of the art AI models and helping foster innovation for everyone.
-  home: https://ai.google.dev/gemma
-  icon: /static/catalog_icons/google.png
-  categories:
-    - llm
-  capabilities:
-    - context/128K
-  sizes: [2, 9, 27]
-  licenses:
-    - gemma
-  release_date: "2024-07-16"
-  templates:
-    - quantizations:
-        - Q3_K_L
-        - Q4_K_M
-        - Q5_K_M
-        - Q6_K_L
-        - Q8_0
-        - f32
-      source: huggingface
-      huggingface_repo_id: bartowski/gemma-2-{size}b-it-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
-      cpu_offloading: true
-      distributed_inference_across_workers: true
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: unsloth/gemma-2-{size}b-it
       replicas: 1
       backend: vllm
 - name: Phi4 Mini
@@ -780,40 +909,6 @@
       huggingface_repo_id: microsoft/Phi-4-mini-instruct
       replicas: 1
       backend: vllm
-- name: Phi3.5 Mini
-  description: Phi-3.5-mini is a lightweight, state-of-the-art open model built upon datasets used for Phi-3 - synthetic data and filtered publicly available websites - with a focus on very high-quality, reasoning dense data. The model belongs to the Phi-3 model family and supports 128K token context length. The model underwent a rigorous enhancement process, incorporating both supervised fine-tuning, proximal policy optimization, and direct preference optimization to ensure precise instruction adherence and robust safety measures.
-  home: https://azure.microsoft.com/en-us/products/phi
-  icon: /static/catalog_icons/microsoft.png
-  categories:
-    - llm
-  capabilities:
-    - context/128K
-  sizes:
-    - 3.8
-  licenses:
-    - mit
-  release_date: "2024-08-16"
-  templates:
-    - quantizations:
-        - Q2_K_L
-        - Q3_K_L
-        - Q4_K_M
-        - Q5_K_M
-        - Q6_K_L
-        - Q8_0
-        - f32
-      source: huggingface
-      huggingface_repo_id: bartowski/Phi-3.5-mini-instruct-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
-      cpu_offloading: true
-      distributed_inference_across_workers: true
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: microsoft/Phi-3.5-mini-instruct
-      replicas: 1
-      backend: vllm
 - name: Phi4
   description: Phi-4 is a state-of-the-art open model built upon a blend of synthetic datasets, data from filtered public domain websites, and acquired academic books and Q&A datasets. The goal of this approach was to ensure that small capable models were trained with data focused on high quality and advanced reasoning.
   home: https://azure.microsoft.com/en-us/products/phi
@@ -841,43 +936,6 @@
       huggingface_repo_id: microsoft/Phi-4
       replicas: 1
       backend: vllm
-- name: Deepseek V2.5
-  description: DeepSeek-V2.5 is an upgraded version that combines DeepSeek-V2-Chat and DeepSeek-Coder-V2-Instruct. The new model integrates the general and coding abilities of the two previous versions.
-  home: https://www.deepseek.com
-  icon: /static/catalog_icons/deepseek.png
-  categories:
-    - llm
-  capabilities:
-    - context/128K
-  sizes:
-    - 236
-  licenses:
-    - deepseek
-  release_date: "2024-12-10"
-  templates:
-    - quantizations:
-        - Q2_K_L
-        - Q3_K_L
-        - Q4_K_M
-        - Q5_K_M
-        - Q6_K
-        - Q8_0
-      source: huggingface
-      huggingface_repo_id: bartowski/DeepSeek-V2.5-1210-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
-      backend_parameters:
-        - --no-context-shift
-      cpu_offloading: true
-      distributed_inference_across_workers: true
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: deepseek-ai/DeepSeek-V2.5-1210
-      replicas: 1
-      backend: vllm
-      backend_parameters:
-        - --trust-remote-code
 - name: Deepseek V3
   description: DeepSeek-V3 is a strong Mixture-of-Experts (MoE) language model with 671B total parameters with 37B activated for each token. To achieve efficient inference and cost-effective training, DeepSeek-V3 adopts Multi-head Latent Attention (MLA) and DeepSeekMoE architectures, which were thoroughly validated in DeepSeek-V2. Furthermore, DeepSeek-V3 pioneers an auxiliary-loss-free strategy for load balancing and sets a multi-token prediction training objective for stronger performance.
   home: https://www.deepseek.com
@@ -1187,39 +1245,6 @@
       backend: vllm
       backend_parameters:
         - --max-model-len=32768
-- name: Yi1.5
-  description: Yi 1.5 is a high-performing, bilingual language model.
-  home: https://www.01.ai
-  icon: /static/catalog_icons/01ai.png
-  categories:
-    - llm
-  capabilities:
-    - context/32K
-  sizes: [6, 9, 34]
-  licenses:
-    - apache-2.0
-  release_date: "2024-05-12"
-  templates:
-    - quantizations:
-        - Q2_K
-        - Q3_K_L
-        - Q4_K_M
-        - Q5_K_M
-        - Q6_K
-        - Q8_0
-        - f32
-      source: huggingface
-      huggingface_repo_id: bartowski/Yi-1.5-{size}B-Chat-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
-      cpu_offloading: true
-      distributed_inference_across_workers: true
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: 01-ai/Yi-1.5-{size}B-Chat
-      replicas: 1
-      backend: vllm
 - name: Command R
   description: C4AI Command R (08-2024) is a research release of a 32 billion parameter highly performant generative model. Command R (08-2024) is a large language model with open weights optimized for a variety of use cases including reasoning, summarization, and question answering. Command R (08-2024) has the capability for multilingual generation, trained on 23 languages and evaluated in 10 languages and highly performant RAG capabilities.
   home: https://cohere.com
@@ -1380,8 +1405,8 @@
         - --chat-template={data_dir}/chat_templates/tool_chat_template_llama3.1_json.jinja
 - name: GLM4 0414
   description: GLM-4-0414 is a family of models with performance comparable to OpenAI's GPT series and DeepSeek's V3/R1 series. It delivers strong results in engineering code generation, artifact creation, function calling, search-based question answering, and report generation.
-  home: https://github.com/THUDM/GLM-4
-  icon: /static/catalog_icons/ZhipuAI.png
+  home: https://z.ai
+  icon: /static/catalog_icons/zai.png
   categories:
     - llm
   capabilities:
@@ -1410,13 +1435,13 @@
       distributed_inference_across_workers: true
     - quantizations: ["BF16"]
       source: huggingface
-      huggingface_repo_id: THUDM/GLM-4-{size}B-0414
+      huggingface_repo_id: zai-org/GLM-4-{size}B-0414
       replicas: 1
       backend: vllm
 - name: GLM4 Z1 0414
   description: GLM-4-Z1 models are reasoning models with deep thinking capabilities in the GLM-4-0414 series. They demonstrate excellent performance in mathematical reasoning and general tasks.
-  home: https://github.com/THUDM/GLM-4
-  icon: /static/catalog_icons/ZhipuAI.png
+  home: https://z.ai
+  icon: /static/catalog_icons/zai.png
   categories:
     - llm
   capabilities:
@@ -1450,57 +1475,15 @@
         - --top-k=40
     - quantizations: ["BF16"]
       source: huggingface
-      huggingface_repo_id: THUDM/GLM-Z1-{size}B-0414
+      huggingface_repo_id: zai-org/GLM-Z1-{size}B-0414
       replicas: 1
       backend: vllm
       backend_parameters:
         - --max-model-len=32768
-- name: GLM4
-  description: GLM-4-9B is the open-source version of the latest generation of pre-trained models in the GLM-4 series launched by Zhipu AI. In the evaluation of data sets in semantics, mathematics, reasoning, code, and knowledge, GLM-4-9B and its human preference-aligned version GLM-4-9B-Chat have shown superior performance beyond Llama-3-8B.
-  home: https://github.com/THUDM/GLM-4
-  icon: /static/catalog_icons/ZhipuAI.png
-  categories:
-    - llm
-  capabilities:
-    - context/128K
-  sizes:
-    - 9
-  licenses:
-    - glm-4
-  release_date: "2024-08-26"
-  templates:
-    - quantizations:
-        - Q2_K_L
-        - Q3_K_L
-        - Q4_K_M
-        - Q5_K_M
-        - Q6_K_L
-        - Q8_0
-      source: huggingface
-      huggingface_repo_id: bartowski/glm-4-9b-chat-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
-      cpu_offloading: true
-      distributed_inference_across_workers: true
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: THUDM/glm-4-9b-chat
-      replicas: 1
-      backend: vllm
-      backend_parameters:
-        - --trust-remote-code
-    - quantizations: ["GPTQ-Int4", "GPTQ-Int8"]
-      source: huggingface
-      huggingface_repo_id: model-scope/glm-4-9b-chat-{quantization}
-      replicas: 1
-      backend: vllm
-      backend_parameters:
-        - --trust-remote-code
 - name: GLM 4.1V Thinking
   description: GLM-4.1V-9B-Thinking is a VLM model based on GLM-4-9B-0414. By introducing a "thinking paradigm" and leveraging reinforcement learning, the model significantly enhances its capabilities. It achieves state-of-the-art performance among 10B-parameter VLMs, matching or even surpassing the 72B-parameter Qwen-2.5-VL-72B on 18 benchmark tasks.
-  home: https://github.com/THUDM/GLM-4.1V-Thinking
-  icon: /static/catalog_icons/ZhipuAI.png
+  home: https://z.ai
+  icon: /static/catalog_icons/zai.png
   categories:
     - llm
   capabilities:
@@ -1514,9 +1497,56 @@
   templates:
     - quantizations: ["BF16"]
       source: huggingface
-      huggingface_repo_id: THUDM/GLM-4.1V-9B-Thinking
+      huggingface_repo_id: zai-org/GLM-4.1V-9B-Thinking
       replicas: 1
       backend: vllm
+- name: GLM4.5
+  description: The GLM-4.5 series models are foundation models designed for intelligent agents. GLM-4.5 models unify reasoning, coding, and intelligent agent capabilities to meet the complex demands of intelligent agent applications.
+  home: https://z.ai
+  icon: /static/catalog_icons/zai.png
+  categories:
+    - llm
+  capabilities:
+    - context/128K
+    - tools
+  sizes:
+    - 106
+    - 355
+  licenses:
+    - mit
+  release_date: "2025-07-28"
+  templates:
+    - quantizations: ["BF16"]
+      source: huggingface
+      sizes: [106]
+      huggingface_repo_id: zai-org/GLM-4.5-Air
+      replicas: 1
+      backend: vllm
+      backend_parameters: &glm45_vllm_parameters
+        - --reasoning-parser=glm45
+        - --tool-call-parser=glm45
+        - --enable-auto-tool-choice
+    - quantizations: ["FP8"]
+      source: huggingface
+      sizes: [106]
+      huggingface_repo_id: zai-org/GLM-4.5-Air-FP8
+      replicas: 1
+      backend: vllm
+      backend_parameters: *glm45_vllm_parameters
+    - quantizations: ["BF16"]
+      source: huggingface
+      sizes: [355]
+      huggingface_repo_id: zai-org/GLM-4.5
+      replicas: 1
+      backend: vllm
+      backend_parameters: *glm45_vllm_parameters
+    - quantizations: ["FP8"]
+      source: huggingface
+      sizes: [355]
+      huggingface_repo_id: zai-org/GLM-4.5-FP8
+      replicas: 1
+      backend: vllm
+      backend_parameters: *glm45_vllm_parameters
 - name: Hunyuan A13B Instruct
   description: Hunyuan-A13B is a large language model based on the Mixture-of-Experts (MoE) architecture, developed by Tencent. Designed for efficiency and scalability, Hunyuan-A13B delivers cutting-edge performance with minimal computational overhead, making it an ideal choice for advanced reasoning and general-purpose applications, especially in resource-constrained environments.
   home: https://huggingface.co/tencent/Hunyuan-A13B-Instruct
@@ -1554,6 +1584,43 @@
       backend_parameters:
         - --trust-remote-code
         - --max-model-len=32768
+- name: GPT OSS
+  description: The gpt-oss series is OpenAI's family of open-weight models, designed for powerful reasoning, agentic tasks, and versatile developer use cases.
+  home: https://openai.com
+  icon: /static/catalog_icons/openai.png
+  categories:
+    - llm
+  capabilities:
+    - context/128K
+  sizes:
+    - 20
+    - 120
+  licenses:
+    - apache-2.0
+  release_date: "2025-08-05"
+  templates:
+    - quantizations:
+        - Q2_K_L
+        - Q3_K_M
+        - Q4_K_M
+        - Q5_K_M
+        - Q6_K
+        - Q8_0
+        - F16
+      source: huggingface
+      huggingface_repo_id: unsloth/gpt-oss-{size}b-GGUF
+      huggingface_filename: "*-{quantization}*.gguf"
+      replicas: 1
+      backend: llama-box
+      backend_parameters:
+        - --ctx-size=32768
+      cpu_offloading: true
+      distributed_inference_across_workers: true
+    - quantizations: ["MXFP4"]
+      source: huggingface
+      huggingface_repo_id: openai/gpt-oss-{size}b
+      replicas: 1
+      backend: vllm
 # Vision language models
 - name: Qwen2.5 VL
   description: Qwen2.5-VL is a collection of vision-language models of Qwen, excelling in visual understanding, document analysis, and long-video comprehension. It accurately localizes objects, extracts structured data from images, and functions as an interactive visual agent capable of reasoning and tool use. It outperforms previous models and rivals GPT-4o in tasks like document and diagram understanding.
@@ -1591,59 +1658,6 @@
     - quantizations: ["AWQ"]
       source: huggingface
       huggingface_repo_id: Qwen/Qwen2.5-VL-{size}B-Instruct-{quantization}
-      replicas: 1
-      backend: vllm
-- name: Qwen2 VL
-  description: Qwen2-VL is a collection of vision language models based on Qwen2 in the Qwen model familities. Qwen2-VL achieves state-of-the-art performance on visual understanding benchmarks, including MathVista, DocVQA, RealWorldQA, MTVQA, etc.
-  home: https://qwenlm.github.io
-  icon: /static/catalog_icons/qwen.png
-  categories:
-    - llm
-  capabilities:
-    - context/32K
-    - vision
-  sizes: [2, 7, 72]
-  licenses:
-    - apache-2.0
-    - qwen
-  release_date: "2024-08-29"
-  templates:
-    - quantizations: *default_f16_quantizations
-      sizes: [2, 7]
-      source: huggingface
-      huggingface_repo_id: bartowski/Qwen2-VL-{size}B-Instruct-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
-      backend_parameters:
-        - --visual-max-image-size=1344
-      cpu_offloading: true
-      distributed_inference_across_workers: true
-    - quantizations:
-        - Q2_K_L
-        - Q3_K_L
-        - Q4_K_M
-        - Q5_K_M
-        - Q6_K_L
-        - Q8_0
-      sizes: [72]
-      source: huggingface
-      huggingface_repo_id: bartowski/Qwen2-VL-{size}B-Instruct-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
-      backend_parameters:
-        - --visual-max-image-size=1344
-      cpu_offloading: true
-      distributed_inference_across_workers: true
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: Qwen/Qwen2-VL-{size}B-Instruct
-      replicas: 1
-      backend: vllm
-    - quantizations: ["GPTQ-Int4", "GPTQ-Int8"]
-      source: huggingface
-      huggingface_repo_id: Qwen/Qwen2-VL-{size}B-Instruct-{quantization}
       replicas: 1
       backend: vllm
 - name: QvQ Preview
@@ -1767,28 +1781,6 @@
       backend: vllm
       backend_parameters:
         - --trust-remote-code
-- name: Phi3.5 Vision
-  description: Phi-3.5-vision is a lightweight, state-of-the-art open multimodal model built upon datasets which include - synthetic data and filtered publicly available websites - with a focus on very high-quality, reasoning dense data both on text and vision. The model belongs to the Phi-3 model family, and the multimodal version comes with 128K context length (in tokens) it can support. The model underwent a rigorous enhancement process, incorporating both supervised fine-tuning and direct preference optimization to ensure precise instruction adherence and robust safety measures.
-  home: https://azure.microsoft.com/en-us/products/phi
-  icon: /static/catalog_icons/microsoft.png
-  categories:
-    - llm
-  capabilities:
-    - context/128K
-    - vision
-  sizes:
-    - 4
-  licenses:
-    - mit
-  release_date: "2024-08-22"
-  templates:
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: microsoft/Phi-3.5-vision-instruct
-      replicas: 1
-      backend: vllm
-      backend_parameters:
-        - --trust-remote-code
 - name: InternVL3
   description: InternVL3 is an advanced multimodal large language model (MLLM) series that demonstrates superior overall performance. InternVL3 exhibits superior multimodal perception and reasoning capabilities, while further extending its multimodal capabilities to encompass tool usage, GUI agents, industrial image analysis, 3D vision perception, and more.
   home: https://github.com/opengvlab
@@ -1806,27 +1798,6 @@
     - quantizations: ["BF16"]
       source: huggingface
       huggingface_repo_id: OpenGVLab/InternVL3-{size}B
-      replicas: 1
-      backend: vllm
-      backend_parameters:
-        - --trust-remote-code
-- name: InternVL2.5 MPO
-  description: InternVL2.5-MPO is an advanced multimodal large language model (MLLM) series that demonstrates superior overall performance. This series builds upon InternVL2.5 and Mixed Preference Optimization.
-  home: https://github.com/opengvlab
-  icon: /static/catalog_icons/OpenGVLab.jpeg
-  categories:
-    - llm
-  capabilities:
-    - context/32K
-    - vision
-  sizes: [1, 2, 4, 8, 26, 38, 78]
-  licenses:
-    - mit
-  release_date: "2024-12-20"
-  templates:
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: OpenGVLab/InternVL2_5-{size}B-MPO
       replicas: 1
       backend: vllm
       backend_parameters:
@@ -2036,6 +2007,8 @@
         - embedding
       replicas: 1
       backend: vllm
+      backend_parameters:
+        - --task=embed
 # Reranker models
 - name: BGE Reranker V2 M3
   description: BGE-Reranker-V2-M3 is a reranker model from BAAI.
@@ -2357,38 +2330,6 @@
       huggingface_filename: "*-{quantization}*.gguf"
       replicas: 1
       backend: llama-box
-- name: Stable Diffusion V1.5 Inpainting
-  description: Stable Diffusion Inpainting is a latent text-to-image diffusion model capable of generating photo-realistic images given any text input, with the extra capability of inpainting the pictures by using a mask.
-  home: https://stability.ai
-  icon: /static/catalog_icons/stability.png
-  categories:
-    - image
-  licenses:
-    - creativeml-openrail-m
-  release_date: "2022-11-24"
-  templates:
-    - quantizations: *image_quantizations
-      source: huggingface
-      huggingface_repo_id: gpustack/stable-diffusion-v1-5-inpainting-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
-- name: Stable Diffusion V1.5
-  description: Stable Diffusion is a latent text-to-image diffusion model capable of generating photo-realistic images given any text input.
-  home: https://stability.ai
-  icon: /static/catalog_icons/stability.png
-  categories:
-    - image
-  licenses:
-    - creativeml-openrail-m
-  release_date: "2022-11-24"
-  templates:
-    - quantizations: *image_quantizations
-      source: huggingface
-      huggingface_repo_id: gpustack/stable-diffusion-v1-5-GGUF
-      huggingface_filename: "*-{quantization}*.gguf"
-      replicas: 1
-      backend: llama-box
 - name: FLUX.1 Dev
   description: FLUX.1 [dev] is a 12 billion parameter rectified flow transformer capable of generating images from text descriptions.
   home: https://blackforestlabs.ai
@@ -2687,7 +2628,7 @@
   templates:
     - quantizations: ["FP16"]
       source: huggingface
-      huggingface_repo_id: FunAudioLLM/CosyVoice-300M
+      huggingface_repo_id: gpustack/CosyVoice-300M
       replicas: 1
       backend: vox-box
 - name: CosyVoice 300M Instruct
@@ -2702,7 +2643,7 @@
   templates:
     - quantizations: ["FP16"]
       source: huggingface
-      huggingface_repo_id: FunAudioLLM/CosyVoice-300M-Instruct
+      huggingface_repo_id: gpustack/CosyVoice-300M-Instruct
       replicas: 1
       backend: vox-box
 - name: CosyVoice 300M SFT
@@ -2717,7 +2658,7 @@
   templates:
     - quantizations: ["FP16"]
       source: huggingface
-      huggingface_repo_id: FunAudioLLM/CosyVoice-300M-SFT
+      huggingface_repo_id: gpustack/CosyVoice-300M-SFT
       replicas: 1
       backend: vox-box
 - name: Dia

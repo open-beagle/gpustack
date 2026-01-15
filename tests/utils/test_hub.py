@@ -56,13 +56,6 @@ def test_get_hub_model_weight_size():
         ),
         (
             Model(
-                source=SourceEnum.HUGGING_FACE,
-                huggingface_repo_id="FunAudioLLM/CosyVoice2-0.5B",
-            ),
-            3_545_354_370,
-        ),
-        (
-            Model(
                 source=SourceEnum.MODEL_SCOPE,
                 model_scope_model_id="Qwen/Qwen2-0.5B-Instruct",
             ),
@@ -108,7 +101,9 @@ def test_get_hub_model_weight_size():
                 source=SourceEnum.MODEL_SCOPE,
                 model_scope_model_id="gpustack/CosyVoice2-0.5B",
             ),
-            3_545_354_370,
+            2_557_256_546,
+            # The CosyVoice2-0.5B repository contains a subdirectory named CosyVoice-BlankEN,
+            # which is optional and should be excluded from weight calculations.
         ),
     ]
 

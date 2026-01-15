@@ -76,7 +76,7 @@ To use AMD ROCm as an accelerator, ensure the following components are installed
 For Ascend CANN as an accelerator, ensure the following components are installed:
 
 - [Ascend NPU Driver & Firmware](https://www.hiascend.com/hardware/firmware-drivers/community)
-- [Ascend CANN Toolkit & Kernels](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.1.RC1.beta1) (Optional, required for non-Docker installations)
+- [Ascend CANN Toolkit & Kernels](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.2.RC1) (Optional, required for non-Docker installations)
 
 ### Hygon DTK
 
@@ -142,6 +142,7 @@ The following ports are used on GPUStack server when Ray is enabled for distribu
 | TCP 40097 | Default port for Ray Client Server               |
 | TCP 40098 | Default port for Ray node manager                |
 | TCP 40099 | Default port for Ray object manager              |
+| TCP 40100 | Default port for Ray runtime env agent           |
 | TCP 8265  | Default Port for Ray dashboard                   |
 | TCP 40101 | Default port for Ray dashboard agent gRPC listen |
 | TCP 52365 | Default port for Ray dashboard agent HTTP listen |

@@ -2,6 +2,8 @@ from typing import List
 
 import pytest
 from unittest.mock import patch, AsyncMock
+
+from gpustack.policies.utils import get_model_num_attention_heads
 from tests.utils.model import new_model, new_model_instance
 from gpustack.policies.candidate_selectors import VLLMResourceFitSelector
 from gpustack.policies.scorers.placement_scorer import PlacementScorer
@@ -555,23 +557,60 @@ async def test_auto_schedule_single_work_single_gpu(config):
         assert resource_fit_selector._messages == expect_msg
 
 
+@pytest.mark.parametrize(
+    "index, workers, model, expect_msg",
+    [
+        (
+            1,
+            [linux_nvidia_4_4080_16gx4()],
+            new_model(
+                1,
+                "test_name",
+                1,
+                huggingface_repo_id="Qwen/Qwen2.5-Omni-7B",
+                cpu_offloading=False,
+                backend_parameters=[],
+            ),
+            [
+                '- The model requires approximately 26.99 GiB of VRAM.\n'
+                '- With --gpu-memory-utilization=0.9, all GPUs combined need to provide at '
+                'least 29.99 GiB of total VRAM and each GPU needs 90% of allocatable VRAM.\n'
+                '- Total number of attention heads (25) must be divisible by gpu count (4).\n'
+                '- The largest available worker has 63.97 GiB allocatable VRAM, 4/4 of GPUs '
+                'meet the VRAM utilization ratio, providing 57.57 GiB of allocatable VRAM.'
+            ],
+        ),
+        (
+            2,
+            [linux_nvidia_4_4080_16gx4()],
+            new_model(
+                1,
+                "test_name",
+                1,
+                huggingface_repo_id="Qwen/Qwen3-32B",
+                cpu_offloading=False,
+                backend_parameters=[],
+            ),
+            [
+                """- The model requires approximately 75.23 GiB of VRAM.
+- With --gpu-memory-utilization=0.9, all GPUs combined need to provide at least 83.59 GiB of total VRAM and each GPU needs 90% of allocatable VRAM.
+- The largest available worker has 63.97 GiB allocatable VRAM, 4/4 of GPUs meet the VRAM utilization ratio, providing 57.57 GiB of allocatable VRAM."""
+            ],
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_auto_schedule_single_work_multi_gpu(config):
-    workers = [
-        linux_nvidia_4_4080_16gx4(),
-    ]
-
-    m = new_model(
-        1,
-        "test_name",
-        1,
-        huggingface_repo_id="Qwen/Qwen3-32B",
-        cpu_offloading=False,
-        backend_parameters=[],
-    )
+async def test_auto_schedule_single_work_multi_gpu(
+    config, index, workers, model, expect_msg
+):
+    m = model
 
     resource_fit_selector = VLLMResourceFitSelector(config, m)
     placement_scorer = PlacementScorer(m)
+
+    if index == 1:
+        # Simulate a scenario where the model's num_attention_heads cannot be evenly divided by the gpu_count through auto-scheduling.
+        resource_fit_selector._num_attention_heads = 25
 
     with (
         patch(
@@ -592,13 +631,7 @@ async def test_auto_schedule_single_work_multi_gpu(config):
         candidates = await resource_fit_selector.select_candidates(workers)
         _ = await placement_scorer.score(candidates)
 
-        expect_msg = [
-            """- The model requires approximately 75.23 GiB of VRAM.
-- With --gpu-memory-utilization=0.9, all GPUs combined need to provide at least 83.59 GiB of total VRAM and each GPU needs 90% of allocatable VRAM.
-- The largest available worker has 63.97 GiB allocatable VRAM, 4/4 of GPUs meet the VRAM utilization ratio, providing 57.57 GiB of allocatable VRAM."""
-        ]
-
-        assert expect_msg == resource_fit_selector._messages
+        assert resource_fit_selector._messages == expect_msg
 
 
 @pytest.mark.asyncio
@@ -755,3 +788,97 @@ async def test_manual_schedule_multi_work_multi_gpu(config):
         ]
 
         assert resource_fit_selector2._messages == expect_msg2
+
+
+@pytest.mark.parametrize(
+    "pretrained_config, expect_num",
+    [
+        (
+            {
+                "_name_or_path": "Qwen/Qwen2.5-VL-72B-Instruct",
+                "num_attention_heads": 64,
+            },
+            64,
+        ),
+        (
+            {
+                "model_type": "llama4",
+                "vision_config": {
+                    "model_type": "llama4_vision_model",
+                    "num_attention_heads": 4,
+                },
+                "text_config": {
+                    "model_type": "llama4_text",
+                    "num_attention_heads": 10,
+                },
+            },
+            10,
+        ),
+        (
+            {
+                "_name_or_path": "/mnt/petrelfs/wangweiyun/workspace_wwy/open_source/InternVL/internvl_chat/work_dirs/internvl_chat_v3_0/InternVL3_0-78B-MPO-try0-2/checkpoint-400",
+                "llm_config": {
+                    "num_attention_heads": 64,
+                },
+                "vision_config": {
+                    "num_attention_heads": 25,
+                },
+            },
+            64,
+        ),
+        (
+            # case: num_attention_heads define error in config
+            {
+                "num_attention_heads": 128,
+                "_name_or_path": "/mnt/petrelfs/wangweiyun/workspace_wwy/open_source/InternVL/internvl_chat/work_dirs/internvl_chat_v3_0/InternVL3_0-78B-MPO-try0-2/checkpoint-400",
+                "llm_config": {
+                    "num_attention_heads": 64,
+                },
+                "vision_config": {
+                    "num_attention_heads": 25,
+                },
+            },
+            64,
+        ),
+        (
+            {
+                # model_scope/LLM-Research/gemma-3-27b-it
+                "text_config": {
+                    "num_attention_heads": 32,
+                },
+                "vision_config": {
+                    "num_attention_heads": 16,
+                },
+            },
+            32,
+        ),
+        (
+            # Qwen/Qwen2.5-Omni-7B
+            {
+                "thinker_config": {
+                    "text_config": {
+                        "num_attention_heads": 28,
+                    }
+                },
+                "talker_config": {
+                    "num_attention_heads": 12,
+                },
+            },
+            28,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_num_attention_heads(config, pretrained_config, expect_num):
+    class DictToObj:
+        def __init__(self, dictionary):
+            for key, value in dictionary.items():
+                if isinstance(value, dict):
+                    setattr(self, key, DictToObj(value))
+                else:
+                    setattr(self, key, value)
+
+    pretrained_config_obj = DictToObj(pretrained_config)
+    num_attention_heads = get_model_num_attention_heads(pretrained_config_obj)
+
+    assert num_attention_heads == expect_num

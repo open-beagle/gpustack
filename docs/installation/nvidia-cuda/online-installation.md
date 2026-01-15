@@ -87,7 +87,7 @@ docker info | grep Runtimes | grep nvidia
 
     To prevent [this issue](https://github.com/NVIDIA/nvidia-container-toolkit/issues/48), disabling systemd cgroup management in Docker is required.
 
-Set the parameter "exec-opts": ["native.cgroupdriver=cgroupfs"] in the `/etc/docker/daemon.json` file and restart docker, such as:
+Set the parameter `"exec-opts": ["native.cgroupdriver=cgroupfs"]` in the `/etc/docker/daemon.json` file and restart docker, such as:
 
 ```bash
 vim /etc/docker/daemon.json
@@ -121,6 +121,18 @@ docker run -d --name gpustack \
     --ipc=host \
     -v gpustack-data:/var/lib/gpustack \
     gpustack/gpustack
+```
+
+If you’re using the **Blackwell** series or the **GeForce RTX 50** series, or if your NVIDIA driver supports **CUDA 12.8** (you can verify this with `nvidia-smi | grep "CUDA Version"`), we strongly recommend using the `latest-cuda12.8` image:
+
+```bash
+docker run -d --name gpustack \
+    --restart=unless-stopped \
+    --gpus all \
+    --network=host \
+    --ipc=host \
+    -v gpustack-data:/var/lib/gpustack \
+    gpustack/gpustack:latest-cuda12.8
 ```
 
 If you need to change the default server port 80, please use the `--port` parameter:
@@ -229,7 +241,7 @@ ENTRYPOINT [ "gpustack", "start" ]
 Run the following command to build the Docker image:
 
 ```bash
-docker build -t gpustack:cuda-12.8 --build-arg CUDA_VERSION=12.8.1 .
+docker build -t gpustack:cuda-12.8 --build-arg CUDA_VERSION=12.8.1 --file pack/Dockerfile .
 ```
 
 ## pip Installation

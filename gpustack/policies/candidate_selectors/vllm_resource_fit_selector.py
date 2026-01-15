@@ -1,11 +1,13 @@
 import asyncio
-import math
+import json
 from collections import defaultdict
 import logging
 import os
 import re
-from functools import reduce
 from typing import Dict, List, Optional
+
+from transformers import PretrainedConfig
+
 from gpustack.policies.base import (
     Allocatable,
     ModelInstanceScheduleCandidate,
@@ -16,6 +18,7 @@ from gpustack.policies.utils import (
     get_worker_allocatable_resource,
     get_worker_model_instances,
     ListMessageBuilder,
+    get_model_num_attention_heads,
 )
 from gpustack.schemas.models import (
     CategoryEnum,
@@ -96,41 +99,6 @@ async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
 
     # Reference: https://blog.eleuther.ai/transformer-math/#total-inference-memory
     return weight_size * 1.2 + framework_overhead
-
-
-def get_model_num_attention_heads(pretrained_config) -> Optional[int]:
-    """
-    Get the number of attention heads in the model.
-    """
-
-    num_attention_heads = None
-    try:
-        num_attention_heads_set = set()
-
-        # Helper to collect num_attention_heads from configs
-        def add_heads_from(cfg, key="num_attention_heads"):
-            value = getattr(cfg, key, None)
-            if isinstance(value, int) and value > 0:
-                num_attention_heads_set.add(value)
-
-        for _config in [
-            pretrained_config,
-            getattr(pretrained_config, "llm_config", None),
-            getattr(pretrained_config, "text_config", None),
-            getattr(pretrained_config, "vision_config", None),
-        ]:
-            if _config:
-                add_heads_from(_config)
-
-        if not num_attention_heads_set:
-            return None
-
-        num_attention_heads = reduce(math.gcd, num_attention_heads_set)
-
-    except Exception as e:
-        logger.warning(f"Cannot get num_attention_heads: {e}")
-
-    return num_attention_heads
 
 
 def parse_model_size_by_name(model_name: str) -> int:
@@ -280,6 +248,24 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             self._pretrained_config = get_pretrained_config(
                 self._model, trust_remote_code=True
             )
+        except ValueError as e:
+            if "architecture" in e.args[0] and self._model.backend_version:
+                # In the AutoConfig.from_pretrained method, the architecture field in config undergoes validation.
+                # For custom backend versions, exceptions caused by unrecognized architectures should be allowed
+                # to prevent startup failures of valid new models with properly customized versions.
+                self._pretrained_config = PretrainedConfig()
+
+                # We can also try to get the architectures from hf-overrides
+                hf_overrides = find_parameter(
+                    self._model.backend_parameters, ["hf-overrides"]
+                )
+                if hf_overrides:
+                    overrides_dict = json.loads(hf_overrides)
+                    self._pretrained_config.architectures = overrides_dict.get(
+                        "architectures", []
+                    )
+            else:
+                raise e
         except Exception as e:
             raise Exception(
                 f"Cannot get pretrained config for model {self._model.readable_source}: {e}"
@@ -626,7 +612,9 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
                 continue
 
             if self._gpu_count and gpu_sum >= self._gpu_count:
-                found_candidate = True
+                if vram_sum >= self._vram_claim:
+                    found_candidate = True
+                # if self._gpu_count is set, cannot return more than gpu_count
                 break
 
             if self._gpu_count is None and vram_sum >= self._vram_claim:
@@ -643,18 +631,31 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
                     ),
                 )
             ]
-
+        event_msg_list = []
+        if (
+            self._num_attention_heads
+            and self._largest_multi_gpu_utilization_satisfied_count != 0
+            and self._num_attention_heads
+            % self._largest_multi_gpu_utilization_satisfied_count
+            != 0
+        ):
+            event_msg_list.append(
+                f"Total number of attention heads ({self._num_attention_heads})"
+                " must be divisible by gpu count "
+                f"({self._largest_multi_gpu_utilization_satisfied_count})."
+            )
         event_msg = f"The largest available worker has {byte_to_gib(self._largest_multi_gpu_vram)} GiB allocatable VRAM."
         if self._gpu_memory_utilization != 0:
             event_msg = (
                 event_msg.rstrip(".")
                 + f", {self._largest_multi_gpu_utilization_satisfied_count}/{self._largest_multi_gpu_total} of GPUs meet the VRAM utilization ratio, providing {self._cal_effective_vram():.2f} GiB of allocatable VRAM."
             )
+        event_msg_list.append(event_msg)
 
         self._event_collector.add(
             EventLevelEnum.INFO,
             EVENT_ACTION_AUTO_SINGLE_WORKER_MULTI_GPU,
-            str(ListMessageBuilder(event_msg)),
+            str(ListMessageBuilder(event_msg_list)),
         )
 
         return []

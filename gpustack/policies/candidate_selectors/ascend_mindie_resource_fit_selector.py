@@ -18,6 +18,7 @@ from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
 from gpustack.policies.utils import (
     get_worker_allocatable_resource,
     ListMessageBuilder,
+    get_model_num_attention_heads,
 )
 from gpustack.schemas.models import (
     ComputedResourceClaim,
@@ -96,11 +97,7 @@ class ModelParameters:
         self.derived_max_seq_len = get_max_model_len(pretrained_config)
         if not self.num_attention_heads:
             # For backward compatibility, try to get num_attention_heads from llm_config.
-            llm_config = getattr(pretrained_config, "llm_config", None)
-            if llm_config:
-                self.num_attention_heads = getattr(
-                    llm_config, "num_attention_heads", None
-                )
+            self.num_attention_heads = get_model_num_attention_heads(pretrained_config)
         if not self.head_dim and self.hidden_size and self.num_attention_heads:
             self.head_dim = self.hidden_size // self.num_attention_heads
         if not self.moe_num_experts:
@@ -341,8 +338,12 @@ class AscendMindIEResourceFitSelector(ScheduleCandidatesSelector):
             if self._model_params.quantization_config:
                 kv_quant_type = self._model_params.quantization_config.get(
                     "kv_quant_type", ""
-                ).lower()
-                if kv_quant_type == "c8":
+                )
+                if (
+                    kv_quant_type
+                    and isinstance(kv_quant_type, str)
+                    and kv_quant_type.lower() == "c8"
+                ):
                     ct_size = 1
 
             if attention_type == ModelAttentionTypeEnum.MHA:

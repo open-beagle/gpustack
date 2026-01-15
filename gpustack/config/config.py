@@ -3,6 +3,7 @@ import secrets
 from typing import List, Optional
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
+import requests
 from gpustack.utils import validators
 from gpustack.schemas.workers import (
     CPUInfo,
@@ -19,6 +20,7 @@ from gpustack.schemas.workers import (
     GPUDevicesInfo,
     GPUNetworkInfo,
 )
+from gpustack.schemas.users import AuthProviderEnum
 from gpustack.utils import platform
 from gpustack.utils.platform import DeviceTypeEnum, device_type_from_vendor
 
@@ -65,6 +67,10 @@ class Config(BaseSettings):
         rpc_server_port_range: Port range for RPC servers, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. Default is '40064-40095'.
         ray_node_manager_port: Raylet port for node manager. Used when Ray is enabled. Default is 40098.
         ray_object_manager_port: Raylet port for object manager. Used when Ray is enabled. Default is 40099.
+        ray_runtime_env_agent_port: Port for Ray Runtime Environment Agent. Used when Ray is enabled. Default is 40100.
+        ray_dashboard_agent_grpc_port: Port for Ray Dashboard Agent gRPC. Used when Ray is enabled. Default is 40101.
+        ray_dashboard_agent_listen_port: Port for Ray Dashboard Agent to listen on. Used when Ray is enabled. Default is 52365.
+        ray_metrics_export_port: Port for Ray Metrics Exporter. Used when Ray is enabled. Default is 40103.
         ray_worker_port_range: Port range for Ray worker processes, specified as a string in the form 'N1-N2'. Both ends of the range are inclusive. Default is '40200-40999'.
         log_dir: Directory to store logs.
         bin_dir: Directory to store additional binaries, e.g., versioned backend executables.
@@ -90,6 +96,7 @@ class Config(BaseSettings):
     ray_args: Optional[List[str]] = None
     ray_node_manager_port: int = 40098
     ray_object_manager_port: int = 40099
+    ray_runtime_env_agent_port: int = 40100
     ray_dashboard_agent_grpc_port: int = 40101
     ray_dashboard_agent_listen_port: int = 52365
     ray_metrics_export_port: int = 40103
@@ -118,6 +125,24 @@ class Config(BaseSettings):
     allow_credentials: bool = False
     allow_methods: Optional[List[str]] = ['GET', 'POST']
     allow_headers: Optional[List[str]] = ['Authorization', 'Content-Type']
+    external_auth_type: Optional[str] = None  # external auth type
+    external_auth_name: Optional[str] = None  # external auth name
+    external_auth_full_name: Optional[str] = None  # external auth full name
+    external_auth_avatar_url: Optional[str] = None  # external auth avatar url
+    oidc_client_id: Optional[str] = None  # oidc client id
+    oidc_client_secret: Optional[str] = None  # oidc client secret
+    oidc_redirect_uri: Optional[str] = None  # oidc redirect uri
+    oidc_issuer: Optional[str] = None  # oidc issuer
+    openid_configuration: Optional[dict] = None  # fetched openid configuration
+    saml_sp_entity_id: Optional[str] = None  # saml sp_entity_id
+    saml_sp_acs_url: Optional[str] = None  # saml sp_acs_url
+    saml_sp_x509_cert: Optional[str] = ''  # saml sp_x509_cert
+    saml_sp_private_key: Optional[str] = ''  # saml sp_private_key
+    saml_sp_attribute_prefix: Optional[str] = None  # saml sp attribute prefix
+    saml_idp_entity_id: Optional[str] = None  # saml idp_entityId
+    saml_idp_server_url: Optional[str] = None  # saml idp_server_url
+    saml_idp_x509_cert: Optional[str] = ''  # saml idp_x509_cert
+    saml_security: Optional[str] = '{}'  # saml security
 
     # Worker options
     server_url: Optional[str] = None
@@ -171,6 +196,7 @@ class Config(BaseSettings):
 
         # server options
         self.init_database_url()
+        self.init_auth()
 
         if self.system_reserved is None:
             self.system_reserved = {"ram": 2, "vram": 1}
@@ -498,6 +524,13 @@ class Config(BaseSettings):
                 "Unsupported database scheme. Supported databases are sqlite, postgresql, and mysql."
             )
 
+    def init_auth(self):
+        if self.oidc_issuer:
+            self.external_auth_type = AuthProviderEnum.OIDC
+            self.openid_configuration = get_openid_configuration(self.oidc_issuer)
+        elif self.saml_idp_server_url:
+            self.external_auth_type = AuthProviderEnum.SAML
+
     @staticmethod
     def get_data_dir():
         app_name = "gpustack"
@@ -548,6 +581,19 @@ class Config(BaseSettings):
 
     def _is_server(self):
         return self.server_url is None
+
+
+def get_openid_configuration(issuer: str) -> dict:
+    """Fetch OpenID configuration from the issuer."""
+    url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        raise Exception(
+            f"Failed to get OpenID configuration: {str(e)}. Please check the issuer URL and ensure {url} is accessible."
+        ) from e
 
 
 def get_global_config() -> Config:

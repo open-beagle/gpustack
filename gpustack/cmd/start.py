@@ -115,6 +115,12 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         default=get_gpustack_env("RAY_OBJECT_MANAGER_PORT"),
     )
     group.add_argument(
+        "--ray-runtime-env-agent-port",
+        type=int,
+        help="Port for Ray runtime env agent. Used when Ray is enabled. The default is 40100.",
+        default=get_gpustack_env("RAY_RUNTIME_ENV_AGENT_PORT"),
+    )
+    group.add_argument(
         "--ray-dashboard-agent-grpc-port",
         type=int,
         help="Port for Ray dashboard agent gPRC listen. Used when Ray is enabled. The default is 40101.",
@@ -363,7 +369,105 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         action='append',
         help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers Content-Type. Default: ["Authorization", "Content-Type"].',
     )
-
+    # External authentication settings
+    group.add_argument(
+        "--external-auth-name",
+        type=str,
+        help="Mapping of external authentication user information to username, e.g., 'preferred_username'. For SAML, you must configure the full attribute name like 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress' or simplify with 'emailaddress' by '--saml-sp-attribute-prefix'.",
+        default=get_gpustack_env("EXTERNAL_AUTH_NAME"),
+    )
+    group.add_argument(
+        "--external-auth-full-name",
+        type=str,
+        help="Mapping of external authentication user information to user's full name. Multiple elements can be combined, e.g., 'name' or 'firstName+lastName'.  For SAML, you must configure the full attribute name like 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name' or simplify with 'name' by '--saml-sp-attribute-prefix'.",
+        default=get_gpustack_env("EXTERNAL_AUTH_FULL_NAME"),
+    )
+    group.add_argument(
+        "--external-auth-avatar-url",
+        type=str,
+        help="Mapping of external authentication user information to user's avatar URL. e.g.,'picture'. For SAML, you must configure the full attribute name like 'http://schemas.auth0.com/picture' or simplify with 'picture' by '--saml-sp-attribute-prefix'.",
+        default=get_gpustack_env("EXTERNAL_AUTH_AVATAR_URL"),
+    )
+    # OIDC settings
+    group.add_argument(
+        "--oidc-issuer",
+        type=str,
+        help="The issuer URL of the OIDC provider. OIDC discovery under `<issuer>/.well-known/openid-configuration` will be used to discover the OIDC configuration.",
+        default=get_gpustack_env("OIDC_ISSUER"),
+    )
+    group.add_argument(
+        "--oidc-client-id",
+        type=str,
+        help="OIDC client ID.",
+        default=get_gpustack_env("OIDC_CLIENT_ID"),
+    )
+    group.add_argument(
+        "--oidc-client-secret",
+        type=str,
+        help="OIDC client secret.",
+        default=get_gpustack_env("OIDC_CLIENT_SECRET"),
+    )
+    group.add_argument(
+        "--oidc-redirect-uri",
+        type=str,
+        help="The redirect URI configured in your OIDC application. This must be set to `<server-url>/auth/oidc/callback`.",
+        default=get_gpustack_env("OIDC_REDIRECT_URI"),
+    )
+    # SAML settings
+    group.add_argument(
+        "--saml-idp-server-url",
+        type=str,
+        help="SAML IdP server URL.",
+        default=get_gpustack_env("SAML_IDP_SERVER_URL"),
+    )
+    group.add_argument(
+        "--saml-idp-entity-id",
+        type=str,
+        help="SAML IdP entity ID.",
+        default=get_gpustack_env("SAML_IDP_ENTITY_ID"),
+    )
+    group.add_argument(
+        "--saml-idp-x509-cert",
+        type=str,
+        help="SAML IdP X.509 certificate.",
+        default=get_gpustack_env("SAML_IDP_X509_CERT"),
+    )
+    group.add_argument(
+        "--saml-sp-entity-id",
+        type=str,
+        help="SAML SP entity ID.",
+        default=get_gpustack_env("SAML_SP_ENTITY_ID"),
+    )
+    group.add_argument(
+        "--saml-sp-acs-url",
+        type=str,
+        help="SAML SP Assertion Consumer Service(ACS) URL. It should be set to `<server-url>/auth/saml/callback`.",
+        default=get_gpustack_env("SAML_SP_ACS_URL"),
+    )
+    group.add_argument(
+        "--saml-sp-x509-cert",
+        type=str,
+        help="SAML SP X.509 certificate.",
+        default=get_gpustack_env("SAML_SP_X509_CERT"),
+    )
+    group.add_argument(
+        "--saml-sp-private-key",
+        type=str,
+        help="SAML SP private key.",
+        default=get_gpustack_env("SAML_SP_PRIVATE_KEY"),
+    )
+    group.add_argument(
+        "--saml-sp-attribute-prefix",
+        type=str,
+        help="SAML Service Provider attribute prefix, which is used for fetching the attributes that are specified by --external-auth-*. e.g., 'http://schemas.auth0.com/'.",
+        default=get_gpustack_env("SAML_SP_ATTRIBUTE_PREFIX"),
+    )
+    group.add_argument(
+        "--saml-security",
+        type=str,
+        help="SAML security settings in JSON.",
+        default=get_gpustack_env("SAML_SECURITY"),
+    )
     parser_server.set_defaults(func=run)
 
 
@@ -489,6 +593,22 @@ def set_server_options(args, config_data: dict):
         "allow_credentials",
         "allow_methods",
         "allow_headers",
+        "external_auth_name",
+        "external_auth_full_name",
+        "external_auth_avatar_url",
+        "oidc_issuer",
+        "oidc_client_id",
+        "oidc_client_secret",
+        "oidc_redirect_uri",
+        "saml_idp_server_url",
+        "saml_idp_entity_id",
+        "saml_idp_x509_cert",
+        "saml_sp_entity_id",
+        "saml_sp_acs_url",
+        "saml_sp_x509_cert",
+        "saml_sp_private_key",
+        "saml_sp_attribute_prefix",
+        "saml_security",
     ]
 
     for option in options:

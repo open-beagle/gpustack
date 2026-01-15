@@ -17,12 +17,13 @@ from gpustack.schemas.models import BackendEnum
 from gpustack.utils.command import get_versioned_command
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils import platform, envs
+from gpustack.worker.backend_dependency_manager import BackendDependencyManager
 
 logger = logging.getLogger(__name__)
 
 
-BUILTIN_LLAMA_BOX_VERSION = "v0.0.164"
-BUILTIN_GGUF_PARSER_VERSION = "v0.21.4"
+BUILTIN_LLAMA_BOX_VERSION = "v0.0.171"
+BUILTIN_GGUF_PARSER_VERSION = "v0.22.1"
 
 
 class ToolsManager:
@@ -63,6 +64,20 @@ class ToolsManager:
         self._data_dir = data_dir
         self._bin_dir = bin_dir
         self._pipx_path = pipx_path
+
+        # Initialize backend dependency manager
+        self._dependency_manager = None
+
+    def init_dependency_manager(
+        self, backend: str, version: str, model_env: Dict[str, str]
+    ):
+        """
+        Init dependency_manager for custom backend version and dependencies.
+        No need for other scenarios.
+        """
+        self._dependency_manager = BackendDependencyManager(
+            backend=backend, version=version, model_env=model_env
+        )
 
     def _check_and_set_download_base_url(self):
         urls = [
@@ -161,11 +176,9 @@ class ToolsManager:
         if backend == BackendEnum.LLAMA_BOX:
             self.install_versioned_llama_box(version)
         elif backend == BackendEnum.VLLM:
-            self.install_versioned_vllm(version)
+            self.install_versioned_vllm_with_deps(version)
         elif backend == BackendEnum.VOX_BOX:
-            self.install_versioned_package_by_pipx(
-                "vox-box", version, "--pip-args='transformers==4.51.3'"
-            )
+            self.install_versioned_vox_box_with_deps(version)
         elif backend == BackendEnum.ASCEND_MINDIE:
             self.install_versioned_ascend_mindie(version)
         else:
@@ -275,7 +288,7 @@ class ToolsManager:
 
         self._download_llama_box(version, target_dir, file_name, disabled_dynamic_link)
 
-    def install_versioned_vllm(self, version: str):
+    def install_versioned_vllm_with_deps(self, version: str):
         system = platform.system()
         arch = platform.arch()
         device = platform.device()
@@ -292,10 +305,22 @@ class ToolsManager:
                     f"Auto-installation for versioned vLLM is only supported on CUDA devices. Please install vLLM manually and link it to {target_path}."
                 )
 
-        self.install_versioned_package_by_pipx(
-            "vllm",
-            version,
+        # Get custom dependencies from dependency manager
+        install_args = (
+            self._dependency_manager.get_pipx_install_args()
+            if self._dependency_manager is not None
+            else []
         )
+        self.install_versioned_package_by_pipx("vllm", version, *install_args)
+
+    def install_versioned_vox_box_with_deps(self, version: str):
+        # Get custom dependencies from dependency manager
+        install_args = (
+            self._dependency_manager.get_pipx_install_args()
+            if self._dependency_manager is not None
+            else []
+        )
+        self.install_versioned_package_by_pipx("vox-box", version, *install_args)
 
     def install_versioned_package_by_pipx(self, package: str, version: str, *args):
         """
@@ -401,6 +426,10 @@ class ToolsManager:
 
         target_file_arch = "x86_64" if self._arch == "amd64" else "aarch64"
         target_file_name = f"Ascend-mindie_{version}_linux-{target_file_arch}.run"
+        if version >= "2.1.rc1":
+            target_file_name = (
+                f"Ascend-mindie_{version}_linux-{target_file_arch}_abi0.run"
+            )
 
         # Construct download url, for example:
         # - https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/MindIE/MindIE%201.0.0/Ascend-mindie_1.0.0_linux-x86_64.run?response-content-type=application/octet-stream
@@ -584,6 +613,7 @@ class ToolsManager:
                 elif major == 12 and minor >= 8:
                     toolkit_version = "12.8"
         elif toolkit == "cann":
+            # Since v0.0.169, llama-box supports CANN 8.2 by default,
             # Since v0.0.145, llama-box supports CANN 8.1 by default,
             # and supports CANN 8.0 only for backward compatibility.
             toolkit_version = "8.0"
@@ -591,10 +621,12 @@ class ToolsManager:
             match = re.match(r"(\d+)\.(\d+)", cann_version)
             if match:
                 major, minor = map(int, match.groups())
-                if major == 8 and minor >= 1 and version > "v0.0.144":
+                if major == 8 and minor >= 2 and version > "v0.0.168":
+                    toolkit_version = "8.2"
+                elif major == 8 and minor >= 1 and version > "v0.0.144":
                     toolkit_version = "8.1"
-            # Currently, llama-box only supports release candidate version of CANN 8.1.
-            if toolkit_version == "8.1":
+            # Currently, llama-box only supports release candidate version of CANN 8.1/8.2.
+            if toolkit_version in ["8.1", "8.2"]:
                 match = re.search(r"\.rc\d+", cann_version)
                 if match:
                     rc = match.group(0)
@@ -606,10 +638,13 @@ class ToolsManager:
         elif toolkit == "hip":
             toolkit_version = "6.2"
         elif toolkit == "musa":
+            # Since v0.0.169, llama-box supports MUSA rc4.2,
             # Since v0.0.150, llama-box supports MUSA rc4.0,
             # and no longer supports MUSA rc3.1.
             toolkit_version = "rc3.1"
-            if version > "v0.0.149":
+            if version > "v0.0.168":
+                toolkit_version = "rc4.2"
+            elif version > "v0.0.149":
                 toolkit_version = "rc4.0"
         elif toolkit == "dtk":
             toolkit_version = "24.04"
