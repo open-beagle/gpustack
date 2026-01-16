@@ -151,6 +151,7 @@ docker run -d --name windstack \
   --shm-size=2g \
   -v /data/windstack/data:/var/lib/gpustack \
   -e TZ=Asia/Shanghai \
+  -e VLLM_TARGET_DEVICE=corex \
   registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-corex \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
@@ -158,16 +159,23 @@ docker run -d --name windstack \
   --worker-s3-access-key=your_access_key \
   --worker-s3-secret-key=your_secret_key
 
-docker rm -f windstack&& rm -rf /data/windstack
+docker rm -f windstack && rm -rf /data/windstack
 
 # start worker node
-docker run -d --ipc=host --shm-size=2g --name windstack \
-  -v /data/windstack/data:/var/lib/gpustack \
+docker run -d --name windstack \
   -v /lib/modules:/lib/modules \
+  -v /dev:/dev \
+  --privileged \
   --cap-add=ALL \
+  --pid=host \
   --restart=unless-stopped \
+  --network=host \
+  --ipc=host \
+  --shm-size=2g \
+  -v /data/windstack/data:/var/lib/gpustack \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-musa \
+  -e VLLM_TARGET_DEVICE=corex \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-corex \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
