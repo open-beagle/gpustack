@@ -26,9 +26,9 @@ docker push registry.cn-qingdao.aliyuncs.com/wod/windstack:0.7.1
 
 ```bash
 # cuda
-docker pull nvidia/cuda:12.5.1-runtime-ubuntu22.04 && \
-docker tag nvidia/cuda:12.5.1-runtime-ubuntu22.04 registry.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04 && \
-docker push registry.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04
+docker pull nvidia/cuda:12.8.1-runtime-ubuntu22.04 && \
+docker tag nvidia/cuda:12.8.1-runtime-ubuntu22.04 registry.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04 && \
+docker push registry.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04
 
 # cann
 docker pull --platform=linux/arm64 ascendai/cann:8.0.rc3.beta1-910b-ubuntu22.04-py3.10 && \
@@ -43,6 +43,8 @@ docker push registry-vpc.cn-qingdao.aliyuncs.com/wod/corex:mr-bi150-4.3.0-x86-ub
 
 ## deploy
 
+### cuda
+
 ```bash
 # default user admin
 docker run -d --gpus all -p 6080:6080 --ipc=host --shm-size=2g --name gpustack \
@@ -52,7 +54,7 @@ docker run -d --gpus all -p 6080:6080 --ipc=host --shm-size=2g --name gpustack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key 
+  --worker-s3-secret-key=your_secret_key
 
 docker rm -f windstack&& rm -rf /data/windstack
 
@@ -66,10 +68,10 @@ docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key 
+  --worker-s3-secret-key=your_secret_key
 ```
 
-## deployNPU
+### NPU
 
 ```bash
 # default user admin
@@ -83,7 +85,7 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstac
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key 
+  --worker-s3-secret-key=your_secret_key
 
 docker rm -f windstack&& rm -rf /data/windstack
 
@@ -99,10 +101,10 @@ docker run -d --ipc=host --shm-size=2g --name windstack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key 
+  --worker-s3-secret-key=your_secret_key
 ```
 
-## deployMthreads（摩尔线程）
+### Mthreads（摩尔线程）
 
 ```bash
 # default user admin
@@ -115,7 +117,7 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstac
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key 
+  --worker-s3-secret-key=your_secret_key
 
 docker rm -f windstack&& rm -rf /data/windstack
 
@@ -130,25 +132,31 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key 
+  --worker-s3-secret-key=your_secret_key
 ```
 
-## deployCoreX （天数智芯）
+### CoreX （天数智芯）
 
 ```bash
 # default user admin
-docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstack \
-  -v /data/windstack/data:/var/lib/gpustack \
+docker run -d --name windstack \
   -v /lib/modules:/lib/modules \
+  -v /dev:/dev \
+  --privileged \
   --cap-add=ALL \
+  --pid=host \
   --restart=unless-stopped \
+  --network=host \
+  --ipc=host \
+  --shm-size=2g \
+  -v /data/windstack/data:/var/lib/gpustack \
   -e TZ=Asia/Shanghai \
   registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-corex \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key 
+  --worker-s3-secret-key=your_secret_key
 
 docker rm -f windstack&& rm -rf /data/windstack
 
@@ -165,10 +173,10 @@ docker run -d --ipc=host --shm-size=2g --name windstack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key 
+  --worker-s3-secret-key=your_secret_key
 ```
 
-## deployDcu
+### DCU
 
 ```bash
 # default user admin
@@ -189,7 +197,7 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstac
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key 
+  --worker-s3-secret-key=your_secret_key
 
 docker rm -f windstack&& rm -rf /data/windstack
 
@@ -212,10 +220,33 @@ docker run -d --ipc=host --shm-size=2g --name windstack \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
-  --worker-s3-secret-key=your_secret_key 
+  --worker-s3-secret-key=your_secret_key
 ```
 
 ## build
+
+### cuda
+
+```bash
+sudo rm -rf .venv dist gpustack/ui && \
+docker pull registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm && \
+docker run -it --rm \
+  -v $PWD/:/go/src/github.com/open-beagle/gpustack \
+  -w /go/src/github.com/open-beagle/gpustack \
+  -e VERSION=v0.7.1 \
+  -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
+  registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
+  bash .beagle/build.sh
+
+docker build \
+  --build-arg BASE=registry.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04 \
+  -t registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-cuda \
+  -f .beagle/cuda.dockerfile \
+  . && \
+docker push registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-cuda
+```
+
+**注意：** 关于 vLLM 版本管理和多版本支持，请参考 [vLLM 版本管理文档](.beagle/vllm.md)
 
 ### corex
 
@@ -254,7 +285,7 @@ docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
   -e DEBIAN_FRONTEND=noninteractive \
-  registry.cn-qingdao.aliyuncs.com/wod/cuda:12.5.1-runtime-ubuntu22.04 \
+  registry.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04 \
   bash
 
   apt-get update && apt-get install -y \
@@ -301,35 +332,6 @@ python3 \
   --tools-download-base-url=https://cache.ali.wodcloud.com/vscode
 
 git apply .beagle/v0.7.1-logginglocal.patch
-```
-
-## s3 patch add minio
-
-```bash
-# add minio to pyproject.toml
-minio = "^7.2.14"
-
-# add s3 to launch.json
-"S3_URL": "https://cache.wodcloud.com/vscode",
-"S3_ACCESS_KEY": "your_access_key",
-"S3_SECRET_KEY": "your_secret_key"
-
-# install poetry
-curl -sSL https://install.python-poetry.org | python3 -
-
-# install minio
-poetry add minio
-poetry lock --no-update
-```
-
-## clean cache
-
-```bash
-bash .beagle/build.sh
-
-sudo rm -rf .venv gpustack/ui dist
-
-sudo rm -rf .git/hooks
 ```
 
 ## tools

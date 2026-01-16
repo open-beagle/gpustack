@@ -1,0 +1,47 @@
+diff --git a/gpustack/main.py b/gpustack/main.py
+index 1444dfd2..8dc6acef 100644
+--- a/gpustack/main.py
++++ b/gpustack/main.py
+@@ -1,4 +1,5 @@
+ import argparse
++import warnings
+ from multiprocessing import freeze_support
+
+ from gpustack.cmd import setup_start_cmd
+@@ -10,6 +11,10 @@ from gpustack.cmd.version import setup_version_cmd
+
+
+ def main():
++    # Filter out known deprecation warnings from dependencies
++    warnings.filterwarnings("ignore", category=DeprecationWarning, module="websockets.legacy")
++    warnings.filterwarnings("ignore", category=DeprecationWarning, module="uvicorn.protocols.websockets.websockets_impl")
++
+     parser = argparse.ArgumentParser(
+         description="GPUStack",
+         conflict_handler="resolve",
+diff --git a/gpustack/mixins/active_record.py b/gpustack/mixins/active_record.py
+index 347572f0..a2e48183 100644
+--- a/gpustack/mixins/active_record.py
++++ b/gpustack/mixins/active_record.py
+@@ -210,7 +210,7 @@ class ActiveRecordMixin:
+         """
+
+         if isinstance(source, SQLModel):
+-            obj = cls.from_orm(source, update=update)
++            obj = cls.model_validate(source, update=update)
+         elif isinstance(source, dict):
+             obj = cls.parse_obj(source, update=update)
+         return obj
+diff --git a/gpustack/policies/candidate_selectors/ascend_mindie_resource_fit_selector.py b/gpustack/policies/candidate_selectors/ascend_mindie_resource_fit_selector.py
+index a838ff8e..9cbde397 100644
+--- a/gpustack/policies/candidate_selectors/ascend_mindie_resource_fit_selector.py
++++ b/gpustack/policies/candidate_selectors/ascend_mindie_resource_fit_selector.py
+@@ -364,7 +364,7 @@ class AscendMindIEResourceFitSelector(ScheduleCandidatesSelector):
+         # see https://www.hiascend.com/document/detail/zh/mindie/20RC2/mindiellm/llmdev/mindie_llm0288.html.
+         at_size = t_size
+         if (
+-            self._model_params.quantize
++            self._model_params.quantize is not None
+             and self._model_params.quantize.lower().startswith("w8a8")
+         ):
+             at_size = 1
