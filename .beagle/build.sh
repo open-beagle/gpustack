@@ -78,6 +78,7 @@ git apply .beagle/v0.7.1-s3-project.patch
 git apply .beagle/v0.7.1-bugfix.patch
 git apply .beagle/v0.7.1-vllm.patch
 git apply .beagle/v0.7.1-apikey.patch
+git apply .beagle/v0.7.1-log-filter.patch
 
 # 设置版本号
 VERSION_FILE="$PWD/gpustack/__init__.py"
@@ -118,6 +119,7 @@ unzip -l dist/*.whl | head -50
 git checkout -- "$VERSION_FILE"
 
 # 撤销补丁
+git apply -R .beagle/v0.7.1-log-filter.patch
 git apply -R .beagle/v0.7.1-apikey.patch
 git apply -R .beagle/v0.7.1-vllm.patch
 git apply -R .beagle/v0.7.1-bugfix.patch
