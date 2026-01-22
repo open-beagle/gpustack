@@ -17,7 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     python3 \
     python3-pip \
+    python3-dev \
     tini \
+    gcc \
+    g++ \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
