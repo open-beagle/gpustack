@@ -9,6 +9,10 @@ LABEL maintainer=$AUTHOR version=$VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# 配置 Ubuntu 镜像源（使用阿里云镜像）
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list
+
 # 安装系统依赖 + 设置时区
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
