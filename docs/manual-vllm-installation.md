@@ -31,7 +31,7 @@ mkdir -p $PIPX_HOME $PIPX_BIN_DIR
 
 **关键参数说明：**
 
-- `--suffix _<版本号>`: **必须**。GPUStack 根据此后缀识别多版本（例如 `vllm_0.14.1`）。
+- `--suffix _v<版本号>`: **必须**。GPUStack 根据此后缀识别多版本（例如 `vllm_v0.14.1`）。
 - `--pip-args`: 可选。用于指定该环境中需要覆盖的依赖（如 `transformers`）。
 
 ### 示例：安装 vLLM v0.14.1 并搭配最新 Transformers
@@ -39,12 +39,14 @@ mkdir -p $PIPX_HOME $PIPX_BIN_DIR
 ```bash
 # 安装 vLLM 0.14.1，同时强制安装较新的 transformers 以支持 GLM-4.7 等新模型
 pipx install --force \
-    --suffix _0.14.1 \
-    --pip-args='transformers>=4.49.0 torch>=2.5.0' \
+    --suffix _v0.14.1 \
+    --pip-args='--index-url https://mirrors.aliyun.com/pypi/simple/ transformers>=4.49.0 torch>=2.5.0' \
     vllm==0.14.1
 
+# 基础安装（使用阿里云镜像加速）
 pipx install --force \
-    --suffix _0.14.1 \
+    --suffix _v0.14.1 \
+    --pip-args='--index-url https://mirrors.aliyun.com/pypi/simple/' \
     vllm==0.14.1
 ```
 
@@ -56,7 +58,7 @@ _(注意：请根据 vLLM 官方文档选择兼容的 torch 版本。如果不�
 
 ```bash
 pipx install --force \
-    --suffix _0.14.1 \
+    --suffix _v0.14.1 \
     --pip-args='--no-index --find-links=/tmp/packages' \
     vllm==0.14.1
 ```
@@ -66,7 +68,7 @@ pipx install --force \
 安装完成后，检查 `bin` 目录下是否生成了对应的可执行文件：
 
 ```bash
-ls -l /var/lib/gpustack/bin/vllm_0.14.1
+ls -l /var/lib/gpustack/bin/vllm_v0.14.1
 ```
 
 如果文件存在，说明安装成功。
@@ -79,4 +81,4 @@ ls -l /var/lib/gpustack/bin/vllm_0.14.1
 2. 在 **"Backend Version / 后端版本"** 输入框中，准确填入你刚才安装的版本号：`0.14.1`。
 3. 保存/部署。
 
-GPUStack 会检测到本地 `bin` 目录下已经存在 `vllm_0.14.1`，因此**不会**再次触发下载，而是直接使用你手动准备好的环境运行模型。
+GPUStack 会检测到本地 `bin` 目录下已经存在 `vllm_v0.14.1`，因此**不会**再次触发下载，而是直接使用你手动准备好的环境运行模型。
