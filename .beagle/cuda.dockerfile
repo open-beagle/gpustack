@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     python3 \
     python3-pip \
+    pipx \
     python3-dev \
     tini \
     gcc \
