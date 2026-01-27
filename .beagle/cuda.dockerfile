@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 安装 GPUStack 和 vLLM
 COPY ./dist/*.whl /tmp/
 RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)[vllm]" && \
-    python3 -m pip install --upgrade pip && \
+    python3 -m pip install -i https://mirrors.aliyun.com/pypi/simple/ --upgrade pip && \
     pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
     pip3 install --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE && \
     rm -rf /tmp/*.whl
