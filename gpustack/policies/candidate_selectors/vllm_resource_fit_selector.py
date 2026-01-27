@@ -249,10 +249,10 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
                 self._model, trust_remote_code=True
             )
         except ValueError as e:
-            if "architecture" in e.args[0] and self._model.backend_version:
+            if "architecture" in str(e).lower() or "trust_remote_code" in str(e).lower():
                 # In the AutoConfig.from_pretrained method, the architecture field in config undergoes validation.
-                # For custom backend versions, exceptions caused by unrecognized architectures should be allowed
-                # to prevent startup failures of valid new models with properly customized versions.
+                # Exceptions caused by unrecognized architectures should be allowed to prevent startup failures
+                # of valid new models.
                 self._pretrained_config = PretrainedConfig()
 
                 # We can also try to get the architectures from hf-overrides
