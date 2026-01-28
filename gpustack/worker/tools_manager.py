@@ -349,6 +349,8 @@ class ToolsManager:
             )
 
         suffix = f"_{version}"
+        # Remove 'v' prefix from version for PyPI package name (e.g., v0.14.1 -> 0.14.1)
+        pypi_version = version[1:] if version.startswith("v") else version
         install_command = [
             pipx_path,
             "install",
@@ -356,7 +358,7 @@ class ToolsManager:
             "--force",
             "--suffix",
             suffix,
-            f"{package}=={version}",
+            f"{package}=={pypi_version}",
         ]
         install_command.extend(args)
 

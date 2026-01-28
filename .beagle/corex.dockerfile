@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     tzdata \
     iproute2 \
     tini \
+    pipx \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install /dist/*.whl && \
@@ -19,5 +20,11 @@ RUN pip install /dist/*.whl && \
     ln -s /usr/local/corex-4.3.0/lib64/python3/dist-packages/bin/vllm /usr/local/bin/vllm
 
 RUN gpustack download-tools
+
+# 设置环境变量
+ENV PIPX_HOME=/var/lib/gpustack/pipx \
+    PIPX_LOCAL_VENVS=/var/lib/gpustack/pipx/venvs \
+    PIPX_BIN_DIR=/var/lib/gpustack/bin \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 ENTRYPOINT [ "tini", "--", "gpustack", "start" ]

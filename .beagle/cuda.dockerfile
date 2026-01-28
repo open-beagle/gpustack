@@ -48,6 +48,7 @@ RUN mkdir -p /var/lib/gpustack && \
 # 设置环境变量
 ENV PIPX_HOME=/var/lib/gpustack/pipx \
     PIPX_LOCAL_VENVS=/var/lib/gpustack/pipx/venvs \
-    PIPX_BIN_DIR=/var/lib/gpustack/bin
+    PIPX_BIN_DIR=/var/lib/gpustack/bin \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 ENTRYPOINT [ "tini", "--", "gpustack", "start" ]
