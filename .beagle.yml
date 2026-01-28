@@ -342,7 +342,7 @@ steps:
       - name: docker
         path: /var/run/docker.sock
     settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/mr-bi150-4.3.0-x86-ubuntu20.04-py3.10-poc-llm-infer:v1.2.3
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/corex:mr-bi150-4.3.0-x86-ubuntu20.04-py3.10-poc-llm-infer-v1.2.3
       dockerfile: .beagle/corex.dockerfile
       repo: wod/windstack
       version: "v0.7.1-corex"
