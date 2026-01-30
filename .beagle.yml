@@ -107,58 +107,58 @@ steps:
 #     commands:
 #       - bash .beagle/build.sh
 
-  # - name: docker-cann
-  #   image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-  #   volumes:
-  #     - name: docker
-  #       path: /var/run/docker.sock
-  #   settings:
-  #     base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.alpha003-kernel910b-py310
-  #     dockerfile: .beagle/cann.dockerfile
-  #     repo: wod/windstack
-  #     version: "v0.7.1-cann"
-  #     args: "TARGETOS=linux,TARGETARCH=arm64"
-  #     registry: registry-vpc.cn-qingdao.aliyuncs.com
-  #     registry_user:
-  #       from_secret: REGISTRY_USER_ALIYUN
-  #     registry_password:
-  #       from_secret: REGISTRY_PASSWORD_ALIYUN
+# - name: docker-cann
+#   image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+#   volumes:
+#     - name: docker
+#       path: /var/run/docker.sock
+#   settings:
+#     base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cann:8.0.RC3.alpha003-kernel910b-py310
+#     dockerfile: .beagle/cann.dockerfile
+#     repo: wod/windstack
+#     version: "v0.7.1-cann"
+#     args: "TARGETOS=linux,TARGETARCH=arm64"
+#     registry: registry-vpc.cn-qingdao.aliyuncs.com
+#     registry_user:
+#       from_secret: REGISTRY_USER_ALIYUN
+#     registry_password:
+#       from_secret: REGISTRY_PASSWORD_ALIYUN
 
-  # # DCU
-  # - name: docker-dcu
-  #   image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-  #   volumes:
-  #     - name: docker
-  #       path: /var/run/docker.sock
-  #   settings:
-  #     base: registry-vpc.cn-qingdao.aliyuncs.com/wod/vllm:0.8.5-ubuntu22.04-dtk25.04.1-py3.10
-  #     dockerfile: .beagle/dcu.dockerfile
-  #     repo: wod/windstack
-  #     version: "v0.7.1-dcu"
-  #     args: "TARGETOS=linux,TARGETARCH=amd64"
-  #     registry: registry-vpc.cn-qingdao.aliyuncs.com
-  #     registry_user:
-  #       from_secret: REGISTRY_USER_ALIYUN
-  #     registry_password:
-  #       from_secret: REGISTRY_PASSWORD_ALIYUN
+# # DCU
+# - name: docker-dcu
+#   image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+#   volumes:
+#     - name: docker
+#       path: /var/run/docker.sock
+#   settings:
+#     base: registry-vpc.cn-qingdao.aliyuncs.com/wod/vllm:0.8.5-ubuntu22.04-dtk25.04.1-py3.10
+#     dockerfile: .beagle/dcu.dockerfile
+#     repo: wod/windstack
+#     version: "v0.7.1-dcu"
+#     args: "TARGETOS=linux,TARGETARCH=amd64"
+#     registry: registry-vpc.cn-qingdao.aliyuncs.com
+#     registry_user:
+#       from_secret: REGISTRY_USER_ALIYUN
+#     registry_password:
+#       from_secret: REGISTRY_PASSWORD_ALIYUN
 
-  # # 摩尔线程
-  # - name: docker-musa
-  #   image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-  #   volumes:
-  #     - name: docker
-  #       path: /var/run/docker.sock
-  #   settings:
-  #     base: registry-vpc.cn-qingdao.aliyuncs.com/wod/musa:rc4.2.0-runtime-ubuntu-amd64
-  #     dockerfile: .beagle/musa.dockerfile
-  #     repo: wod/windstack
-  #     version: "v0.7.1-musa"
-  #     args: "TARGETOS=linux,TARGETARCH=amd64"
-  #     registry: registry-vpc.cn-qingdao.aliyuncs.com
-  #     registry_user:
-  #       from_secret: REGISTRY_USER_ALIYUN
-  #     registry_password:
-  #       from_secret: REGISTRY_PASSWORD_ALIYUN
+# # 摩尔线程
+# - name: docker-musa
+#   image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+#   volumes:
+#     - name: docker
+#       path: /var/run/docker.sock
+#   settings:
+#     base: registry-vpc.cn-qingdao.aliyuncs.com/wod/musa:rc4.2.0-runtime-ubuntu-amd64
+#     dockerfile: .beagle/musa.dockerfile
+#     repo: wod/windstack
+#     version: "v0.7.1-musa"
+#     args: "TARGETOS=linux,TARGETARCH=amd64"
+#     registry: registry-vpc.cn-qingdao.aliyuncs.com
+#     registry_user:
+#       from_secret: REGISTRY_USER_ALIYUN
+#     registry_password:
+#       from_secret: REGISTRY_PASSWORD_ALIYUN
 
 ---
 kind: pipeline
@@ -286,8 +286,6 @@ steps:
         from_secret: REGISTRY_USER_ALIYUN
       registry_password:
         from_secret: REGISTRY_PASSWORD_ALIYUN
-
-
 
 ---
 kind: pipeline
