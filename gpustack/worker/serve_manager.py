@@ -19,6 +19,7 @@ from gpustack.utils.process import terminate_process_tree, add_signal_handlers
 from gpustack.worker.backends.llama_box import LlamaBoxServer
 from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.vllm import VLLMServer
+from gpustack.worker.backends.vllm_omni import VLLMOmniServer
 from gpustack.worker.backends.ascend_mindie import AscendMindIEServer
 from gpustack.client import ClientSet
 from gpustack.schemas.models import (
@@ -329,6 +330,8 @@ class ServeManager:
                     VoxBoxServer(clientset, mi, cfg, worker_id).start()
                 elif backend == BackendEnum.ASCEND_MINDIE:
                     AscendMindIEServer(clientset, mi, cfg, worker_id).start()
+                elif backend == BackendEnum.VLLM_OMNI:
+                    VLLMOmniServer(clientset, mi, cfg, worker_id).start()
                 else:
                     raise ValueError(f"Unsupported backend {backend}")
 
@@ -552,10 +555,13 @@ def is_ready(backend: str, mi: ModelInstance) -> bool:
             hostname = mi.worker_ip
 
         # Check /v1/models by default if dedicated health check endpoint is not available.
-        # This is served by all backends (llama-box, vox-box, vllm, mindIE)
+        # This is served by all backends (llama-box, vox-box, vllm, mindIE, vllm-omni)
         health_check_url = f"http://{hostname}:{mi.port}/v1/models"
         if backend == BackendEnum.LLAMA_BOX:
             # For llama-box, use /health to avoid printing error logs.
+            health_check_url = f"http://{hostname}:{mi.port}/health"
+        elif backend == BackendEnum.VLLM_OMNI:
+            # For vllm-omni, use /health endpoint
             health_check_url = f"http://{hostname}:{mi.port}/health"
 
         response = requests.get(health_check_url, timeout=1)

@@ -46,6 +46,7 @@ class BackendEnum(str, Enum):
     VLLM = "vllm"
     VOX_BOX = "vox-box"
     ASCEND_MINDIE = "ascend-mindie"
+    VLLM_OMNI = "vllm-omni"
 
 
 class GPUSelector(BaseModel):

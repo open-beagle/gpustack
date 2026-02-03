@@ -44,12 +44,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
 
-# 安装 GPUStack 和 vLLM
+# 安装 GPUStack、vLLM 和 vLLM-Omni
 COPY ./dist/*.whl /tmp/
 RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)[vllm]" && \
     python3 -m pip install -i https://mirrors.aliyun.com/pypi/simple/ --upgrade pip && \
     pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
     pip3 install --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE && \
+    # 安装 vLLM-Omni 用于支持 Diffusion 模型（Z-Image、Flux 等）
+    pip3 install --no-cache-dir --default-timeout=12000 vllm-omni && \
     rm -rf /tmp/*.whl
 
 # 下载工具
