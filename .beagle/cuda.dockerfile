@@ -15,6 +15,7 @@ RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu
 
 # 安装系统依赖 + 设置时区
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     git \
     curl \
     wget \
@@ -26,6 +27,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     gcc \
     g++ \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libxcb1 \
+    libxcb-xinerama0 \
+    libxcb-icccm4 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-randr0 \
+    libxcb-render-util0 \
+    libxcb-shape0 \
+    libxcb-xfixes0 \
+    libxcb-xkb1 \
+    libxkbcommon-x11-0 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
