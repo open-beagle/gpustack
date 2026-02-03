@@ -8,6 +8,10 @@ GPUStack v0.7.1 默认使用 **vLLM 0.11.2**
 
 vLLM 0.11.2 带来了许多新特性和性能改进，包括更好的模型支持、KV cache offloading、异步调度优化等。
 
+### vLLM 0.15.0 + Transformers v5
+
+vLLM 0.15.0 虽然默认不依赖 transformers v5，但可以通过 `--pip-args` 强制安装 transformers v5 来支持最新模型（如 GLM-4.7 Flash）。这种组合可以让你使用最新的模型架构，同时享受 vLLM 0.15.0 的性能优化。
+
 ## 解决方案
 
 ### 方案 1：使用 Backend Version 功能（推荐）
@@ -76,22 +80,49 @@ gpustack models create \
   --backend vllm \
   --huggingface-repo-id meta-llama/Llama-3.1-8B-Instruct
 
-# 模型 B 使用 vLLM 0.12.0（自定义版本）
+# 模型 B 使用 vLLM 0.15.0（最新版本）
 gpustack models create \
   --name model-b \
   --backend vllm \
-  --backend-version 0.12.0 \
+  --backend-version 0.15.0 \
   --huggingface-repo-id Qwen/Qwen2.5-7B-Instruct
 
-# 模型 C 使用 vLLM 0.10.1（旧版本）
+# 模型 C 使用 vLLM 0.12.0（自定义版本）
 gpustack models create \
   --name model-c \
   --backend vllm \
-  --backend-version 0.10.1 \
+  --backend-version 0.12.0 \
   --huggingface-repo-id deepseek-ai/DeepSeek-V3
 ```
 
 三个模型可以同时运行，使用各自的 vLLM 版本！
+
+#### 使用 vLLM 0.15.0 + Transformers v5（支持 GLM-4.7 Flash 等新模型）
+
+如果你需要运行 GLM-4.7 Flash 等需要 transformers v5 的模型，可以手动安装带有 transformers v5 的 vLLM 0.15.0：
+
+```bash
+# 进入容器
+docker exec -it <container-name> bash
+
+# 手动安装 vLLM 0.15.0 + transformers v5
+pipx install --force \
+  --suffix _v0.15.0 \
+  --pip-args='--index-url https://mirrors.aliyun.com/pypi/simple/ transformers>=5.0.0 torch>=2.5.0' \
+  vllm==0.15.0
+```
+
+然后在部署模型时指定 `backend-version` 为 `0.15.0`：
+
+```bash
+gpustack models create \
+  --name glm-4-flash \
+  --backend vllm \
+  --backend-version 0.15.0 \
+  --huggingface-repo-id THUDM/glm-4-9b-chat
+```
+
+详细步骤请参考：[手动安装 vLLM 指南](../docs/manual-vllm-installation.md)
 
 ---
 
