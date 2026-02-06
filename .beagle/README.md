@@ -264,8 +264,7 @@ poetry run python3 \
   --worker-ip=127.0.0.1 \
   --worker-name=local-debug \
   --data-dir=${HOME}/gpustack \
-  --tools-download-base-url=https://cache.ali.wodcloud.com/vscode \
-  --disable-worker
+  --tools-download-base-url=https://cache.ali.wodcloud.com/vscode
 ```
 
 ## build
