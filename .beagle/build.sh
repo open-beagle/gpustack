@@ -41,12 +41,13 @@ rm -rf "$UI_PATH"
 mkdir -p "$UI_PATH/tmp/ui"
 
 echo "Downloading UI assets for ${VERSION}..."
+# 尝试从自己的 S3 服务器下载
 if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
-  "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/${VERSION}.tar.gz" | \
+  "https://cache.ali.wodcloud.com/gpustack-ui/releases/${VERSION}.tar.gz" | \
   tar -xzf - --directory "$UI_PATH/tmp/ui" 2>/dev/null; then
   echo "Failed to download ${VERSION}, trying latest..."
   curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
-    "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/latest.tar.gz" | \
+    "https://cache.ali.wodcloud.com/gpustack-ui/releases/latest.tar.gz" | \
     tar -xzf - --directory "$UI_PATH/tmp/ui"
 fi
 cp -a "$UI_PATH/tmp/ui/dist/." "$UI_PATH"
@@ -72,13 +73,6 @@ rm -rf "$UI_PATH/tmp"
 if [ -d "$PWD/static" ]; then
   cp -a "$PWD/static/." "$UI_PATH/static/"
 fi
-
-# 应用补丁
-git apply .beagle/v0.7.1-s3-project.patch
-git apply .beagle/v0.7.1-bugfix.patch
-git apply .beagle/v0.7.1-vllm.patch
-git apply .beagle/v0.7.1-apikey.patch
-git apply .beagle/v0.7.1-log-filter.patch
 
 # 设置版本号
 VERSION_FILE="$PWD/gpustack/__init__.py"
@@ -117,10 +111,3 @@ unzip -l dist/*.whl | head -50
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
-
-# 撤销补丁
-git apply -R .beagle/v0.7.1-log-filter.patch
-git apply -R .beagle/v0.7.1-apikey.patch
-git apply -R .beagle/v0.7.1-vllm.patch
-git apply -R .beagle/v0.7.1-bugfix.patch
-git apply -R .beagle/v0.7.1-s3-project.patch

@@ -1,0 +1,3 @@
+[submodule "gpustack/ui"]
+	path = gpustack/ui
+	url = git@github.com:open-beagle/gpustack-ui.git
