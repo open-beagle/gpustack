@@ -240,13 +240,29 @@ curl -sSL https://install.python-poetry.org | python3 -
 # 配置国内镜像源
 poetry config repositories.pypi-mirror https://pypi.tuna.tsinghua.edu.cn/simple
 
+# 配置 pip 使用国内镜像（加速依赖安装）
+pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
+
+# 删除旧的 logging.py（避免与标准库冲突）
+rm -f gpustack/logging.py
+
+# 编译前端（可选，如果需要修改 UI）
+cd gpustack/ui
+pnpm install
+pnpm build
+cd ../..
+
 # 安装依赖（会自动创建虚拟环境 .venv）
+# 注意：首次安装可能需要较长时间（30分钟-1小时），因为需要编译 vLLM 等大型依赖
 poetry install
+
+# 如果安装太慢或失败，可以尝试不安装 vLLM 等可选依赖
+# poetry install --no-dev --without vllm
 
 # 激活虚拟环境
 poetry shell
 
-# 或者使用 poetry run 直接运行
+# 启动服务（无 UI 模式，仅 API）
 poetry run python3 \
   gpustack/main.py start \
   --bootstrap-password='password' \
@@ -254,8 +270,37 @@ poetry run python3 \
   --worker-ip=127.0.0.1 \
   --worker-name=local-debug \
   --data-dir=${HOME}/gpustack \
-  --tools-download-base-url=https://cache.ali.wodcloud.com/vscode
+  --tools-download-base-url=https://cache.ali.wodcloud.com/vscode \
+  --disable-worker
 ```
+
+**注意事项：**
+
+1. **前端编译**：如果需要修改 UI，在 `gpustack/ui` 目录下运行 `pnpm install && pnpm build`
+2. **Worker 模式**：使用 `--disable-worker` 可以只启动 server，不启动 worker（适合纯 API 调试）
+3. **数据目录**：首次启动会在 `${HOME}/gpustack` 创建数据库和缓存
+4. **默认账号**：用户名 `admin`，密码 `password`
+
+**验证服务启动：**
+
+```bash
+# 检查健康状态
+curl http://127.0.0.1:6080/healthz
+
+# 访问 Web UI（浏览器打开）
+http://127.0.0.1:6080
+
+# 访问 API 文档
+http://127.0.0.1:6080/docs
+```
+
+**调试技巧：**
+
+- 如果 `poetry install` 网络超时，可以按 `Ctrl+C` 中断后重试
+- 可以使用 `poetry install -vvv` 查看详细安装日志
+- 如果只需要调试核心功能，可以跳过某些可选依赖的安装
+- 访问 API 文档：`http://127.0.0.1:6080/docs`
+- 前端修改后需要重新运行 `pnpm build` 并重启服务
 
 ## build
 
