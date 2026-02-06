@@ -243,14 +243,8 @@ poetry config repositories.pypi-mirror https://pypi.tuna.tsinghua.edu.cn/simple
 # 配置 pip 使用国内镜像（加速依赖安装）
 pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
-# 删除旧的 logging.py（避免与标准库冲突）
-rm -f gpustack/logging.py
-
 # 编译前端（可选，如果需要修改 UI）
-cd gpustack/ui
-pnpm install
-pnpm build
-cd ../..
+bash -c "cd gpustack/ui && pnpm install && pnpm build && cd ../.."
 
 # 安装依赖（会自动创建虚拟环境 .venv）
 # 注意：首次安装可能需要较长时间（30分钟-1小时），因为需要编译 vLLM 等大型依赖
