@@ -41,8 +41,6 @@ docker tag git.modelhub.org.cn:9443/enginex-iluvatar/mr-bi150-4.3.0-x86-ubuntu20
 docker push registry-vpc.cn-qingdao.aliyuncs.com/wod/corex:mr-bi150-4.3.0-x86-ubuntu20.04-py3.10-poc-llm-infer-v1.2.3
 ```
 
-## deploy
-
 ### cuda
 
 ```bash
@@ -229,6 +227,34 @@ docker run -d --ipc=host --shm-size=2g --name windstack \
   --worker-s3-host=your_s3_host \
   --worker-s3-access-key=your_access_key \
   --worker-s3-secret-key=your_secret_key
+```
+
+## debug
+
+### 本地调试
+
+```bash
+# 安装 poetry
+curl -sSL https://install.python-poetry.org | python3 -
+
+# 配置国内镜像源
+poetry config repositories.pypi-mirror https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 安装依赖（会自动创建虚拟环境 .venv）
+poetry install
+
+# 激活虚拟环境
+poetry shell
+
+# 或者使用 poetry run 直接运行
+poetry run python3 \
+  gpustack/main.py start \
+  --bootstrap-password='password' \
+  --port=6080 \
+  --worker-ip=127.0.0.1 \
+  --worker-name=local-debug \
+  --data-dir=${HOME}/gpustack \
+  --tools-download-base-url=https://cache.ali.wodcloud.com/vscode
 ```
 
 ## build
