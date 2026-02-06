@@ -270,7 +270,8 @@ poetry run python3 \
 
 **注意事项：**
 
-1. **前端编译**：如果需要修改 UI，在 `gpustack/ui` 目录下运行 `pnpm install && pnpm build`
+1. **前端编译**：如果需要修改 UI，在 `gpustack/ui` 目录下运行编译命令，编译后的文件会自动复制到 `gpustack/ui/` 目录
+   - `css/`、`js/`、`static/`、`index.html` 等都是编译产物，不应该提交到 git
 2. **Worker 模式**：使用 `--disable-worker` 可以只启动 server，不启动 worker（适合纯 API 调试）
 3. **数据目录**：首次启动会在 `${HOME}/gpustack` 创建数据库和缓存
 4. **默认账号**：用户名 `admin`，密码 `password`
