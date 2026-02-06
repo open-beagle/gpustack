@@ -6,7 +6,14 @@ from fastapi.staticfiles import StaticFiles
 
 
 def register(app: FastAPI):
-    ui_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ui")
+    base_dir = os.path.dirname(os.path.dirname(__file__))
+    
+    # Try dist directory first (for development with pnpm build)
+    ui_dir = os.path.join(base_dir, "ui", "dist")
+    if not os.path.isdir(ui_dir):
+        # Fallback to ui directory (for production builds)
+        ui_dir = os.path.join(base_dir, "ui")
+    
     if not os.path.isdir(ui_dir):
         raise RuntimeError(f"directory '{ui_dir}' does not exist")
 
