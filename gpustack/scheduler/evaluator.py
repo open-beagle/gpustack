@@ -299,6 +299,9 @@ async def evaluate_model_metadata(
             await scheduler.evaluate_gguf_model(config, model)
         elif is_audio_model(model):
             await scheduler.evaluate_audio_model(config, model)
+        elif get_backend(model) == BackendEnum.VLLM_OMNI:
+            # vLLM-Omni can auto-detect model type, skip architecture check
+            model.categories = model.categories or [CategoryEnum.LLM]
         else:
             await scheduler.evaluate_pretrained_config(model)
 
