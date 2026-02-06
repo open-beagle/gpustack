@@ -42,7 +42,7 @@ case "$ARCH-$DEVICE" in
     ;;
 esac
 
-curl -fL -o "$TOOLS_DIR/llama-box/releases/download/$LLAMA_BOX_VERSION/$LLAMA_BOX_FILE" \
+curl -fL -x $SOCKS5_PROXY_LOCAL -o "$TOOLS_DIR/llama-box/releases/download/$LLAMA_BOX_VERSION/$LLAMA_BOX_FILE" \
   "https://github.com/gpustack/llama-box/releases/download/$LLAMA_BOX_VERSION/$LLAMA_BOX_FILE"
 
 # 下载 gguf-parser-go
@@ -51,11 +51,11 @@ mkdir -p "$TOOLS_DIR/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION"
 
 case "$ARCH" in
   amd64)
-    curl -fL -o "$TOOLS_DIR/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/gguf-parser-linux-amd64" \
+    curl -fL -x $SOCKS5_PROXY_LOCAL -o "$TOOLS_DIR/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/gguf-parser-linux-amd64" \
       "https://github.com/gpustack/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/gguf-parser-linux-amd64"
     ;;
   arm64)
-    curl -fL -o "$TOOLS_DIR/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/gguf-parser-linux-arm64" \
+    curl -fL -x $SOCKS5_PROXY_LOCAL -o "$TOOLS_DIR/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/gguf-parser-linux-arm64" \
       "https://github.com/gpustack/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/gguf-parser-linux-arm64"
     ;;
 esac
@@ -66,11 +66,11 @@ mkdir -p "$TOOLS_DIR/fastfetch/releases/download/$FASTFETCH_VERSION"
 
 case "$ARCH" in
   amd64)
-    curl -fL -o "$TOOLS_DIR/fastfetch/releases/download/$FASTFETCH_VERSION/fastfetch-linux-amd64.zip" \
+    curl -fL -x $SOCKS5_PROXY_LOCAL -o "$TOOLS_DIR/fastfetch/releases/download/$FASTFETCH_VERSION/fastfetch-linux-amd64.zip" \
       "https://github.com/gpustack/fastfetch/releases/download/$FASTFETCH_VERSION/fastfetch-linux-amd64.zip"
     ;;
   arm64)
-    curl -fL -o "$TOOLS_DIR/fastfetch/releases/download/$FASTFETCH_VERSION/fastfetch-linux-aarch64.zip" \
+    curl -fL -x $SOCKS5_PROXY_LOCAL -o "$TOOLS_DIR/fastfetch/releases/download/$FASTFETCH_VERSION/fastfetch-linux-aarch64.zip" \
       "https://github.com/gpustack/fastfetch/releases/download/$FASTFETCH_VERSION/fastfetch-linux-aarch64.zip"
     ;;
 esac
