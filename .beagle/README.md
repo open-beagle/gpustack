@@ -247,7 +247,7 @@ poetry config repositories.pypi-mirror https://pypi.tuna.tsinghua.edu.cn/simple
 pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
 # 编译前端（可选，如果需要修改 UI）
-bash -c "cd gpustack/ui && pnpm install && pnpm build"
+bash -c "cd gpustack/ui && pnpm install && pnpm build && cp -r dist/* ../"
 
 # 安装依赖（会自动创建虚拟环境 .venv）
 # 注意：首次安装可能需要较长时间（30分钟-1小时），因为需要编译 vLLM 等大型依赖
