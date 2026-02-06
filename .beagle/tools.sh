@@ -9,8 +9,8 @@ ARCH="${ARCH:-amd64}"
 DEVICE="${DEVICE:-cuda}"
 
 # 版本定义
-LLAMA_BOX_VERSION="v0.0.140"
-GGUF_PARSER_GO_VERSION="v0.13.8"
+LLAMA_BOX_VERSION="v0.0.171"
+GGUF_PARSER_GO_VERSION="v0.22.1"
 FASTFETCH_VERSION="2.25.0.1"
 
 # 清理旧的下载
@@ -29,18 +29,21 @@ mkdir -p "$TOOLS_DIR/llama-box/releases/download/$LLAMA_BOX_VERSION"
 
 case "$ARCH-$DEVICE" in
   amd64-cuda)
-    curl -fL -o "$TOOLS_DIR/llama-box/releases/download/$LLAMA_BOX_VERSION/llama-box-linux-amd64-cuda-12.4.zip" \
-      "https://github.com/gpustack/llama-box/releases/download/$LLAMA_BOX_VERSION/llama-box-linux-amd64-cuda-12.4.zip"
+    # 动态链接版本
+    LLAMA_BOX_FILE="dl-llama-box-linux-amd64-cuda-12.4.zip"
     ;;
   arm64-cann)
-    curl -fL -o "$TOOLS_DIR/llama-box/releases/download/$LLAMA_BOX_VERSION/llama-box-linux-arm64-cann-8.0.zip" \
-      "https://github.com/gpustack/llama-box/releases/download/$LLAMA_BOX_VERSION/llama-box-linux-arm64-cann-8.0.zip"
+    # 静态链接版本（CANN 需要静态链接）
+    LLAMA_BOX_FILE="llama-box-linux-arm64-cann-8.0.zip"
     ;;
   *)
     echo "不支持的架构-设备组合: $ARCH-$DEVICE"
     exit 1
     ;;
 esac
+
+curl -fL -o "$TOOLS_DIR/llama-box/releases/download/$LLAMA_BOX_VERSION/$LLAMA_BOX_FILE" \
+  "https://github.com/gpustack/llama-box/releases/download/$LLAMA_BOX_VERSION/$LLAMA_BOX_FILE"
 
 # 下载 gguf-parser-go
 echo "下载 gguf-parser-go $GGUF_PARSER_GO_VERSION..."
