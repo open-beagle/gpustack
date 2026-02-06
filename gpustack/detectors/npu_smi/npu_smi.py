@@ -13,7 +13,7 @@ from gpustack.schemas.workers import (
 from gpustack.utils import platform
 from gpustack.utils.command import is_command_available
 from gpustack.utils.convert import safe_float, safe_int
-import gpustack.logging as glogging
+import gpustack.logginglocal as glogging
 
 logger = logging.getLogger(__name__)
 

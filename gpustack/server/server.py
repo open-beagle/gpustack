@@ -7,7 +7,7 @@ import uvicorn
 import logging
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel.ext.asyncio.session import AsyncSession
-from gpustack.logging import setup_logging
+from gpustack.logginglocal import setup_logging
 from gpustack.schemas.users import User
 from gpustack.security import JWTManager, generate_secure_password, get_secret_hash
 from gpustack.server.app import create_app

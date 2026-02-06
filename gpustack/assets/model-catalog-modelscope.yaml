@@ -2699,3 +2699,44 @@
       model_scope_model_id: nari-labs/Dia-1.6B
       replicas: 1
       backend: vox-box
+# vLLM-Omni Diffusion Models
+- name: Z-Image Turbo
+  description: Z-Image-Turbo is a 6B parameter text-to-image model from Alibaba Tongyi-MAI. It delivers high-fidelity images in 8 steps with sub-second inference latency, supports bilingual text rendering (English & Chinese), and is optimized for photorealistic image generation.
+  home: https://github.com/Tongyi-MAI/Z-Image
+  icon: /static/catalog_icons/alibaba.png
+  categories:
+    - image
+  licenses:
+    - apache-2.0
+  release_date: "2025-05-30"
+  templates:
+    - quantizations: ["BF16"]
+      source: model_scope
+      model_scope_model_id: Tongyi-MAI/Z-Image-Turbo
+      replicas: 1
+      backend: vllm-omni
+      backend_parameters:
+        - --num-inference-steps
+        - "9"
+        - --guidance-scale
+        - "0.0"
+- name: Z-Image
+  description: Z-Image is a 6B parameter foundation model for high-quality image generation. It focuses on rich aesthetics, strong diversity, and controllability, well-suited for creative generation and fine-tuning.
+  home: https://github.com/Tongyi-MAI/Z-Image
+  icon: /static/catalog_icons/alibaba.png
+  categories:
+    - image
+  licenses:
+    - apache-2.0
+  release_date: "2025-05-30"
+  templates:
+    - quantizations: ["BF16"]
+      source: model_scope
+      model_scope_model_id: Tongyi-MAI/Z-Image
+      replicas: 1
+      backend: vllm-omni
+      backend_parameters:
+        - --num-inference-steps
+        - "50"
+        - --guidance-scale
+        - "4.0"

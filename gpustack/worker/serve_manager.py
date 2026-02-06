@@ -10,7 +10,7 @@ import logging
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
-from gpustack.logging import (
+from gpustack.logginglocal import (
     RedirectStdoutStderr,
 )
 from gpustack.utils import network, platform

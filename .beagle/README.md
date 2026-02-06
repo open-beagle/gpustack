@@ -247,7 +247,7 @@ poetry config repositories.pypi-mirror https://pypi.tuna.tsinghua.edu.cn/simple
 pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
 # 编译前端（可选，如果需要修改 UI）
-bash -c "cd gpustack/ui && pnpm install && pnpm build && cp -r dist/* ../"
+bash -c "cd gpustack/ui && pnpm install && pnpm build"
 
 # 安装依赖（会自动创建虚拟环境 .venv）
 # 注意：首次安装可能需要较长时间（30分钟-1小时），因为需要编译 vLLM 等大型依赖
@@ -256,7 +256,7 @@ poetry install
 # 激活虚拟环境
 poetry shell
 
-# 启动服务（无 UI 模式，仅 API）
+# 启动服务
 poetry run python3 \
   gpustack/main.py start \
   --bootstrap-password='password' \
@@ -267,35 +267,6 @@ poetry run python3 \
   --tools-download-base-url=https://cache.ali.wodcloud.com/vscode \
   --disable-worker
 ```
-
-**注意事项：**
-
-1. **前端编译**：如果需要修改 UI，在 `gpustack/ui` 目录下运行编译命令，编译后的文件会自动复制到 `gpustack/ui/` 目录
-   - `css/`、`js/`、`static/`、`index.html` 等都是编译产物，不应该提交到 git
-2. **Worker 模式**：使用 `--disable-worker` 可以只启动 server，不启动 worker（适合纯 API 调试）
-3. **数据目录**：首次启动会在 `${HOME}/gpustack` 创建数据库和缓存
-4. **默认账号**：用户名 `admin`，密码 `password`
-
-**验证服务启动：**
-
-```bash
-# 检查健康状态
-curl http://127.0.0.1:6080/healthz
-
-# 访问 Web UI（浏览器打开）
-http://127.0.0.1:6080
-
-# 访问 API 文档
-http://127.0.0.1:6080/docs
-```
-
-**调试技巧：**
-
-- 如果 `poetry install` 网络超时，可以按 `Ctrl+C` 中断后重试
-- 可以使用 `poetry install -vvv` 查看详细安装日志
-- 如果只需要调试核心功能，可以跳过某些可选依赖的安装
-- 访问 API 文档：`http://127.0.0.1:6080/docs`
-- 前端修改后需要重新运行 `pnpm build` 并重启服务
 
 ## build
 

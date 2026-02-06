@@ -1,8 +1,8 @@
-# vLLM-Omni 集成指南
+# vLLM-Omni 使用指南
 
 ## 概述
 
-本文档描述 GPUStack 集成 vLLM-Omni 后端的方案，用于支持 **Omni-Modality 模型**（全模态模型）的推理服务，包括：
+本文档描述 GPUStack 中 vLLM-Omni 后端的使用方法。vLLM-Omni 后端**已完全集成**，用于支持 **Omni-Modality 模型**（全模态模型）的推理服务，包括：
 
 - **Diffusion 图像生成模型**：Z-Image、Flux、Stable Diffusion 3 等
 - **音频模型**：语音生成、语音识别等
@@ -15,6 +15,14 @@
 - ✅ 统一的 API 接口，兼容 OpenAI 格式
 - ✅ 高性能推理，支持缓存加速
 - ✅ 与 GPUStack 现有架构无缝集成
+
+**实现状态**：
+
+- ✅ 后端代码已实现：`gpustack/worker/backends/vllm_omni.py`
+- ✅ 已集成到 ServeManager
+- ✅ Model Catalog 包含 Z-Image 模型
+- ✅ 支持自动模型类型检测
+- ✅ 支持缓存加速
 
 ---
 
@@ -47,26 +55,26 @@ GPUStack 现有后端的局限性：
 
 ## 架构设计
 
-### 系统架构
+### 系统架构（已实现）
 
 ```
 GPUStack Server
       │
       ├── Model Catalog (model-catalog.yaml)
-      │       └── Z-Image, Flux 等模型定义
+      │       └── Z-Image, Z-Image Turbo 等模型定义 ✅
       │
       ├── Scheduler
-      │       └── 根据 backend 类型分配到对应 Worker
+      │       └── 根据 backend 类型分配到对应 Worker ✅
       │
       └── Worker
-              ├── serve_manager.py
+              ├── serve_manager.py ✅
               │       └── 根据 BackendEnum 启动对应服务
               │
               └── backends/
                       ├── vllm.py          # LLM 推理
                       ├── llama_box.py     # GGUF 模型
                       ├── vox_box.py       # 音频模型
-                      └── vllm_omni.py     # 🆕 Omni 模态模型
+                      └── vllm_omni.py     # ✅ Omni 模态模型（已实现）
 ```
 
 ### 数据流
@@ -89,9 +97,9 @@ vLLM-Omni Server (Worker 节点)
 
 ---
 
-## 代码改动
+## 代码实现（已完成）
 
-### 1. 新增 BackendEnum
+### 1. BackendEnum 枚举 ✅
 
 **文件**：`gpustack/schemas/models.py`
 
@@ -101,75 +109,65 @@ class BackendEnum(str, Enum):
     VLLM = "vllm"
     VOX_BOX = "vox-box"
     ASCEND_MINDIE = "ascend-mindie"
-    VLLM_OMNI = "vllm-omni"  # 🆕 新增
+    VLLM_OMNI = "vllm-omni"  # ✅ 已实现
 ```
 
-### 2. 新增 vLLM-Omni 后端实现
+### 2. vLLM-Omni 后端实现 ✅
 
 **文件**：`gpustack/worker/backends/vllm_omni.py`
 
+已实现的功能：
+
+- ✅ 自动检测模型类型（diffusion/audio/llm）
+- ✅ 构建命令行参数
+- ✅ 支持用户自定义参数
+- ✅ 默认启用缓存加速（TeaCache）
+- ✅ 健康检查端点
+- ✅ 错误处理和日志记录
+
+核心方法：
+
 ```python
 class VLLMOmniServer(InferenceServer):
-    """
-    vLLM-Omni 推理服务器
-
-    支持：
-    - Diffusion 模型 (Z-Image, Flux, SD3)
-    - 音频模型
-    - 视频模型
-    """
-
     def start(self):
-        command_path = get_command_path("vllm-omni")
-        arguments = self._build_arguments()
+        # 启动 vllm-omni 服务
 
-        # 启动 vllm-omni serve
-        subprocess.run([command_path] + arguments, ...)
+    def _detect_model_type(self) -> str:
+        # 自动检测模型类型
 
-    def _build_arguments(self):
-        # 根据模型类型构建参数
-        model_type = self._detect_model_type()
-        if model_type == "diffusion":
-            return self._get_diffusion_arguments()
-        ...
+    def _get_diffusion_arguments(self) -> list:
+        # 获取 Diffusion 模型参数
 ```
 
-### 3. 更新 ServeManager
+### 3. ServeManager 集成 ✅
 
 **文件**：`gpustack/worker/serve_manager.py`
 
 ```python
 from gpustack.worker.backends.vllm_omni import VLLMOmniServer
 
-# 在 serve_model_instance 方法中添加
+# 已集成到 serve_model_instance 方法
 elif backend == BackendEnum.VLLM_OMNI:
     VLLMOmniServer(clientset, mi, cfg, worker_id).start()
 ```
 
-### 4. 添加模型目录
+### 4. Model Catalog ✅
 
 **文件**：`gpustack/assets/model-catalog.yaml`
 
+已添加的模型：
+
+- ✅ Z-Image Turbo（快速版本，8 步生成）
+- ✅ Z-Image（标准版本，50 步生成）
+
 ```yaml
 - name: Z-Image Turbo
-  description: 阿里通义 6B 参数图像生成模型，8 步快速生成
-  home: https://github.com/Tongyi-MAI/Z-Image
-  icon: /static/catalog_icons/alibaba.png
-  categories:
-    - image
-  licenses:
-    - apache-2.0
-  templates:
-    - quantizations: ["BF16"]
-      source: huggingface
-      huggingface_repo_id: Tongyi-MAI/Z-Image-Turbo
-      replicas: 1
-      backend: vllm-omni
-      backend_parameters:
-        - --num-inference-steps
-        - "9"
-        - --guidance-scale
-        - "0.0"
+  backend: vllm-omni
+  backend_parameters:
+    - --num-inference-steps
+    - "9"
+    - --guidance-scale
+    - "0.0"
 ```
 
 ---
@@ -437,14 +435,15 @@ tail -f /var/lib/gpustack/log/serve/{instance_id}.log
 
 ## 未来规划
 
-### 短期（1-2 个月）
+### 短期（已完成）
 
-- [ ] 完善 vLLM-Omni 后端实现
-- [ ] 添加更多 Diffusion 模型支持
-- [ ] 优化图像生成 API 路由
+- [x] 完善 vLLM-Omni 后端实现
+- [x] 添加 Z-Image 模型支持
+- [x] 集成到 ServeManager
 
-### 中期（3-6 个月）
+### 中期（进行中）
 
+- [ ] 添加更多 Diffusion 模型（Flux、SD3）
 - [ ] 支持音频生成模型
 - [ ] 支持视频生成模型
 - [ ] 添加 LoRA 微调支持

@@ -31,8 +31,24 @@ from gpustack.utils.hub import (
     match_model_scope_file_paths,
     FileEntry,
 )
+from gpustack.worker.downloader_s3 import S3Downloader
+from gpustack.config.config import Config
 
 logger = logging.getLogger(__name__)
+s3Downloader = None
+
+
+def init_s3_client(cfg: Config):
+    global s3Downloader
+    s3Downloader = S3Downloader(
+        host=cfg.worker_s3_host,
+        access_key=cfg.worker_s3_access_key,
+        secret_key=cfg.worker_s3_secret_key,
+        ssl=cfg.worker_s3_ssl,
+        use_virtual_hosted_style=cfg.worker_s3_use_virtual_hosted_style,
+        cache_dir=os.path.join(cfg.cache_dir, "beagle"),
+        region=cfg.worker_s3_region,
+    )
 
 
 def download_model(
@@ -41,6 +57,7 @@ def download_model(
     cache_dir: Optional[str] = None,
     ollama_library_base_url: Optional[str] = None,
     huggingface_token: Optional[str] = None,
+    cfg: Config = None,
 ) -> List[str]:
     if model.source == SourceEnum.HUGGING_FACE:
         return HfDownloader.download(
@@ -69,7 +86,13 @@ def download_model(
             cache_dir=os.path.join(cache_dir, "model_scope"),
         )
     elif model.source == SourceEnum.LOCAL_PATH:
-        return file.get_sharded_file_paths(model.local_path)
+        if model.local_path and 's3://beagle_wind' in model.local_path:
+            if s3Downloader is None:
+                init_s3_client(cfg)
+            # example s3://beagle_wind/bd-wind/datamodel/51c63609-faf4-446a-a2cf-47dd8d1a3e97/v1
+            return file.get_sharded_file_paths(s3Downloader.download(model.local_path))
+        else:
+            return file.get_sharded_file_paths(model.local_path)
 
 
 def get_model_file_info(
@@ -77,6 +100,7 @@ def get_model_file_info(
     huggingface_token: Optional[str] = None,
     cache_dir: Optional[str] = None,
     ollama_library_base_url: Optional[str] = None,
+    cfg: Config = None,
 ) -> List[FileEntry]:
     if model.source == SourceEnum.HUGGING_FACE:
         return HfDownloader.get_model_file_info(
@@ -96,6 +120,12 @@ def get_model_file_info(
             cache_dir=os.path.join(cache_dir, "ollama"),
         )
     elif model.source == SourceEnum.LOCAL_PATH:
+        if model.local_path and 's3://beagle_wind' in model.local_path:
+            if s3Downloader is None:
+                init_s3_client(cfg)
+            return s3Downloader.get_model_file_size(
+                model_instance=model,
+            )
         sharded_or_original_file_paths = file.get_sharded_file_paths(model.local_path)
         file_list = [
             FileEntry(f, file.getsize(f)) for f in sharded_or_original_file_paths

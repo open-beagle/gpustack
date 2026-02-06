@@ -164,6 +164,13 @@ class Config(BaseSettings):
     enable_hf_transfer: bool = False
     enable_hf_xet: bool = False
 
+    worker_s3_host: Optional[str] = ""
+    worker_s3_access_key: Optional[str] = ""
+    worker_s3_secret_key: Optional[str] = ""
+    worker_s3_ssl: bool = False
+    worker_s3_use_virtual_hosted_style: bool = True
+    worker_s3_region: Optional[str] = ""
+
     def __init__(self, **values):
         super().__init__(**values)
 

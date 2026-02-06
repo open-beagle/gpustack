@@ -210,7 +210,7 @@ class ActiveRecordMixin:
         """
 
         if isinstance(source, SQLModel):
-            obj = cls.from_orm(source, update=update)
+            obj = cls.model_validate(source, update=update)
         elif isinstance(source, dict):
             obj = cls.parse_obj(source, update=update)
         return obj

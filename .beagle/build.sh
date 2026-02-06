@@ -45,10 +45,7 @@ echo "Downloading UI assets for ${VERSION}..."
 if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
   "https://cache.ali.wodcloud.com/vscode/gpustack/gpustack-ui-${VERSION}.tar.gz" | \
   tar -xzf - --directory "$UI_PATH/tmp/ui" 2>/dev/null; then
-  echo "Failed to download ${VERSION}, trying latest..."
-  curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
-    "https://cache.ali.wodcloud.com/vscode/gpustack/gpustack-ui-latest.tar.gz" | \
-    tar -xzf - --directory "$UI_PATH/tmp/ui"
+  echo "Failed to download ${VERSION} ."
 fi
 cp -a "$UI_PATH/tmp/ui/dist/." "$UI_PATH"
 

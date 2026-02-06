@@ -18,7 +18,7 @@ from huggingface_hub.utils import build_hf_headers
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
-from gpustack.logging import setup_logging
+from gpustack.logginglocal import setup_logging
 from gpustack.schemas.model_files import ModelFile, ModelFileUpdate, ModelFileStateEnum
 from gpustack.client import ClientSet
 from gpustack.schemas.models import SourceEnum
@@ -508,6 +508,7 @@ class ModelFileDownloadTask:
             cache_dir=self._config.cache_dir,
             ollama_library_base_url=self._config.ollama_library_base_url,
             huggingface_token=self._config.huggingface_token,
+            cfg=self._config,
         )
         self._download_completed = True
         self._update_model_file(
@@ -709,6 +710,7 @@ class ModelFileDownloadTask:
             huggingface_token=self._config.huggingface_token,
             cache_dir=self._config.cache_dir,
             ollama_library_base_url=self._config.ollama_library_base_url,
+            cfg=self._config,
         )
 
         (size, file_paths) = hub.match_file_and_calculate_size(

@@ -152,9 +152,10 @@ async def get_user_from_bearer_token(
 ) -> Optional[User]:
     try:
         parts = bearer_token.credentials.split("_")
-        if len(parts) == 3 and parts[0] == API_KEY_PREFIX:
-            access_key = parts[1]
-            secret_key = parts[2]
+        if len(parts) == 2:
+            # Format: {access_key}_{secret_key}
+            access_key = parts[0]
+            secret_key = parts[1]
             api_key = await APIKeyService(session).get_by_access_key(access_key)
             if (
                 api_key is not None

@@ -364,7 +364,7 @@ class AscendMindIEResourceFitSelector(ScheduleCandidatesSelector):
         # see https://www.hiascend.com/document/detail/zh/mindie/20RC2/mindiellm/llmdev/mindie_llm0288.html.
         at_size = t_size
         if (
-            self._model_params.quantize
+            self._model_params.quantize is not None
             and self._model_params.quantize.lower().startswith("w8a8")
         ):
             at_size = 1

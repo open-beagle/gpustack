@@ -631,7 +631,23 @@ async def calculate_model_resource_claim(
         kwargs: Additional arguments to pass to the GGUF parser.
     """
 
-    if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(model.local_path):
+    # 获取cache_dir的父目录
+    cache_dir = kwargs.get("cache_dir")
+    if cache_dir:
+        cache_dir = os.path.dirname(cache_dir)  # 获取上一级目录
+    cache_path = model.local_path
+    if model.source == SourceEnum.LOCAL_PATH and model.local_path and model.local_path.startswith(
+        "s3://beagle_wind/"
+    ):
+        # 构建本地缓存路径
+        if cache_dir:
+            cache_path = os.path.join(
+                cache_dir,
+                "beagle",
+                model.local_path.removeprefix("s3://beagle_wind/bd-wind/datamodel/"),
+            )
+
+    if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(cache_path):
         # Skip the calculation if the model is not available, policies like spread strategy still apply.
         # TODO Support user provided resource claim for better scheduling.
         e, a = _get_empty_estimate()

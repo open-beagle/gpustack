@@ -11,7 +11,7 @@ import yaml
 
 from gpustack import __version__, __git_commit__
 from gpustack.config.config import set_global_config
-from gpustack.logging import setup_logging
+from gpustack.logginglocal import setup_logging
 from gpustack.utils.envs import get_gpustack_env, get_gpustack_env_bool
 from gpustack.worker.worker import Worker
 from gpustack.config import Config
@@ -369,6 +369,43 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         action='append',
         help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers Content-Type. Default: ["Authorization", "Content-Type"].',
     )
+    group.add_argument(
+        "--worker-s3-host",
+        type=str,
+        help="HOST to s3.",
+        default=get_gpustack_env("STACK_WORKER_S3_HOST"),
+    )
+    group.add_argument(
+        "--worker-s3-access-key",
+        type=str,
+        help="AccessKey to s3.",
+        default=get_gpustack_env("STACK_WORKER_S3_ACCESS_KEY"),
+    )
+    group.add_argument(
+        "--worker-s3-secret-key",
+        type=str,
+        help="SecretKey to s3.",
+        default=get_gpustack_env("STACK_WORKER_S3_SECRET_KEY"),
+    )
+    group.add_argument(
+        "--worker-s3-ssl",
+        action=OptionalBoolAction,
+        help="SecretKey to s3.",
+        default=get_gpustack_env_bool("STACK_WORKER_S3_SSL") or False,
+    )
+    group.add_argument(
+        "--worker-s3-use-virtual-hosted-style",
+        action=OptionalBoolAction,
+        help="Use virtual hosted style to s3.",
+        default=get_gpustack_env_bool("STACK_WORKER_S3_USE_VIRTUAL_HOSTED_STYLE")
+        or False,
+    )
+    group.add_argument(
+        "--worker-s3-region",
+        type=str,
+        help="Region to s3.",
+        default=get_gpustack_env("STACK_WORKER_S3_REGION"),
+    )
     # External authentication settings
     group.add_argument(
         "--external-auth-name",
@@ -565,6 +602,12 @@ def set_common_options(args, config_data: dict):
         "ray_args",
         "ray_node_manager_port",
         "ray_object_manager_port",
+        "worker_s3_host",
+        "worker_s3_access_key",
+        "worker_s3_secret_key",
+        "worker_s3_ssl",
+        "worker_s3_use_virtual_hosted_style",
+        "worker_s3_region",
     ]
 
     for option in options:
