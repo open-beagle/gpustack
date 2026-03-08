@@ -34,10 +34,8 @@ class UserCreate(UserBase):
 
     @field_validator('password')
     def validate_password(cls, value):
-        if not re.search(r'[A-Z]', value):
-            raise ValueError('Password must contain at least one uppercase letter')
-        if not re.search(r'[a-z]', value):
-            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search(r'[a-zA-Z]', value):
+            raise ValueError('Password must contain at least one letter')
         if not re.search(r'[0-9]', value):
             raise ValueError('Password must contain at least one digit')
         if not re.search(r'[!@#$%^&*_+]', value):
@@ -55,10 +53,8 @@ class UpdatePassword(SQLModel):
 
     @field_validator('new_password')
     def validate_password(cls, value):
-        if not re.search(r'[A-Z]', value):
-            raise ValueError('Password must contain at least one uppercase letter')
-        if not re.search(r'[a-z]', value):
-            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search(r'[a-zA-Z]', value):
+            raise ValueError('Password must contain at least one letter')
         if not re.search(r'[0-9]', value):
             raise ValueError('Password must contain at least one digit')
         if not re.search(r'[!@#$%^&*_+]', value):
