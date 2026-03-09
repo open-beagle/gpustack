@@ -290,7 +290,11 @@ docker build \
 docker push registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-cuda
 ```
 
-**注意：** 关于 vLLM 版本管理和多版本支持，请参考 [vLLM 版本管理文档](.beagle/vllm.md)
+**注意：**
+
+- 默认 vLLM 版本已升级至 0.17.0，transformers 版本升级至 >=5.3.0
+- 关于 vLLM 版本管理和多版本支持，请参考 [vLLM 版本管理文档](.beagle/vllm.md)
+- vLLM 0.17.0 新特性和升级指南，请参考 [vLLM 0.17.0 快速指南](../docs/beagle-vllm-0.17.0-guide.md)
 
 ### corex
 

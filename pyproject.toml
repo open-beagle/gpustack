@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "gpustack"
-version = "v0.7.1"
+version = "v0.7.2"
 description = "GPUStack"
 authors = ["GPUStack Authors <contact@gpustack.ai>"]
 readme = "README.md"
@@ -39,21 +39,21 @@ cryptography = "^43.0.0"
 tzdata = "^2024.1"
 modelscope = "^1.28"
 ray = {version = "2.48.0", extras = ["default"]}
-vllm = {version = "0.11.2", optional = true}
+vllm = {version = "0.17.0", optional = true}
 mistral_common = {version = "^1.4.3", optional = true, extras = ["opencv"]}
 uvicorn = "^0.32.0"
-transformers = "^4.51.3"
+transformers = ">=4.56.0,<5"
 fastapi-cdn-host = "^0.8.0"
 wmi = { version="^1.5.1", markers = "platform_system == 'Windows'" }
 pywin32 = { version="^308", markers = "platform_system == 'Windows'" }
 packaging = "^24.1"
 psycopg2-binary = "^2.9.10"
-vox-box = {version = "0.0.19", optional = true}
+vox-box = {version = "0.0.21", optional = true}
 
 tenacity = "^9.0.0"
 aiocache = "^0.12.3"
 aiofiles = "^23.2.1"
-aiohttp = "^3.11.2"
+aiohttp = ">=3.13.3"
 bitsandbytes = {version = "^0.45.2", optional = true}
 python-json-logger = "^3.3.0"
 hf-transfer = "^0.1.9"
