@@ -161,3 +161,6 @@ __pycache__/
 
 /.tmp
 /.downloads
+
+# UI build artifacts (source code is in ./ui submodule)
+/gpustack/ui

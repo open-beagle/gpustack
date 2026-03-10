@@ -9,7 +9,7 @@ VENV_DIR="$PWD/.venv"
 VERSION="${VERSION:-v0.7.1}"
 
 # 清理旧的构建产物
-rm -rf "$PWD/dist" "$PWD/gpustack/ui"
+rm -rf "$PWD/dist"
 
 # 检查 venv 是否与当前 Python 版本匹配
 CURRENT_PYTHON_VERSION=$(python3 --version | awk '{print $2}' | cut -d. -f1,2)
@@ -35,40 +35,35 @@ if ! [ -e "$VENV_DIR/bin/poetry" ]; then
   "$VENV_DIR/bin/pip" install poetry==1.8.3
 fi
 
-# 下载 UI
+# UI 产物目录（打包进 wheel 的目录）
 UI_PATH="$PWD/gpustack/ui"
-rm -rf "$UI_PATH"
-mkdir -p "$UI_PATH/tmp/ui"
 
-echo "Downloading UI assets for ${VERSION}..."
-# 尝试从自己的 S3 服务器下载
-if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
-  "https://cache.ali.wodcloud.com/vscode/gpustack/gpustack-ui-${VERSION}.tar.gz" | \
-  tar -xzf - --directory "$UI_PATH/tmp/ui" 2>/dev/null; then
-  echo "Failed to download ${VERSION} ."
-fi
-cp -a "$UI_PATH/tmp/ui/dist/." "$UI_PATH"
+# 优先级：本地 gpustack/ui > ui/dist（本地构建） > 远程下载
+if [ -f "$UI_PATH/index.html" ]; then
+  echo "UI build artifacts already exist at $UI_PATH, skipping download."
+elif [ -f "$PWD/ui/dist/index.html" ]; then
+  echo "Found local UI build at ui/dist, copying to $UI_PATH..."
+  rm -rf "$UI_PATH"
+  mkdir -p "$UI_PATH"
+  cp -a "$PWD/ui/dist/." "$UI_PATH"
+else
+  echo "Downloading UI assets for ${VERSION}..."
+  rm -rf "$UI_PATH"
+  mkdir -p "$UI_PATH"
 
-# 复制自定义静态文件
-cp -r "$PWD/.beagle/static/"* "$UI_PATH/static/"
+  UI_TMP="$PWD/.tmp/ui-download"
+  rm -rf "$UI_TMP"
+  mkdir -p "$UI_TMP"
 
-# 修改版权信息
-UMI_JS="$(ls $UI_PATH/js/umi.*.js)"
-sed -i 's/数澈软件/北京比格/g' "$UMI_JS"
+  if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
+    "https://cache.ali.wodcloud.com/vscode/gpustack/gpustack-ui-${VERSION}.tar.gz" | \
+    tar -xzf - --directory "$UI_TMP" 2>/dev/null; then
+    echo "Failed to download UI assets for ${VERSION}."
+    exit 1
+  fi
 
-# 修改帮助超链接
-sed -i 's|https://docs.gpustack.ai|https://www.bc-cloud.com|g' "$UI_PATH/index.html"
-
-# 禁用 help & lang 菜单
-UMI_CSS="$(ls $UI_PATH/css/umi.*.css)"
-echo 'div[data-menu-id^="rc-menu-uuid-"][data-menu-id$="-help"]{display:none;}' >> "$UMI_CSS"
-echo 'div[data-menu-id^="rc-menu-uuid-"][data-menu-id$="-lang"]{display:none;}' >> "$UMI_CSS"
-
-rm -rf "$UI_PATH/tmp"
-
-# 复制额外静态文件
-if [ -d "$PWD/static" ]; then
-  cp -a "$PWD/static/." "$UI_PATH/static/"
+  cp -a "$UI_TMP/dist/." "$UI_PATH"
+  rm -rf "$UI_TMP"
 fi
 
 # 设置版本号
@@ -76,7 +71,6 @@ VERSION_FILE="$PWD/gpustack/__init__.py"
 GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "HEAD")
 GIT_COMMIT_SHORT="${GIT_COMMIT:0:7}"
 
-# 使用 Python 修改版本，避免 sed 引号问题
 python3 -c "
 import re
 with open('$VERSION_FILE', 'r') as f:
@@ -90,14 +84,14 @@ with open('$VERSION_FILE', 'w') as f:
 "$VENV_DIR/bin/pip" install msgpack
 "$VENV_DIR/bin/poetry" version "${VERSION}"
 
-# 验证 UI 目录存在
-if [ ! -d "$PWD/gpustack/ui" ] || [ ! -f "$PWD/gpustack/ui/index.html" ]; then
+# 验证 UI 目录
+if [ ! -f "$UI_PATH/index.html" ]; then
   echo "ERROR: UI directory not found or incomplete!"
   exit 1
 fi
 
 echo "UI directory contents:"
-ls -la "$PWD/gpustack/ui/"
+ls -la "$UI_PATH/"
 
 # 使用 poetry 构建
 "$VENV_DIR/bin/poetry" build

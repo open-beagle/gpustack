@@ -3,7 +3,7 @@ ARG BASE=registry.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04
 FROM $BASE
 
 ARG AUTHOR=mengkzhaoyun@gmail.com
-ARG VERSION=v0.7.1
+ARG VERSION=dev
 
 LABEL maintainer=$AUTHOR version=$VERSION
 
@@ -52,6 +52,8 @@ RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)[vllm]" && \
     pip3 install --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE && \
     # 安装 vLLM-Omni 用于支持 Diffusion 模型（Z-Image、Flux 等）
     pip3 install --no-cache-dir --default-timeout=12000 vllm-omni && \
+    # 强制升级 transformers 以支持最新模型架构
+    pip3 install --no-cache-dir "transformers>=5.3.0" && \
     rm -rf /tmp/*.whl
 
 # 下载工具

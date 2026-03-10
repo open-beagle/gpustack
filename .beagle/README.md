@@ -9,7 +9,7 @@ git remote add upstream git@github.com:gpustack/gpustack.git
 
 git fetch upstream
 
-git merge v0.7.1
+git merge v0.7.2
 ```
 
 ## images
@@ -47,7 +47,7 @@ docker push registry-vpc.cn-qingdao.aliyuncs.com/wod/corex:mr-bi150-4.3.0-x86-ub
 # default user admin
 docker run -d --gpus all -p 6080:6080 --ipc=host --shm-size=2g --name gpustack \
   -v /data/gpustack:/var/lib/gpustack \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-cuda \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-cuda \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
@@ -60,7 +60,7 @@ docker rm -f windstack&& rm -rf /data/windstack
 docker run -d --gpus all --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /data/gpustack:/var/lib/gpustack \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-cuda \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-cuda \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -78,7 +78,7 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstac
   -v /data/windstack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-cann \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-cann \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
@@ -93,7 +93,7 @@ docker run -d --ipc=host --shm-size=2g --name windstack \
   -v /usr/share/hwdata:/usr/share/hwdata \
   -v /data/windstack/data:/var/lib/gpustack \
   -e ASCEND_VISIBLE_DEVICES=0-7 \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-cann \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-cann \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -110,7 +110,7 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstac
   -v /data/windstack/data:/var/lib/gpustack \
   -e MTHREADS_VISIBLE_DEVICES=0-7 \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-musa \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-musa \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
@@ -124,7 +124,7 @@ docker run -d --ipc=host --shm-size=2g --name gpustack \
   -p 10150:10150 -p 40000-41024:40000-41024 \
   -v /data/windstack/data:/var/lib/gpustack \
   -e MTHREADS_VISIBLE_DEVICES=0-7 \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-musa \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-musa \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -150,7 +150,7 @@ docker run -d --name windstack \
   -v /data/windstack/data:/var/lib/gpustack \
   -e TZ=Asia/Shanghai \
   -e VLLM_TARGET_DEVICE=corex \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-corex \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-corex \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
@@ -173,7 +173,7 @@ docker run -d --name windstack \
   -v /data/windstack/data:/var/lib/gpustack \
   -e TZ=Asia/Shanghai \
   -e VLLM_TARGET_DEVICE=corex \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-corex \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-corex \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -198,7 +198,7 @@ docker run -d -p 6080:6080 --privileged --ipc=host --shm-size=2g --name windstac
   --security-opt seccomp=unconfined \
   -v /data/windstack/data:/var/lib/gpustack \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-musa \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-musa \
   --bootstrap-password 'beagle!@#123' --port 6080 \
   --worker-name <host-name> \
   --worker-s3-host=your_s3_host \
@@ -220,7 +220,7 @@ docker run -d --ipc=host --shm-size=2g --name windstack \
   --security-opt seccomp=unconfined \
   -v /data/windstack/data:/var/lib/gpustack \
   -e TZ=Asia/Shanghai \
-  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-musa \
+  registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-musa \
   --server-url http://myserver:6080 --token mytoken \
   --worker-ip <host-ip> \
   --worker-name <host-name> \
@@ -247,7 +247,7 @@ poetry config repositories.pypi-mirror https://pypi.tuna.tsinghua.edu.cn/simple
 pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
 # 编译前端（可选，如果需要修改 UI）
-bash -c "cd gpustack/ui && pnpm install && pnpm build"
+bash -c "cd ui && pnpm install && pnpm build"
 
 # 安装依赖（会自动创建虚拟环境 .venv）
 # 注意：首次安装可能需要较长时间（30分钟-1小时），因为需要编译 vLLM 等大型依赖
@@ -272,22 +272,22 @@ poetry run python3 \
 ### cuda
 
 ```bash
-sudo rm -rf .venv dist gpustack/ui && \
+sudo rm -rf .venv dist && \
 docker pull registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm && \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
-  -e VERSION=v0.7.1 \
+  -e VERSION=v0.7.2 \
   -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
   bash .beagle/build.sh
 
 docker build \
   --build-arg BASE=registry.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04 \
-  -t registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-cuda \
+  -t registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-cuda \
   -f .beagle/cuda.dockerfile \
   . && \
-docker push registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-cuda
+docker push registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-cuda
 ```
 
 **注意：**
@@ -299,22 +299,22 @@ docker push registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-cuda
 ### corex
 
 ```bash
-sudo rm -rf rm -rf .venv dist gpustack/ui && \
+sudo rm -rf rm -rf .venv dist && \
 docker pull registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm && \
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
-  -e VERSION=v0.7.1 \
+  -e VERSION=v0.7.2 \
   -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
   bash .beagle/build.sh
 
 docker build \
   --build-arg BASE=registry.cn-qingdao.aliyuncs.com/wod/corex:mr-bi150-4.3.0-x86-ubuntu20.04-py3.10-poc-llm-infer-v1.2.3 \
-  -t registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-corex \
+  -t registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-corex \
   -f .beagle/corex.dockerfile \
   . && \
-docker push registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-corex
+docker push registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.2-corex
 ```
 
 ### cann
@@ -324,7 +324,7 @@ docker push registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.1-corex
 docker run -it --rm \
   -v $PWD/:/go/src/github.com/open-beagle/gpustack \
   -w /go/src/github.com/open-beagle/gpustack \
-  -e VERSION=v0.7.1 \
+  -e VERSION=v0.7.2 \
   -e POETRY_PYPI_MIRROR_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/ \
   registry.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm \
   bash .beagle/build.sh
@@ -379,7 +379,7 @@ python3 \
   --data-dir=${HOME}/gpustack \
   --tools-download-base-url=https://cache.ali.wodcloud.com/vscode
 
-git apply .beagle/v0.7.1-logginglocal.patch
+git apply .beagle/v0.7.2-logginglocal.patch
 ```
 
 ## tools
