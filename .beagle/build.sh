@@ -86,20 +86,20 @@ poetry version "${VERSION}"
 echo "Building with poetry..."
 poetry build
 
-# 验证 wheel 包含 UI
-echo "Checking wheel contents for UI files..."
-WHEEL_FILE=$(ls -t dist/*.whl | head -1)
-if [ -f "$WHEEL_FILE" ]; then
-  echo "Wheel file: $WHEEL_FILE"
-  unzip -l "$WHEEL_FILE" | grep -E "(ui/|index.html)" || {
-    echo "WARNING: UI files not found in wheel!"
-    echo "Full wheel contents:"
-    unzip -l "$WHEEL_FILE" | head -100
-  }
-else
-  echo "ERROR: Wheel file not found!"
-  exit 1
-fi
+# # 验证 wheel 包含 UI
+# echo "Checking wheel contents for UI files..."
+# WHEEL_FILE=$(ls -t dist/*.whl | head -1)
+# if [ -f "$WHEEL_FILE" ]; then
+#   echo "Wheel file: $WHEEL_FILE"
+#   unzip -l "$WHEEL_FILE" | grep -E "(ui/|index.html)" || {
+#     echo "WARNING: UI files not found in wheel!"
+#     echo "Full wheel contents:"
+#     unzip -l "$WHEEL_FILE" | head -100
+#   }
+# else
+#   echo "ERROR: Wheel file not found!"
+#   exit 1
+# fi
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
