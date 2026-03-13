@@ -1,7 +1,14 @@
 #!/bin/bash
 
 git config --global --add safe.directory "$PWD"
-pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
+
+# 配置 PyPI 镜像源：优先阿里云内网，不可达则回退公网
+if curl -s --connect-timeout 2 https://mirrors.cloud.aliyuncs.com/pypi/simple/ > /dev/null 2>&1; then
+  PYPI_MIRROR="https://mirrors.cloud.aliyuncs.com/pypi/simple/"
+else
+  PYPI_MIRROR="https://mirrors.aliyun.com/pypi/simple/"
+fi
+pip config set global.index-url "$PYPI_MIRROR"
 
 set -ex
 
