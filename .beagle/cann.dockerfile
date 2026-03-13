@@ -10,7 +10,7 @@ LABEL maintainer=$AUTHOR version=$VERSION
 COPY ./dist/*.whl /tmp/
 
 RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
-  pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
+  pip3 config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simple/ && \
   pip3 install --use-pep517 $WHEEL_PACKAGE &&\
   rm /tmp/*.whl && \
   pip3 cache purge

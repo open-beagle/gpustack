@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y \
     tini \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout=600 --retries=10 /tmp/*.whl && \
+RUN pip install -i https://mirrors.cloud.aliyuncs.com/pypi/simple/ --timeout=600 --retries=10 /tmp/*.whl && \
     pip cache purge && rm -rf /tmp/*.whl
 
 RUN gpustack download-tools

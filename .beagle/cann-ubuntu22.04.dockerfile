@@ -10,7 +10,7 @@ LABEL maintainer=$AUTHOR version=$VERSION
 COPY ./dist/*.whl /tmp/
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN sed -i 's/http:\/\/ports.ubuntu.com\/ubuntu-ports\//https:\/\/mirrors.tuna.tsinghua.edu.cn\/ubuntu-ports\//g' /etc/apt/sources.list && \
+RUN sed -i 's/http:\/\/ports.ubuntu.com\/ubuntu-ports\//https:\/\/mirrors.cloud.aliyuncs.com\/ubuntu-ports\//g' /etc/apt/sources.list && \
   apt-get update && \
   apt-get install -y \
   gcc \
@@ -19,7 +19,7 @@ RUN sed -i 's/http:\/\/ports.ubuntu.com\/ubuntu-ports\//https:\/\/mirrors.tuna.t
   rm -rf /var/lib/apt/lists/*
 
 RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
-  pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
+  pip3 config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simple/ && \
   pip3 install --use-pep517 $WHEEL_PACKAGE &&\
   rm /tmp/*.whl && \
   pip3 cache purge
