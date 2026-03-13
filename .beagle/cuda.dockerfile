@@ -44,17 +44,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
 
-ARG PYPI_MIRROR=https://mirrors.cloud.aliyuncs.com/pypi/simple/
+ARG PYPI_MIRROR=http://mirrors.cloud.aliyuncs.com/pypi/simple/
+ARG PYPI_HOST=mirrors.cloud.aliyuncs.com
 
 # 安装 GPUStack、vLLM 和 vLLM-Omni
 COPY ./dist/*.whl /tmp/
 RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)[vllm]" && \
-    python3 -m pip install -i ${PYPI_MIRROR} --upgrade pip && \
-    pip3 install -i ${PYPI_MIRROR} --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE && \
+    python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --upgrade pip && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE && \
     # 安装 vLLM-Omni 用于支持 Diffusion 模型（Z-Image、Flux 等）
-    pip3 install -i ${PYPI_MIRROR} --no-cache-dir --default-timeout=12000 vllm-omni && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 vllm-omni && \
     # 强制升级 transformers 以支持最新模型架构
-    pip3 install -i ${PYPI_MIRROR} --no-cache-dir "transformers>=5.3.0" && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir "transformers>=5.3.0" && \
     rm -rf /tmp/*.whl
 
 # 下载工具

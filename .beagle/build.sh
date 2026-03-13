@@ -3,12 +3,15 @@
 git config --global --add safe.directory "$PWD"
 
 # 配置 PyPI 镜像源：优先阿里云内网，不可达则回退公网
-if curl -s --connect-timeout 2 https://mirrors.cloud.aliyuncs.com/pypi/simple/ > /dev/null 2>&1; then
-  PYPI_MIRROR="https://mirrors.cloud.aliyuncs.com/pypi/simple/"
+if curl -s --connect-timeout 2 http://mirrors.cloud.aliyuncs.com/pypi/simple/ > /dev/null 2>&1; then
+  PYPI_MIRROR="http://mirrors.cloud.aliyuncs.com/pypi/simple/"
+  PYPI_HOST="mirrors.cloud.aliyuncs.com"
 else
   PYPI_MIRROR="https://mirrors.aliyun.com/pypi/simple/"
+  PYPI_HOST="mirrors.aliyun.com"
 fi
 pip config set global.index-url "$PYPI_MIRROR"
+pip config set global.trusted-host "$PYPI_HOST"
 
 set -ex
 
