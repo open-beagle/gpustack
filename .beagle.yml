@@ -40,7 +40,6 @@ steps:
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
     environment:
       VERSION: v0.7.2
-      POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
     commands:
       - bash .beagle/build.sh
 

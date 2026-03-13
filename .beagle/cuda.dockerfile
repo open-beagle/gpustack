@@ -49,9 +49,9 @@ ARG PYPI_HOST=mirrors.cloud.aliyuncs.com
 
 # 安装 GPUStack、vLLM 和 vLLM-Omni
 COPY ./dist/*.whl /tmp/
-RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)[vllm]" && \
+RUN WHEEL_PACKAGE_STACK="$(ls /tmp/*.whl)[vllm]" && \
     python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --upgrade pip && \
-    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE_STACK && \
     # 安装 vLLM-Omni 用于支持 Diffusion 模型（Z-Image、Flux 等）
     pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 vllm-omni && \
     # 强制升级 transformers 以支持最新模型架构
