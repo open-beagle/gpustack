@@ -84,6 +84,7 @@ def download_model(
             extra_file_path=get_mmproj_filename(model),
             local_dir=local_dir,
             cache_dir=os.path.join(cache_dir, "model_scope"),
+            cfg=cfg,
         )
     elif model.source == SourceEnum.LOCAL_PATH:
         if model.local_path and 's3://beagle_wind' in model.local_path:
@@ -581,6 +582,59 @@ class ModelScopeDownloader:
         return file_list
 
     @classmethod
+    def check_s3_model_exists(cls, model_id: str, cfg: Config) -> bool:
+        """检查本地 S3 是否存在指定的 ModelScope 模型
+        
+        Args:
+            model_id: ModelScope 模型 ID，如 "Qwen/Qwen3.5-35B-A3B-FP8"
+            cfg: 配置对象
+            
+        Returns:
+            bool: 模型是否存在
+        """
+        # 检查是否配置了 S3
+        if not cfg or not cfg.worker_s3_host:
+            return False
+            
+        try:
+            # 初始化 S3 客户端（如果还没有初始化）
+            global s3Downloader
+            if s3Downloader is None:
+                init_s3_client(cfg)
+            
+            # 构造 S3 路径
+            s3_path = f"s3://beagle_wind/bd-wind/datamodel/{model_id}"
+            base_path = s3_path.removeprefix("s3://beagle_wind/")
+            bucket_name = base_path.split("/")[0]
+            
+            if s3Downloader.use_virtual_hosted_style:
+                base_path = base_path.removeprefix(bucket_name + "/")
+            else:
+                base_path = "/".join(base_path.split("/")[1:])
+            
+            object_prefix = base_path.removeprefix("datamodel/")
+            
+            # 检查是否存在对象（设置较短超时）
+            objects = list(s3Downloader._s3_client.list_objects(
+                bucket_name, 
+                prefix=object_prefix, 
+                recursive=False,
+                max_keys=1  # 只需要检查是否有文件即可
+            ))
+            
+            exists = len(objects) > 0
+            if exists:
+                logger.info(f"本地 S3 存在模型: {model_id}")
+            else:
+                logger.info(f"本地 S3 不存在模型: {model_id}")
+            
+            return exists
+            
+        except Exception as e:
+            logger.warning(f"检查本地 S3 模型存在性失败: {e}")
+            return False
+
+    @classmethod
     def download(
         cls,
         model_id: str,
@@ -588,6 +642,7 @@ class ModelScopeDownloader:
         extra_file_path: Optional[str],
         local_dir: Optional[Union[str, os.PathLike[str]]] = None,
         cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
+        cfg: Config = None,
     ) -> List[str]:
         """Download a model from Model Scope.
 
@@ -598,11 +653,61 @@ class ModelScopeDownloader:
                 A filename or glob pattern to match the model file in the repo.
             cache_dir:
                 The cache directory to save the model to.
+            cfg:
+                Configuration object for S3 settings.
 
         Returns:
             The path to the downloaded model.
         """
+        
+        # 检查本地 S3 是否存在该模型
+        if cfg and cls.check_s3_model_exists(model_id, cfg):
+            logger.info(f"检测到 ModelScope 模型: {model_id}")
+            logger.info(f"本地 S3 存在该模型，优先从本地 S3 下载")
+            
+            try:
+                # 构造 S3 路径
+                s3_path = f"s3://beagle_wind/bd-wind/datamodel/{model_id}"
+                logger.info(f"下载源: {s3_path}")
+                
+                # 从本地 S3 下载
+                global s3Downloader
+                if s3Downloader is None:
+                    init_s3_client(cfg)
+                
+                downloaded_path = s3Downloader.download(s3_path)
+                logger.info(f"从本地 S3 下载成功")
+                
+                # 如果指定了 file_path，需要匹配文件
+                if file_path:
+                    # 列出下载目录中的所有文件
+                    import glob
+                    all_files = []
+                    for root, dirs, files in os.walk(downloaded_path):
+                        for f in files:
+                            rel_path = os.path.relpath(os.path.join(root, f), downloaded_path)
+                            all_files.append(rel_path)
+                    
+                    # 使用 glob 匹配
+                    import fnmatch
+                    matching_files = [f for f in all_files if fnmatch.fnmatch(f, file_path)]
+                    
+                    if len(matching_files) == 0:
+                        raise ValueError(f"No file found in S3 path that match {file_path}")
+                    
+                    return [os.path.join(downloaded_path, f) for f in matching_files]
+                
+                # 返回整个目录
+                return [downloaded_path]
+                
+            except Exception as e:
+                logger.warning(f"从本地 S3 下载失败: {e}")
+                logger.info(f"降级到 ModelScope 下载")
+                # 继续执行下面的 ModelScope 下载逻辑
 
+        # 从 ModelScope 下载（原有逻辑）
+        logger.info(f"从 ModelScope 下载模型: {model_id}")
+        
         group_or_owner, name = model_id_to_group_owner_name(model_id)
         lock_filename = os.path.join(cache_dir, group_or_owner, f"{name}.lock")
 

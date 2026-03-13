@@ -1,10 +1,17 @@
 [tool.poetry]
 name = "gpustack"
-version = "v0.7.2"
+version = "0.7.2"
 description = "GPUStack"
 authors = ["GPUStack Authors <contact@gpustack.ai>"]
 readme = "README.md"
-include = ["*/third_party/config/**/*","*/ui/**/*", "gpustack.pth"]
+packages = [
+    { include = "gpustack" }
+]
+include = [
+    { path = "gpustack/third_party/config/**/*", format = ["sdist", "wheel"] },
+    { path = "gpustack/ui/**/*", format = ["sdist", "wheel"] },
+    { path = "gpustack.pth", format = ["sdist", "wheel"] }
+]
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.13"

@@ -59,18 +59,29 @@ class S3Downloader:
 
         # 解析S3路径
         # s3://beagle_wind/bd-wind/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/v1/qwen2.5-3b-instruct-q8_0.gguf
+        # 或 s3://beagle_wind/bd-wind/datamodel/Qwen/Qwen3.5-35B-A3B-FP8 (目录)
         base_path = s3_path.removeprefix("s3://beagle_wind/")
         bucket_name = base_path.split("/")[0]
         if self.use_virtual_hosted_style:
             base_path = base_path.removeprefix(bucket_name)
-        object_prefix = "/".join(base_path.split("/")[1:-1])  # 去掉最后的文件名部分
+        
+        # 判断是文件还是目录
+        # 如果路径以文件扩展名结尾，认为是文件；否则认为是目录
+        is_file = any(s3_path.endswith(ext) for ext in ['.gguf', '.safetensors', '.bin', '.pth', '.pt'])
+        
+        if is_file:
+            # 原有逻辑：下载单个文件及其分片
+            object_prefix = "/".join(base_path.split("/")[1:-1])  # 去掉最后的文件名部分
+        else:
+            # 新逻辑：下载整个目录
+            object_prefix = "/".join(base_path.split("/")[1:])  # 保留完整路径作为前缀
 
         # 准备本地缓存路径
         local_cache = cache_dir or self._cache_dir
         local_path = os.path.join(
             local_cache, s3_path.removeprefix("s3://beagle_wind/"+bucket_name+"/datamodel/")
         )
-        local_dir = os.path.dirname(local_path)  # 获取local_path的父目录
+        local_dir = os.path.dirname(local_path) if is_file else local_path
         if not os.path.exists(local_dir):  # 创建父目录
             os.makedirs(local_dir)
 
@@ -97,7 +108,7 @@ class S3Downloader:
                     )
 
                 logger.debug(f"已下载 {bucket_name}/{object_prefix}")
-                return local_path
+                return local_path if is_file else local_dir
 
             except S3Error as e:
                 logger.error(f"S3下载错误: {e}")

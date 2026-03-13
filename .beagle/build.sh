@@ -5,35 +5,17 @@ pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
 set -ex
 
-VENV_DIR="$PWD/.venv"
 VERSION="${VERSION:-v0.7.1}"
+
+# 检查并安装 poetry
+if ! command -v poetry &> /dev/null; then
+  echo "Poetry not found, installing..."
+  curl -sSL https://install.python-poetry.org | python3 -
+  export PATH="$HOME/.local/bin:$PATH"
+fi
 
 # 清理旧的构建产物
 rm -rf "$PWD/dist"
-
-# 检查 venv 是否与当前 Python 版本匹配
-CURRENT_PYTHON_VERSION=$(python3 --version | awk '{print $2}' | cut -d. -f1,2)
-if [ -e "$VENV_DIR/bin/python" ]; then
-  VENV_PYTHON_VERSION=$("$VENV_DIR/bin/python" --version 2>/dev/null | awk '{print $2}' | cut -d. -f1,2 || echo "")
-  if [ "$CURRENT_PYTHON_VERSION" != "$VENV_PYTHON_VERSION" ]; then
-    echo "Python version mismatch (current: $CURRENT_PYTHON_VERSION, venv: $VENV_PYTHON_VERSION), recreating venv..."
-    rm -rf "$VENV_DIR"
-  fi
-fi
-
-if ! [ -e "$VENV_DIR/bin/activate" ]; then
-  python3 -m venv "$VENV_DIR"
-fi
-
-# 使用虚拟环境中的 pip 和 poetry
-export PATH="$VENV_DIR/bin:$PATH"
-export VIRTUAL_ENV="$VENV_DIR"
-
-# 安装 poetry（如果不存在）
-if ! [ -e "$VENV_DIR/bin/poetry" ]; then
-  "$VENV_DIR/bin/pip" install --upgrade pip
-  "$VENV_DIR/bin/pip" install poetry==1.8.3
-fi
 
 # UI 产物目录（打包进 wheel 的目录）
 UI_PATH="$PWD/gpustack/ui"
@@ -66,6 +48,15 @@ else
   rm -rf "$UI_TMP"
 fi
 
+# 验证 UI 目录
+if [ ! -f "$UI_PATH/index.html" ]; then
+  echo "ERROR: UI directory not found or incomplete!"
+  exit 1
+fi
+
+echo "UI directory contents:"
+ls -la "$UI_PATH/"
+
 # 设置版本号
 VERSION_FILE="$PWD/gpustack/__init__.py"
 GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "HEAD")
@@ -81,24 +72,29 @@ with open('$VERSION_FILE', 'w') as f:
     f.write(content)
 "
 
-"$VENV_DIR/bin/pip" install msgpack
-"$VENV_DIR/bin/poetry" version "${VERSION}"
+# 更新 pyproject.toml 中的版本号
+poetry version "${VERSION}"
 
-# 验证 UI 目录
-if [ ! -f "$UI_PATH/index.html" ]; then
-  echo "ERROR: UI directory not found or incomplete!"
+# 使用 poetry build 构建 wheel 和 sdist
+echo "Building with poetry..."
+poetry build
+
+# 验证 wheel 包含 UI
+echo "Checking wheel contents for UI files..."
+WHEEL_FILE=$(ls -t dist/*.whl | head -1)
+if [ -f "$WHEEL_FILE" ]; then
+  echo "Wheel file: $WHEEL_FILE"
+  unzip -l "$WHEEL_FILE" | grep -E "(ui/|index.html)" || {
+    echo "WARNING: UI files not found in wheel!"
+    echo "Full wheel contents:"
+    unzip -l "$WHEEL_FILE" | head -100
+  }
+else
+  echo "ERROR: Wheel file not found!"
   exit 1
 fi
 
-echo "UI directory contents:"
-ls -la "$UI_PATH/"
-
-# 使用 poetry 构建
-"$VENV_DIR/bin/poetry" build
-
-# 验证 wheel 包含 UI
-echo "Checking wheel contents..."
-unzip -l dist/*.whl | head -50
-
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
+
+echo "Build completed successfully!"
