@@ -608,19 +608,23 @@ class ModelScopeDownloader:
             bucket_name = base_path.split("/")[0]
             
             if s3Downloader.use_virtual_hosted_style:
-                base_path = base_path.removeprefix(bucket_name + "/")
+                # removeprefix(bucket_name) 不带 /，保持和 S3Downloader.download() 一致
+                base_path = base_path.removeprefix(bucket_name)
+                # base_path = "/datamodel/nv-community/xxx"
+                # split("/")[1:] = ["datamodel", "nv-community", "xxx"]
+                object_prefix = "/".join(base_path.split("/")[1:])
             else:
-                base_path = "/".join(base_path.split("/")[1:])
+                object_prefix = "/".join(base_path.split("/")[1:])
             
-            object_prefix = base_path.removeprefix("datamodel/")
-            
-            # 检查是否存在对象（设置较短超时）
-            objects = list(s3Downloader._s3_client.list_objects(
+            # 检查是否存在对象
+            objects = []
+            for obj in s3Downloader._s3_client.list_objects(
                 bucket_name, 
                 prefix=object_prefix, 
                 recursive=False,
-                max_keys=1  # 只需要检查是否有文件即可
-            ))
+            ):
+                objects.append(obj)
+                break  # 只需要检查是否有文件即可
             
             exists = len(objects) > 0
             if exists:
