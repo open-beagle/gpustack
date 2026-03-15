@@ -602,6 +602,11 @@ def should_skip_architecture_check(model: Model) -> bool:
         # New model architectures may be added with custom backend version.
         return True
 
+    if model.backend == BackendEnum.VLLM_OMNI:
+        # vllm-omni supports diffusion models (Flux, Z-Image, etc.) that use diffusers-format
+        # configs without standard transformers architecture fields.
+        return True
+
     if model.backend_parameters and find_parameter(
         model.backend_parameters, ["tokenizer-mode"]
     ):
