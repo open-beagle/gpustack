@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     gcc \
     g++ \
+    ffmpeg \
     libgl1-mesa-glx \
     libglib2.0-0 \
     libxcb1 \
