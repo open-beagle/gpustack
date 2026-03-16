@@ -67,6 +67,7 @@ class VLLMOmniServer(InferenceServer):
                 stdout=sys.stdout,
                 stderr=sys.stderr,
                 env=env,
+                cwd=self._model_path,
             )
             self.exit_with_code(result.returncode)
 
@@ -143,24 +144,7 @@ class VLLMOmniServer(InferenceServer):
 
     def _get_diffusion_arguments(self) -> list:
         """Get arguments specific to diffusion models."""
-        args = []
-
-        # Default diffusion settings
-        num_steps = find_parameter(
-            self._model.backend_parameters, ["num-inference-steps", "steps"]
-        )
-        if not num_steps:
-            args.extend(["--num-inference-steps", "20"])
-
-        # Enable cache acceleration if not specified
-        cache_method = find_parameter(
-            self._model.backend_parameters, ["cache-method"]
-        )
-        if not cache_method:
-            # TeaCache or Cache-DiT for faster inference
-            args.extend(["--cache-method", "teacache"])
-
-        return args
+        return []
 
     def _get_audio_arguments(self) -> list:
         """Get arguments specific to audio models."""

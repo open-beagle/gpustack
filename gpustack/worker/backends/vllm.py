@@ -101,6 +101,7 @@ class VLLMServer(InferenceServer):
                 stdout=sys.stdout,
                 stderr=sys.stderr,
                 env=env,
+                cwd=self._model_path,
             )
             self.exit_with_code(result.returncode)
         except Exception as e:

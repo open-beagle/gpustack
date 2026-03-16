@@ -679,21 +679,23 @@ class ModelScopeDownloader:
                 if s3Downloader is None:
                     init_s3_client(cfg)
                 
-                downloaded_path = s3Downloader.download(s3_path)
-                logger.info(f"从本地 S3 下载成功")
+                # 下载到 ModelScope 的 local_dir，保持路径一致
+                group_or_owner, name = model_id_to_group_owner_name(model_id)
+                if local_dir is None:
+                    local_dir = os.path.join(cache_dir, group_or_owner, name)
+                
+                downloaded_path = s3Downloader.download(s3_path, cache_dir=cache_dir)
+                logger.info(f"从本地 S3 下载成功: {downloaded_path}")
                 
                 # 如果指定了 file_path，需要匹配文件
                 if file_path:
-                    # 列出下载目录中的所有文件
-                    import glob
+                    import fnmatch
                     all_files = []
                     for root, dirs, files in os.walk(downloaded_path):
                         for f in files:
                             rel_path = os.path.relpath(os.path.join(root, f), downloaded_path)
                             all_files.append(rel_path)
                     
-                    # 使用 glob 匹配
-                    import fnmatch
                     matching_files = [f for f in all_files if fnmatch.fnmatch(f, file_path)]
                     
                     if len(matching_files) == 0:
