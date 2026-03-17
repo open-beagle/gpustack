@@ -27,6 +27,7 @@ from gpustack.schemas.models import (
     BackendEnum,
     CategoryEnum,
     Model,
+    get_backend,
 )
 from gpustack.server.db import get_engine
 from gpustack.server.deps import SessionDep
@@ -144,13 +145,17 @@ async def list_models(
     models = (await session.exec(statement)).all()
     result = SyncPage[OAIModel](data=[], object="list")
     for model in models:
+        meta = None
+        if with_meta:
+            meta = dict(model.meta) if model.meta else {}
+            meta["backend"] = model.backend or get_backend(model)
         result.data.append(
             OAIModel(
                 id=model.name,
                 object="model",
                 created=int(model.created_at.timestamp()),
                 owned_by="gpustack",
-                meta=model.meta if with_meta else None,
+                meta=meta,
             )
         )
     return result
