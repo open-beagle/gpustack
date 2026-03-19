@@ -169,6 +169,12 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
 
             allocatable = await get_worker_allocatable_resource(self._engine, worker)
 
+            if instance.computed_resource_claim is None:
+                scored_instances.append(
+                    ModelInstanceScore(model_instance=instance, score=0)
+                )
+                continue
+
             final_score = 0
             score = await self._score_binpack_item(
                 instance.gpu_indexes,
@@ -285,6 +291,7 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
     ) -> int:
         score = 0
         gpu_count = len(gpu_indexes) if gpu_indexes else 0
+        ram_claim = computed_resource_claim.ram or 0
 
         def calculate_score(
             ram_claim: Optional[int],
@@ -299,53 +306,64 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
                     ram_claim / ram_allocatable * MaxScore * self._resource_weight.ram
                 )
 
-            vram_score = (
-                vram_claim / vram_allocatable * MaxScore * self._resource_weight.vram
-            )
+            if vram_allocatable == 0:
+                vram_score = 0
+            else:
+                vram_score = (
+                    vram_claim / vram_allocatable * MaxScore * self._resource_weight.vram
+                )
             return (ram_score + vram_score) / (
                 self._resource_weight.ram + self._resource_weight.vram
             )
 
         if gpu_count == 0:
-            if scale_type == ScaleTypeEnum.SCALE_UP:
-                score = computed_resource_claim.ram / allocatable.ram * MaxScore
+            if allocatable.ram == 0:
+                score = 0
+            elif scale_type == ScaleTypeEnum.SCALE_UP:
+                score = ram_claim / allocatable.ram * MaxScore
             elif scale_type == ScaleTypeEnum.SCALE_DOWN:
                 score = (
-                    computed_resource_claim.ram
-                    / (allocatable.ram + computed_resource_claim.ram)
+                    ram_claim
+                    / (allocatable.ram + ram_claim)
                     * MaxScore
                 )
+        elif computed_resource_claim.vram is None:
+            score = 0
         elif gpu_count == 1:
+            gpu_idx = gpu_indexes[0]
+            vram_claim = computed_resource_claim.vram.get(gpu_idx, 0)
+            vram_alloc = allocatable.vram.get(gpu_idx, 0)
             if scale_type == ScaleTypeEnum.SCALE_UP:
                 score = calculate_score(
-                    computed_resource_claim.ram,
+                    ram_claim,
                     allocatable.ram,
-                    computed_resource_claim.vram[gpu_indexes[0]],
-                    allocatable.vram[gpu_indexes[0]],
+                    vram_claim,
+                    vram_alloc,
                 )
             elif scale_type == ScaleTypeEnum.SCALE_DOWN:
                 score = calculate_score(
-                    computed_resource_claim.ram,
-                    allocatable.ram + computed_resource_claim.ram,
-                    computed_resource_claim.vram[gpu_indexes[0]],
-                    allocatable.vram[gpu_indexes[0]]
-                    + computed_resource_claim.vram[gpu_indexes[0]],
+                    ram_claim,
+                    allocatable.ram + ram_claim,
+                    vram_claim,
+                    vram_alloc + vram_claim,
                 )
         else:
             for i in gpu_indexes:
+                vram_claim_i = computed_resource_claim.vram.get(i, 0)
+                vram_alloc_i = allocatable.vram.get(i, 0)
                 if scale_type == ScaleTypeEnum.SCALE_UP:
                     result = calculate_score(
-                        computed_resource_claim.ram,
+                        ram_claim,
                         allocatable.ram,
-                        computed_resource_claim.vram[i],
-                        allocatable.vram[i],
+                        vram_claim_i,
+                        vram_alloc_i,
                     )
                 elif scale_type == ScaleTypeEnum.SCALE_DOWN:
                     result = calculate_score(
-                        computed_resource_claim.ram,
-                        allocatable.ram + computed_resource_claim.ram,
-                        computed_resource_claim.vram[i],
-                        allocatable.vram[i] + computed_resource_claim.vram[i],
+                        ram_claim,
+                        allocatable.ram + ram_claim,
+                        vram_claim_i,
+                        vram_alloc_i + vram_claim_i,
                     )
                 if result > score:
                     score = result
