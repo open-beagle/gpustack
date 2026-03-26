@@ -1,5 +1,0 @@
-[submodule "ui"]
-	path = ui
-	url = https://github.com/open-beagle/gpustack-ui.git
-	branch = dev
-	ignore = all

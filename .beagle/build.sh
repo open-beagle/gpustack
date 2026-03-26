@@ -30,14 +30,14 @@ rm -rf "$PWD/dist"
 # UI 产物目录（打包进 wheel 的目录）
 UI_PATH="$PWD/gpustack/ui"
 
-# 优先级：本地 gpustack/ui > ui/dist（本地构建） > 远程下载
+# 优先级：本地 gpustack/ui > ../gpustack-ui/dist（本地构建） > 远程下载
 if [ -f "$UI_PATH/index.html" ]; then
   echo "UI build artifacts already exist at $UI_PATH, skipping download."
-elif [ -f "$PWD/ui/dist/index.html" ]; then
-  echo "Found local UI build at ui/dist, copying to $UI_PATH..."
+elif [ -f "$PWD/../gpustack-ui/dist/index.html" ]; then
+  echo "Found local UI build at ../gpustack-ui/dist, copying to $UI_PATH..."
   rm -rf "$UI_PATH"
   mkdir -p "$UI_PATH"
-  cp -a "$PWD/ui/dist/." "$UI_PATH"
+  cp -a "$PWD/../gpustack-ui/dist/." "$UI_PATH"
 else
   echo "Downloading UI assets for ${VERSION}..."
   rm -rf "$UI_PATH"
