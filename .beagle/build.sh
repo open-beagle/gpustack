@@ -20,7 +20,7 @@ VERSION="${VERSION:-v0.7.1}"
 # 检查并安装 poetry
 if ! command -v poetry &> /dev/null; then
   echo "Poetry not found, installing..."
-  curl -sSL https://install.python-poetry.org | python3 -
+  pip3 install poetry
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
@@ -88,21 +88,6 @@ poetry version "${VERSION}"
 # 使用 poetry build 构建 wheel 和 sdist
 echo "Building with poetry..."
 poetry build
-
-# # 验证 wheel 包含 UI
-# echo "Checking wheel contents for UI files..."
-# WHEEL_FILE=$(ls -t dist/*.whl | head -1)
-# if [ -f "$WHEEL_FILE" ]; then
-#   echo "Wheel file: $WHEEL_FILE"
-#   unzip -l "$WHEEL_FILE" | grep -E "(ui/|index.html)" || {
-#     echo "WARNING: UI files not found in wheel!"
-#     echo "Full wheel contents:"
-#     unzip -l "$WHEEL_FILE" | head -100
-#   }
-# else
-#   echo "ERROR: Wheel file not found!"
-#   exit 1
-# fi
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
