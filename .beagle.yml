@@ -207,6 +207,7 @@ steps:
 
   - name: docker-cann-kernel
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    pull: always
     volumes:
       - name: docker
         path: /var/run/docker.sock
@@ -271,6 +272,8 @@ steps:
 
   - name: docker-cann
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
+    environment:
+      DOCKER_DEFAULT_PLATFORM: linux/arm64
     volumes:
       - name: docker
         path: /var/run/docker.sock
