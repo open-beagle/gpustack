@@ -29,9 +29,7 @@ ARG PYPI_HOST=mirrors.cloud.aliyuncs.com
 RUN python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} pipx
 
 RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
-  pip3 config set global.index-url ${PYPI_MIRROR} && \
-  pip3 config set global.trusted-host ${PYPI_HOST} && \
-  pip3 install --use-pep517 $WHEEL_PACKAGE &&\
+  pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --use-pep517 $WHEEL_PACKAGE &&\
   rm /tmp/*.whl && \
   pip3 cache purge
 
