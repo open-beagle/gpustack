@@ -9,9 +9,29 @@ LABEL maintainer=$AUTHOR version=$VERSION
 
 COPY ./dist/*.whl /tmp/
 
+ENV DEBIAN_FRONTEND=noninteractive
+RUN sed -i 's|http://ports.ubuntu.com/ubuntu-ports/|http://mirrors.cloud.aliyuncs.com/ubuntu-ports/|g' /etc/apt/sources.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git \
+    curl \
+    wget \
+    tzdata \
+    python3-pip \
+    pipx \
+    python3-dev \
+    gcc \
+    g++ \
+    tini && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+ARG PYPI_MIRROR=http://mirrors.cloud.aliyuncs.com/pypi/simple/
+ARG PYPI_HOST=mirrors.cloud.aliyuncs.com
+
 RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
-  pip3 config set global.index-url http://mirrors.cloud.aliyuncs.com/pypi/simple/ && \
-  pip3 config set global.trusted-host mirrors.cloud.aliyuncs.com && \
+  pip3 config set global.index-url ${PYPI_MIRROR} && \
+  pip3 config set global.trusted-host ${PYPI_HOST} && \
   pip3 install --use-pep517 $WHEEL_PACKAGE &&\
   rm /tmp/*.whl && \
   pip3 cache purge
@@ -21,4 +41,14 @@ RUN gpustack download-tools \
   --arch arm64 --device npu \
   --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
-ENTRYPOINT [ "gpustack", "start" ]
+# 设置目录
+RUN mkdir -p /var/lib/gpustack && \
+    chmod -R 0755 /var/lib/gpustack
+
+# 设置环境变量
+ENV PIPX_HOME=/var/lib/gpustack/pipx \
+    PIPX_LOCAL_VENVS=/var/lib/gpustack/pipx/venvs \
+    PIPX_BIN_DIR=/var/lib/gpustack/bin \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
+ENTRYPOINT [ "tini", "--", "gpustack", "start" ]
