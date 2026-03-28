@@ -58,9 +58,9 @@ RUN WHEEL_PACKAGE_STACK="$(ls /tmp/*.whl)[vllm]" && \
     python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --upgrade pip && \
     pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE_STACK && \
     # 安装 vLLM-Omni 用于支持 Diffusion 模型（Z-Image、Flux 等）
-    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 vllm-omni && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 vllm-omni==0.18.0 && \
     # 强制升级 transformers 以支持最新模型架构
-    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir "transformers>=5.3.0" && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir "transformers>=5.4.0" && \
     rm -rf /tmp/*.whl
 
 # 下载工具
