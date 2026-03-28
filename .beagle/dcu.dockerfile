@@ -37,7 +37,7 @@ RUN pip config set global.index-url http://mirrors.cloud.aliyuncs.com/pypi/simpl
     && pipx install $WHEEL_PACKAGE --pip-args="--index-url http://mirrors.cloud.aliyuncs.com/pypi/simple/ --trusted-host mirrors.cloud.aliyuncs.com --timeout=600 --retries=5" \
     && pip cache purge
 
-RUN gpustack download-tools --device dcu \
+RUN gpustack download-tools --device dcu --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode' \
     && ln -s $(which vllm) /root/.local/share/pipx/venvs/gpustack/bin/vllm
 
 ENTRYPOINT [ "tini", "--", "gpustack", "start" ]

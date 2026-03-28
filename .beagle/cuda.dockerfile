@@ -64,7 +64,7 @@ RUN WHEEL_PACKAGE_STACK="$(ls /tmp/*.whl)[vllm]" && \
     rm -rf /tmp/*.whl
 
 # 下载工具
-RUN gpustack download-tools --device cuda
+RUN gpustack download-tools --device cuda --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
 # 设置目录
 RUN mkdir -p /var/lib/gpustack && \
