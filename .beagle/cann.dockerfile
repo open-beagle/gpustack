@@ -17,9 +17,6 @@ RUN sed -i 's|http://ports.ubuntu.com/ubuntu-ports/|http://mirrors.cloud.aliyunc
     curl \
     wget \
     tzdata \
-    python3-pip \
-    pipx \
-    python3-dev \
     gcc \
     g++ \
     tini && \
@@ -28,6 +25,8 @@ RUN sed -i 's|http://ports.ubuntu.com/ubuntu-ports/|http://mirrors.cloud.aliyunc
 
 ARG PYPI_MIRROR=http://mirrors.cloud.aliyuncs.com/pypi/simple/
 ARG PYPI_HOST=mirrors.cloud.aliyuncs.com
+
+RUN python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} pipx
 
 RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
   pip3 config set global.index-url ${PYPI_MIRROR} && \
