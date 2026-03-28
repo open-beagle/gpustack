@@ -16,6 +16,7 @@ RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
   rm /tmp/*.whl && \
   pip3 cache purge
 
+ENV CANN_VERSION=8.2.rc1
 RUN gpustack download-tools \
   --arch arm64 --device npu \
   --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
