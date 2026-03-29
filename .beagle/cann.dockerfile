@@ -19,7 +19,21 @@ RUN sed -i 's|http://ports.ubuntu.com/ubuntu-ports/|http://mirrors.aliyun.com/ub
     tzdata \
     gcc \
     g++ \
-    tini && \
+    tini \
+    ffmpeg \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libxcb1 \
+    libxcb-xinerama0 \
+    libxcb-icccm4 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-randr0 \
+    libxcb-render-util0 \
+    libxcb-shape0 \
+    libxcb-xfixes0 \
+    libxcb-xkb1 \
+    libxkbcommon-x11-0 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
