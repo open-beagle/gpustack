@@ -30,12 +30,34 @@ class S3Downloader:
         cache_dir: Optional[str] = None,
         region: str = "",
     ):
+        # 兼容带 http 或 https 前缀的 S3 地址以及末尾可能存在的斜杠
+        host = host.rstrip('/')
+        if host.startswith("http://"):
+            host = host[len("http://"):]
+            ssl = False
+        elif host.startswith("https://"):
+            host = host[len("https://"):]
+            ssl = True
+
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        http_client = urllib3.PoolManager(
+            timeout=urllib3.Timeout.DEFAULT_TIMEOUT,
+            cert_reqs='CERT_NONE',
+            retries=urllib3.Retry(
+                total=5,
+                backoff_factor=0.2,
+                status_forcelist=[500, 502, 503, 504],
+            )
+        )
+
         self._s3_client = Minio(
             host,
             access_key=access_key,
             secret_key=secret_key,
             secure=ssl,
             region=region,
+            http_client=http_client if ssl else None,
         )
         self._cache_dir = cache_dir or self._default_cache_dir
         self.use_virtual_hosted_style = use_virtual_hosted_style
@@ -54,13 +76,15 @@ class S3Downloader:
         Returns:
             下载后的本地文件路径
         """
-        if not s3_path.startswith("s3://beagle_wind/"):
+        if not s3_path.startswith("s3://"):
             return s3_path
 
+        # 兼容旧版本的固定前缀 s3://beagle_wind/
+        if s3_path.startswith("s3://beagle_wind/"):
+            s3_path = s3_path.replace("s3://beagle_wind/", "s3://", 1)
+
         # 解析S3路径
-        # s3://beagle_wind/bd-wind/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/v1/qwen2.5-3b-instruct-q8_0.gguf
-        # 或 s3://beagle_wind/bd-wind/datamodel/Qwen/Qwen3.5-35B-A3B-FP8 (目录)
-        base_path = s3_path.removeprefix("s3://beagle_wind/")
+        base_path = s3_path.removeprefix("s3://")
         bucket_name = base_path.split("/")[0]
         if self.use_virtual_hosted_style:
             base_path = base_path.removeprefix(bucket_name)
@@ -79,7 +103,7 @@ class S3Downloader:
         # 准备本地缓存路径
         local_cache = cache_dir or self._cache_dir
         local_path = os.path.join(
-            local_cache, s3_path.removeprefix("s3://beagle_wind/"+bucket_name+"/datamodel/")
+            local_cache, s3_path.removeprefix("s3://" + bucket_name + "/datamodel/")
         )
         local_dir = os.path.dirname(local_path) if is_file else local_path
         if not os.path.exists(local_dir):  # 创建父目录
@@ -172,12 +196,16 @@ class S3Downloader:
         Raises:
             S3Error: 当S3操作失败时抛出
         """
-        if not model_instance.local_path.startswith("s3://beagle_wind/"):
+        if not model_instance.local_path.startswith("s3://"):
             return None
 
         try:
+            s3_path = model_instance.local_path
+            if s3_path.startswith("s3://beagle_wind/"):
+                s3_path = s3_path.replace("s3://beagle_wind/", "s3://", 1)
+
             # 解析S3路径
-            base_path = model_instance.local_path.removeprefix("s3://beagle_wind/")
+            base_path = s3_path.removeprefix("s3://")
             bucket_name = base_path.split("/")[0]
             if self.use_virtual_hosted_style:
                 base_path = base_path.removeprefix(bucket_name)

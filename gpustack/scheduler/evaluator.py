@@ -266,7 +266,7 @@ async def evaluate_model_metadata(
     model: ModelSpec,
 ) -> Tuple[bool, List[str]]:
     try:
-        if model.local_path and model.local_path.startswith("s3://beagle_wind/"):
+        if model.local_path and model.local_path.startswith("s3://"):
             # s3://beagle_wind/bd-wind/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/q8/qwen2.5-3b-instruct-q8_0.gguf
             # /var/lib/gpustack
             arr = model.local_path.split("datamodel")

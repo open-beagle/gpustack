@@ -87,10 +87,9 @@ def download_model(
             cfg=cfg,
         )
     elif model.source == SourceEnum.LOCAL_PATH:
-        if model.local_path and 's3://beagle_wind' in model.local_path:
+        if model.local_path and model.local_path.startswith('s3://'):
             if s3Downloader is None:
                 init_s3_client(cfg)
-            # example s3://beagle_wind/bd-wind/datamodel/51c63609-faf4-446a-a2cf-47dd8d1a3e97/v1
             return file.get_sharded_file_paths(s3Downloader.download(model.local_path))
         else:
             return file.get_sharded_file_paths(model.local_path)
@@ -121,7 +120,7 @@ def get_model_file_info(
             cache_dir=os.path.join(cache_dir, "ollama"),
         )
     elif model.source == SourceEnum.LOCAL_PATH:
-        if model.local_path and 's3://beagle_wind' in model.local_path:
+        if model.local_path and model.local_path.startswith('s3://'):
             if s3Downloader is None:
                 init_s3_client(cfg)
             return s3Downloader.get_model_file_size(
@@ -603,8 +602,8 @@ class ModelScopeDownloader:
                 init_s3_client(cfg)
             
             # 构造 S3 路径
-            s3_path = f"s3://beagle_wind/bd-wind/datamodel/{model_id}"
-            base_path = s3_path.removeprefix("s3://beagle_wind/")
+            s3_path = f"s3://bd-wind/datamodel/{model_id}"
+            base_path = s3_path.removeprefix("s3://")
             bucket_name = base_path.split("/")[0]
             
             if s3Downloader.use_virtual_hosted_style:
@@ -671,7 +670,7 @@ class ModelScopeDownloader:
             
             try:
                 # 构造 S3 路径
-                s3_path = f"s3://beagle_wind/bd-wind/datamodel/{model_id}"
+                s3_path = f"s3://bd-wind/datamodel/{model_id}"
                 logger.info(f"下载源: {s3_path}")
                 
                 # 从本地 S3 下载
