@@ -192,14 +192,21 @@ class ServeManager:
         sw_pos: Optional[int] = None
         sw: Optional[ModelInstanceSubordinateWorker] = None
         if not is_main_worker:
+            subordinate_workers = (
+                mi.distributed_servers.subordinate_workers
+                if mi.distributed_servers and mi.distributed_servers.subordinate_workers
+                else []
+            )
             sw_pos = next(
                 (
                     i
-                    for i, sw in enumerate(mi.distributed_servers.subordinate_workers)
+                    for i, sw in enumerate(subordinate_workers)
                     if sw.worker_id == self._worker_id
                 ),
+                None
             )
-            sw = mi.distributed_servers.subordinate_workers[sw_pos]
+            if sw_pos is not None:
+                sw = subordinate_workers[sw_pos]
 
         try:
             model = self._get_model_with_cache(mi)
@@ -436,25 +443,30 @@ class ServeManager:
                                 "state": ModelInstanceStateEnum.ERROR,
                                 "state_message": f"Inference server exited with code {process.exitcode}.",
                             }
-                        # Get patch dict for subordinate worker.
                         else:
+                            subordinate_workers = (
+                                mi.distributed_servers.subordinate_workers
+                                if mi.distributed_servers and mi.distributed_servers.subordinate_workers
+                                else []
+                            )
                             sw_pos = next(
                                 (
                                     i
-                                    for i, sw in enumerate(
-                                        mi.distributed_servers.subordinate_workers
-                                    )
+                                    for i, sw in enumerate(subordinate_workers)
                                     if sw.worker_id == self._worker_id
                                 ),
+                                None
                             )
-                            sw = mi.distributed_servers.subordinate_workers[sw_pos]
-                            sw.state = ModelInstanceStateEnum.ERROR
-                            sw.state_message = (
-                                f"Inference server exited with code {process.exitcode}."
-                            )
-                            patch_dict = {
-                                f"distributed_servers.subordinate_workers.{sw_pos}": sw,
-                            }
+                            patch_dict = {}
+                            if sw_pos is not None:
+                                sw = subordinate_workers[sw_pos]
+                                sw.state = ModelInstanceStateEnum.ERROR
+                                sw.state_message = (
+                                    f"Inference server exited with code {process.exitcode}."
+                                )
+                                patch_dict = {
+                                    f"distributed_servers.subordinate_workers.{sw_pos}": sw,
+                                }
                         # Update model instance.
                         self._update_model_instance(mi.id, **patch_dict)
                 except NotFoundException:
@@ -503,23 +515,29 @@ class ServeManager:
                         self._starting_model_instances.pop(mi.id, None)
                         continue
                     # Otherwise, update subordinate worker state to RUNNING.
+                    subordinate_workers = (
+                        mi.distributed_servers.subordinate_workers
+                        if mi.distributed_servers and mi.distributed_servers.subordinate_workers
+                        else []
+                    )
                     sw_pos = next(
                         (
                             i
-                            for i, sw in enumerate(
-                                mi.distributed_servers.subordinate_workers
-                            )
+                            for i, sw in enumerate(subordinate_workers)
                             if sw.worker_id == self._worker_id
                         ),
+                        None
                     )
-                    sw = mi.distributed_servers.subordinate_workers[sw_pos]
-                    if sw.state == ModelInstanceStateEnum.RUNNING:
-                        continue
-                    sw.state = ModelInstanceStateEnum.RUNNING
-                    sw.state_message = ""
-                    patch_dict = {
-                        f"distributed_servers.subordinate_workers.{sw_pos}": sw,
-                    }
+                    patch_dict = {}
+                    if sw_pos is not None:
+                        sw = subordinate_workers[sw_pos]
+                        if sw.state == ModelInstanceStateEnum.RUNNING:
+                            continue
+                        sw.state = ModelInstanceStateEnum.RUNNING
+                        sw.state_message = ""
+                        patch_dict = {
+                            f"distributed_servers.subordinate_workers.{sw_pos}": sw,
+                        }
                 # Update model instance.
                 self._update_model_instance(mi.id, **patch_dict)
                 # Remove from starting instances if it was started.
