@@ -51,8 +51,8 @@ RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
   pip3 install vllm-ascend==0.17.0rc1 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/simple -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} &&\
   # 强制升级 transformers 以支持最新模型架构
   pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} "transformers>=5.3.0" &&\
-  python3 -c "import transformers.modeling_rope_utils as m; p = m.__file__; c = open(p, 'r').read(); c = c.replace('received_keys -= ignore_keys', 'received_keys -= set(ignore_keys)'); open(p, 'w').write(c)" &&\
-  python3 -c "import os; p = '/usr/local/python3.11.14/lib/python3.11/site-packages/torchaudio/_extension/utils.py'; c = open(p, 'r').read() if os.path.exists(p) else ''; c = c.replace('torch.ops.load_library(paths[0])\n    return True', 'try:\n        torch.ops.load_library(paths[0])\n        return True\n    except Exception:\n        return False') if c else c; open(p, 'w').write(c) if c else None" &&\
+  TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 -c "import transformers.modeling_rope_utils as m; p = m.__file__; c = open(p, 'r').read(); c = c.replace('received_keys -= ignore_keys', 'received_keys -= set(ignore_keys)'); open(p, 'w').write(c)" &&\
+  TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 -c "import os; p = '/usr/local/python3.11.14/lib/python3.11/site-packages/torchaudio/_extension/utils.py'; c = open(p, 'r').read() if os.path.exists(p) else ''; c = c.replace('torch.ops.load_library(paths[0])\n    return True', 'try:\n        torch.ops.load_library(paths[0])\n        return True\n    except Exception:\n        return False') if c else c; open(p, 'w').write(c) if c else None" &&\
   rm /tmp/*.whl && \
   pip3 cache purge
 
