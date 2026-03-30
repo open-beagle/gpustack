@@ -117,11 +117,17 @@ async def get_serving_logs(  # noqa: C901
                 async with client.get(model_instance_log_url, timeout=timeout) as resp:
                     if resp.status != 200:
                         body = await resp.read()
-                        yield body, resp.headers, resp.status
+                        resp_headers = dict(resp.headers)
+                        resp_headers.pop("server", None)
+                        resp_headers.pop("Server", None)
+                        yield body, resp_headers, resp.status
                         return
 
                     async for chunk in resp.content.iter_any():
-                        yield chunk, resp.headers, resp.status
+                        resp_headers = dict(resp.headers)
+                        resp_headers.pop("server", None)
+                        resp_headers.pop("Server", None)
+                        yield chunk, resp_headers, resp.status
             except Exception as e:
                 error_response = f"Error fetching serving logs: {str(e)}\n"
                 yield error_response, {}, status.HTTP_500_INTERNAL_SERVER_ERROR

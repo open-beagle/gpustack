@@ -348,11 +348,11 @@ async def handle_streaming_request(
                 timeout=timeout,
             ) as resp:
                 if resp.status >= 400:
-                    yield await resp.read(), resp.headers, resp.status
+                    yield await resp.read(), filter_response_headers(resp.headers), resp.status
                     return
 
                 async for chunk in _stream_response_chunks(resp):
-                    yield chunk, resp.headers, resp.status
+                    yield chunk, filter_response_headers(resp.headers), resp.status
         except aiohttp.ClientError as e:
             error_response = OpenAIAPIErrorResponse(
                 error=OpenAIAPIError(
@@ -401,7 +401,7 @@ async def handle_standard_request(
         content = await response.read()
         return Response(
             status_code=response.status,
-            headers=dict(response.headers),
+            headers=filter_response_headers(response.headers),
             content=content,
         )
 
@@ -415,6 +415,14 @@ def filter_headers(headers):
         and key.lower() != "content-type"
         and key.lower() != "transfer-encoding"
         and key.lower() != "authorization"
+    }
+
+
+def filter_response_headers(headers):
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in ["server", "date", "content-length", "content-encoding", "transfer-encoding"]
     }
 
 

@@ -43,10 +43,16 @@ async def proxy(path: str, request: Request):
             timeout=timeout,
         )
 
+        resp_headers = dict(resp.headers)
+        resp_headers.pop("server", None)
+        resp_headers.pop("Server", None)
+        resp_headers.pop("date", None)
+        resp_headers.pop("Date", None)
+
         return StreamingResponse(
             stream_response(resp),
             status_code=resp.status,
-            headers=dict(resp.headers),
+            headers=resp_headers,
             background=BackgroundTask(resp.close),
         )
 

@@ -46,13 +46,13 @@ RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
   # 只安装基础 GPUStack，刻意丢弃 [vllm] extra 以绕开不支持 ARM64 的 bitsandbytes (量化主要交由华为自有框架)
   pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --use-pep517 "${WHEEL_PACKAGE}" &&\
   # 手动补齐不含硬件绑定偏见的多模态与大语言模型运行库
-  VLLM_TARGET_DEVICE=empty pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} "vllm==0.18.0" "mistral_common>=1.4.3" "timm>=1.0.15" &&\
+  VLLM_TARGET_DEVICE=empty pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} "vllm==0.17.0" "mistral_common>=1.4.3" "timm>=1.0.15" &&\
   # 安装 vLLM-Omni 用于支持 Diffusion 模型（Z-Image、Flux 等）
-  VLLM_TARGET_DEVICE=empty pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple/ vllm-omni==0.18.0rc1 &&\
-  # 强制升级 transformers 以支持最新模型架构
-  pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} "transformers>=5.4.0" &&\
+  VLLM_TARGET_DEVICE=empty pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple/ vllm-omni==0.17.0rc1 &&\
   # 继续补装对应的华为 NPU 架构后端实现插件
-  pip3 install vllm-ascend --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/simple -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} &&\
+  pip3 install vllm-ascend==0.17.0rc1 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/simple -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} &&\
+  # 强制升级 transformers 以支持最新模型架构
+  pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} "transformers>=5.3.0" &&\
   rm /tmp/*.whl && \
   pip3 cache purge
 
