@@ -47,8 +47,6 @@ RUN WHEEL_PACKAGE="$(ls /tmp/*-any.whl)" && \
   pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --use-pep517 "${WHEEL_PACKAGE}" &&\
   # 手动补齐不含硬件绑定偏见的多模态与大语言模型运行库
   VLLM_TARGET_DEVICE=empty pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} "vllm==0.17.0" "mistral_common>=1.4.3" "timm>=1.0.15" &&\
-  # 安装 vLLM-Omni 用于支持 Diffusion 模型（Z-Image、Flux 等）
-  VLLM_TARGET_DEVICE=empty pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple/ vllm-omni==0.17.0rc1 &&\
   # 继续补装对应的华为 NPU 架构后端实现插件
   pip3 install vllm-ascend==0.17.0rc1 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/simple -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} &&\
   # 强制升级 transformers 以支持最新模型架构
