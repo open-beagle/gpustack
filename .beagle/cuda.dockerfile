@@ -68,6 +68,13 @@ p = m.__file__; \
 c = open(p, 'r').read(); \
 c = c.replace('received_keys -= ignore_keys', 'received_keys -= set(ignore_keys)'); \
 open(p, 'w').write(c)" && \
+    # 修复 vLLM 0.18.0 编译中 standalone_compile 缺少 FakeTensorMode 属性的报错
+    python3 -c "\
+import vllm.compilation.compiler_interface as ci; \
+p = ci.__file__; \
+c = open(p, 'r').read(); \
+c = c.replace('mock.patch(\"torch._dynamo.eval_frame.standalone_compile.FakeTensorMode\"', 'mock.patch(\"torch._dynamo.eval_frame.standalone_compile.FakeTensorMode\", create=True'); \
+open(p, 'w').write(c)" && \
     rm -rf /tmp/*.whl
 
 # 下载工具
