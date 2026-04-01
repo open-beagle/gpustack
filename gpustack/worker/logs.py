@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class LogOptions:
     tail: int = -1  # -1 by default means read all logs
     follow: bool = False
-    filter_gpustack: bool = True  # 将 gpustack 替换为 stack
+    filter_gpustack: bool = True  # 将 gpustack 替换为 windstack
 
     def url_encode(self):
         params = f"tail={self.tail}&follow={self.follow}"
@@ -30,7 +30,7 @@ default_tail = Query(
 )
 default_follow = Query(default=False, description="Whether to follow the log output")
 default_filter_gpustack = Query(
-    default=True, description="Replace 'gpustack' with 'stack' in log output"
+    default=True, description="Replace 'gpustack' with 'windstack' in log output"
 )
 
 
@@ -47,11 +47,11 @@ LogOptionsDep = Annotated[LogOptions, Depends(get_log_options)]
 
 def filter_log_line(line: str, filter_gpustack: bool = True) -> str:
     """
-    过滤日志行，将 gpustack 替换为 stack
+    过滤日志行，将 gpustack 替换为 windstack
     """
     if filter_gpustack:
         # 替换模块名中的 gpustack
-        line = line.replace('gpustack.', 'stack.')
+        line = line.replace('gpustack', 'windstack')
         # 也可以选择完全移除 gpustack 前缀
         # line = line.replace('gpustack.', '')
     return line
