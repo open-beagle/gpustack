@@ -50,10 +50,7 @@ def filter_log_line(line: str, filter_gpustack: bool = True) -> str:
     过滤日志行，将 gpustack 替换为 stack
     """
     if filter_gpustack:
-        # 替换模块名中的 gpustack
-        line = line.replace('gpustack.', 'stack.')
-        # 也可以选择完全移除 gpustack 前缀
-        # line = line.replace('gpustack.', '')
+        line = line.replace('gpustack', 'stack')
     return line
 
 
