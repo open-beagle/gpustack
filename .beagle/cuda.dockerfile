@@ -42,7 +42,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-xkb1 \
     libxkbcommon-x11-0 \
     cuda-nvcc-12-8 \
-    libcublas-dev-12-8 \
     libcurand-dev-12-8 \
     cuda-nvrtc-dev-12-8 \
     && rm -rf /var/lib/apt/lists/* \
