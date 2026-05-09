@@ -12,7 +12,11 @@ import yaml
 from gpustack import __version__, __git_commit__
 from gpustack.config.config import set_global_config
 from gpustack.logginglocal import setup_logging
-from gpustack.utils.envs import get_gpustack_env, get_gpustack_env_bool
+from gpustack.utils.envs import (
+    get_gpustack_env,
+    get_gpustack_env_bool,
+    get_gpustack_env_list,
+)
 from gpustack.worker.worker import Worker
 from gpustack.config import Config
 from gpustack.server.server import Server
@@ -370,6 +374,12 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers Content-Type. Default: ["Authorization", "Content-Type"].',
     )
     group.add_argument(
+        "--trusted-proxy-cidrs",
+        action='append',
+        help="Trusted proxy CIDR ranges for resolving client IP from forwarded headers. Specify the flag multiple times.",
+        default=get_gpustack_env_list("TRUSTED_PROXY_CIDRS"),
+    )
+    group.add_argument(
         "--worker-s3-host",
         type=str,
         help="HOST to s3.",
@@ -636,6 +646,7 @@ def set_server_options(args, config_data: dict):
         "allow_credentials",
         "allow_methods",
         "allow_headers",
+        "trusted_proxy_cidrs",
         "external_auth_name",
         "external_auth_full_name",
         "external_auth_avatar_url",
