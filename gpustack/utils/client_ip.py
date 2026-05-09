@@ -58,7 +58,18 @@ def _first_forwarded_for_ip(header_value: str) -> Optional[str]:
 
 
 def _forwarded_header_ip(header_value: str) -> Optional[str]:
-    for part in header_value.split(";"):
+    for element in header_value.split(","):
+        element = element.strip()
+        if not element:
+            continue
+        ip = _forwarded_element_ip(element)
+        if ip:
+            return ip
+    return None
+
+
+def _forwarded_element_ip(element: str) -> Optional[str]:
+    for part in element.split(";"):
         key, separator, value = part.strip().partition("=")
         if separator and key.lower() == "for":
             return _clean_forwarded_ip(value)

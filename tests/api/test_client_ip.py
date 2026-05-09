@@ -54,6 +54,17 @@ def test_get_client_ip_uses_forwarded_header_from_trusted_proxy():
     assert get_client_ip(request, ["10.0.0.0/24"]) == "9.9.9.9"
 
 
+def test_get_client_ip_uses_first_forwarded_element_from_trusted_proxy():
+    request = FakeRequest(
+        "10.0.0.10",
+        {
+            "forwarded": 'for="9.9.9.9";proto=https, for="8.8.8.8"',
+        },
+    )
+
+    assert get_client_ip(request, ["10.0.0.0/24"]) == "9.9.9.9"
+
+
 def test_get_client_ip_falls_back_to_client_host_without_forwarded_headers():
     request = FakeRequest("10.0.0.10")
 

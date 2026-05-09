@@ -12,7 +12,11 @@ import yaml
 from gpustack import __version__, __git_commit__
 from gpustack.config.config import set_global_config
 from gpustack.logginglocal import setup_logging
-from gpustack.utils.envs import get_gpustack_env, get_gpustack_env_bool
+from gpustack.utils.envs import (
+    get_gpustack_env,
+    get_gpustack_env_bool,
+    get_gpustack_env_list,
+)
 from gpustack.worker.worker import Worker
 from gpustack.config import Config
 from gpustack.server.server import Server
@@ -373,6 +377,7 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         "--trusted-proxy-cidrs",
         action='append',
         help="Trusted proxy CIDR ranges for resolving client IP from forwarded headers. Specify the flag multiple times.",
+        default=get_gpustack_env_list("TRUSTED_PROXY_CIDRS"),
     )
     group.add_argument(
         "--worker-s3-host",
