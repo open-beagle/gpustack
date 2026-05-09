@@ -370,6 +370,11 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers Content-Type. Default: ["Authorization", "Content-Type"].',
     )
     group.add_argument(
+        "--trusted-proxy-cidrs",
+        action='append',
+        help="Trusted proxy CIDR ranges for resolving client IP from forwarded headers. Specify the flag multiple times.",
+    )
+    group.add_argument(
         "--worker-s3-host",
         type=str,
         help="HOST to s3.",
@@ -636,6 +641,7 @@ def set_server_options(args, config_data: dict):
         "allow_credentials",
         "allow_methods",
         "allow_headers",
+        "trusted_proxy_cidrs",
         "external_auth_name",
         "external_auth_full_name",
         "external_auth_avatar_url",

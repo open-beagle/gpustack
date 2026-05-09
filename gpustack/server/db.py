@@ -12,7 +12,7 @@ from sqlalchemy import DDL, event
 
 from gpustack.config.envs import DB_ECHO, DB_MAX_OVERFLOW, DB_POOL_SIZE, DB_POOL_TIMEOUT
 from gpustack.schemas.api_keys import ApiKey
-from gpustack.schemas.model_usage import ModelUsage
+from gpustack.schemas.model_usage import ModelUsage, ModelUsageLog
 from gpustack.schemas.models import Model, ModelInstance
 from gpustack.schemas.system_load import SystemLoad
 from gpustack.schemas.users import User
@@ -76,6 +76,7 @@ async def create_db_and_tables(engine: AsyncEngine):
             tables=[
                 ApiKey.__table__,
                 ModelUsage.__table__,
+                ModelUsageLog.__table__,
                 Model.__table__,
                 ModelInstance.__table__,
                 SystemLoad.__table__,

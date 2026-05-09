@@ -187,6 +187,10 @@ async def proxy_request_by_model(request: Request, endpoint: str):
                 message=f"Worker with ID {instance.worker_id} not found",
                 is_openai_exception=True,
             )
+        request.state.model_instance_id = instance.id
+        request.state.worker_id = instance.worker_id
+        request.state.worker_name = instance.worker_name
+        request.state.worker_ip = instance.worker_ip
 
     url = f"http://{instance.worker_ip}:{worker.port}/proxy/v1/{endpoint}"
     token = request.app.state.server_config.token

@@ -125,6 +125,7 @@ class Config(BaseSettings):
     allow_credentials: bool = False
     allow_methods: Optional[List[str]] = ['GET', 'POST']
     allow_headers: Optional[List[str]] = ['Authorization', 'Content-Type']
+    trusted_proxy_cidrs: Optional[List[str]] = None
     external_auth_type: Optional[str] = None  # external auth type
     external_auth_name: Optional[str] = None  # external auth name
     external_auth_full_name: Optional[str] = None  # external auth full name
