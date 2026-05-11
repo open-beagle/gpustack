@@ -750,7 +750,7 @@ async def stream_calls_csv(session: SessionDep, statement, batch_size: int = 500
         if not rows:
             break
         yield calls_csv_rows(rows)
-        last_log = rows[-1][0]
+        last_log = call_log_from_row(rows[-1])
         last_call_time = last_log.call_time
         last_id = last_log.id
 
@@ -832,15 +832,15 @@ def aggregate_row(row):
 
 
 def call_row(row):
-    log = row[0]
+    log = call_log_from_row(row)
     return {
         "request_id": log.request_id,
         "call_time": to_iso(log.call_time),
         "api_key_id": log.api_key_id,
-        "api_key_name": row.api_key_name,
+        "api_key_name": getattr(row, "api_key_name", None),
         "api_key_access_key": log.api_key_access_key,
         "user_id": log.user_id,
-        "username": row.username,
+        "username": getattr(row, "username", None),
         "model_id": log.model_id,
         "model_name": log.model_name,
         "operation": log.operation.value if log.operation else None,
@@ -862,6 +862,12 @@ def call_row(row):
         "error_type": log.error_type,
         "error_message": log.error_message,
     }
+
+
+def call_log_from_row(row):
+    if isinstance(row, ModelUsageLog):
+        return row
+    return row[0]
 
 
 def public_dimension_id(value: Optional[int]):
