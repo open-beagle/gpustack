@@ -58,6 +58,22 @@ def log_aggregate_columns(source):
     ]
 
 
+def rolled_up_aggregate_columns(source):
+    return [
+        func.sum(source.c.request_count).label("request_count"),
+        func.sum(source.c.success_count).label("success_count"),
+        func.sum(source.c.failure_count).label("failure_count"),
+        func.sum(source.c.prompt_tokens).label("prompt_tokens"),
+        func.sum(source.c.completion_tokens).label("completion_tokens"),
+        func.sum(source.c.total_tokens).label("total_tokens"),
+        func.sum(source.c.api_key_count).label("api_key_count"),
+        func.sum(source.c.model_count).label("model_count"),
+        func.sum(source.c.source_ip_count).label("source_ip_count"),
+        func.max(source.c.last_call_time).label("last_call_time"),
+        func.sum(source.c.duration_ms_sum).label("duration_ms_sum"),
+    ]
+
+
 def distinct_non_zero(column):
     return func.count(func.distinct(case((column != 0, column), else_=None)))
 
@@ -186,7 +202,7 @@ def stat_statement(
     elif status == "failure":
         statement = statement.where(stat_cls.failure_count > 0)
     if worker_id is not None:
-        statement = statement.where(stat_cls.worker_id == worker_id)
+        statement = statement.where(stat_cls.worker_id == (worker_id or 0))
     return statement
 
 
@@ -201,10 +217,25 @@ def aggregate_source(
     worker_id: Optional[int] = None,
 ):
     if should_use_log_aggregation(start_at, end_at, status):
-        source = base_statement(
+        logs = base_statement(
             start_at, end_at, api_key, model, source_ip, operation, status, worker_id
         ).subquery()
-        return source, log_aggregate_columns(source), source.c.total_token_count
+        source = aggregate_statement(
+            logs,
+            [
+                logs.c.date,
+                logs.c.api_key_id,
+                logs.c.api_key_access_key,
+                logs.c.model_id,
+                logs.c.model_name,
+                logs.c.source_ip,
+                logs.c.operation,
+                logs.c.worker_id,
+                logs.c.worker_name,
+            ],
+            log_aggregate_columns(logs),
+        ).subquery()
+        return source, stat_aggregate_columns(source), source.c.total_tokens
     source = stat_statement(
         ModelUsageDailyStat,
         start_at, end_at, api_key, model, source_ip, operation, status, worker_id
@@ -223,10 +254,15 @@ def hourly_source(
     worker_id: Optional[int] = None,
 ):
     if status:
-        source = base_statement(
+        logs = base_statement(
             start_at, end_at, api_key, model, source_ip, operation, status, worker_id
         ).subquery()
-        return source, log_aggregate_columns(source)
+        source = aggregate_statement(
+            logs,
+            [logs.c.hour],
+            log_aggregate_columns(logs),
+        ).subquery()
+        return source, rolled_up_aggregate_columns(source)
     source = stat_statement(
         ModelUsageHourlyStat,
         start_at, end_at, api_key, model, source_ip, operation, status, worker_id
@@ -610,7 +646,7 @@ async def hourly_logs(
         .order_by(filtered.c.hour)
     )
     rows = (await session.exec(statement)).all()
-    by_hour = {row.hour: aggregate_row(row) for row in rows}
+    by_hour = {row.hour: aggregate_row(row) for row in rows if row.hour is not None}
     items = []
     for hour in range(24):
         items.append(
