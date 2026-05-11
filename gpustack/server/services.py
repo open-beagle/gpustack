@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import functools
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Union
 from aiocache import Cache, BaseCache
 from sqlmodel import SQLModel, bindparam, cast, col, select
@@ -337,6 +338,31 @@ class ModelUsageStatService:
             rebuilt_count += len(logs)
             offset += batch_size
         return rebuilt_count
+
+    async def cleanup_before(self, cutoff_date: date, batch_size: int = 500):
+        cutoff_time = datetime.combine(cutoff_date, datetime.min.time(), tzinfo=timezone.utc)
+        deleted = {}
+        for stat_cls in (ModelUsageHourlyStat, ModelUsageDailyStat):
+            deleted[stat_cls.__tablename__] = await self._delete_in_batches(
+                select(stat_cls).where(stat_cls.date < cutoff_date), batch_size
+            )
+
+        deleted[ModelUsageLog.__tablename__] = await self._delete_in_batches(
+            select(ModelUsageLog).where(ModelUsageLog.call_time < cutoff_time), batch_size
+        )
+        return deleted
+
+    async def _delete_in_batches(self, statement, batch_size: int):
+        deleted_count = 0
+        while True:
+            rows = (await self.session.exec(statement.limit(batch_size))).all()
+            if not rows:
+                break
+            for row in rows:
+                await self.session.delete(row)
+            await self.session.commit()
+            deleted_count += len(rows)
+        return deleted_count
 
     async def _delete_existing_stats(self, start_date=None, end_date=None):
         for stat_cls in (ModelUsageHourlyStat, ModelUsageDailyStat):

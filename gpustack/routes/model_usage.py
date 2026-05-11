@@ -1,3 +1,4 @@
+import calendar
 import csv
 import io
 from datetime import date, datetime, time, timezone
@@ -307,6 +308,14 @@ def to_float(value):
     return float(value or 0)
 
 
+def subtract_months(value: date, months: int):
+    month_index = value.month - months
+    year = value.year + (month_index - 1) // 12
+    month = (month_index - 1) % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
 @router.get("/overview")
 async def overview(
     session: SessionDep,
@@ -368,6 +377,22 @@ async def rebuild_stats(
         "rebuilt_log_count": rebuilt_log_count,
         "start_date": start_date.isoformat() if start_date else None,
         "end_date": end_date.isoformat() if end_date else None,
+    }
+
+
+@router.post("/cleanup")
+async def cleanup_usage_data(
+    session: SessionDep,
+    retention_months: int = Query(...),
+):
+    if retention_months not in (3, 6):
+        raise BadRequestException("retention_months must be 3 or 6")
+    cutoff_date = subtract_months(date.today(), retention_months)
+    deleted = await ModelUsageStatService(session).cleanup_before(cutoff_date)
+    return {
+        "retention_months": retention_months,
+        "cutoff_date": cutoff_date.isoformat(),
+        "deleted": deleted,
     }
 
 
