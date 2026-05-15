@@ -5,7 +5,7 @@ import functools
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Union
 from aiocache import Cache, BaseCache
-from sqlmodel import SQLModel, bindparam, cast, col, select
+from sqlmodel import SQLModel, bindparam, cast, col, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -216,6 +216,11 @@ class ModelService:
         return result
 
     async def delete(self, model: Model):
+        await self.session.exec(
+            update(ModelUsageLog)
+            .where(ModelUsageLog.model_id == model.id)
+            .values(model_id=None)
+        )
         result = await model.delete(self.session)
         await delete_cache_by_key(self.get_by_id, model.id)
         await delete_cache_by_key(self.get_by_name, model.name)
