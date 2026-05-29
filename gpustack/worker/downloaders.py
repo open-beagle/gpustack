@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 s3Downloader = None
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(int(os.getenv(name, str(default))), minimum)
+    except ValueError:
+        logger.warning("Invalid integer value for %s, using default %s", name, default)
+        return default
+
+
 def init_s3_client(cfg: Config):
     global s3Downloader
     s3Downloader = S3Downloader(
@@ -572,6 +580,11 @@ class OllamaLibraryDownloader:
 
 
 class ModelScopeDownloader:
+    _max_workers = _env_int("GPUSTACK_MODELSCOPE_MAX_WORKERS", 4)
+    _download_retries = _env_int("GPUSTACK_MODELSCOPE_DOWNLOAD_RETRIES", 5, 0)
+    _download_retry_interval = _env_int(
+        "GPUSTACK_MODELSCOPE_DOWNLOAD_RETRY_INTERVAL", 10
+    )
 
     @classmethod
     def get_model_file_info(cls, model: Model) -> List[FileEntry]:
@@ -730,15 +743,43 @@ class ModelScopeDownloader:
                         f"No file found in {model_id} that match {file_path}"
                     )
 
-                model_dir = modelscope_snapshot_download(
+                model_dir = cls._snapshot_download_with_retry(
                     model_id=model_id,
                     local_dir=local_dir,
                     allow_patterns=matching_files,
+                    max_workers=cls._max_workers,
                 )
                 return [os.path.join(model_dir, file) for file in matching_files]
 
-            modelscope_snapshot_download(
+            cls._snapshot_download_with_retry(
                 model_id=model_id,
                 local_dir=local_dir,
+                max_workers=cls._max_workers,
             )
             return [local_dir]
+
+    @classmethod
+    def _snapshot_download_with_retry(cls, **kwargs):
+        last_error = None
+        for attempt in range(cls._download_retries + 1):
+            try:
+                return modelscope_snapshot_download(**kwargs)
+            except Exception as e:
+                last_error = e
+                if attempt >= cls._download_retries:
+                    break
+
+                sleep_seconds = cls._download_retry_interval * (attempt + 1)
+                model_id = kwargs.get("model_id")
+                logger.warning(
+                    "ModelScope download failed for %s, retrying in %s seconds "
+                    "(attempt %s/%s): %s",
+                    model_id,
+                    sleep_seconds,
+                    attempt + 1,
+                    cls._download_retries,
+                    e,
+                )
+                time.sleep(sleep_seconds)
+
+        raise last_error
