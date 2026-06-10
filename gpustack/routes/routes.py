@@ -13,6 +13,7 @@ from gpustack.routes import (
     model_sets,
     probes,
     proxy,
+    runtime,
     update,
     users,
     models,
@@ -46,6 +47,7 @@ v1_admin_router.include_router(workers.router, prefix="/workers", tags=["Workers
 v1_admin_router.include_router(
     model_instances.router, prefix="/model-instances", tags=["Model Instances"]
 )
+v1_admin_router.include_router(runtime.router, prefix="/runtime", tags=["Runtime"])
 v1_admin_router.include_router(
     model_sets.router, prefix="/model-sets", tags=["Model Sets"]
 )
