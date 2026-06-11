@@ -16,7 +16,7 @@ from gpustack.schemas.models import (
     is_image_model,
     is_renaker_model,
 )
-from gpustack.utils.command import find_parameter
+from gpustack.utils.command import ensure_bool_parameter, find_parameter
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.worker.backends.base import InferenceServer
 from gpustack.worker.tools_manager import (
@@ -91,6 +91,7 @@ class LlamaBoxServer(InferenceServer):
             "--no-mmap",
             "--no-warmup",
         ]
+        arguments = ensure_metrics_enabled(arguments, self._model.backend_parameters)
 
         if is_renaker_model(self._model):
             arguments.append("--rerank")
@@ -241,6 +242,14 @@ def set_priority(pid: int):
         pass
     except Exception as e:
         logger.error(f"Failed to set priority for process {pid}: {e}")
+
+
+def ensure_metrics_enabled(arguments: List[str], backend_parameters: List[str]) -> List[str]:
+    return ensure_bool_parameter(
+        arguments,
+        "metrics",
+        existing_parameters=backend_parameters,
+    )
 
 
 def get_rpc_servers(
