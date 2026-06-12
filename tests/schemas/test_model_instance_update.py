@@ -1,3 +1,6 @@
+import asyncio
+from unittest.mock import AsyncMock, patch
+
 from gpustack.schemas.models import (
     ModelInstance,
     ModelInstanceCreate,
@@ -89,3 +92,21 @@ def test_model_instance_internal_update_can_dump_for_table_update():
 
     assert source["state"] == "running"
     assert source["placement_override"].gpu_selector.gpu_ids == ["host-a:cuda:0"]
+
+
+def test_model_instance_can_update_from_internal_update_schema():
+    instance = ModelInstance(**_instance_payload())
+    update = ModelInstanceInternalUpdate(
+        **_instance_payload(),
+        state="running",
+        placement_override={"gpu_selector": {"gpu_ids": ["host-a:cuda:0"]}},
+    )
+
+    with (
+        patch.object(ModelInstance, "save", new=AsyncMock()),
+        patch.object(ModelInstance, "_publish_event", new=AsyncMock()),
+    ):
+        asyncio.run(instance.update(AsyncMock(), update))
+
+    assert instance.state == "running"
+    assert instance.placement_override.gpu_selector.gpu_ids == ["host-a:cuda:0"]

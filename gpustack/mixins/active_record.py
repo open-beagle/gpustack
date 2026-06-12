@@ -288,7 +288,9 @@ class ActiveRecordMixin:
         if isinstance(source, SQLModel):
             source = source.model_dump(exclude_unset=True)
         elif isinstance(source, BaseModel):
-            validated = cls.model_validate(source.model_dump(exclude_unset=True))
+            validated = self.__class__.model_validate(
+                source.model_dump(exclude_unset=True)
+            )
             source = {
                 key: getattr(validated, key)
                 for key in source.model_fields_set
