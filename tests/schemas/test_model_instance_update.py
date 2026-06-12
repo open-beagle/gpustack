@@ -1,4 +1,5 @@
 from gpustack.schemas.models import (
+    ModelInstance,
     ModelInstanceCreate,
     ModelInstanceInternalCreate,
     ModelInstanceInternalUpdate,
@@ -36,6 +37,18 @@ def test_model_instance_internal_create_exposes_placement_override():
     )
 
     assert create.placement_override.gpu_selector.gpu_ids == ["host-a:cuda:0"]
+
+
+def test_model_instance_internal_create_can_convert_to_table_model():
+    create = ModelInstanceInternalCreate(
+        **_instance_payload(),
+        placement_override={"gpu_selector": {"gpu_ids": ["host-a:cuda:0"]}},
+    )
+
+    instance = ModelInstance.convert_without_saving(create)
+
+    assert instance.name == "instance-a"
+    assert instance.placement_override.gpu_selector.gpu_ids == ["host-a:cuda:0"]
 
 
 def test_model_instance_update_does_not_expose_placement_override():

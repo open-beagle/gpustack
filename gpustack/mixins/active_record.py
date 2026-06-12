@@ -7,6 +7,7 @@ import math
 from typing import Any, AsyncGenerator, Callable, List, Optional, Union, Tuple
 
 from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel
 from sqlalchemy import func
 from sqlmodel import SQLModel, and_, asc, col, desc, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -210,10 +211,12 @@ class ActiveRecordMixin:
         """
 
         if isinstance(source, SQLModel):
-            obj = cls.model_validate(source, update=update)
-        elif isinstance(source, dict):
-            obj = cls.parse_obj(source, update=update)
-        return obj
+            return cls.model_validate(source, update=update)
+        if isinstance(source, BaseModel):
+            return cls.model_validate(source.model_dump(exclude_unset=True), update=update)
+        if isinstance(source, dict):
+            return cls.parse_obj(source, update=update)
+        return None
 
     @classmethod
     async def create(
