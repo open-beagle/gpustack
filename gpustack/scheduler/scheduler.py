@@ -29,6 +29,7 @@ from gpustack.scheduler.model_registry import (
     vllm_supported_llm_architectures,
     vllm_supported_reranker_architectures,
 )
+from gpustack.scheduler.placement_override import get_model_for_instance_scheduling
 from gpustack.scheduler.queue import AsyncUniqueQueue
 from gpustack.policies.worker_filters.status_filter import StatusFilter
 from gpustack.schemas.workers import Worker
@@ -156,21 +157,24 @@ class Scheduler:
 
                 should_update_model = False
                 try:
-                    if is_gguf_model(model):
+                    evaluation_model = get_model_for_instance_scheduling(
+                        model, instance
+                    )
+                    if is_gguf_model(evaluation_model):
                         should_update_model = await evaluate_gguf_model(
-                            self._config, model
+                            self._config, evaluation_model
                         )
                         if await self.check_model_distributability(
-                            session, model, instance
+                            session, evaluation_model, instance
                         ):
                             return
-                    elif is_audio_model(model):
+                    elif is_audio_model(evaluation_model):
                         should_update_model = await evaluate_audio_model(
-                            self._config, model
+                            self._config, evaluation_model
                         )
                     else:
                         should_update_model = await evaluate_pretrained_config(
-                            model, raise_raw=True
+                            evaluation_model, raise_raw=True
                         )
                 except Exception as e:
                     # Even if the evaluation failed, we still want to proceed to deployment.
@@ -289,8 +293,11 @@ class Scheduler:
             messages = []
             if workers and model:
                 try:
+                    scheduling_model = get_model_for_instance_scheduling(
+                        model, model_instance
+                    )
                     candidate, messages = await find_candidate(
-                        self._config, model, workers
+                        self._config, scheduling_model, workers
                     )
                 except Exception as e:
                     state_message = f"Failed to find candidate: {e}"

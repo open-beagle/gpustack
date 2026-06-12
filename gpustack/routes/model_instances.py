@@ -16,6 +16,7 @@ from gpustack.server.deps import EngineDep, ListParamsDep, SessionDep
 from gpustack.schemas.models import (
     ModelInstance,
     ModelInstanceCreate,
+    ModelInstanceInternalUpdate,
     ModelInstancePublic,
     ModelInstanceUpdate,
     ModelInstancesPublic,
@@ -168,6 +169,27 @@ async def create_model_instance(
 @router.put("/{id}", response_model=ModelInstancePublic)
 async def update_model_instance(
     session: SessionDep, id: int, model_instance_in: ModelInstanceUpdate
+):
+    model_instance = await ModelInstance.one_by_id(session, id)
+    if not model_instance:
+        raise NotFoundException(message="Model instance not found")
+
+    try:
+        await ModelInstanceService(session).update(model_instance, model_instance_in)
+    except Exception as e:
+        raise InternalServerErrorException(
+            message=f"Failed to update model instance: {e}"
+        )
+    return model_instance
+
+
+@router.put(
+    "/{id}/internal",
+    response_model=ModelInstancePublic,
+    include_in_schema=False,
+)
+async def update_model_instance_internal(
+    session: SessionDep, id: int, model_instance_in: ModelInstanceInternalUpdate
 ):
     model_instance = await ModelInstance.one_by_id(session, id)
     if not model_instance:

@@ -13,7 +13,7 @@ from gpustack.logginglocal import setup_logging
 from gpustack.schemas.models import (
     BackendEnum,
     ModelInstance,
-    ModelInstanceUpdate,
+    ModelInstanceInternalUpdate,
     ModelInstanceStateEnum,
     get_backend,
 )
@@ -149,11 +149,11 @@ class InferenceServer(ABC):
     def _update_model_instance(self, id: str, **kwargs):
         mi_public = self._clientset.model_instances.get(id=id)
 
-        mi = ModelInstanceUpdate(**mi_public.model_dump())
+        mi = ModelInstanceInternalUpdate(**mi_public.model_dump())
         for key, value in kwargs.items():
             setattr(mi, key, value)
 
-        self._clientset.model_instances.update(id=id, model_update=mi)
+        self._clientset.model_instances.internal_update(id=id, model_update=mi)
 
     def get_inference_running_env(
         self, env: Dict[str, str] = None, version: str = None

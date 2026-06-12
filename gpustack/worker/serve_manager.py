@@ -26,7 +26,7 @@ from gpustack.schemas.models import (
     BackendEnum,
     Model,
     ModelInstance,
-    ModelInstanceUpdate,
+    ModelInstanceInternalUpdate,
     ModelInstanceStateEnum,
     get_backend,
     DistributedServerCoordinateModeEnum,
@@ -345,11 +345,11 @@ class ServeManager:
     def _update_model_instance(self, id: str, **kwargs):
         mi_public = self._clientset.model_instances.get(id=id)
 
-        mi = ModelInstanceUpdate(**mi_public.model_dump())
+        mi = ModelInstanceInternalUpdate(**mi_public.model_dump())
         for key, value in kwargs.items():
             set_attr(mi, key, value)
 
-        self._clientset.model_instances.update(id=id, model_update=mi)
+        self._clientset.model_instances.internal_update(id=id, model_update=mi)
 
     def _get_model_with_cache(self, mi: ModelInstance) -> Model:
         """Get model from cache or fetch from clientset."""
@@ -500,6 +500,10 @@ class ServeManager:
                         patch_dict = {
                             "state": ModelInstanceStateEnum.RUNNING,
                             "state_message": "",
+                            # The override is a one-shot scheduling constraint
+                            # for manual scale-up. Once the instance is running,
+                            # future restarts should use model-level placement.
+                            "placement_override": None,
                         }
                     # Otherwise, update the main worker state to ERROR.
                     else:

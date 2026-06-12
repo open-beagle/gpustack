@@ -19,6 +19,7 @@ from gpustack.schemas.common import Pagination
 from gpustack.schemas.models import (
     ModelInstance,
     ModelInstancesPublic,
+    GPUSelector,
     get_backend,
     is_audio_model,
     BackendEnum,
@@ -33,6 +34,7 @@ from gpustack.schemas.models import (
     ModelsPublic,
 )
 from gpustack.server.services import ModelService, WorkerService
+from gpustack.server.controllers import sync_replicas
 from gpustack.utils.command import find_parameter
 from gpustack.utils.convert import safe_int
 from gpustack.utils.gpu import parse_gpu_id
@@ -166,6 +168,9 @@ async def validate_model_in(
     if model_in.gpu_selector is not None and model_in.replicas > 0:
         await validate_gpu_ids(session, model_in)
 
+    if isinstance(model_in, ModelUpdate) and model_in.placement_override:
+        await validate_placement_override(session, model_in)
+
     if model_in.backend_parameters:
         param_gpu_layers = find_parameter(
             model_in.backend_parameters, ["ngl", "gpu-layers", "n-gpu-layers"]
@@ -197,6 +202,25 @@ async def validate_model_in(
             raise BadRequestException(
                 message="Setting the port using --port is not supported."
             )
+
+
+async def validate_placement_override(session: SessionDep, model_in: ModelUpdate):
+    replica_groups = model_in.placement_override.groups_for_new_replicas()
+    if not replica_groups:
+        return
+
+    for replica_group in replica_groups:
+        if replica_group.gpu_selector is None:
+            continue
+
+        if not replica_group.gpu_selector.gpu_ids:
+            continue
+
+        model_in_for_validation = model_in.model_copy(deep=True)
+        model_in_for_validation.gpu_selector = GPUSelector(
+            gpu_ids=replica_group.gpu_selector.gpu_ids
+        )
+        await validate_gpu_ids(session, model_in_for_validation)
 
 
 async def validate_gpu_ids(  # noqa: C901
@@ -340,7 +364,17 @@ async def update_model(session: SessionDep, id: int, model_in: ModelUpdate):
     await validate_model_in(session, model_in)
 
     try:
-        await ModelService(session).update(model, model_in)
+        source = model_in.model_dump(exclude_unset=True, exclude={"placement_override"})
+        if model_in.placement_override:
+            await ModelService(session).update(model, source)
+            await sync_replicas(
+                session,
+                model,
+                get_global_config(),
+                placement_override=model_in.placement_override,
+            )
+        else:
+            await ModelService(session).update(model, source)
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to update model: {e}")
 

@@ -54,6 +54,29 @@ class GPUSelector(BaseModel):
     gpu_ids: Optional[List[str]] = None
 
 
+class PlacementOverrideReplicaGroup(BaseModel):
+    # A group describes the full GPU placement for one newly-created replica.
+    gpu_selector: Optional[GPUSelector] = None
+
+
+class ModelPlacementOverride(BaseModel):
+    # One-shot placement for scale-up requests. These groups are consumed only by
+    # the replicas created by this request, not by already existing replicas.
+    new_replica_groups: Optional[List[PlacementOverrideReplicaGroup]] = None
+    # Backward-compatible alias for clients that already send replica_groups.
+    # It has the same "new replicas only" semantics as new_replica_groups.
+    replica_groups: Optional[List[PlacementOverrideReplicaGroup]] = None
+
+    def groups_for_new_replicas(self) -> List[PlacementOverrideReplicaGroup]:
+        return self.new_replica_groups or self.replica_groups or []
+
+
+class ModelInstancePlacementOverride(BaseModel):
+    # One-shot scheduling constraint. The worker clears it after the instance
+    # reaches RUNNING so later restarts can fall back to the model-level policy.
+    gpu_selector: Optional[GPUSelector] = None
+
+
 class ModelSource(BaseModel):
     source: SourceEnum
     huggingface_repo_id: Optional[str] = None
@@ -235,7 +258,7 @@ class ModelCreate(ModelBase):
 
 
 class ModelUpdate(ModelBase):
-    pass
+    placement_override: Optional[ModelPlacementOverride] = Field(default=None)
 
 
 class ModelPublic(
@@ -357,6 +380,10 @@ class ModelInstanceBase(SQLModel, ModelSource):
     distributed_servers: Optional[DistributedServers] = Field(
         sa_column=Column(pydantic_column_type(DistributedServers)), default=None
     )
+    placement_override: Optional[ModelInstancePlacementOverride] = Field(
+        sa_column=Column(pydantic_column_type(ModelInstancePlacementOverride)),
+        default=None,
+    )
     # The "model_id" field conflicts with the protected namespace "model_" in Pydantic.
     # Disable it given that it's not a real issue for this particular field.
     model_config = ConfigDict(protected_namespaces=())
@@ -382,12 +409,57 @@ class ModelInstance(ModelInstanceBase, BaseModelMixin, table=True):
         return self.id
 
 
-class ModelInstanceCreate(ModelInstanceBase):
-    pass
+class ModelInstanceCreate(ModelSource):
+    name: str = Field(index=True, unique=True)
+    worker_id: Optional[int] = None
+    worker_name: Optional[str] = None
+    worker_ip: Optional[str] = None
+    pid: Optional[int] = None
+    # FIXME: Migrate to ports.
+    port: Optional[int] = None
+    ports: Optional[List[int]] = Field(default=[])
+    download_progress: Optional[float] = None
+    resolved_path: Optional[str] = None
+    restart_count: Optional[int] = 0
+    last_restart_time: Optional[datetime] = None
+    state: ModelInstanceStateEnum = ModelInstanceStateEnum.PENDING
+    state_message: Optional[str] = None
+    computed_resource_claim: Optional[ComputedResourceClaim] = None
+    gpu_indexes: Optional[List[int]] = Field(default=[])
+    gpu_addresses: Optional[List[str]] = Field(default=[])
+    model_id: int
+    model_name: str
+    distributed_servers: Optional[DistributedServers] = None
 
 
-class ModelInstanceUpdate(ModelInstanceBase):
-    pass
+class ModelInstanceInternalCreate(ModelInstanceCreate):
+    placement_override: Optional[ModelInstancePlacementOverride] = None
+
+
+class ModelInstanceUpdate(ModelSource):
+    name: str
+    worker_id: Optional[int] = None
+    worker_name: Optional[str] = None
+    worker_ip: Optional[str] = None
+    pid: Optional[int] = None
+    port: Optional[int] = None
+    ports: Optional[List[int]] = Field(default=[])
+    download_progress: Optional[float] = None
+    resolved_path: Optional[str] = None
+    restart_count: Optional[int] = 0
+    last_restart_time: Optional[datetime] = None
+    state: ModelInstanceStateEnum = ModelInstanceStateEnum.PENDING
+    state_message: Optional[str] = None
+    computed_resource_claim: Optional[ComputedResourceClaim] = None
+    gpu_indexes: Optional[List[int]] = Field(default=[])
+    gpu_addresses: Optional[List[str]] = Field(default=[])
+    model_id: int
+    model_name: str
+    distributed_servers: Optional[DistributedServers] = None
+
+
+class ModelInstanceInternalUpdate(ModelInstanceUpdate):
+    placement_override: Optional[ModelInstancePlacementOverride] = None
 
 
 class ModelInstancePublic(

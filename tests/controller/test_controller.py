@@ -1,13 +1,17 @@
+import asyncio
 from typing import List
 import pytest
 from gpustack.policies.base import ModelInstanceScore
 
 from gpustack.schemas.models import (
     ComputedResourceClaim,
+    GPUSelector,
+    ModelPlacementOverride,
+    PlacementOverrideReplicaGroup,
     ModelInstanceStateEnum,
 )
 from gpustack.schemas.workers import WorkerStateEnum
-from gpustack.server.controllers import find_scale_down_candidates
+from gpustack.server.controllers import find_scale_down_candidates, sync_replicas
 from tests.fixtures.workers.fixtures import (
     linux_nvidia_19_4090_24gx2,
     linux_nvidia_2_4080_16gx2,
@@ -126,3 +130,145 @@ def compare_candidates(candidates: List[ModelInstanceScore], expected_candidates
 
         if "score" in expected:
             assert str(candidate.score)[:5] == str(expected["score"])[:5]
+
+
+def test_sync_replicas_puts_placement_override_on_new_instances_only():
+    model = new_model(1, "test", 2, huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    created_instances = []
+
+    async def mock_create(instance):
+        created_instances.append(instance)
+        return instance
+
+    placement_override = ModelPlacementOverride(
+        replica_groups=[
+            PlacementOverrideReplicaGroup(
+                gpu_selector=GPUSelector(gpu_ids=["host4090:cuda:0"])
+            ),
+            PlacementOverrideReplicaGroup(
+                gpu_selector=GPUSelector(
+                    gpu_ids=["host4080:cuda:0", "host4080:cuda:1"]
+                )
+            ),
+        ]
+    )
+
+    with (
+        patch(
+            'gpustack.schemas.models.ModelInstance.all_by_field',
+            return_value=[],
+        ),
+        patch(
+            'gpustack.server.services.ModelInstanceService.create',
+            side_effect=mock_create,
+        ),
+    ):
+        asyncio.run(
+            sync_replicas(
+                AsyncMock(),
+                model,
+                AsyncMock(),
+                placement_override=placement_override,
+            )
+        )
+
+    assert model.gpu_selector is None
+    assert len(created_instances) == 2
+    assert created_instances[0].placement_override.gpu_selector.gpu_ids == [
+        "host4090:cuda:0"
+    ]
+    assert created_instances[1].placement_override.gpu_selector.gpu_ids == [
+        "host4080:cuda:0",
+        "host4080:cuda:1",
+    ]
+
+
+def test_sync_replicas_interprets_replica_groups_as_new_instances_only():
+    model = new_model(1, "test", 3, huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    existing_instances = [
+        new_model_instance(1, "test-existing-1", model.id),
+    ]
+    created_instances = []
+
+    async def mock_create(instance):
+        created_instances.append(instance)
+        return instance
+
+    placement_override = ModelPlacementOverride(
+        replica_groups=[
+            PlacementOverrideReplicaGroup(
+                gpu_selector=GPUSelector(gpu_ids=["host4090:cuda:0"])
+            ),
+            PlacementOverrideReplicaGroup(
+                gpu_selector=GPUSelector(gpu_ids=["host4080:cuda:1"])
+            ),
+        ]
+    )
+
+    with (
+        patch(
+            'gpustack.schemas.models.ModelInstance.all_by_field',
+            return_value=existing_instances,
+        ),
+        patch(
+            'gpustack.server.services.ModelInstanceService.create',
+            side_effect=mock_create,
+        ),
+    ):
+        asyncio.run(
+            sync_replicas(
+                AsyncMock(),
+                model,
+                AsyncMock(),
+                placement_override=placement_override,
+            )
+        )
+
+    assert len(created_instances) == 2
+    assert created_instances[0].placement_override.gpu_selector.gpu_ids == [
+        "host4090:cuda:0"
+    ]
+    assert created_instances[1].placement_override.gpu_selector.gpu_ids == [
+        "host4080:cuda:1"
+    ]
+
+
+def test_sync_replicas_accepts_new_replica_groups_name():
+    model = new_model(1, "test", 1, huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    created_instances = []
+
+    async def mock_create(instance):
+        created_instances.append(instance)
+        return instance
+
+    placement_override = ModelPlacementOverride(
+        new_replica_groups=[
+            PlacementOverrideReplicaGroup(
+                gpu_selector=GPUSelector(gpu_ids=["host4090:cuda:0"])
+            )
+        ]
+    )
+
+    with (
+        patch(
+            'gpustack.schemas.models.ModelInstance.all_by_field',
+            return_value=[],
+        ),
+        patch(
+            'gpustack.server.services.ModelInstanceService.create',
+            side_effect=mock_create,
+        ),
+    ):
+        asyncio.run(
+            sync_replicas(
+                AsyncMock(),
+                model,
+                AsyncMock(),
+                placement_override=placement_override,
+            )
+        )
+
+    assert len(created_instances) == 1
+    assert created_instances[0].placement_override.gpu_selector.gpu_ids == [
+        "host4090:cuda:0"
+    ]

@@ -15,8 +15,10 @@ from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.models import (
     BackendEnum,
     Model,
+    ModelPlacementOverride,
     ModelInstance,
-    ModelInstanceCreate,
+    ModelInstanceInternalCreate,
+    ModelInstancePlacementOverride,
     ModelInstanceStateEnum,
     SourceEnum,
     get_backend,
@@ -187,7 +189,12 @@ async def set_default_worker_selector(session: AsyncSession, model: Model):
         await ModelService(session).update(model)
 
 
-async def sync_replicas(session: AsyncSession, model: Model, cfg: Config):
+async def sync_replicas(
+    session: AsyncSession,
+    model: Model,
+    cfg: Config,
+    placement_override: ModelPlacementOverride = None,
+):
     """
     Synchronize the replicas.
     """
@@ -197,11 +204,26 @@ async def sync_replicas(session: AsyncSession, model: Model, cfg: Config):
 
     instances = await ModelInstance.all_by_field(session, "model_id", model.id)
     if len(instances) < model.replicas:
-        for _ in range(model.replicas - len(instances)):
+        # placement_override is request-scoped and applies only to instances
+        # created in this sync. Existing replicas keep their current placement.
+        replica_groups = (
+            placement_override.groups_for_new_replicas()
+            if placement_override
+            else []
+        )
+        for index in range(model.replicas - len(instances)):
             name_prefix = ''.join(
                 random.choices(string.ascii_letters + string.digits, k=5)
             )
-            instance = ModelInstanceCreate(
+            instance_placement_override = None
+            if index < len(replica_groups):
+                replica_group = replica_groups[index]
+                if replica_group.gpu_selector and replica_group.gpu_selector.gpu_ids:
+                    instance_placement_override = ModelInstancePlacementOverride(
+                        gpu_selector=replica_group.gpu_selector
+                    )
+
+            instance = ModelInstanceInternalCreate(
                 name=f"{model.name}-{name_prefix}",
                 model_id=model.id,
                 model_name=model.name,
@@ -213,6 +235,7 @@ async def sync_replicas(session: AsyncSession, model: Model, cfg: Config):
                 model_scope_file_path=model.model_scope_file_path,
                 local_path=model.local_path,
                 state=ModelInstanceStateEnum.PENDING,
+                placement_override=instance_placement_override,
             )
 
             await ModelInstanceService(session).create(instance)
