@@ -272,3 +272,62 @@ def test_sync_replicas_accepts_new_replica_groups_name():
     assert created_instances[0].placement_override.gpu_selector.gpu_ids == [
         "host4090:cuda:0"
     ]
+
+
+def test_sync_replicas_deletes_specified_scale_in_instances_as_whole_replicas():
+    model = new_model(1, "test", 1, huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    instances = [
+        new_model_instance(1, "test-1", model.id, 1, ModelInstanceStateEnum.RUNNING, [0, 1]),
+        new_model_instance(2, "test-2", model.id, 1, ModelInstanceStateEnum.RUNNING, [2, 3]),
+        new_model_instance(3, "test-3", model.id, 1, ModelInstanceStateEnum.RUNNING, [4, 5]),
+    ]
+    deleted_instances = []
+
+    async def mock_delete(instance):
+        deleted_instances.append(instance)
+        return instance
+
+    with (
+        patch(
+            'gpustack.schemas.models.ModelInstance.all_by_field',
+            return_value=instances,
+        ),
+        patch(
+            'gpustack.server.services.ModelInstanceService.delete',
+            side_effect=mock_delete,
+        ),
+    ):
+        asyncio.run(
+            sync_replicas(
+                AsyncMock(),
+                model,
+                AsyncMock(),
+                scale_in_instance_ids=[2, 3],
+            )
+        )
+
+    assert [instance.id for instance in deleted_instances] == [2, 3]
+    assert deleted_instances[0].gpu_indexes == [2, 3]
+
+
+def test_sync_replicas_rejects_invalid_specified_scale_in_instances():
+    model = new_model(1, "test", 1, huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    instances = [
+        new_model_instance(1, "test-1", model.id),
+        new_model_instance(2, "test-2", model.id),
+        new_model_instance(3, "test-3", model.id),
+    ]
+
+    with patch(
+        'gpustack.schemas.models.ModelInstance.all_by_field',
+        return_value=instances,
+    ):
+        with pytest.raises(ValueError, match="scale_in_instance_ids"):
+            asyncio.run(
+                sync_replicas(
+                    AsyncMock(),
+                    model,
+                    AsyncMock(),
+                    scale_in_instance_ids=[2],
+                )
+            )

@@ -194,6 +194,7 @@ async def sync_replicas(
     model: Model,
     cfg: Config,
     placement_override: ModelPlacementOverride = None,
+    scale_in_instance_ids: List[int] = None,
 ):
     """
     Synchronize the replicas.
@@ -242,14 +243,51 @@ async def sync_replicas(
             logger.debug(f"Created model instance for model {model.name}")
 
     elif len(instances) > model.replicas:
-        candidates = await find_scale_down_candidates(instances, model)
-
-        scale_down_count = len(candidates) - model.replicas
+        scale_down_count = len(instances) - model.replicas
         if scale_down_count > 0:
-            for candidate in candidates[:scale_down_count]:
-                instance = candidate.model_instance
+            if scale_in_instance_ids:
+                deleting_instances = specified_scale_down_instances(
+                    instances, model, scale_in_instance_ids, scale_down_count
+                )
+            else:
+                candidates = await find_scale_down_candidates(instances, model)
+                deleting_instances = [
+                    candidate.model_instance
+                    for candidate in candidates[:scale_down_count]
+                ]
+            for instance in deleting_instances:
                 await ModelInstanceService(session).delete(instance)
                 logger.debug(f"Deleted model instance {instance.name}")
+
+
+def specified_scale_down_instances(
+    instances: List[ModelInstance],
+    model: Model,
+    scale_in_instance_ids: List[int],
+    scale_down_count: int,
+) -> List[ModelInstance]:
+    if len(scale_in_instance_ids) != scale_down_count:
+        raise ValueError(
+            "scale_in_instance_ids count must match scale down replica count"
+        )
+    seen_ids = set()
+    instance_map = {}
+    for instance in instances:
+        if instance.model_id == model.id:
+            instance_map[instance.id] = instance
+    deleting_instances = []
+    for instance_id in scale_in_instance_ids:
+        if instance_id in seen_ids:
+            raise ValueError("scale_in_instance_ids must not contain duplicates")
+        seen_ids.add(instance_id)
+        instance = instance_map.get(instance_id)
+        if not instance:
+            raise ValueError(
+                f"scale_in_instance_ids contains instance {instance_id} "
+                f"that does not belong to model {model.id}"
+            )
+        deleting_instances.append(instance)
+    return deleting_instances
 
 
 async def ensure_instance_model_file(session: AsyncSession, instance: ModelInstance):

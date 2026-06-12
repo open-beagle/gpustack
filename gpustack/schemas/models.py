@@ -259,6 +259,9 @@ class ModelCreate(ModelBase):
 
 class ModelUpdate(ModelBase):
     placement_override: Optional[ModelPlacementOverride] = Field(default=None)
+    # Request-scoped scale-in target. It is consumed by sync_replicas and is not
+    # persisted on the model.
+    scale_in_instance_ids: Optional[List[int]] = Field(default=None)
 
 
 class ModelPublic(

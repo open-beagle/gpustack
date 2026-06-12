@@ -33,8 +33,13 @@ from gpustack.schemas.models import (
     ModelPublic,
     ModelsPublic,
 )
-from gpustack.server.services import ModelService, WorkerService
-from gpustack.server.controllers import sync_replicas
+from gpustack.server.bus import EventType
+from gpustack.server.services import (
+    ModelService,
+    WorkerService,
+    delete_cache_by_key,
+)
+from gpustack.server.controllers import specified_scale_down_instances, sync_replicas
 from gpustack.utils.command import find_parameter
 from gpustack.utils.convert import safe_int
 from gpustack.utils.gpu import parse_gpu_id
@@ -364,17 +369,47 @@ async def update_model(session: SessionDep, id: int, model_in: ModelUpdate):
     await validate_model_in(session, model_in)
 
     try:
-        source = model_in.model_dump(exclude_unset=True, exclude={"placement_override"})
-        if model_in.placement_override:
+        source = model_in.model_dump(
+            exclude_unset=True,
+            exclude={"placement_override", "scale_in_instance_ids"},
+        )
+        if model_in.scale_in_instance_ids:
+            target_replicas = source.get("replicas", model.replicas)
+            instances = await ModelInstance.all_by_field(session, "model_id", model.id)
+            scale_down_count = len(instances) - target_replicas
+            specified_scale_down_instances(
+                instances,
+                model,
+                model_in.scale_in_instance_ids,
+                scale_down_count,
+            )
+            for key, value in source.items():
+                setattr(model, key, value)
+            await model.save(session)
+            model_service = ModelService(session)
+            await delete_cache_by_key(model_service.get_by_id, model.id)
+            await delete_cache_by_key(model_service.get_by_name, model.name)
+            await sync_replicas(
+                session,
+                model,
+                get_global_config(),
+                placement_override=model_in.placement_override,
+                scale_in_instance_ids=model_in.scale_in_instance_ids,
+            )
+            await Model._publish_event(EventType.UPDATED, model)
+        elif model_in.placement_override:
             await ModelService(session).update(model, source)
             await sync_replicas(
                 session,
                 model,
                 get_global_config(),
                 placement_override=model_in.placement_override,
+                scale_in_instance_ids=model_in.scale_in_instance_ids,
             )
         else:
             await ModelService(session).update(model, source)
+    except ValueError as e:
+        raise BadRequestException(message=str(e))
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to update model: {e}")
 
