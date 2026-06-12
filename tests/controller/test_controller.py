@@ -23,8 +23,7 @@ from unittest.mock import patch, AsyncMock
 from tests.utils.model import new_model, new_model_instance
 
 
-@pytest.mark.asyncio
-async def test_find_scale_down_candidates():
+def test_find_scale_down_candidates():
     w1 = linux_nvidia_19_4090_24gx2()
     w1.state = WorkerStateEnum.NOT_READY
     workers = [
@@ -93,7 +92,7 @@ async def test_find_scale_down_candidates():
         ),
     ):
 
-        candidates = await find_scale_down_candidates(mis, m)
+        candidates = asyncio.run(find_scale_down_candidates(mis, m))
 
         expected_candidates = [
             {
@@ -308,6 +307,96 @@ def test_sync_replicas_deletes_specified_scale_in_instances_as_whole_replicas():
 
     assert [instance.id for instance in deleted_instances] == [2, 3]
     assert deleted_instances[0].gpu_indexes == [2, 3]
+
+
+def test_sync_replicas_serializes_scale_down_for_same_model():
+    model = new_model(1, "test", 1, huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    remaining_instances = {
+        1: new_model_instance(1, "test-1", model.id, 1, ModelInstanceStateEnum.RUNNING, [0]),
+        2: new_model_instance(2, "test-2", model.id, 1, ModelInstanceStateEnum.RUNNING, [1]),
+    }
+    deleted_instance_ids = []
+
+    async def mock_all_by_field(*args, **kwargs):
+        return list(remaining_instances.values())
+
+    async def mock_delete(instance):
+        await asyncio.sleep(0.01)
+        remaining_instances.pop(instance.id, None)
+        deleted_instance_ids.append(instance.id)
+        return instance
+
+    async def mock_find_scale_down_candidates(instances, model):
+        return [ModelInstanceScore(model_instance=instances[0], score=0)]
+
+    async def run_concurrent_syncs():
+        await asyncio.gather(
+            sync_replicas(
+                AsyncMock(),
+                model,
+                AsyncMock(),
+                scale_in_instance_ids=[2],
+            ),
+            sync_replicas(AsyncMock(), model, AsyncMock()),
+        )
+
+    with (
+        patch(
+            'gpustack.schemas.models.ModelInstance.all_by_field',
+            side_effect=mock_all_by_field,
+        ),
+        patch(
+            'gpustack.server.services.ModelInstanceService.delete',
+            side_effect=mock_delete,
+        ),
+        patch(
+            'gpustack.server.controllers.find_scale_down_candidates',
+            side_effect=mock_find_scale_down_candidates,
+        ),
+    ):
+        asyncio.run(run_concurrent_syncs())
+
+    assert deleted_instance_ids == [2]
+    assert list(remaining_instances) == [1]
+
+
+def test_sync_replicas_rechecks_current_instances_before_delete():
+    model = new_model(1, "test", 1, huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    stale_instances = [
+        new_model_instance(1, "test-1", model.id, 1, ModelInstanceStateEnum.RUNNING, [0]),
+        new_model_instance(2, "test-2", model.id, 1, ModelInstanceStateEnum.RUNNING, [1]),
+    ]
+    current_instances = [stale_instances[0]]
+    all_by_field_results = [stale_instances, current_instances]
+    deleted_instances = []
+
+    async def mock_all_by_field(*args, **kwargs):
+        return all_by_field_results.pop(0)
+
+    async def mock_find_scale_down_candidates(instances, model):
+        return [ModelInstanceScore(model_instance=instances[0], score=0)]
+
+    async def mock_delete(instance):
+        deleted_instances.append(instance)
+        return instance
+
+    with (
+        patch(
+            'gpustack.schemas.models.ModelInstance.all_by_field',
+            side_effect=mock_all_by_field,
+        ),
+        patch(
+            'gpustack.server.controllers.find_scale_down_candidates',
+            side_effect=mock_find_scale_down_candidates,
+        ),
+        patch(
+            'gpustack.server.services.ModelInstanceService.delete',
+            side_effect=mock_delete,
+        ),
+    ):
+        asyncio.run(sync_replicas(AsyncMock(), model, AsyncMock()))
+
+    assert deleted_instances == []
 
 
 def test_sync_replicas_rejects_invalid_specified_scale_in_instances():

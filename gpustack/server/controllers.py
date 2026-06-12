@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 import string
@@ -33,6 +34,8 @@ from gpustack.server.services import (
 )
 
 logger = logging.getLogger(__name__)
+
+replica_sync_locks: Dict[int, asyncio.Lock] = {}
 
 
 class ModelController:
@@ -197,7 +200,29 @@ async def sync_replicas(
     scale_in_instance_ids: List[int] = None,
 ):
     """
-    Synchronize the replicas.
+    同步模型副本数。
+    """
+
+    lock = replica_sync_locks.setdefault(model.id, asyncio.Lock())
+    async with lock:
+        await _sync_replicas_locked(
+            session,
+            model,
+            cfg,
+            placement_override=placement_override,
+            scale_in_instance_ids=scale_in_instance_ids,
+        )
+
+
+async def _sync_replicas_locked(
+    session: AsyncSession,
+    model: Model,
+    cfg: Config,
+    placement_override: ModelPlacementOverride = None,
+    scale_in_instance_ids: List[int] = None,
+):
+    """
+    已获取模型级锁后的副本同步逻辑。
     """
 
     if model.deleted_at is not None:
@@ -256,6 +281,14 @@ async def sync_replicas(
                     for candidate in candidates[:scale_down_count]
                 ]
             for instance in deleting_instances:
+                current_instances = await ModelInstance.all_by_field(
+                    session, "model_id", model.id
+                )
+                if len(current_instances) <= model.replicas:
+                    break
+                current_instance_ids = {current.id for current in current_instances}
+                if instance.id not in current_instance_ids:
+                    continue
                 await ModelInstanceService(session).delete(instance)
                 logger.debug(f"Deleted model instance {instance.name}")
 
