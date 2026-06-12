@@ -71,3 +71,21 @@ def test_model_instance_internal_update_exposes_placement_override():
     )
 
     assert update.placement_override.gpu_selector.gpu_ids == ["host-a:cuda:0"]
+
+
+def test_model_instance_internal_update_can_dump_for_table_update():
+    update = ModelInstanceInternalUpdate(
+        **_instance_payload(),
+        state="running",
+        placement_override={"gpu_selector": {"gpu_ids": ["host-a:cuda:0"]}},
+    )
+
+    validated = ModelInstance.model_validate(update.model_dump(exclude_unset=True))
+    source = {
+        key: getattr(validated, key)
+        for key in update.model_fields_set
+        if hasattr(validated, key)
+    }
+
+    assert source["state"] == "running"
+    assert source["placement_override"].gpu_selector.gpu_ids == ["host-a:cuda:0"]
