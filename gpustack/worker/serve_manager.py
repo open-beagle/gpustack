@@ -576,19 +576,29 @@ def is_ready(backend: str, mi: ModelInstance) -> bool:
             # Use worker IP instead.
             hostname = mi.worker_ip
 
-        # Check /v1/models by default if dedicated health check endpoint is not available.
-        # This is served by all backends (llama-box, vox-box, vllm, mindIE, vllm-omni)
-        health_check_url = f"http://{hostname}:{mi.port}/v1/models"
         if backend == BackendEnum.LLAMA_BOX:
             # For llama-box, use /health to avoid printing error logs.
-            health_check_url = f"http://{hostname}:{mi.port}/health"
+            # The llama.cpp runtime also runs under the GGUF/llama-box control
+            # plane, so fall back to /v1/models for compatibility.
+            health_check_urls = [
+                f"http://{hostname}:{mi.port}/health",
+                f"http://{hostname}:{mi.port}/v1/models",
+            ]
         elif backend == BackendEnum.VLLM_OMNI:
             # For vllm-omni, use /health endpoint
-            health_check_url = f"http://{hostname}:{mi.port}/health"
+            health_check_urls = [f"http://{hostname}:{mi.port}/health"]
+        else:
+            # Check /v1/models by default if dedicated health check endpoint is not available.
+            # This is served by all backends (llama-box, vox-box, vllm, mindIE, vllm-omni)
+            health_check_urls = [f"http://{hostname}:{mi.port}/v1/models"]
 
-        response = requests.get(health_check_url, timeout=1)
-        if response.status_code == 200:
-            return True
+        for health_check_url in health_check_urls:
+            try:
+                response = requests.get(health_check_url, timeout=1)
+                if response.status_code == 200:
+                    return True
+            except Exception:
+                continue
     except Exception:
         pass
     return False

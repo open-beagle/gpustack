@@ -299,7 +299,7 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         action=OptionalBoolAction,
         help="Disable RPC servers.",
         default=get_gpustack_env_bool(
-            "DISABLE_METRICS",
+            "DISABLE_RPC_SERVERS",
         ),
     )
     group.add_argument(

@@ -215,7 +215,13 @@ class ModelSpecBase(SQLModel, ModelSource):
 
         if self.distributed_inference_across_workers is None:
             self.distributed_inference_across_workers = (
-                True if backend in [BackendEnum.LLAMA_BOX, BackendEnum.VLLM] else False
+                True
+                if backend == BackendEnum.VLLM
+                or (
+                    backend == BackendEnum.LLAMA_BOX
+                    and get_gguf_runtime(self) != "llama-cpp"
+                )
+                else False
             )
         return self
 
@@ -228,6 +234,13 @@ class ModelBase(ModelSpecBase):
             if self.source == SourceEnum.HUGGING_FACE and not self.huggingface_filename:
                 raise ValueError(
                     "huggingface_filename must be provided when source is 'huggingface'"
+                )
+            if (
+                get_gguf_runtime(self) == "llama-cpp"
+                and self.distributed_inference_across_workers
+            ):
+                raise ValueError(
+                    "Distributed inference across workers is not supported for the llama.cpp runtime"
                 )
         elif backend == BackendEnum.VLLM:
             if self.cpu_offloading:
@@ -558,6 +571,21 @@ def get_backend(model: Model) -> str:
         return BackendEnum.VOX_BOX
 
     return BackendEnum.VLLM
+
+
+def get_gguf_runtime(model: Model) -> str:
+    env = getattr(model, "env", None) or {}
+    runtime = env.get("GPUSTACK_GGUF_RUNTIME")
+    if runtime:
+        return runtime.strip().lower()
+
+    runtime = find_parameter(
+        getattr(model, "backend_parameters", None), ["gpustack-runtime"]
+    )
+    if runtime:
+        return runtime.strip().lower()
+
+    return "llama-box"
 
 
 def get_mmproj_filename(model: Union[Model, ModelSource]) -> Optional[str]:
