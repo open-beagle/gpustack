@@ -103,6 +103,22 @@ def create_session(client, session_id="cterm_route"):
     return response.json()
 
 
+def create_admin_session(admin_client, session_id="cterm_admin_route"):
+    response = admin_client.post(
+        "/v1/admin/container-exec/sessions",
+        json={
+            "session_id": session_id,
+            "target_type": "worker",
+            "worker_id": 1,
+            "worker_uuid": "ready-worker-uuid",
+            "cols": 80,
+            "rows": 24,
+        },
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
 def bind_message(session_id, ticket):
     return {"op": "bind", "session_id": session_id, "ticket": ticket}
 
@@ -255,6 +271,35 @@ def test_websocket_bind_rejects_expired_ticket(client):
     assert container_exec.manager.get_session("cterm_expired") is None
 
 
+def test_create_session_rejects_naive_expires_at(client):
+    response = client.post(
+        "/admin/container-exec/sessions",
+        headers=auth_headers(),
+        json={
+            "session_id": "cterm_naive_time",
+            "cols": 80,
+            "rows": 24,
+            "expires_at": "2999-01-01T00:00:00",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_create_session_rejects_unsafe_session_id(client):
+    response = client.post(
+        "/admin/container-exec/sessions",
+        headers=auth_headers(),
+        json={
+            "session_id": "cterm/bad",
+            "cols": 80,
+            "rows": 24,
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_websocket_requires_worker_internal_credential(client):
     create_session(client, "cterm_ws_auth")
 
@@ -396,6 +441,39 @@ def test_admin_create_session_validates_target_and_creates_remote_pending_sessio
     assert request["rows"] == 30
 
 
+def test_admin_create_session_rejects_unsafe_session_id(admin_client):
+    response = admin_client.post(
+        "/v1/admin/container-exec/sessions",
+        json={
+            "session_id": "cterm/bad",
+            "target_type": "worker",
+            "worker_id": 1,
+            "worker_uuid": "ready-worker-uuid",
+            "cols": 80,
+            "rows": 24,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_admin_create_session_rejects_naive_expires_at(admin_client):
+    response = admin_client.post(
+        "/v1/admin/container-exec/sessions",
+        json={
+            "session_id": "cterm_admin_naive_time",
+            "target_type": "worker",
+            "worker_id": 1,
+            "worker_uuid": "ready-worker-uuid",
+            "cols": 80,
+            "rows": 24,
+            "expires_at": "2999-01-01T00:00:00",
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_admin_create_session_rejects_offline_target(admin_client):
     response = admin_client.post(
         "/v1/admin/container-exec/sessions",
@@ -529,6 +607,7 @@ def test_admin_websocket_rejects_bad_bind_token(admin_client):
         message = receive_control_until(websocket, "error", timeout=3)
 
     assert message["code"] == "auth_failed"
+    assert admin_container_exec.session_store.get("cterm_admin_bad_bind") is not None
 
 
 def receive_until(websocket, marker: bytes, timeout: float) -> bytes:

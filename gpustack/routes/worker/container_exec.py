@@ -19,6 +19,30 @@ from gpustack.worker.container_exec_manager import (
 
 router = APIRouter()
 manager = ContainerExecManager()
+_cleanup_task: asyncio.Task | None = None
+_CLEANUP_INTERVAL_SECONDS = 30
+
+
+async def start_cleanup_task() -> None:
+    global _cleanup_task
+    if _cleanup_task is None or _cleanup_task.done():
+        _cleanup_task = asyncio.create_task(_cleanup_loop())
+
+
+async def stop_cleanup_task() -> None:
+    global _cleanup_task
+    if _cleanup_task is None:
+        return
+    _cleanup_task.cancel()
+    await asyncio.gather(_cleanup_task, return_exceptions=True)
+    _cleanup_task = None
+
+
+async def _cleanup_loop() -> None:
+    while True:
+        manager.cleanup_expired_sessions()
+        manager.check_session_limits()
+        await asyncio.sleep(_CLEANUP_INTERVAL_SECONDS)
 
 
 @router.post("/admin/container-exec/sessions", dependencies=[Depends(worker_auth)])

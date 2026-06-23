@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ContainerExecCloseReason(str, Enum):
@@ -15,12 +15,21 @@ class ContainerExecCloseReason(str, Enum):
 
 
 class ContainerExecCreateRequest(BaseModel):
-    session_id: str
+    session_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
     worker_id: Optional[int] = None
     worker_uuid: Optional[str] = None
     cols: int = Field(default=80, ge=1, le=1000)
     rows: int = Field(default=24, ge=1, le=1000)
     expires_at: Optional[datetime] = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def normalize_expires_at(cls, value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("expires_at must include timezone")
+        return value.astimezone(timezone.utc)
 
 
 class ContainerExecResizeMessage(BaseModel):

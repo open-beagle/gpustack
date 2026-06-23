@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 import aiohttp
 from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlmodel import select
 
 from gpustack.api.exceptions import (
@@ -27,13 +27,22 @@ router = APIRouter()
 
 
 class AdminContainerExecCreateRequest(BaseModel):
-    session_id: str
+    session_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
     target_type: str = Field(default="worker")
     worker_id: Optional[int] = None
     worker_uuid: Optional[str] = None
     cols: int = Field(default=80, ge=1, le=1000)
     rows: int = Field(default=24, ge=1, le=1000)
     expires_at: Optional[datetime] = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def normalize_expires_at(cls, value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("expires_at must include timezone")
+        return value.astimezone(timezone.utc)
 
 
 class AdminContainerExecSession(BaseModel):
@@ -150,7 +159,16 @@ class WorkerExecForwarder:
         timeout = aiohttp.ClientTimeout(total=10, sock_connect=5)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as client:
             try:
-                async with client.delete(url, headers=self._auth_headers(worker)):
+                async with client.delete(url, headers=self._auth_headers(worker)) as response:
+                    if response.status in (
+                        status.HTTP_401_UNAUTHORIZED,
+                        status.HTTP_403_FORBIDDEN,
+                    ):
+                        raise WorkerExecForwardError("auth_failed", "worker auth failed")
+                    if response.status >= status.HTTP_400_BAD_REQUEST:
+                        raise WorkerExecForwardError(
+                            "worker_unreachable", "worker returned close error"
+                        )
                     return
             except aiohttp.ClientError as exc:
                 raise WorkerExecForwardError(
@@ -291,6 +309,7 @@ async def delete_session(request: Request, session_id: str):
 @router.websocket("/sessions/{session_id}/ws")
 async def websocket_session(websocket: WebSocket, session_id: str):
     await websocket.accept()
+    bound = False
     try:
         bind_message = await websocket.receive_text()
         payload = json.loads(bind_message)
@@ -304,6 +323,7 @@ async def websocket_session(websocket: WebSocket, session_id: str):
             return
 
         try:
+            bound = True
             if session.target_type == "server":
                 await _pump_local_server(websocket, session)
             else:
@@ -313,7 +333,8 @@ async def websocket_session(websocket: WebSocket, session_id: str):
     except (WebSocketDisconnect, json.JSONDecodeError):
         return
     finally:
-        session_store.remove(session_id)
+        if bound:
+            session_store.remove(session_id)
 
 
 async def _list_workers(request: Request, session: Any) -> list[Any]:

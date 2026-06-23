@@ -277,12 +277,22 @@ class ContainerExecManager:
             self._exec_shell_child(slave_fd, shell_path, cwd, session.session_id)
 
         os.close(slave_fd)
-        self._set_nonblocking(master_fd)
-        session.master_fd = master_fd
-        session.pid = pid
-        session.pgid = self._wait_for_child_pgid(pid)
-        session.shell_path = shell_path
-        session.cwd = cwd
+        try:
+            self._set_nonblocking(master_fd)
+            session.master_fd = master_fd
+            session.pid = pid
+            session.pgid = self._wait_for_child_pgid(pid)
+            session.shell_path = shell_path
+            session.cwd = cwd
+        except Exception:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            session.master_fd = None
+            if pid is not None:
+                self._terminate_process(pid)
+            raise
 
     def _exec_shell_child(
         self, slave_fd: int, shell_path: str, cwd: str, session_id: str
@@ -350,6 +360,24 @@ class ContainerExecManager:
 
         try:
             os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self._wait_child(pid, block=True)
+
+    def _terminate_process(self, pid: int) -> None:
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                self._wait_child(pid)
+                return
+        deadline = time.monotonic() + self.terminate_grace_seconds
+        while time.monotonic() < deadline:
+            if self._wait_child(pid):
+                return
+            time.sleep(0.02)
+        try:
+            os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         self._wait_child(pid, block=True)

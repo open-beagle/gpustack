@@ -252,7 +252,9 @@ class Worker:
             app.state.http_client = aiohttp.ClientSession(
                 connector=connector, trust_env=True
             )
+            await container_exec.start_cleanup_task()
             yield
+            await container_exec.stop_cleanup_task()
             await app.state.http_client.close()
 
         app = FastAPI(

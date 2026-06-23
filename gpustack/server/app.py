@@ -11,6 +11,7 @@ from gpustack.config.envs import (
     TCP_CONNECTOR_LIMIT,
 )
 from gpustack.routes import ui
+from gpustack.routes.worker import container_exec as worker_container_exec
 from gpustack.routes.routes import api_router
 
 
@@ -24,7 +25,9 @@ def create_app(cfg: Config) -> FastAPI:
         app.state.http_client = aiohttp.ClientSession(
             connector=connector, trust_env=True
         )
+        await worker_container_exec.start_cleanup_task()
         yield
+        await worker_container_exec.stop_cleanup_task()
         await app.state.http_client.close()
 
     app = FastAPI(
