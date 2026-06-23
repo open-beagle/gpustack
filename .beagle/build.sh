@@ -16,6 +16,7 @@ pip config set global.trusted-host "$PYPI_HOST"
 set -ex
 
 VERSION="${VERSION:-v0.7.1}"
+UI_VERSION="${UI_VERSION:-v0.7.3}"
 
 # 检查并安装 poetry
 if ! command -v poetry &> /dev/null; then
@@ -39,7 +40,7 @@ elif [ -f "$PWD/../gpustack-ui/dist/index.html" ]; then
   mkdir -p "$UI_PATH"
   cp -a "$PWD/../gpustack-ui/dist/." "$UI_PATH"
 else
-  echo "Downloading UI assets for ${VERSION}..."
+  echo "Downloading UI assets for ${UI_VERSION}..."
   rm -rf "$UI_PATH"
   mkdir -p "$UI_PATH"
 
@@ -48,9 +49,9 @@ else
   mkdir -p "$UI_TMP"
 
   if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
-    "https://cache.ali.wodcloud.com/vscode/gpustack/gpustack-ui-${VERSION}.tar.gz" | \
+    "https://cache.ali.wodcloud.com/vscode/gpustack/gpustack-ui-${UI_VERSION}.tar.gz" | \
     tar -xzf - --directory "$UI_TMP" 2>/dev/null; then
-    echo "Failed to download UI assets for ${VERSION}."
+    echo "Failed to download UI assets for ${UI_VERSION}."
     exit 1
   fi
 
