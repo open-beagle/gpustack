@@ -21,6 +21,7 @@ from gpustack.routes import (
     voice,
     workers,
 )
+from gpustack.routes.admin import container_exec as admin_container_exec
 
 from gpustack.api.exceptions import error_responses, openai_api_error_responses
 from gpustack.routes import rerank
@@ -62,6 +63,11 @@ v1_admin_router.include_router(
 )
 v1_admin_router.include_router(
     gpu_devices.router, prefix="/gpu-devices", tags=["GPU Devices"]
+)
+v1_admin_router.include_router(
+    admin_container_exec.router,
+    prefix="/admin/container-exec",
+    tags=["Admin Container Exec"],
 )
 
 api_router.include_router(

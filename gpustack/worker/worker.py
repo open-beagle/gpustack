@@ -16,7 +16,7 @@ from gpustack.api import exceptions
 from gpustack.config import Config
 from gpustack.config.envs import TCP_CONNECTOR_LIMIT
 from gpustack.routes import debug, probes
-from gpustack.routes.worker import logs, proxy
+from gpustack.routes.worker import container_exec, logs, proxy
 from gpustack.schemas.workers import SystemReserved, WorkerUpdate
 from gpustack.server import catalog
 from gpustack.ray.manager import RayManager
@@ -264,6 +264,7 @@ class Worker:
 
         app.include_router(debug.router, prefix="/debug")
         app.include_router(probes.router)
+        app.include_router(container_exec.router)
         app.include_router(logs.router)
         app.include_router(proxy.router)
         exceptions.register_handlers(app)
