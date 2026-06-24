@@ -5,6 +5,8 @@ from fastapi.responses import JSONResponse
 import httpx
 from pydantic import BaseModel
 
+HTTP_422_STATUS_CODE = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
+
 
 class HTTPException(Exception):
     def __init__(self, status_code: int, reason: str, message: str):
@@ -52,7 +54,7 @@ ForbiddenException = http_exception_factory(
     status.HTTP_403_FORBIDDEN, "Forbidden", "Forbidden"
 )
 InvalidException = http_exception_factory(
-    status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid", "Invalid input"
+    HTTP_422_STATUS_CODE, "Invalid", "Invalid input"
 )
 BadRequestException = http_exception_factory(
     status.HTTP_400_BAD_REQUEST, "BadRequest", "Bad request"
@@ -100,7 +102,7 @@ def raise_if_response_error(response: httpx.Response):  # noqa: C901
     if response.status_code == status.HTTP_403_FORBIDDEN:
         raise ForbiddenException(error.message)
 
-    if response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY:
+    if response.status_code == HTTP_422_STATUS_CODE:
         raise InvalidException(error.message)
 
     if response.status_code == status.HTTP_400_BAD_REQUEST:
@@ -193,9 +195,9 @@ def register_handlers(app: FastAPI):
         for err in exc.errors():
             message += f"  {err}\n"
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=HTTP_422_STATUS_CODE,
             content=ErrorResponse(
-                code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                code=HTTP_422_STATUS_CODE,
                 reason="Invalid",
                 message=message,
             ).model_dump(),

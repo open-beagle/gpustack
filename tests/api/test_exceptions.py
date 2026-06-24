@@ -3,6 +3,7 @@ import pytest
 
 from gpustack.api.exceptions import (
     ErrorResponse,
+    HTTP_422_STATUS_CODE,
     raise_if_response_error,
     BadRequestException,
     InternalServerErrorException,
@@ -157,3 +158,11 @@ def test_raise_if_response_error(name, given, expected):
         assert str(e) == str(
             expected
         ), f"Case {name} expected exception {expected} but got {e}"
+
+
+def test_422_status_code_uses_non_deprecated_starlette_name():
+    import inspect
+    import gpustack.api.exceptions as exceptions
+
+    assert HTTP_422_STATUS_CODE == 422
+    assert "HTTP_422_UNPROCESSABLE_ENTITY" not in inspect.getsource(exceptions)
