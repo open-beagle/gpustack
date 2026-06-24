@@ -126,6 +126,32 @@ class WorkerExecForwardError(RuntimeError):
 
 
 class WorkerExecForwarder:
+    async def get_capabilities(self, worker: Any) -> dict:
+        url = self._worker_http_url(worker, "/admin/container-exec/capabilities")
+        timeout = aiohttp.ClientTimeout(total=5, sock_connect=3)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as client:
+            try:
+                async with client.get(url, headers=self._auth_headers(worker)) as response:
+                    if response.status in (
+                        status.HTTP_401_UNAUTHORIZED,
+                        status.HTTP_403_FORBIDDEN,
+                    ):
+                        raise WorkerExecForwardError("auth_failed", "worker auth failed")
+                    if response.status == status.HTTP_404_NOT_FOUND:
+                        raise WorkerExecForwardError(
+                            "worker_exec_unsupported",
+                            "worker does not support container exec",
+                        )
+                    if response.status >= status.HTTP_400_BAD_REQUEST:
+                        raise WorkerExecForwardError(
+                            "worker_unreachable", "worker returned error"
+                        )
+                    return await response.json()
+            except aiohttp.ClientError as exc:
+                raise WorkerExecForwardError(
+                    "worker_unreachable", "failed to reach worker"
+                ) from exc
+
     async def create_session(self, worker: Any, request: dict[str, Any]) -> dict:
         url = self._worker_http_url(worker, "/admin/container-exec/sessions")
         timeout = aiohttp.ClientTimeout(total=10, sock_connect=5)
@@ -230,7 +256,22 @@ default_forwarder = WorkerExecForwarder()
 @router.get("/targets")
 async def list_targets(request: Request, session: Any = Depends(get_session)):
     workers = await _list_workers(request, session)
-    return {"items": [_server_target()] + [_worker_target(w) for w in workers]}
+    targets = [_worker_target(worker) for worker in workers]
+    online_indexes = [
+        index for index, worker in enumerate(workers) if _is_online(worker)
+    ]
+    support_results = await asyncio.gather(
+        *(
+            _worker_supports_container_exec(request, workers[index])
+            for index in online_indexes
+        )
+    )
+    for index, is_supported in zip(online_indexes, support_results):
+        if is_supported:
+            continue
+        targets[index]["status"] = "unsupported"
+        targets[index]["risk_flags"] = ["container_exec_unsupported"]
+    return {"items": [_server_target()] + targets}
 
 
 @router.post("/sessions")
@@ -337,11 +378,28 @@ async def websocket_session(websocket: WebSocket, session_id: str):
 async def _list_workers(request: Request, session: Any) -> list[Any]:
     injected_workers = getattr(request.app.state, "container_exec_workers", None)
     if injected_workers is not None:
-        return list(injected_workers)
+        return sorted(list(injected_workers), key=_worker_sort_key)
     if session is None:
         return []
-    result = await session.exec(select(Worker))
+    result = await session.exec(select(Worker).order_by(Worker.id))
     return list(result.all())
+
+
+def _worker_sort_key(worker: Any) -> tuple[int, str]:
+    worker_id = getattr(worker, "id", None)
+    if isinstance(worker_id, int):
+        return worker_id, ""
+    return 0, str(worker_id or "")
+
+
+async def _worker_supports_container_exec(request: Request, worker: Any) -> bool:
+    try:
+        capabilities = await _forwarder(request).get_capabilities(
+            _worker_namespace(worker, _worker_token(request))
+        )
+    except WorkerExecForwardError:
+        return False
+    return bool(capabilities.get("container_exec"))
 
 
 async def _resolve_target(
@@ -361,6 +419,8 @@ async def _resolve_target(
             and worker.worker_uuid == create_request.worker_uuid
             and _is_online(worker)
         ):
+            if not await _worker_supports_container_exec(request, worker):
+                raise BadRequestException(message="target_offline")
             target = _worker_target(worker)
             target["token"] = _worker_token(request)
             return target, _worker_namespace(worker, _worker_token(request))
