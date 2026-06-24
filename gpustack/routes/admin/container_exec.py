@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -7,9 +9,17 @@ from typing import Any, Optional
 
 import aiohttp
 from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect, status
+from fastapi.security import HTTPBasicCredentials
 from pydantic import BaseModel, Field, field_validator
 from sqlmodel import select
 
+from gpustack.api.auth import (
+    SESSION_COOKIE_NAME,
+    SYSTEM_WORKER_USER_PREFIX,
+    authenticate_system_user,
+    authenticate_user,
+    get_user_from_jwt_token,
+)
 from gpustack.api.exceptions import (
     BadRequestException,
     ServiceUnavailableException,
@@ -24,6 +34,7 @@ DEFAULT_BIND_TIMEOUT_SECONDS = 60
 DEFAULT_CONTAINER_NAME = "gpustack"
 
 router = APIRouter()
+ws_router = APIRouter()
 
 
 class AdminContainerExecCreateRequest(BaseModel):
@@ -344,8 +355,12 @@ async def delete_session(request: Request, session_id: str):
     return {"session_id": session_id, "state": "closed"}
 
 
-@router.websocket("/sessions/{session_id}/ws")
+@ws_router.websocket("/sessions/{session_id}/ws")
 async def websocket_session(websocket: WebSocket, session_id: str):
+    if not await _authenticate_admin_websocket(websocket):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     await websocket.accept()
     bound = False
     try:
@@ -373,6 +388,55 @@ async def websocket_session(websocket: WebSocket, session_id: str):
     finally:
         if bound:
             session_store.remove(session_id)
+
+
+async def _authenticate_admin_websocket(websocket: WebSocket) -> bool:
+    user = await _authenticate_admin_websocket_basic(websocket)
+    if user is None:
+        user = await _authenticate_admin_websocket_cookie(websocket)
+    return bool(getattr(user, "is_admin", False))
+
+
+async def _authenticate_admin_websocket_basic(websocket: WebSocket) -> Any:
+    authorization = websocket.headers.get("authorization", "")
+    scheme, _, credential = authorization.partition(" ")
+    if scheme.lower() != "basic" or not credential:
+        return None
+    try:
+        decoded = base64.b64decode(credential).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+    username, separator, password = decoded.partition(":")
+    if not separator:
+        return None
+
+    try:
+        if username.startswith(SYSTEM_WORKER_USER_PREFIX):
+            config = getattr(websocket.app.state, "server_config", None) or getattr(
+                websocket.app.state, "config", None
+            )
+            return await authenticate_system_user(
+                config, HTTPBasicCredentials(username=username, password=password)
+            )
+
+        async for session in get_session():
+            return await authenticate_user(session, username, password)
+    except Exception:
+        return None
+    return None
+
+
+async def _authenticate_admin_websocket_cookie(websocket: WebSocket) -> Any:
+    token = websocket.cookies.get(SESSION_COOKIE_NAME)
+    jwt_manager = getattr(websocket.app.state, "jwt_manager", None)
+    if not token or jwt_manager is None:
+        return None
+    try:
+        async for session in get_session():
+            return await get_user_from_jwt_token(session, jwt_manager, token)
+    except Exception:
+        return None
+    return None
 
 
 async def _list_workers(request: Request, session: Any) -> list[Any]:

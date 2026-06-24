@@ -3,15 +3,18 @@ import os
 from pathlib import Path
 import time
 from types import SimpleNamespace
+import base64
 
-from fastapi import FastAPI
+from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.testclient import TestClient
 import pytest
 
 from gpustack.api import exceptions
+from gpustack.api.auth import get_admin_user
 from gpustack.routes.admin import container_exec as admin_container_exec
 from gpustack.routes.worker import container_exec
 from gpustack.schemas.container_exec import ContainerExecCloseReason
+from gpustack.schemas.users import User
 from gpustack.schemas.workers import WorkerStateEnum
 from gpustack.server.db import get_session
 
@@ -81,6 +84,9 @@ def admin_app():
     test_app.include_router(
         admin_container_exec.router, prefix="/v1/admin/container-exec"
     )
+    test_app.include_router(
+        admin_container_exec.ws_router, prefix="/v1/admin/container-exec"
+    )
     exceptions.register_handlers(test_app)
     yield test_app
     admin_container_exec.session_store.clear()
@@ -92,8 +98,52 @@ def admin_client(admin_app):
         yield test_client
 
 
+@pytest.fixture
+def mounted_admin_app(admin_app):
+    test_app = FastAPI()
+    test_app.state.config = SimpleNamespace(token=WORKER_TOKEN)
+    test_app.state.server_config = SimpleNamespace(token=WORKER_TOKEN)
+    test_app.state.container_exec_workers = admin_app.state.container_exec_workers
+    test_app.state.container_exec_forwarder = FakeWorkerForwarder()
+
+    async def session_override():
+        yield None
+
+    async def admin_user_override(request: Request):
+        request.state.user = User(username="admin", is_admin=True, hashed_password="")
+        return request.state.user
+
+    test_app.dependency_overrides[get_session] = session_override
+    test_app.dependency_overrides[get_admin_user] = admin_user_override
+    admin_router = APIRouter(dependencies=[Depends(get_admin_user)])
+    admin_router.include_router(
+        admin_container_exec.router,
+        prefix="/admin/container-exec",
+    )
+    test_app.include_router(admin_router, prefix="/v1")
+    test_app.include_router(
+        admin_container_exec.ws_router,
+        prefix="/v1/admin/container-exec",
+    )
+    exceptions.register_handlers(test_app)
+    yield test_app
+
+
+@pytest.fixture
+def mounted_admin_client(mounted_admin_app):
+    with TestClient(mounted_admin_app) as test_client:
+        yield test_client
+
+
 def auth_headers(token=WORKER_TOKEN):
     return {"Authorization": f"Bearer {token}"}
+
+
+def admin_ws_headers():
+    token = base64.b64encode(
+        f"system/worker/test:{WORKER_TOKEN}".encode("utf-8")
+    ).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
 
 
 def create_session(client, session_id="cterm_route"):
@@ -672,7 +722,8 @@ def test_admin_websocket_binds_and_pumps_to_worker(admin_client):
     bind_token = response.json()["bind_token"]
 
     with admin_client.websocket_connect(
-        "/v1/admin/container-exec/sessions/cterm_admin_ws/ws"
+        "/v1/admin/container-exec/sessions/cterm_admin_ws/ws",
+        headers=admin_ws_headers(),
     ) as websocket:
         websocket.send_text(json.dumps(admin_bind_message("cterm_admin_ws", bind_token)))
         assert receive_control_until(websocket, "bind", timeout=3)["state"] == "connected"
@@ -683,6 +734,38 @@ def test_admin_websocket_binds_and_pumps_to_worker(admin_client):
 
         websocket.send_text(json.dumps({"op": "close", "reason": "user_close"}))
         assert receive_control_until(websocket, "close", timeout=3)["reason"] == "user_close"
+
+
+def test_mounted_admin_websocket_works_with_admin_router_dependencies(
+    mounted_admin_client,
+):
+    response = mounted_admin_client.post(
+        "/v1/admin/container-exec/sessions",
+        json={
+            "session_id": "cterm_mounted_admin_ws",
+            "target_type": "worker",
+            "worker_id": 1,
+            "worker_uuid": "ready-worker-uuid",
+            "cols": 80,
+            "rows": 24,
+        },
+    )
+    assert response.status_code == 200
+
+    with mounted_admin_client.websocket_connect(
+        "/v1/admin/container-exec/sessions/cterm_mounted_admin_ws/ws",
+        headers=admin_ws_headers(),
+    ) as websocket:
+        websocket.send_text(
+            json.dumps(
+                admin_bind_message(
+                    "cterm_mounted_admin_ws", response.json()["bind_token"]
+                )
+            )
+        )
+        assert receive_control_until(websocket, "bind", timeout=3)[
+            "state"
+        ] == "connected"
 
 
 def test_admin_websocket_rejects_bad_bind_token(admin_client):
@@ -700,7 +783,8 @@ def test_admin_websocket_rejects_bad_bind_token(admin_client):
     assert response.status_code == 200
 
     with admin_client.websocket_connect(
-        "/v1/admin/container-exec/sessions/cterm_admin_bad_bind/ws"
+        "/v1/admin/container-exec/sessions/cterm_admin_bad_bind/ws",
+        headers=admin_ws_headers(),
     ) as websocket:
         websocket.send_text(
             json.dumps(admin_bind_message("cterm_admin_bad_bind", "wrong-token"))
