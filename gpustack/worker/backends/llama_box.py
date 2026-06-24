@@ -293,8 +293,9 @@ class LlamaBoxServer(InferenceServer):
         )
         base_path = Path(
             str(
-                pkg_resources.files("gpustack.third_party.bin").joinpath(
-                    "llama.cpp",
+                pkg_resources.files("gpustack.third_party.bin")
+                .joinpath("llama.cpp")
+                .joinpath(
                     get_llama_cpp_version_dir_name(
                         version,
                         platform.system(),

@@ -132,6 +132,17 @@ class ToolsManager:
         self.download_llama_box()
         self.download_gguf_parser()
         self.download_fastfetch()
+        
+        # Only download llama.cpp for supported environments
+        if (
+            self._os == "linux"
+            and self._arch == "amd64"
+            and self._device == platform.DeviceTypeEnum.CUDA.value
+        ):
+            try:
+                self.install_llama_cpp()
+            except Exception as e:
+                logger.warning(f"Failed to download llama.cpp: {e}")
 
     def remove_cached_tools(self):
         """
