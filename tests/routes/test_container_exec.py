@@ -140,7 +140,17 @@ class FakeWorkerForwarder:
     def __init__(self):
         self.created_sessions = []
         self.closed_sessions = []
+        self.capability_worker_ids = []
         self.fail_code = None
+        self.unsupported_worker_ids = set()
+
+    async def get_capabilities(self, worker):
+        self.capability_worker_ids.append(worker.id)
+        if worker.id in self.unsupported_worker_ids:
+            raise admin_container_exec.WorkerExecForwardError(
+                "worker_exec_unsupported", "worker does not support container exec"
+            )
+        return {"container_exec": True}
 
     async def create_session(self, worker, request):
         if self.fail_code:
@@ -411,6 +421,83 @@ def test_admin_targets_returns_server_and_worker_statuses(admin_client):
         "offline",
         "unreachable",
     ]
+
+
+def test_admin_targets_sorts_workers_by_id(admin_app, admin_client):
+    admin_app.state.container_exec_workers = list(
+        reversed(admin_app.state.container_exec_workers)
+    )
+
+    response = admin_client.get("/v1/admin/container-exec/targets")
+
+    assert response.status_code == 200
+    worker_targets = [
+        target
+        for target in response.json()["items"]
+        if target["container_role"] == "worker"
+    ]
+    assert [target["worker_id"] for target in worker_targets] == [1, 2, 3]
+
+
+def test_admin_targets_marks_online_worker_without_exec_capability_unsupported(
+    admin_app, admin_client
+):
+    admin_app.state.container_exec_forwarder.unsupported_worker_ids = {1}
+
+    response = admin_client.get("/v1/admin/container-exec/targets")
+
+    assert response.status_code == 200
+    worker_targets = [
+        target
+        for target in response.json()["items"]
+        if target["container_role"] == "worker"
+    ]
+    assert worker_targets[0]["worker_id"] == 1
+    assert worker_targets[0]["status"] == "unsupported"
+    assert "container_exec_unsupported" in worker_targets[0]["risk_flags"]
+
+
+def test_admin_targets_checks_capability_only_for_online_workers(
+    admin_app, admin_client
+):
+    admin_app.state.container_exec_forwarder.unsupported_worker_ids = {2, 3}
+
+    response = admin_client.get("/v1/admin/container-exec/targets")
+
+    assert response.status_code == 200
+    worker_targets = [
+        target
+        for target in response.json()["items"]
+        if target["container_role"] == "worker"
+    ]
+    assert [target["status"] for target in worker_targets] == [
+        "online",
+        "offline",
+        "unreachable",
+    ]
+    assert admin_app.state.container_exec_forwarder.capability_worker_ids == [1]
+
+
+def test_admin_create_session_rejects_worker_without_exec_capability(
+    admin_app, admin_client
+):
+    admin_app.state.container_exec_forwarder.unsupported_worker_ids = {1}
+
+    response = admin_client.post(
+        "/v1/admin/container-exec/sessions",
+        json={
+            "session_id": "cterm_admin_unsupported",
+            "target_type": "worker",
+            "worker_id": 1,
+            "worker_uuid": "ready-worker-uuid",
+            "cols": 80,
+            "rows": 24,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["message"] == "target_offline"
+    assert admin_app.state.container_exec_forwarder.created_sessions == []
 
 
 def test_admin_container_exec_router_is_registered_in_v1_admin_router():

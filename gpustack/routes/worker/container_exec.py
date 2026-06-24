@@ -23,6 +23,11 @@ _cleanup_task: asyncio.Task | None = None
 _CLEANUP_INTERVAL_SECONDS = 30
 
 
+@router.get("/admin/container-exec/capabilities", dependencies=[Depends(worker_auth)])
+async def get_capabilities():
+    return {"container_exec": True}
+
+
 async def start_cleanup_task() -> None:
     global _cleanup_task
     if _cleanup_task is None or _cleanup_task.done():
