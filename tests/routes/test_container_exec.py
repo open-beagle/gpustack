@@ -62,6 +62,15 @@ def admin_app():
             state=WorkerStateEnum.NOT_READY,
             worker_uuid="offline-worker-uuid",
         ),
+        SimpleNamespace(
+            id=3,
+            name="gpu-node-03",
+            hostname="gpu-node-03",
+            ip="10.0.0.13",
+            port=10150,
+            state=WorkerStateEnum.UNREACHABLE,
+            worker_uuid="unreachable-worker-uuid",
+        ),
     ]
     test_app.state.container_exec_forwarder = FakeWorkerForwarder()
 
@@ -380,7 +389,7 @@ def test_websocket_control_messages_support_ping_resize_and_close(client):
         assert receive_control_until(websocket, "close", timeout=3)["reason"] == "user_close"
 
 
-def test_admin_targets_returns_server_and_online_workers(admin_client):
+def test_admin_targets_returns_server_and_worker_statuses(admin_client):
     response = admin_client.get("/v1/admin/container-exec/targets")
 
     assert response.status_code == 200
@@ -394,9 +403,14 @@ def test_admin_targets_returns_server_and_online_workers(admin_client):
     worker_targets = [
         target for target in targets if target["container_role"] == "worker"
     ]
-    assert [target["worker_id"] for target in worker_targets] == [1]
+    assert [target["worker_id"] for target in worker_targets] == [1, 2, 3]
     assert worker_targets[0]["worker_uuid"] == "ready-worker-uuid"
     assert worker_targets[0]["node_ip"] == "10.0.0.11"
+    assert [target["status"] for target in worker_targets] == [
+        "online",
+        "offline",
+        "unreachable",
+    ]
 
 
 def test_admin_container_exec_router_is_registered_in_v1_admin_router():

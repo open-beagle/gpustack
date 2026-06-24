@@ -230,10 +230,7 @@ default_forwarder = WorkerExecForwarder()
 @router.get("/targets")
 async def list_targets(request: Request, session: Any = Depends(get_session)):
     workers = await _list_workers(request, session)
-    return {
-        "items": [_server_target()]
-        + [_worker_target(w) for w in workers if _is_online(w)]
-    }
+    return {"items": [_server_target()] + [_worker_target(w) for w in workers]}
 
 
 @router.post("/sessions")
@@ -515,13 +512,21 @@ def _worker_target(worker: Any) -> dict[str, Any]:
         "container_name": DEFAULT_CONTAINER_NAME,
         "risk_level": "normal",
         "risk_flags": ["unknown"],
-        "status": "online" if _is_online(worker) else "offline",
+        "status": _worker_status(worker),
         "port": worker.port,
     }
 
 
 def _is_online(worker: Any) -> bool:
     return worker.state == WorkerStateEnum.READY
+
+
+def _worker_status(worker: Any) -> str:
+    if worker.state == WorkerStateEnum.READY:
+        return "online"
+    if worker.state == WorkerStateEnum.UNREACHABLE:
+        return "unreachable"
+    return "offline"
 
 
 def _worker_namespace(worker: Any, token: str) -> Any:
