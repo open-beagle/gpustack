@@ -77,6 +77,11 @@ api_router.include_router(
     v1_admin_router, dependencies=[Depends(get_admin_user)], prefix="/v1"
 )
 api_router.include_router(
+    admin_container_exec.ws_router,
+    prefix="/v1/admin/container-exec",
+    tags=["Admin Container Exec"],
+)
+api_router.include_router(
     debug.router,
     dependencies=[Depends(get_admin_user)],
     prefix="/debug",
