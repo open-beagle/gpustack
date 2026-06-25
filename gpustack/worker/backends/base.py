@@ -224,12 +224,13 @@ def set_vllm_env(
 
     llvm = None
     for g in gpu_devices:
+        gpu_labels = g.labels or {}
         if (
             g.index in gpu_indexes
-            and g.labels.get("llvm")
+            and gpu_labels.get("llvm")
             and g.vendor == VendorEnum.AMD
         ):
-            llvm = g.labels.get("llvm")
+            llvm = gpu_labels.get("llvm")
             break
 
     if llvm:
