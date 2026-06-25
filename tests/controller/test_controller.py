@@ -11,7 +11,8 @@ from gpustack.schemas.models import (
     ModelInstanceStateEnum,
 )
 from gpustack.schemas.workers import WorkerStateEnum
-from gpustack.server.controllers import find_scale_down_candidates, sync_replicas
+from gpustack.server.controllers import find_scale_down_candidates, safe_event_attr, sync_replicas
+from gpustack.server.bus import Event, EventType
 from tests.fixtures.workers.fixtures import (
     linux_nvidia_19_4090_24gx2,
     linux_nvidia_2_4080_16gx2,
@@ -129,6 +130,27 @@ def compare_candidates(candidates: List[ModelInstanceScore], expected_candidates
 
         if "score" in expected:
             assert str(candidate.score)[:5] == str(expected["score"])[:5]
+
+
+def test_model_event_data_is_safe_to_access_after_publish():
+    model = new_model(1, "test", 1, huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    event = Event(
+        type=EventType.UPDATED,
+        data=model.__class__.model_construct(**model.model_dump()),
+    )
+
+    assert event.data.id == 1
+    assert event.data.name == "test"
+    assert not hasattr(event.data, "_sa_instance_state")
+
+
+def test_safe_event_attr_handles_detached_orm_attribute_errors():
+    class DetachedLike:
+        @property
+        def name(self):
+            raise RuntimeError("detached")
+
+    assert safe_event_attr(DetachedLike(), "name") == "<unknown>"
 
 
 def test_sync_replicas_puts_placement_override_on_new_instances_only():

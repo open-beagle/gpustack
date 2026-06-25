@@ -341,6 +341,25 @@ async def validate_distributed_vllm_limit_per_worker(
             )
 
 
+async def save_request_scoped_model_update(
+    session: SessionDep, model: Model, source: dict
+) -> Model:
+    model_id = model.id
+    model_name = model.name
+    for key, value in source.items():
+        setattr(model, key, value)
+    await model.save(session)
+
+    model_service = ModelService(session)
+    await delete_cache_by_key(model_service.get_by_id, model_id)
+    await delete_cache_by_key(model_service.get_by_name, model_name)
+
+    refreshed_model = await Model.one_by_id(session, model_id)
+    if not refreshed_model:
+        raise ValueError("Model not found after update")
+    return refreshed_model
+
+
 @router.post("", response_model=ModelPublic)
 async def create_model(session: SessionDep, model_in: ModelCreate):
     existing = await Model.one_by_field(session, "name", model_in.name)
@@ -383,12 +402,7 @@ async def update_model(session: SessionDep, id: int, model_in: ModelUpdate):
                 model_in.scale_in_instance_ids,
                 scale_down_count,
             )
-            for key, value in source.items():
-                setattr(model, key, value)
-            await model.save(session)
-            model_service = ModelService(session)
-            await delete_cache_by_key(model_service.get_by_id, model.id)
-            await delete_cache_by_key(model_service.get_by_name, model.name)
+            model = await save_request_scoped_model_update(session, model, source)
             await sync_replicas(
                 session,
                 model,
@@ -398,7 +412,7 @@ async def update_model(session: SessionDep, id: int, model_in: ModelUpdate):
             )
             await Model._publish_event(EventType.UPDATED, model)
         elif model_in.placement_override:
-            await ModelService(session).update(model, source)
+            model = await save_request_scoped_model_update(session, model, source)
             await sync_replicas(
                 session,
                 model,
@@ -406,6 +420,7 @@ async def update_model(session: SessionDep, id: int, model_in: ModelUpdate):
                 placement_override=model_in.placement_override,
                 scale_in_instance_ids=model_in.scale_in_instance_ids,
             )
+            await Model._publish_event(EventType.UPDATED, model)
         else:
             await ModelService(session).update(model, source)
     except ValueError as e:

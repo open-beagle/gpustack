@@ -2,7 +2,7 @@ import asyncio
 from multiprocessing import Process
 import os
 import re
-from typing import List
+from typing import Awaitable, Callable, List
 import uvicorn
 import logging
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,6 +46,28 @@ class Server:
 
     def _create_async_task(self, coro):
         self._async_tasks.append(asyncio.create_task(coro))
+
+    async def _run_restartable_background_task(
+        self, task_factory: Callable[[], Awaitable], task_name: str
+    ):
+        while True:
+            try:
+                await task_factory()
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Restartable background task {task_name} failed: {e}")
+                await asyncio.sleep(5)
+
+    def _create_restartable_async_task(
+        self, task_factory: Callable[[], Awaitable], task_name: str
+    ):
+        self._async_tasks.append(
+            asyncio.create_task(
+                self._run_restartable_background_task(task_factory, task_name)
+            )
+        )
 
     @property
     def config(self):
@@ -158,16 +180,20 @@ class Server:
 
     def _start_controllers(self):
         model_controller = ModelController(self._config)
-        self._create_async_task(model_controller.start())
+        self._create_restartable_async_task(model_controller.start, "model controller")
 
         model_instance_controller = ModelInstanceController(self._config)
-        self._create_async_task(model_instance_controller.start())
+        self._create_restartable_async_task(
+            model_instance_controller.start, "model instance controller"
+        )
 
         worker_controller = WorkerController()
-        self._create_async_task(worker_controller.start())
+        self._create_restartable_async_task(worker_controller.start, "worker controller")
 
         model_file_controller = ModelFileController()
-        self._create_async_task(model_file_controller.start())
+        self._create_restartable_async_task(
+            model_file_controller.start, "model file controller"
+        )
 
         logger.debug("Controllers started.")
 
