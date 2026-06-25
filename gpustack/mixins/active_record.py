@@ -356,7 +356,7 @@ class ActiveRecordMixin:
     async def _publish_event(cls, event_type: str, data: Any):
         try:
             if hasattr(data, "model_copy"):
-                data = data.__class__.model_construct(**data.model_dump())
+                data = data.model_copy(deep=True)
             await event_bus.publish(
                 cls.__name__.lower(), Event(type=event_type, data=data)
             )
@@ -444,7 +444,20 @@ class ActiveRecordMixin:
         """Convert the instance to the corresponding Public class if it exists."""
         class_module = importlib.import_module(cls.__module__)
         public_class = getattr(class_module, f"{cls.__name__}Public", None)
-        return public_class.model_validate(data) if public_class else data
+        if not public_class:
+            return data
+        if hasattr(data, "model_dump"):
+            source = data.model_dump()
+            data_dict = getattr(data, "__dict__", {})
+            for field in public_class.model_fields:
+                if field not in source and field in data_dict:
+                    source[field] = data_dict[field]
+            try:
+                return public_class.model_validate(source)
+            except Exception as e:
+                logger.error(f"Failed to convert {cls.__name__} event to public data: {e}")
+                return source
+        return public_class.model_validate(data)
 
     @staticmethod
     def _format_event(event: Any) -> str:

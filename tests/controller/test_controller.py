@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 from typing import List
 import pytest
 from gpustack.policies.base import ModelInstanceScore
@@ -134,14 +135,42 @@ def compare_candidates(candidates: List[ModelInstanceScore], expected_candidates
 
 def test_model_event_data_is_safe_to_access_after_publish():
     model = new_model(1, "test", 1, huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
-    event = Event(
-        type=EventType.UPDATED,
-        data=model.__class__.model_construct(**model.model_dump()),
-    )
+    event = Event(type=EventType.UPDATED, data=model.model_copy(deep=True))
 
     assert event.data.id == 1
     assert event.data.name == "test"
-    assert not hasattr(event.data, "_sa_instance_state")
+
+
+def test_convert_to_public_class_handles_model_construct_snapshot():
+    from gpustack.schemas.models import ModelInstance
+
+    instance = new_model_instance(6, "test-6", 1)
+    instance.source = new_model(1, "test", huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct").source
+    instance.__dict__["created_at"] = datetime.now()
+    instance.__dict__["updated_at"] = datetime.now()
+    snapshot = instance.__class__.model_construct(**instance.model_dump())
+
+    public = ModelInstance._convert_to_public_class(snapshot)
+
+    assert not hasattr(snapshot, "_sa_instance_state")
+    assert public["id"] == 6
+    assert public["name"] == "test-6"
+
+
+def test_convert_to_public_class_uses_public_schema_for_complete_data():
+    from gpustack.schemas.models import ModelInstance
+
+    now = datetime.now()
+    instance = new_model_instance(7, "test-7", 1)
+    instance.source = new_model(1, "test", huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct").source
+    instance.huggingface_repo_id = "Qwen/Qwen2.5-7B-Instruct"
+    instance.__dict__["created_at"] = now
+    instance.__dict__["updated_at"] = now
+
+    public = ModelInstance._convert_to_public_class(instance)
+
+    assert public.id == 7
+    assert public.name == "test-7"
 
 
 def test_safe_event_attr_handles_detached_orm_attribute_errors():
