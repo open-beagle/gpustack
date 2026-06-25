@@ -44,12 +44,15 @@ def find_bool_parameter(parameters: List[str], param_names: List[str]) -> bool:
     Find specified boolean parameter by name from the parameters.
     Return True if the parameter is set, otherwise return False.
     """
+    if parameters is None:
+        return False
+
     for i, param in enumerate(parameters):
         if '=' in param:
             key, _ = param.split('=', 1)
             if key.lstrip('-') in param_names:
-                return True
-        if param.lstrip('-') in param_names:
+                continue
+        elif param.lstrip('-') in param_names:
             return True
     return False
 

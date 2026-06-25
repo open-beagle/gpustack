@@ -236,14 +236,16 @@ async def evaluate_environment(
     workers: List[Worker],
 ) -> Tuple[bool, List[str]]:
     backend = get_backend(model)
-    has_linux_workers = any(worker.labels.get("os") == "linux" for worker in workers)
+    has_linux_workers = any(
+        (worker.labels or {}).get("os") == "linux" for worker in workers
+    )
     if backend == BackendEnum.VLLM and not has_linux_workers:
         return False, [
             "The model requires Linux workers but none are available. Use GGUF models instead."
         ]
 
     only_windows_workers = all(
-        worker.labels.get("os") == "windows" for worker in workers
+        (worker.labels or {}).get("os") == "windows" for worker in workers
     )
     if (
         only_windows_workers

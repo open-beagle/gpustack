@@ -135,11 +135,8 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
 
         candidates = []
 
-        if (
-            self._required_os
-            and worker.labels.get("os")
-            and worker.labels["os"].lower() not in self._required_os
-        ):
+        worker_os = (worker.labels or {}).get("os")
+        if self._required_os and worker_os and worker_os.lower() not in self._required_os:
             return []
 
         allocatable = await get_worker_allocatable_resource(self._engine, worker)
@@ -202,11 +199,8 @@ class VoxBoxResourceFitSelector(ScheduleCandidatesSelector):
         Find single worker without offloading candidates for the model instance.
         """
 
-        if (
-            self._required_os
-            and worker.labels.get("os")
-            and worker.labels["os"].lower() not in self._required_os
-        ):
+        worker_os = (worker.labels or {}).get("os")
+        if self._required_os and worker_os and worker_os.lower() not in self._required_os:
             return []
 
         allocatable = await get_worker_allocatable_resource(self._engine, worker)

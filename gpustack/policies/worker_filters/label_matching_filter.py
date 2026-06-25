@@ -43,6 +43,8 @@ def label_matching(required_labels: Dict[str, str], current_labels) -> bool:
     """
     Check if the current labels matched the required labels.
     """
+    if current_labels is None:
+        return False
 
     for key, value in required_labels.items():
         if key not in current_labels or current_labels[key] != value:

@@ -46,12 +46,14 @@ def test_find_parameter(parameters, param_names, expected):
 @pytest.mark.parametrize(
     'parameters,param_names,expected',
     [
+        (None, ['foo'], False),
         # flag present
         (['--foo'], ['foo'], True),
         (['-f'], ['f'], True),
         (['--enable-feature'], ['enable-feature'], True),
         # key=value should not count as boolean flag
         (['--foo=bar'], ['foo'], False),
+        (['--foo=bar', '--foo'], ['foo'], True),
         # flag not present
         (['--bar'], ['foo'], False),
         ([], ['foo'], False),
