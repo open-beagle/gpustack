@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 replica_sync_locks: Dict[int, asyncio.Lock] = {}
 
 
+def safe_event_attr(obj: Any, attr: str, default: str = "<unknown>"):
+    try:
+        value = getattr(obj, attr)
+    except Exception:
+        return default
+    return value if value is not None else default
+
+
 class ModelController:
     def __init__(self, cfg: Config):
         self._engine = get_engine()
@@ -62,12 +70,13 @@ class ModelController:
         """
 
         model: Model = event.data
+        model_name = safe_event_attr(model, "name")
         try:
             async with AsyncSession(self._engine) as session:
                 await set_default_worker_selector(session, model)
                 await sync_replicas(session, model, self._config)
         except Exception as e:
-            logger.error(f"Failed to reconcile model {model.name}: {e}")
+            logger.error(f"Failed to reconcile model {model_name}: {e}")
 
 
 class ModelInstanceController:
@@ -94,6 +103,7 @@ class ModelInstanceController:
         """
 
         model_instance: ModelInstance = event.data
+        model_instance_name = safe_event_attr(model_instance, "name")
         try:
             async with AsyncSession(self._engine) as session:
                 model = await Model.one_by_id(session, model_instance.model_id)
@@ -130,7 +140,7 @@ class ModelInstanceController:
 
         except Exception as e:
             logger.error(
-                f"Failed to reconcile model instance {model_instance.name}: {e}"
+                f"Failed to reconcile model instance {model_instance_name}: {e}"
             )
 
     async def get_meta_from_running_instance(

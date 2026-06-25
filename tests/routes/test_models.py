@@ -14,7 +14,7 @@ from gpustack.schemas.models import (
 from tests.utils.model import new_model, new_model_instance
 
 
-def test_update_model_with_placement_override_updates_model_once():
+def test_update_model_with_placement_override_syncs_before_publishing_event():
     model = new_model(
         1,
         "test",
@@ -35,22 +35,42 @@ def test_update_model_with_placement_override_updates_model_once():
         ),
     )
 
-    update_mock = AsyncMock(return_value=model)
-    sync_mock = AsyncMock()
+    operations = []
+
+    async def save_mock(*args, **kwargs):
+        operations.append("save")
+
+    synced_models = []
+
+    async def sync_mock(*args, **kwargs):
+        operations.append("sync")
+        synced_models.append(args[1])
+
+    published_models = []
+
+    async def publish_mock(*args, **kwargs):
+        operations.append("publish")
+        published_models.append(args[1])
+
+    delete_cache_mock = AsyncMock()
+    fresh_model = model.model_copy(deep=True)
 
     with (
-        patch("gpustack.schemas.models.Model.one_by_id", return_value=model),
+        patch("gpustack.routes.models.Model.one_by_id", side_effect=[model, fresh_model]),
         patch("gpustack.routes.models.validate_model_in", new=AsyncMock()),
+        patch("gpustack.routes.models.Model.save", new=save_mock),
+        patch("gpustack.routes.models.Model._publish_event", new=publish_mock),
+        patch("gpustack.routes.models.delete_cache_by_key", new=delete_cache_mock),
         patch("gpustack.routes.models.ModelService") as service_cls,
         patch("gpustack.routes.models.sync_replicas", new=sync_mock),
     ):
-        service_cls.return_value.update = update_mock
-
         result = asyncio.run(update_model(AsyncMock(), model.id, model_in))
 
-    assert result is model
-    assert update_mock.await_count == 1
-    sync_mock.assert_awaited_once()
+    assert result is fresh_model
+    service_cls.return_value.update.assert_not_called()
+    assert operations == ["save", "sync", "publish"]
+    assert synced_models == [fresh_model]
+    assert published_models == [fresh_model]
 
 
 def test_update_model_with_scale_in_instance_ids_does_not_persist_request_field():
@@ -69,11 +89,21 @@ def test_update_model_with_scale_in_instance_ids_does_not_persist_request_field(
     )
 
     save_mock = AsyncMock()
-    publish_mock = AsyncMock()
-    sync_mock = AsyncMock()
+    synced_models = []
+
+    async def sync_mock(*args, **kwargs):
+        synced_models.append(args[1])
+
+    published_models = []
+
+    async def publish_mock(*args, **kwargs):
+        published_models.append(args[1])
+
+    delete_cache_mock = AsyncMock()
+    fresh_model = model.model_copy(deep=True)
 
     with (
-        patch("gpustack.schemas.models.Model.one_by_id", return_value=model),
+        patch("gpustack.routes.models.Model.one_by_id", side_effect=[model, fresh_model]),
         patch("gpustack.routes.models.validate_model_in", new=AsyncMock()),
         patch(
             "gpustack.routes.models.ModelInstance.all_by_field",
@@ -85,19 +115,26 @@ def test_update_model_with_scale_in_instance_ids_does_not_persist_request_field(
         ),
         patch("gpustack.routes.models.Model.save", new=save_mock),
         patch("gpustack.routes.models.Model._publish_event", new=publish_mock),
-        patch("gpustack.routes.models.delete_cache_by_key", new=AsyncMock()),
+        patch("gpustack.routes.models.delete_cache_by_key", new=delete_cache_mock),
         patch("gpustack.routes.models.ModelService") as service_cls,
         patch("gpustack.routes.models.sync_replicas", new=sync_mock),
     ):
         result = asyncio.run(update_model(AsyncMock(), model.id, model_in))
 
-    assert result is model
+    assert result is fresh_model
     service_cls.return_value.update.assert_not_called()
     save_mock.assert_awaited_once()
     assert not hasattr(model, "scale_in_instance_ids")
-    sync_mock.assert_awaited_once()
-    assert sync_mock.await_args.kwargs["scale_in_instance_ids"] == [10, 11]
-    publish_mock.assert_awaited_once()
+    assert synced_models == [fresh_model]
+    assert published_models == [fresh_model]
+    assert delete_cache_mock.await_args_list[0].args == (
+        service_cls.return_value.get_by_id,
+        1,
+    )
+    assert delete_cache_mock.await_args_list[1].args == (
+        service_cls.return_value.get_by_name,
+        "test",
+    )
 
 
 def test_update_model_validates_scale_in_instance_ids_before_persisting_replicas():

@@ -88,7 +88,7 @@ class Scheduler:
 
         try:
             # scheduler queue.
-            asyncio.create_task(self._schedule_cycle())
+            asyncio.create_task(self._run_schedule_cycle())
 
             # scheduler job trigger by time interval.
             trigger = IntervalTrigger(
@@ -107,12 +107,31 @@ class Scheduler:
 
         logger.info("Scheduler started.")
 
-        # scheduler job trigger by event.
-        async for event in ModelInstance.subscribe(self._engine):
-            if event.type != EventType.CREATED:
-                continue
+        await self._run_event_trigger()
 
-            await self._enqueue_pending_instances()
+    async def _run_schedule_cycle(self):
+        while True:
+            try:
+                await self._schedule_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Scheduler cycle failed: {e}")
+                await asyncio.sleep(5)
+
+    async def _run_event_trigger(self):
+        while True:
+            try:
+                async for event in ModelInstance.subscribe(self._engine):
+                    if event.type != EventType.CREATED:
+                        continue
+
+                    await self._enqueue_pending_instances()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Scheduler event trigger failed: {e}")
+                await asyncio.sleep(5)
 
     async def _enqueue_pending_instances(self):
         """

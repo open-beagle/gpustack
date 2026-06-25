@@ -355,6 +355,8 @@ class ActiveRecordMixin:
     @classmethod
     async def _publish_event(cls, event_type: str, data: Any):
         try:
+            if hasattr(data, "model_copy"):
+                data = data.__class__.model_construct(**data.model_dump())
             await event_bus.publish(
                 cls.__name__.lower(), Event(type=event_type, data=data)
             )
