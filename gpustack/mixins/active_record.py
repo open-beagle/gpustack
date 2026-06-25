@@ -355,7 +355,7 @@ class ActiveRecordMixin:
     @classmethod
     async def _publish_event(cls, event_type: str, data: Any):
         try:
-            if hasattr(data, "model_copy"):
+            if hasattr(data, "model_copy") and not cls._is_orm_instance(data):
                 data = data.model_copy(deep=True)
             await event_bus.publish(
                 cls.__name__.lower(), Event(type=event_type, data=data)
@@ -412,7 +412,7 @@ class ActiveRecordMixin:
                 if not cls._match_fuzzy_fields(event, fuzzy_fields):
                     continue
 
-                if filter_func and not filter_func(event.data):
+                if filter_func and not cls._safe_filter(filter_func, event.data):
                     continue
 
                 event.data = cls._convert_to_public_class(event.data)
@@ -426,7 +426,7 @@ class ActiveRecordMixin:
     def _match_fields(cls, event: Any, fields: Optional[dict]) -> bool:
         """Match fields using AND condition."""
         for key, value in (fields or {}).items():
-            if getattr(event.data, key, None) != value:
+            if cls._safe_event_value(event.data, key) != value:
                 return False
         return True
 
@@ -434,10 +434,18 @@ class ActiveRecordMixin:
     def _match_fuzzy_fields(cls, event: Any, fuzzy_fields: Optional[dict]) -> bool:
         """Match fuzzy fields using OR condition."""
         for key, value in (fuzzy_fields or {}).items():
-            attr_value = str(getattr(event.data, key, "")).lower()
+            attr_value = str(cls._safe_event_value(event.data, key, "")).lower()
             if str(value).lower() in attr_value:
                 return True
         return not fuzzy_fields
+
+    @classmethod
+    def _safe_filter(cls, filter_func: Callable[[Any], bool], data: Any) -> bool:
+        try:
+            return filter_func(data)
+        except Exception as e:
+            logger.error(f"Failed to filter {cls.__name__} event: {e}")
+            return False
 
     @classmethod
     def _convert_to_public_class(cls, data: Any) -> Any:
@@ -446,18 +454,75 @@ class ActiveRecordMixin:
         public_class = getattr(class_module, f"{cls.__name__}Public", None)
         if not public_class:
             return data
-        if hasattr(data, "model_dump"):
-            source = data.model_dump()
-            data_dict = getattr(data, "__dict__", {})
-            for field in public_class.model_fields:
-                if field not in source and field in data_dict:
-                    source[field] = data_dict[field]
+        source = cls._event_data_to_dict(data)
+        if source is not None:
             try:
                 return public_class.model_validate(source)
             except Exception as e:
-                logger.error(f"Failed to convert {cls.__name__} event to public data: {e}")
+                logger.error(
+                    f"Failed to convert {cls.__name__} event to public data: {e}"
+                )
                 return source
         return public_class.model_validate(data)
+
+    @classmethod
+    def _event_data_to_dict(cls, data: Any) -> Optional[dict]:
+        if isinstance(data, dict):
+            return dict(data)
+
+        if not hasattr(data, "model_dump"):
+            return None
+
+        try:
+            source = data.model_dump()
+        except Exception:
+            source = {}
+
+        data_dict = getattr(data, "__dict__", {})
+        if isinstance(data_dict, dict):
+            for key, value in data_dict.items():
+                if key.startswith("_"):
+                    continue
+                source.setdefault(key, value)
+
+        class_module = importlib.import_module(cls.__module__)
+        public_class = getattr(class_module, f"{cls.__name__}Public", None)
+        if public_class:
+            for field in public_class.model_fields:
+                if field in source:
+                    continue
+                value = cls._safe_event_value(data, field, None)
+                if value is not None:
+                    source[field] = value
+
+        return source
+
+    @staticmethod
+    def _safe_event_value(data: Any, key: str, default: Any = None) -> Any:
+        if isinstance(data, dict):
+            return data.get(key, default)
+
+        data_dict = getattr(data, "__dict__", {})
+        if isinstance(data_dict, dict) and key in data_dict:
+            return data_dict[key]
+
+        if hasattr(data, "model_dump"):
+            try:
+                source = data.model_dump()
+                if key in source:
+                    return source[key]
+            except Exception:
+                pass
+
+        try:
+            value = getattr(data, key)
+        except Exception:
+            return default
+        return default if value is None else value
+
+    @staticmethod
+    def _is_orm_instance(data: Any) -> bool:
+        return isinstance(data, SQLModel) and hasattr(data, "_sa_instance_state")
 
     @staticmethod
     def _format_event(event: Any) -> str:
