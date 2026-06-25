@@ -525,12 +525,17 @@ def is_audio_model(model: Model):
     if model.backend == BackendEnum.VOX_BOX:
         return True
 
-    if model.categories:
+    categories = model_categories(model)
+    if categories:
         return (
-            'speech_to_text' in model.categories or 'text_to_speech' in model.categories
+            'speech_to_text' in categories or 'text_to_speech' in categories
         )
 
     return False
+
+
+def model_categories(model: Model) -> List[str]:
+    return getattr(model, "categories", None) or []
 
 
 def is_image_model(model: Model):
@@ -539,7 +544,7 @@ def is_image_model(model: Model):
     Args:
         model: Model to check.
     """
-    return "image" in model.categories
+    return "image" in model_categories(model)
 
 
 def is_embedding_model(model: Model):
@@ -548,7 +553,7 @@ def is_embedding_model(model: Model):
     Args:
         model: Model to check.
     """
-    return "embedding" in model.categories
+    return "embedding" in model_categories(model)
 
 
 def is_renaker_model(model: Model):
@@ -557,7 +562,7 @@ def is_renaker_model(model: Model):
     Args:
         model: Model to check.
     """
-    return "reranker" in model.categories
+    return "reranker" in model_categories(model)
 
 
 def get_backend(model: Model) -> str:

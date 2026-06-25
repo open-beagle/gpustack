@@ -27,6 +27,7 @@ from gpustack.schemas.models import (
     get_backend,
     is_audio_model,
     is_gguf_model,
+    model_categories,
 )
 from gpustack.utils.gpu import any_gpu_match
 from gpustack.utils.hub import (
@@ -247,7 +248,7 @@ async def evaluate_environment(
     if (
         only_windows_workers
         and backend == BackendEnum.VOX_BOX
-        and CategoryEnum.TEXT_TO_SPEECH.value in model.categories
+        and CategoryEnum.TEXT_TO_SPEECH.value in model_categories(model)
     ):
         return False, ["The model is not supported on Windows workers."]
 
