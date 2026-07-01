@@ -15,8 +15,8 @@ pip config set global.trusted-host "$PYPI_HOST"
 
 set -ex
 
-VERSION="${VERSION:-v0.7.1}"
-UI_VERSION="${UI_VERSION:-v0.7.3}"
+VERSION="${VERSION:-v0.7.5}"
+UI_VERSION="${UI_VERSION:-v0.7.5}"
 
 # 检查并安装 poetry
 if ! command -v poetry &> /dev/null; then

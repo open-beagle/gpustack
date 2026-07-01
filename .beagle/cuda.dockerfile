@@ -56,8 +56,6 @@ COPY ./dist/*.whl /tmp/
 RUN WHEEL_PACKAGE_STACK="$(ls /tmp/*.whl)[vllm]" && \
     python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --upgrade pip && \
     pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE_STACK && \
-    # 强制升级 transformers 以支持最新模型架构
-    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir "transformers>=5.4.0" && \
     # 修复 transformers RoPE 验证类型错误 (set -= list)
     python3 -c "\
 import transformers.modeling_rope_utils as m; \
@@ -65,6 +63,9 @@ p = m.__file__; \
 c = open(p, 'r').read(); \
 c = c.replace('received_keys -= ignore_keys', 'received_keys -= set(ignore_keys)'); \
 open(p, 'w').write(c)" && \
+    command -v vllm && \
+    command -v vllm-omni && \
+    python3 -m pip show vllm vllm-omni && \
     rm -rf /tmp/*.whl
 
 # 下载工具

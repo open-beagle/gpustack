@@ -190,6 +190,8 @@ class ToolsManager:
             self.install_versioned_llama_box(version)
         elif backend == BackendEnum.VLLM:
             self.install_versioned_vllm_with_deps(version)
+        elif backend == BackendEnum.VLLM_OMNI:
+            self.install_versioned_vllm_omni_with_deps(version)
         elif backend == BackendEnum.VOX_BOX:
             self.install_versioned_vox_box_with_deps(version)
         elif backend == BackendEnum.ASCEND_MINDIE:
@@ -349,6 +351,15 @@ class ToolsManager:
             else []
         )
         self.install_versioned_package_by_pipx("vllm", version, *install_args)
+
+    def install_versioned_vllm_omni_with_deps(self, version: str):
+        # Get custom dependencies from dependency manager
+        install_args = (
+            self._dependency_manager.get_pipx_install_args()
+            if self._dependency_manager is not None
+            else []
+        )
+        self.install_versioned_package_by_pipx("vllm-omni", version, *install_args)
 
     def install_versioned_vox_box_with_deps(self, version: str):
         # Get custom dependencies from dependency manager
