@@ -11,16 +11,20 @@ import logging
 import os
 import subprocess
 import sys
-from typing import Optional
 
 from gpustack.schemas.models import ModelInstanceStateEnum
 from gpustack.utils.command import (
-    find_parameter,
     get_versioned_command,
     get_command_path,
 )
 from gpustack.utils.envs import sanitize_env
 from gpustack.worker.backends.base import InferenceServer
+from gpustack.worker.backends.vllm_omni_args import (
+    build_vllm_omni_arguments,
+    detect_model_type,
+    get_audio_arguments,
+    get_diffusion_arguments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,34 +90,14 @@ class VLLMOmniServer(InferenceServer):
 
     def _build_arguments(self) -> list:
         """Build command line arguments for vLLM-Omni server."""
-        arguments = [
-            "serve",
+        return build_vllm_omni_arguments(
             self._model_path,
-        ]
-
-        # Determine model type and add appropriate arguments
-        model_type = self._detect_model_type()
-        if model_type == "diffusion":
-            arguments.extend(self._get_diffusion_arguments())
-        elif model_type == "audio":
-            arguments.extend(self._get_audio_arguments())
-
-        # Add user-defined backend parameters
-        if self._model.backend_parameters:
-            arguments.extend(self._model.backend_parameters)
-
-        # Built-in arguments (cannot be overridden)
-        built_in_arguments = [
-            "--host",
-            "0.0.0.0",
-            "--port",
-            str(self._model_instance.port),
-            "--served-model-name",
+            self._model.name,
             self._model_instance.model_name,
-        ]
-        arguments.extend(built_in_arguments)
-
-        return arguments
+            self._model.categories,
+            self._model.backend_parameters,
+            self._model_instance.port,
+        )
 
     def _detect_model_type(self) -> str:
         """
@@ -122,32 +106,12 @@ class VLLMOmniServer(InferenceServer):
         Returns:
             str: Model type ('diffusion', 'audio', 'llm', etc.)
         """
-        model_name = self._model.name.lower()
-        categories = self._model.categories or []
-
-        # Check for diffusion/image models
-        diffusion_keywords = [
-            "flux", "z-image", "stable-diffusion", "sd3", "sdxl",
-            "dit", "lumina", "hunyuan-dit", "pixart"
-        ]
-        if "image" in categories or any(kw in model_name for kw in diffusion_keywords):
-            return "diffusion"
-
-        # Check for audio models
-        audio_keywords = ["whisper", "tts", "stt", "audio", "speech"]
-        if any(cat in categories for cat in ["speech_to_text", "text_to_speech"]):
-            return "audio"
-        if any(kw in model_name for kw in audio_keywords):
-            return "audio"
-
-        return "llm"
+        return detect_model_type(self._model.name, self._model.categories)
 
     def _get_diffusion_arguments(self) -> list:
         """Get arguments specific to diffusion models."""
-        return []
+        return get_diffusion_arguments()
 
     def _get_audio_arguments(self) -> list:
         """Get arguments specific to audio models."""
-        args = []
-        # Add audio-specific configurations here
-        return args
+        return get_audio_arguments()

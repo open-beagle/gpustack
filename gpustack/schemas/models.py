@@ -30,6 +30,7 @@ class CategoryEnum(str, Enum):
     LLM = "llm"
     EMBEDDING = "embedding"
     IMAGE = "image"
+    VIDEO = "video"
     RERANKER = "reranker"
     SPEECH_TO_TEXT = "speech_to_text"
     TEXT_TO_SPEECH = "text_to_speech"
@@ -547,6 +548,42 @@ def is_image_model(model: Model):
     return "image" in model_categories(model)
 
 
+def is_video_model(model: Model):
+    """
+    Check if the model is a video model.
+    Args:
+        model: Model to check.
+    """
+    return "video" in model_categories(model)
+
+
+def is_diffusers_model(model: Model):
+    """
+    Check if the local model path uses diffusers format.
+    """
+    local_path = getattr(model, "local_path", None)
+    if not local_path:
+        return False
+    return Path(local_path).joinpath("model_index.json").is_file()
+
+
+def is_vllm_omni_model(model: Model):
+    """
+    Check if the model should default to vLLM-Omni when backend is not explicitly set.
+    """
+    if is_image_model(model) or is_video_model(model) or is_diffusers_model(model):
+        return True
+
+    source_values = [
+        getattr(model, "name", None),
+        getattr(model, "huggingface_repo_id", None),
+        getattr(model, "model_scope_model_id", None),
+        getattr(model, "local_path", None),
+    ]
+    source_text = " ".join(value for value in source_values if value).lower()
+    return "omni" in source_text
+
+
 def is_embedding_model(model: Model):
     """
     Check if the model is an embedding model.
@@ -574,6 +611,9 @@ def get_backend(model: Model) -> str:
 
     if is_audio_model(model):
         return BackendEnum.VOX_BOX
+
+    if is_vllm_omni_model(model):
+        return BackendEnum.VLLM_OMNI
 
     return BackendEnum.VLLM
 

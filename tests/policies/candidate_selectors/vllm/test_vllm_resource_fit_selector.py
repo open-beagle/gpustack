@@ -32,6 +32,21 @@ from tests.fixtures.workers.fixtures import (
 from tests.utils.scheduler import compare_candidates
 
 
+def test_image_model_ignores_gpu_memory_utilization_parameter(config):
+    model = new_model(
+        1,
+        "qwen-image-2512",
+        1,
+        model_scope_model_id="Qwen/Qwen-Image-2512",
+        categories=[CategoryEnum.IMAGE],
+        backend_parameters=["--gpu-memory-utilization", "0.9"],
+    )
+
+    selector = VLLMResourceFitSelector(config, model)
+
+    assert selector._gpu_memory_utilization == 0
+
+
 @pytest.mark.asyncio
 async def test_manual_schedule_to_2_worker_2_gpu(config):
     workers = [
