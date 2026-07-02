@@ -523,6 +523,9 @@ def is_audio_model(model: Model):
     Args:
         model: Model to check.
     """
+    if model.backend and model.backend != BackendEnum.VOX_BOX:
+        return False
+
     if model.backend == BackendEnum.VOX_BOX:
         return True
 

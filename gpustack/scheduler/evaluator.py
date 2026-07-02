@@ -239,9 +239,9 @@ async def evaluate_environment(
     has_linux_workers = any(
         (worker.labels or {}).get("os") == "linux" for worker in workers
     )
-    if backend == BackendEnum.VLLM and not has_linux_workers:
+    if backend in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI) and not has_linux_workers:
         return False, [
-            "The model requires Linux workers but none are available. Use GGUF models instead."
+            f"The {backend} backend requires Linux workers but none are available. Use GGUF models instead."
         ]
 
     only_windows_workers = all(
@@ -321,9 +321,9 @@ def set_default_worker_selector(
     if (
         not model.worker_selector
         and not model.gpu_selector
-        and get_backend(model) == BackendEnum.VLLM
+        and get_backend(model) in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI)
     ):
-        # vLLM models are only supported on Linux
+        # vLLM and vLLM-Omni models are only supported on Linux.
         model.worker_selector = {"os": "linux"}
     return model
 

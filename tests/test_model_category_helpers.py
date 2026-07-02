@@ -144,6 +144,14 @@ def test_get_backend_keeps_audio_model_on_vox_box_by_default():
     assert get_backend(model) == BackendEnum.VOX_BOX
 
 
+def test_explicit_vllm_omni_audio_model_does_not_use_vox_box_helpers():
+    model = AudioModel("whisper-large")
+    model.backend = BackendEnum.VLLM_OMNI
+
+    assert is_audio_model(model) is False
+    assert get_backend(model) == BackendEnum.VLLM_OMNI
+
+
 def test_get_backend_keeps_regular_llm_on_vllm():
     model = NamedModel("Qwen2.5-VL-7B")
 
