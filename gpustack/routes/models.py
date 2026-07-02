@@ -269,9 +269,12 @@ async def validate_gpu_ids(  # noqa: C901
             if worker.labels is not None
             else "unknown"
         )
-        if model_backend == BackendEnum.VLLM and worker_os != "linux":
+        if (
+            model_backend in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI)
+            and worker_os != "linux"
+        ):
             raise BadRequestException(
-                message=f'vLLM backend is only supported on Linux, but the selected worker "{worker.name}" is running on {worker_os.capitalize()}.'
+                message=f'{model_backend} backend is only supported on Linux, but the selected worker "{worker.name}" is running on {worker_os.capitalize()}.'
             )
 
         if model_backend == BackendEnum.VLLM and len(worker_name_set) > 1:
@@ -315,11 +318,12 @@ def validate_gpu(
             f"Ascend MindIE backend requires Ascend NPUs. Selected {gpu_device.vendor} GPU is not supported."
         )
 
-    if model_backend == BackendEnum.VLLM and gpu_device.vendor in [
-        VendorEnum.Apple.value,
-    ]:
+    if (
+        model_backend in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI)
+        and gpu_device.vendor in [VendorEnum.Apple.value]
+    ):
         raise BadRequestException(
-            f"vLLM backend is not supported on {gpu_device.vendor} GPUs."
+            f"{model_backend} backend is not supported on {gpu_device.vendor} GPUs."
         )
 
 

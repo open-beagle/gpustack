@@ -191,6 +191,12 @@ class Scheduler:
                         should_update_model = await evaluate_audio_model(
                             self._config, evaluation_model
                         )
+                    elif get_backend(evaluation_model) == BackendEnum.VLLM_OMNI:
+                        # vLLM-Omni can serve models that do not expose a standard
+                        # transformers config, such as diffusion-format models.
+                        evaluation_model.categories = evaluation_model.categories or [
+                            CategoryEnum.LLM
+                        ]
                     else:
                         should_update_model = await evaluate_pretrained_config(
                             evaluation_model, raise_raw=True

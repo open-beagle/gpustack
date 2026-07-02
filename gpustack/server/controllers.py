@@ -201,9 +201,9 @@ async def set_default_worker_selector(session: AsyncSession, model: Model):
     if (
         not model.worker_selector
         and not model.gpu_selector
-        and get_backend(model) == BackendEnum.VLLM
+        and get_backend(model) in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI)
     ):
-        # vLLM models are only supported on Linux
+        # vLLM and vLLM-Omni models are only supported on Linux.
         model.worker_selector = {"os": "linux"}
         await ModelService(session).update(model)
 
