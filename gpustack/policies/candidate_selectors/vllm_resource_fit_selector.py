@@ -208,7 +208,8 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
     def _set_gpu_memory_utilization(self):
         self._gpu_memory_utilization = 0.9
         model = self._model
-        if self._disable_gpu_memory_utilization():
+        gpu_memory_utilization_disabled = self._disable_gpu_memory_utilization()
+        if gpu_memory_utilization_disabled:
             # gpu memory utilization is not used for non-LLM models
             self._gpu_memory_utilization = 0
 
@@ -216,7 +217,7 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         gmu = find_parameter(
             model.backend_parameters, [self._gpu_memory_utilization_parameter_name]
         )
-        if gmu:
+        if gmu and not gpu_memory_utilization_disabled:
             self._gpu_memory_utilization = float(gmu)
 
     def _disable_gpu_memory_utilization(self) -> bool:
