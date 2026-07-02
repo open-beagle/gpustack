@@ -3,8 +3,18 @@ This module adds a sitecustomize hook to Ray to allow setting the current
 placement group from an environment variable.
 """
 
+import enum
 import json
 import os
+
+
+if not hasattr(enum, "StrEnum"):
+
+    class StrEnum(str, enum.Enum):
+        def __str__(self):
+            return self.value
+
+    enum.StrEnum = StrEnum
 
 try:
     from ray.util import (

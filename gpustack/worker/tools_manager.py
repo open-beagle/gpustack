@@ -426,8 +426,39 @@ class ToolsManager:
             logger.info(
                 f"{package} {version} successfully installed and linked to {target_path}"
             )
+            self._install_sitecustomize_for_versioned_package(target_path)
         except Exception as e:
             raise Exception(f"Failed to install {package} {version} using pipx: {e}")
+
+    def _install_sitecustomize_for_versioned_package(self, command_path: Path):
+        command_path = command_path.resolve()
+        venv_dir = command_path.parent.parent
+        python_path = venv_dir / "bin" / "python"
+        if not python_path.exists():
+            logger.warning(
+                f"Failed to install sitecustomize for {command_path}: {python_path} not found"
+            )
+            return
+
+        try:
+            result = subprocess.run(
+                [
+                    str(python_path),
+                    "-c",
+                    "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            site_packages = Path(result.stdout.strip())
+            site_packages.mkdir(parents=True, exist_ok=True)
+            source = Path(__file__).resolve().parents[1] / "_sitecustomize.py"
+            shutil.copyfile(source, site_packages / "sitecustomize.py")
+        except Exception as e:
+            logger.warning(
+                f"Failed to install sitecustomize for {command_path}: {e}"
+            )
 
     def _get_pipx_bin_dir(self, pipx_path: str) -> Path:
         """
