@@ -56,6 +56,7 @@ COPY ./dist/*.whl /tmp/
 RUN WHEEL_PACKAGE_STACK="$(ls /tmp/*.whl)[vllm]" && \
     python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --upgrade pip && \
     pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE_STACK && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir 'argcomplete>=1.9.4' && \
     # 修复 transformers RoPE 验证类型错误 (set -= list)
     python3 -c "\
 import transformers.modeling_rope_utils as m; \
@@ -65,6 +66,12 @@ c = c.replace('received_keys -= ignore_keys', 'received_keys -= set(ignore_keys)
 open(p, 'w').write(c)" && \
     command -v vllm && \
     command -v vllm-omni && \
+    python3 -c "\
+import importlib.metadata as m; \
+from packaging.version import Version; \
+assert Version(m.version('argcomplete')) >= Version('1.9.4'), m.version('argcomplete'); \
+print('argcomplete', m.version('argcomplete'))" && \
+    pipx --version && \
     python3 -m pip show vllm vllm-omni && \
     rm -rf /tmp/*.whl
 
