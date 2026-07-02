@@ -51,12 +51,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG PYPI_MIRROR=http://mirrors.cloud.aliyuncs.com/pypi/simple/
 ARG PYPI_HOST=mirrors.cloud.aliyuncs.com
 
-# 安装 GPUStack、vLLM 和 vLLM-Omni
-COPY ./dist/*.whl /tmp/
-RUN WHEEL_PACKAGE_STACK="$(ls /tmp/*.whl)[vllm]" && \
-    python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --upgrade pip && \
-    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE_STACK && \
-    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir 'argcomplete>=1.9.4' && \
+# 安装稳定依赖层。业务 wheel 或 UI 变化时，该层可以复用 Docker 缓存。
+COPY ./dist/requirements-vllm.txt /tmp/requirements-vllm.txt
+RUN python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --upgrade pip && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --upgrade 'pipx==1.7.1' 'argcomplete>=1.9.4' && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 -r /tmp/requirements-vllm.txt && \
     # 修复 transformers RoPE 验证类型错误 (set -= list)
     python3 -c "\
 import transformers.modeling_rope_utils as m; \
@@ -73,6 +72,12 @@ assert Version(m.version('argcomplete')) >= Version('1.9.4'), m.version('argcomp
 print('argcomplete', m.version('argcomplete'))" && \
     pipx --version && \
     python3 -m pip show vllm vllm-omni && \
+    rm -f /tmp/requirements-vllm.txt
+
+# 安装 GPUStack 应用层。依赖已在上一层安装，避免 wheel 内容变化导致重建 vLLM 大层。
+COPY ./dist/*.whl /tmp/
+RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --no-deps --force-reinstall "${WHEEL_PACKAGE}" && \
     rm -rf /tmp/*.whl
 
 # 下载工具

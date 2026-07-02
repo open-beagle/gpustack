@@ -25,6 +25,11 @@ if ! command -v poetry &> /dev/null; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
+POETRY_CMD=(poetry)
+if ! command -v poetry &> /dev/null; then
+  POETRY_CMD=(python3 -m poetry)
+fi
+
 # 清理旧的构建产物
 rm -rf "$PWD/dist"
 
@@ -84,13 +89,61 @@ with open('$VERSION_FILE', 'w') as f:
 "
 
 # 更新 pyproject.toml 中的版本号
-poetry version "${VERSION}"
+"${POETRY_CMD[@]}" version "${VERSION}"
 
 # 使用 poetry build 构建 wheel 和 sdist
 echo "Building with poetry..."
-poetry build
+"${POETRY_CMD[@]}" build
+
+# 从 wheel 元数据导出 CUDA 镜像依赖清单，供 Dockerfile 先安装稳定依赖层。
+# 这样业务代码或 UI 变化只会重装 gpustack wheel，不会反复重建 vLLM 大依赖层。
+python3 - <<'PY'
+import email
+import glob
+import os
+import zipfile
+
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+
+wheel_files = glob.glob("dist/*.whl")
+if len(wheel_files) != 1:
+    raise SystemExit(f"Expected exactly one wheel in dist, got {wheel_files}")
+
+env = default_environment()
+requirements = []
+
+with zipfile.ZipFile(wheel_files[0]) as wheel:
+    metadata_name = next(
+        name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")
+    )
+    metadata = email.message_from_bytes(wheel.read(metadata_name))
+
+for value in metadata.get_all("Requires-Dist") or []:
+    req = Requirement(value)
+    marker = req.marker
+    if marker is not None:
+        include = marker.evaluate({**env, "extra": ""}) or marker.evaluate(
+            {**env, "extra": "vllm"}
+        )
+        if not include:
+            continue
+        req.marker = None
+    requirements.append(str(req))
+
+requirements.append("argcomplete>=1.9.4")
+requirements = sorted(set(requirements), key=str.lower)
+
+requirements_path = os.path.join("dist", "requirements-vllm.txt")
+with open(requirements_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(requirements))
+    f.write("\n")
+
+print(f"Wrote {requirements_path} with {len(requirements)} requirements.")
+PY
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
+git checkout -- "$PWD/pyproject.toml"
 
 echo "Build completed successfully!"

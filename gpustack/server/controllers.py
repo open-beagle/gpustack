@@ -106,6 +106,12 @@ class ModelInstanceController:
         model_instance_name = safe_event_attr(model_instance, "name")
         try:
             async with AsyncSession(self._engine) as session:
+                model_instance = await ModelInstance.one_by_id(
+                    session, model_instance.id
+                )
+                if not model_instance:
+                    return
+
                 model = await Model.one_by_id(session, model_instance.model_id)
                 if not model:
                     return
