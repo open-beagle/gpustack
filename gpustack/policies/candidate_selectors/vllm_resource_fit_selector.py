@@ -21,6 +21,7 @@ from gpustack.policies.utils import (
     get_model_num_attention_heads,
 )
 from gpustack.schemas.models import (
+    BackendEnum,
     CategoryEnum,
     ComputedResourceClaim,
     Model,
@@ -229,6 +230,9 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         1. For non-LLM models, GPU memory utilization is DISABLED (return True) unless they are in the exception list.
         2. Otherwise, GPU memory utilization is ENABLED (return False).
         """
+        if self._model.backend == BackendEnum.VLLM_OMNI:
+            return True
+
         categories = model_categories(self._model)
         if not categories:
             return False
