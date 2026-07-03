@@ -21,11 +21,13 @@ from gpustack.policies.utils import (
     get_model_num_attention_heads,
 )
 from gpustack.schemas.models import (
+    BackendEnum,
     CategoryEnum,
     ComputedResourceClaim,
     Model,
     ModelInstanceSubordinateWorker,
     SourceEnum,
+    model_categories,
 )
 from gpustack.schemas.workers import GPUDevicesInfo, Worker
 from gpustack.config import Config
@@ -73,9 +75,10 @@ async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
     # CUDA graphs can take additional 1~3 GiB memory
     # https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/worker/model_runner.py#L1313
     # For non-LLM models like embedding, set a smaller overhead
+    categories = model_categories(model)
     framework_overhead = (
         2 * 1024**3
-        if not model.categories or CategoryEnum.LLM in model.categories
+        if not categories or CategoryEnum.LLM in categories
         else 512 * 1024**2
     )
     weight_size = 0
@@ -206,7 +209,8 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
     def _set_gpu_memory_utilization(self):
         self._gpu_memory_utilization = 0.9
         model = self._model
-        if self._disable_gpu_memory_utilization():
+        gpu_memory_utilization_disabled = self._disable_gpu_memory_utilization()
+        if gpu_memory_utilization_disabled:
             # gpu memory utilization is not used for non-LLM models
             self._gpu_memory_utilization = 0
 
@@ -214,7 +218,7 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         gmu = find_parameter(
             model.backend_parameters, [self._gpu_memory_utilization_parameter_name]
         )
-        if gmu:
+        if gmu and not gpu_memory_utilization_disabled:
             self._gpu_memory_utilization = float(gmu)
 
     def _disable_gpu_memory_utilization(self) -> bool:
@@ -226,7 +230,11 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         1. For non-LLM models, GPU memory utilization is DISABLED (return True) unless they are in the exception list.
         2. Otherwise, GPU memory utilization is ENABLED (return False).
         """
-        if not self._model.categories:
+        if self._model.backend == BackendEnum.VLLM_OMNI:
+            return True
+
+        categories = model_categories(self._model)
+        if not categories:
             return False
 
         architectures = getattr(self._pretrained_config, "architectures", []) or []
@@ -237,7 +245,7 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
             "Qwen3ForSequenceClassification",  # Qwen3-Embedding & Qwen3-Reranker
         }
 
-        if CategoryEnum.LLM not in self._model.categories:
+        if CategoryEnum.LLM not in categories:
             # Disable for non-LLM models unless they are in the exception list
             return not any(arch in NON_LLM_GMU_EXCEPTIONS for arch in architectures)
 
@@ -249,10 +257,14 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
                 self._model, trust_remote_code=True
             )
         except ValueError as e:
-            if "architecture" in str(e).lower() or "trust_remote_code" in str(e).lower():
+            if (
+                "architecture" in str(e).lower()
+                or "trust_remote_code" in str(e).lower()
+                or "model_type" in str(e).lower()
+            ):
                 # In the AutoConfig.from_pretrained method, the architecture field in config undergoes validation.
-                # Exceptions caused by unrecognized architectures should be allowed to prevent startup failures
-                # of valid new models.
+                # Exceptions caused by unrecognized architectures or missing model_type (e.g. diffusers-format
+                # models like Flux) should be allowed to prevent startup failures of valid new models.
                 self._pretrained_config = PretrainedConfig()
 
                 # We can also try to get the architectures from hf-overrides

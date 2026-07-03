@@ -9,11 +9,11 @@ from abc import ABC, abstractmethod
 
 from gpustack.client.generated_clientset import ClientSet
 from gpustack.config.config import Config, set_global_config, get_global_config
-from gpustack.logging import setup_logging
+from gpustack.logginglocal import setup_logging
 from gpustack.schemas.models import (
     BackendEnum,
     ModelInstance,
-    ModelInstanceUpdate,
+    ModelInstanceInternalUpdate,
     ModelInstanceStateEnum,
     get_backend,
 )
@@ -24,9 +24,11 @@ from gpustack.utils.platform import get_cann_chip
 from gpustack.utils.profiling import time_decorator
 from gpustack.utils import platform, envs
 from gpustack.worker.tools_manager import ToolsManager
+from gpustack.worker.downloader_s3 import S3Downloader
 
 logger = logging.getLogger(__name__)
 lock = threading.Lock()
+s3Downloader = None
 
 _VISIBLE_DEVICES_ENV_NAME_MAPPER = {
     VendorEnum.NVIDIA: "CUDA_VISIBLE_DEVICES",
@@ -52,6 +54,7 @@ class InferenceServer(ABC):
         worker_id: int,
     ):
         setup_logging(debug=cfg.debug)
+        self.init_s3_client(cfg)
         set_global_config(cfg)
 
         try:
@@ -124,6 +127,18 @@ class InferenceServer(ABC):
             exit_code = 128 + signal_number
         sys.exit(exit_code)
 
+    def init_s3_client(self, cfg):
+        global s3Downloader
+        s3Downloader = S3Downloader(
+            cfg.worker_s3_host,
+            access_key=cfg.worker_s3_access_key,
+            secret_key=cfg.worker_s3_secret_key,
+            ssl=cfg.worker_s3_ssl,
+            cache_dir=os.path.join(cfg.cache_dir, "beagle"),
+            use_virtual_hosted_style=cfg.worker_s3_use_virtual_hosted_style,
+            region=cfg.worker_s3_region,
+        )
+
     def _until_model_instance_starting(self):
         self._clientset.model_instances.watch(
             callback=None,
@@ -134,11 +149,11 @@ class InferenceServer(ABC):
     def _update_model_instance(self, id: str, **kwargs):
         mi_public = self._clientset.model_instances.get(id=id)
 
-        mi = ModelInstanceUpdate(**mi_public.model_dump())
+        mi = ModelInstanceInternalUpdate(**mi_public.model_dump())
         for key, value in kwargs.items():
             setattr(mi, key, value)
 
-        self._clientset.model_instances.update(id=id, model_update=mi)
+        self._clientset.model_instances.internal_update(id=id, model_update=mi)
 
     def get_inference_running_env(
         self, env: Dict[str, str] = None, version: str = None
@@ -209,12 +224,13 @@ def set_vllm_env(
 
     llvm = None
     for g in gpu_devices:
+        gpu_labels = g.labels or {}
         if (
             g.index in gpu_indexes
-            and g.labels.get("llvm")
+            and gpu_labels.get("llvm")
             and g.vendor == VendorEnum.AMD
         ):
-            llvm = g.labels.get("llvm")
+            llvm = gpu_labels.get("llvm")
             break
 
     if llvm:

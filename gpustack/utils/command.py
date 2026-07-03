@@ -44,10 +44,32 @@ def find_bool_parameter(parameters: List[str], param_names: List[str]) -> bool:
     Find specified boolean parameter by name from the parameters.
     Return True if the parameter is set, otherwise return False.
     """
+    if parameters is None:
+        return False
+
     for i, param in enumerate(parameters):
-        if param.lstrip('-') in param_names:
+        if '=' in param:
+            key, _ = param.split('=', 1)
+            if key.lstrip('-') in param_names:
+                continue
+        elif param.lstrip('-') in param_names:
             return True
     return False
+
+
+def ensure_bool_parameter(
+    parameters: List[str],
+    param_name: str,
+    existing_parameters: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Append a boolean parameter when it is not already present.
+    """
+    if find_bool_parameter(existing_parameters or [], [param_name]):
+        return parameters
+    if find_bool_parameter(parameters or [], [param_name]):
+        return parameters
+    return (parameters or []) + [f"--{param_name}"]
 
 
 def normalize_parameters(args: List[str], removes: Optional[List[str]] = None):

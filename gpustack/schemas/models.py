@@ -30,6 +30,7 @@ class CategoryEnum(str, Enum):
     LLM = "llm"
     EMBEDDING = "embedding"
     IMAGE = "image"
+    VIDEO = "video"
     RERANKER = "reranker"
     SPEECH_TO_TEXT = "speech_to_text"
     TEXT_TO_SPEECH = "text_to_speech"
@@ -46,11 +47,35 @@ class BackendEnum(str, Enum):
     VLLM = "vllm"
     VOX_BOX = "vox-box"
     ASCEND_MINDIE = "ascend-mindie"
+    VLLM_OMNI = "vllm-omni"
 
 
 class GPUSelector(BaseModel):
     # format of each element: "worker_name:device:gpu_index", example: "worker1:cuda:0"
     gpu_ids: Optional[List[str]] = None
+
+
+class PlacementOverrideReplicaGroup(BaseModel):
+    # A group describes the full GPU placement for one newly-created replica.
+    gpu_selector: Optional[GPUSelector] = None
+
+
+class ModelPlacementOverride(BaseModel):
+    # One-shot placement for scale-up requests. These groups are consumed only by
+    # the replicas created by this request, not by already existing replicas.
+    new_replica_groups: Optional[List[PlacementOverrideReplicaGroup]] = None
+    # Backward-compatible alias for clients that already send replica_groups.
+    # It has the same "new replicas only" semantics as new_replica_groups.
+    replica_groups: Optional[List[PlacementOverrideReplicaGroup]] = None
+
+    def groups_for_new_replicas(self) -> List[PlacementOverrideReplicaGroup]:
+        return self.new_replica_groups or self.replica_groups or []
+
+
+class ModelInstancePlacementOverride(BaseModel):
+    # One-shot scheduling constraint. The worker clears it after the instance
+    # reaches RUNNING so later restarts can fall back to the model-level policy.
+    gpu_selector: Optional[GPUSelector] = None
 
 
 class ModelSource(BaseModel):
@@ -191,7 +216,13 @@ class ModelSpecBase(SQLModel, ModelSource):
 
         if self.distributed_inference_across_workers is None:
             self.distributed_inference_across_workers = (
-                True if backend in [BackendEnum.LLAMA_BOX, BackendEnum.VLLM] else False
+                True
+                if backend == BackendEnum.VLLM
+                or (
+                    backend == BackendEnum.LLAMA_BOX
+                    and get_gguf_runtime(self) != "llama-cpp"
+                )
+                else False
             )
         return self
 
@@ -204,6 +235,13 @@ class ModelBase(ModelSpecBase):
             if self.source == SourceEnum.HUGGING_FACE and not self.huggingface_filename:
                 raise ValueError(
                     "huggingface_filename must be provided when source is 'huggingface'"
+                )
+            if (
+                get_gguf_runtime(self) == "llama-cpp"
+                and self.distributed_inference_across_workers
+            ):
+                raise ValueError(
+                    "Distributed inference across workers is not supported for the llama.cpp runtime"
                 )
         elif backend == BackendEnum.VLLM:
             if self.cpu_offloading:
@@ -234,7 +272,10 @@ class ModelCreate(ModelBase):
 
 
 class ModelUpdate(ModelBase):
-    pass
+    placement_override: Optional[ModelPlacementOverride] = Field(default=None)
+    # Request-scoped scale-in target. It is consumed by sync_replicas and is not
+    # persisted on the model.
+    scale_in_instance_ids: Optional[List[int]] = Field(default=None)
 
 
 class ModelPublic(
@@ -356,6 +397,10 @@ class ModelInstanceBase(SQLModel, ModelSource):
     distributed_servers: Optional[DistributedServers] = Field(
         sa_column=Column(pydantic_column_type(DistributedServers)), default=None
     )
+    placement_override: Optional[ModelInstancePlacementOverride] = Field(
+        sa_column=Column(pydantic_column_type(ModelInstancePlacementOverride)),
+        default=None,
+    )
     # The "model_id" field conflicts with the protected namespace "model_" in Pydantic.
     # Disable it given that it's not a real issue for this particular field.
     model_config = ConfigDict(protected_namespaces=())
@@ -381,12 +426,57 @@ class ModelInstance(ModelInstanceBase, BaseModelMixin, table=True):
         return self.id
 
 
-class ModelInstanceCreate(ModelInstanceBase):
-    pass
+class ModelInstanceCreate(ModelSource):
+    name: str = Field(index=True, unique=True)
+    worker_id: Optional[int] = None
+    worker_name: Optional[str] = None
+    worker_ip: Optional[str] = None
+    pid: Optional[int] = None
+    # FIXME: Migrate to ports.
+    port: Optional[int] = None
+    ports: Optional[List[int]] = Field(default=[])
+    download_progress: Optional[float] = None
+    resolved_path: Optional[str] = None
+    restart_count: Optional[int] = 0
+    last_restart_time: Optional[datetime] = None
+    state: ModelInstanceStateEnum = ModelInstanceStateEnum.PENDING
+    state_message: Optional[str] = None
+    computed_resource_claim: Optional[ComputedResourceClaim] = None
+    gpu_indexes: Optional[List[int]] = Field(default=[])
+    gpu_addresses: Optional[List[str]] = Field(default=[])
+    model_id: int
+    model_name: str
+    distributed_servers: Optional[DistributedServers] = None
 
 
-class ModelInstanceUpdate(ModelInstanceBase):
-    pass
+class ModelInstanceInternalCreate(ModelInstanceCreate):
+    placement_override: Optional[ModelInstancePlacementOverride] = None
+
+
+class ModelInstanceUpdate(ModelSource):
+    name: str
+    worker_id: Optional[int] = None
+    worker_name: Optional[str] = None
+    worker_ip: Optional[str] = None
+    pid: Optional[int] = None
+    port: Optional[int] = None
+    ports: Optional[List[int]] = Field(default=[])
+    download_progress: Optional[float] = None
+    resolved_path: Optional[str] = None
+    restart_count: Optional[int] = 0
+    last_restart_time: Optional[datetime] = None
+    state: ModelInstanceStateEnum = ModelInstanceStateEnum.PENDING
+    state_message: Optional[str] = None
+    computed_resource_claim: Optional[ComputedResourceClaim] = None
+    gpu_indexes: Optional[List[int]] = Field(default=[])
+    gpu_addresses: Optional[List[str]] = Field(default=[])
+    model_id: int
+    model_name: str
+    distributed_servers: Optional[DistributedServers] = None
+
+
+class ModelInstanceInternalUpdate(ModelInstanceUpdate):
+    placement_override: Optional[ModelInstancePlacementOverride] = None
 
 
 class ModelInstancePublic(
@@ -433,15 +523,23 @@ def is_audio_model(model: Model):
     Args:
         model: Model to check.
     """
+    if model.backend and model.backend != BackendEnum.VOX_BOX:
+        return False
+
     if model.backend == BackendEnum.VOX_BOX:
         return True
 
-    if model.categories:
+    categories = model_categories(model)
+    if categories:
         return (
-            'speech_to_text' in model.categories or 'text_to_speech' in model.categories
+            'speech_to_text' in categories or 'text_to_speech' in categories
         )
 
     return False
+
+
+def model_categories(model: Model) -> List[str]:
+    return getattr(model, "categories", None) or []
 
 
 def is_image_model(model: Model):
@@ -450,7 +548,43 @@ def is_image_model(model: Model):
     Args:
         model: Model to check.
     """
-    return "image" in model.categories
+    return "image" in model_categories(model)
+
+
+def is_video_model(model: Model):
+    """
+    Check if the model is a video model.
+    Args:
+        model: Model to check.
+    """
+    return "video" in model_categories(model)
+
+
+def is_diffusers_model(model: Model):
+    """
+    Check if the local model path uses diffusers format.
+    """
+    local_path = getattr(model, "local_path", None)
+    if not local_path:
+        return False
+    return Path(local_path).joinpath("model_index.json").is_file()
+
+
+def is_vllm_omni_model(model: Model):
+    """
+    Check if the model should default to vLLM-Omni when backend is not explicitly set.
+    """
+    if is_image_model(model) or is_video_model(model) or is_diffusers_model(model):
+        return True
+
+    source_values = [
+        getattr(model, "name", None),
+        getattr(model, "huggingface_repo_id", None),
+        getattr(model, "model_scope_model_id", None),
+        getattr(model, "local_path", None),
+    ]
+    source_text = " ".join(value for value in source_values if value).lower()
+    return "omni" in source_text
 
 
 def is_embedding_model(model: Model):
@@ -459,7 +593,7 @@ def is_embedding_model(model: Model):
     Args:
         model: Model to check.
     """
-    return "embedding" in model.categories
+    return "embedding" in model_categories(model)
 
 
 def is_renaker_model(model: Model):
@@ -468,7 +602,7 @@ def is_renaker_model(model: Model):
     Args:
         model: Model to check.
     """
-    return "reranker" in model.categories
+    return "reranker" in model_categories(model)
 
 
 def get_backend(model: Model) -> str:
@@ -481,7 +615,25 @@ def get_backend(model: Model) -> str:
     if is_audio_model(model):
         return BackendEnum.VOX_BOX
 
+    if is_vllm_omni_model(model):
+        return BackendEnum.VLLM_OMNI
+
     return BackendEnum.VLLM
+
+
+def get_gguf_runtime(model: Model) -> str:
+    env = getattr(model, "env", None) or {}
+    runtime = env.get("GPUSTACK_GGUF_RUNTIME")
+    if runtime:
+        return runtime.strip().lower()
+
+    runtime = find_parameter(
+        getattr(model, "backend_parameters", None), ["gpustack-runtime"]
+    )
+    if runtime:
+        return runtime.strip().lower()
+
+    return "llama-box"
 
 
 def get_mmproj_filename(model: Union[Model, ModelSource]) -> Optional[str]:

@@ -60,7 +60,17 @@ class EventBus:
     async def publish(self, topic: str, event: Event):
         if topic in self.subscribers:
             for subscriber in self.subscribers[topic]:
-                await subscriber.enqueue(copy.deepcopy(event))
+                await subscriber.enqueue(_copy_event_for_subscriber(event))
 
 
 event_bus = EventBus()
+
+
+def _copy_event_for_subscriber(event: Event) -> Event:
+    if _is_table_model_event_data(event.data):
+        return Event(type=event.type, data=event.data)
+    return copy.deepcopy(event)
+
+
+def _is_table_model_event_data(data: Any) -> bool:
+    return hasattr(data, "_sa_instance_state") or hasattr(type(data), "__table__")

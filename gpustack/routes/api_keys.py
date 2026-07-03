@@ -8,7 +8,7 @@ from gpustack.api.exceptions import (
     InternalServerErrorException,
     NotFoundException,
 )
-from gpustack.security import API_KEY_PREFIX, get_secret_hash
+from gpustack.security import get_secret_hash
 from gpustack.server.deps import CurrentUserDep, ListParamsDep, SessionDep, EngineDep
 from gpustack.schemas.api_keys import ApiKey, ApiKeyCreate, ApiKeyPublic, ApiKeysPublic
 from gpustack.server.services import APIKeyService
@@ -79,7 +79,7 @@ async def create_api_key(
         name=api_key.name,
         description=api_key.description,
         id=api_key.id,
-        value=f"{API_KEY_PREFIX}_{access_key}_{secret_key}",
+        value=f"{access_key}_{secret_key}",
         created_at=api_key.created_at,
         updated_at=api_key.updated_at,
         expires_at=api_key.expires_at,

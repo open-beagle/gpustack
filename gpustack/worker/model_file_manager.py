@@ -1,14 +1,16 @@
 import asyncio
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from functools import partial
 import glob
 from itertools import chain
 import logging
+import os
 from pathlib import Path
 import platform
 import time
 import threading
-from typing import Dict, Tuple
+from typing import Dict
 from modelscope.hub.constants import TEMPORARY_FOLDER_NAME
 from multiprocessing import Manager, cpu_count
 from huggingface_hub._local_folder import get_local_download_paths
@@ -18,7 +20,7 @@ from huggingface_hub.utils import build_hf_headers
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
-from gpustack.logging import setup_logging
+from gpustack.logginglocal import setup_logging
 from gpustack.schemas.model_files import ModelFile, ModelFileUpdate, ModelFileStateEnum
 from gpustack.client import ClientSet
 from gpustack.schemas.models import SourceEnum
@@ -31,6 +33,20 @@ from gpustack.worker import downloaders
 logger = logging.getLogger(__name__)
 
 max_concurrent_downloads = 5
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(int(os.getenv(name, str(default))), minimum)
+    except ValueError:
+        logger.warning("Invalid integer value for %s, using default %s", name, default)
+        return default
+
+
+download_no_progress_timeout = _env_int(
+    "GPUSTACK_DOWNLOAD_NO_PROGRESS_TIMEOUT", 7200
+)
+download_watchdog_interval = _env_int("GPUSTACK_DOWNLOAD_WATCHDOG_INTERVAL", 300)
 
 
 def _cleanup_download_log(config_log_dir, model_file_id):
@@ -62,11 +78,14 @@ class ModelFileManager:
         self._worker_id = worker_id
         self._config = cfg
         self._clientset = clientset
-        self._active_downloads: Dict[int, Tuple] = {}
+        self._active_downloads: Dict[int, Dict] = {}
         self._download_pool = None
+        self._watchdog_task = None
 
     async def watch_model_files(self):
         self._prerun()
+        if self._watchdog_task is None:
+            self._watchdog_task = asyncio.create_task(self._watch_active_downloads())
         while True:
             try:
                 logger.debug("Started watching model files.")
@@ -81,9 +100,101 @@ class ModelFileManager:
 
     def _prerun(self):
         self._mp_manager = Manager()
+        self._create_download_pool()
+
+    def _create_download_pool(self):
+        if self._download_pool:
+            self._download_pool.shutdown(wait=False, cancel_futures=True)
         self._download_pool = ProcessPoolExecutor(
             max_workers=min(max_concurrent_downloads, cpu_count()),
         )
+
+    def _recreate_download_pool(self):
+        logger.warning("Recreating model file download process pool")
+        self._create_download_pool()
+
+    def _terminate_download_pool(self):
+        if not self._download_pool:
+            return
+
+        processes = getattr(self._download_pool, "_processes", {}) or {}
+        for process in processes.values():
+            if process.is_alive():
+                process.terminate()
+
+        self._download_pool.shutdown(wait=False, cancel_futures=True)
+        self._download_pool = None
+
+    async def _watch_active_downloads(self):
+        while True:
+            try:
+                await asyncio.sleep(download_watchdog_interval)
+                await self._restart_stalled_downloads()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Failed to watch active model file downloads: {e}")
+
+    async def _restart_stalled_downloads(self):
+        if not self._active_downloads:
+            return
+
+        now = time.time()
+        stalled_model_files = []
+        active_model_files = []
+
+        for model_file_id, entry in list(self._active_downloads.items()):
+            try:
+                model_file = await asyncio.to_thread(
+                    self._clientset.model_files.get, id=model_file_id
+                )
+            except NotFoundException:
+                self._active_downloads.pop(model_file_id, None)
+                continue
+
+            if model_file.state != ModelFileStateEnum.DOWNLOADING:
+                continue
+
+            active_model_files.append(ModelFile.model_validate(model_file))
+            progress = model_file.download_progress or 0
+            if progress != entry["last_progress"]:
+                entry["last_progress"] = progress
+                entry["last_progress_time"] = now
+                continue
+
+            idle_seconds = now - entry["last_progress_time"]
+            if idle_seconds >= download_no_progress_timeout:
+                stalled_model_files.append(model_file)
+
+        if not stalled_model_files:
+            return
+
+        stalled_ids = ", ".join(str(model_file.id) for model_file in stalled_model_files)
+        logger.warning(
+            "Model file downloads have no progress for %s seconds, restarting "
+            "download process pool. model_file_ids=%s",
+            download_no_progress_timeout,
+            stalled_ids,
+        )
+
+        for entry in self._active_downloads.values():
+            entry["cancel_flag"].set()
+            entry["future"].cancel()
+
+        self._active_downloads.clear()
+        self._terminate_download_pool()
+        self._create_download_pool()
+
+        for model_file in active_model_files:
+            self._update_model_file(
+                model_file.id,
+                state=ModelFileStateEnum.DOWNLOADING,
+                state_message=(
+                    "Download had no progress for "
+                    f"{download_no_progress_timeout} seconds, retrying."
+                ),
+            )
+            self._create_download_task(model_file)
 
     def _handle_model_file_event(self, event: Event):
         mf = ModelFile.model_validate(event.data)
@@ -113,7 +224,8 @@ class ModelFileManager:
     async def _handle_deletion(self, model_file: ModelFile):
         entry = self._active_downloads.pop(model_file.id, None)
         if entry:
-            future, cancel_flag = entry
+            future = entry["future"]
+            cancel_flag = entry["cancel_flag"]
             cancel_flag.set()
             future.cancel()
             try:
@@ -246,7 +358,7 @@ class ModelFileManager:
             logger.error(
                 f"Failed to delete {model_file.readable_source}(id: {model_file.id}: {e}"
             )
-            await self._update_model_file(
+            self._update_model_file(
                 model_file.id,
                 state=ModelFileStateEnum.ERROR,
                 state_message=f"Deletion failed: {str(e)}",
@@ -259,27 +371,64 @@ class ModelFileManager:
         cancel_flag = self._mp_manager.Event()
 
         download_task = ModelFileDownloadTask(model_file, self._config, cancel_flag)
-        future = self._download_pool.submit(download_task.run)
-        self._active_downloads[model_file.id] = (future, cancel_flag)
+        try:
+            future = self._download_pool.submit(download_task.run)
+        except BrokenProcessPool:
+            self._recreate_download_pool()
+            future = self._download_pool.submit(download_task.run)
+
+        entry = {
+            "future": future,
+            "cancel_flag": cancel_flag,
+            "last_progress": model_file.download_progress or 0,
+            "last_progress_time": time.time(),
+        }
+        self._active_downloads[model_file.id] = entry
 
         logger.debug(f"Created download task for {model_file.readable_source}")
 
         async def _check_completion():
+            retry_download = False
             try:
                 await asyncio.wrap_future(future)
             except NotFoundException:
                 logger.info(
                     f"Model file {model_file.readable_source} not found. Maybe it was cancelled."
                 )
+            except BrokenProcessPool as e:
+                logger.error(f"Model file download process pool failed: {e}")
+                if self._active_downloads.get(model_file.id) is entry:
+                    self._recreate_download_pool()
+                    self._update_model_file(
+                        model_file.id,
+                        state=ModelFileStateEnum.DOWNLOADING,
+                        state_message="Download worker process crashed, retrying.",
+                    )
+                    retry_download = True
             except Exception as e:
                 logger.error(f"Failed to download model file: {e}")
-                await self._update_model_file(
+                self._update_model_file(
                     model_file.id,
                     state=ModelFileStateEnum.ERROR,
                     state_message=str(e),
                 )
             finally:
-                self._active_downloads.pop(model_file.id, None)
+                if self._active_downloads.get(model_file.id) is entry:
+                    self._active_downloads.pop(model_file.id, None)
+
+            if retry_download:
+                try:
+                    current_model_file = self._clientset.model_files.get(
+                        id=model_file.id
+                    )
+                    if current_model_file.state == ModelFileStateEnum.DOWNLOADING:
+                        self._create_download_task(
+                            ModelFile.model_validate(current_model_file)
+                        )
+                except NotFoundException:
+                    logger.info(
+                        f"Model file {model_file.readable_source} not found. Maybe it was cancelled."
+                    )
 
             logger.debug(f"Download completed for {model_file.readable_source}")
 
@@ -478,6 +627,12 @@ class ModelFileDownloadTask:
             self._write_to_instance_download_logs(
                 f"Model file download task started: {self._model_file.readable_source}"
             )
+            if self._reconcile_completed_model_file():
+                self._write_to_instance_download_logs(
+                    f"Model file already exists locally: {self._model_file.readable_source}"
+                )
+                return
+
             self._download_model_file()
             self._write_to_instance_download_logs(
                 f"Model file download task completed successfully: {self._model_file.readable_source}"
@@ -508,6 +663,7 @@ class ModelFileDownloadTask:
             cache_dir=self._config.cache_dir,
             ollama_library_base_url=self._config.ollama_library_base_url,
             huggingface_token=self._config.huggingface_token,
+            cfg=self._config,
         )
         self._download_completed = True
         self._update_model_file(
@@ -519,6 +675,49 @@ class ModelFileDownloadTask:
         self._write_to_instance_download_logs(
             f"Successfully downloaded {self._model_file.readable_source}"
         )
+
+    def _reconcile_completed_model_file(self) -> bool:
+        if not self._local_model_file_complete():
+            return False
+
+        self._download_completed = True
+        self._update_model_file(
+            self._model_file.id,
+            state=ModelFileStateEnum.READY,
+            download_progress=100,
+            resolved_paths=self._model_file.resolved_paths,
+            state_message="",
+        )
+        return True
+
+    def _local_model_file_complete(self) -> bool:
+        if not self._model_file.size or not self._model_file.resolved_paths:
+            return False
+
+        total_size = 0
+        for path in self._model_file.resolved_paths:
+            matched_paths = glob.glob(path) if '*' in path else [path]
+            if not matched_paths:
+                return False
+
+            for matched_path in matched_paths:
+                path_obj = Path(matched_path)
+                if path_obj.is_file():
+                    total_size += path_obj.stat().st_size
+                elif path_obj.is_dir():
+                    total_size += self._directory_size(path_obj)
+                else:
+                    return False
+
+        return total_size >= self._model_file.size
+
+    @staticmethod
+    def _directory_size(path: Path) -> int:
+        total_size = 0
+        for item in path.rglob("*"):
+            if item.is_file():
+                total_size += item.stat().st_size
+        return total_size
 
     def hijack_tqdm_progress(task_self):
         """
@@ -582,7 +781,7 @@ class ModelFileDownloadTask:
 
         # Get the tqdm ID and line number for this instance
         tqdm_id = getattr(tqdm_instance, '_gpustack_id', None)
-        if not tqdm_id or tqdm_id not in self._file_line_mapping:
+        if tqdm_id is None or tqdm_id not in self._file_line_mapping:
             return
 
         line_number = self._file_line_mapping[tqdm_id]
@@ -701,7 +900,7 @@ class ModelFileDownloadTask:
         )
 
     def _ensure_model_file_size_and_paths(self):
-        if self._model_file.size is not None:
+        if self._model_file.size is not None and self._model_file.resolved_paths:
             return
 
         repo_file_list = downloaders.get_model_file_info(
@@ -709,6 +908,7 @@ class ModelFileDownloadTask:
             huggingface_token=self._config.huggingface_token,
             cache_dir=self._config.cache_dir,
             ollama_library_base_url=self._config.ollama_library_base_url,
+            cfg=self._config,
         )
 
         (size, file_paths) = hub.match_file_and_calculate_size(

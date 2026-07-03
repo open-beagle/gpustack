@@ -23,6 +23,8 @@ async def get_worker_allocatable_resource(  # noqa: C901
     """
 
     def update_allocated_vram(allocated, resource_claim):
+        if resource_claim.vram is None:
+            return
         for gpu_index, vram in resource_claim.vram.items():
             allocated.vram[gpu_index] = allocated.vram.get(gpu_index, 0) + vram
 
@@ -32,6 +34,8 @@ async def get_worker_allocatable_resource(  # noqa: C901
 
     for model_instance in model_instances:
         if model_instance.worker_id != worker.id:
+            continue
+        if model_instance.computed_resource_claim is None:
             continue
         allocated.ram += model_instance.computed_resource_claim.ram or 0
         if model_instance.gpu_indexes:

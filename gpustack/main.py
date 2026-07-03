@@ -1,4 +1,5 @@
 import argparse
+import warnings
 from multiprocessing import freeze_support
 
 from gpustack.cmd import setup_start_cmd
@@ -10,6 +11,10 @@ from gpustack.cmd.version import setup_version_cmd
 
 
 def main():
+    # Filter out known deprecation warnings from dependencies
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module="websockets.legacy")
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module="uvicorn.protocols.websockets.websockets_impl")
+
     parser = argparse.ArgumentParser(
         description="GPUStack",
         conflict_handler="resolve",

@@ -19,6 +19,7 @@ from gpustack.schemas.common import Pagination
 from gpustack.schemas.models import (
     ModelInstance,
     ModelInstancesPublic,
+    GPUSelector,
     get_backend,
     is_audio_model,
     BackendEnum,
@@ -32,7 +33,13 @@ from gpustack.schemas.models import (
     ModelPublic,
     ModelsPublic,
 )
-from gpustack.server.services import ModelService, WorkerService
+from gpustack.server.bus import EventType
+from gpustack.server.services import (
+    ModelService,
+    WorkerService,
+    delete_cache_by_key,
+)
+from gpustack.server.controllers import specified_scale_down_instances, sync_replicas
 from gpustack.utils.command import find_parameter
 from gpustack.utils.convert import safe_int
 from gpustack.utils.gpu import parse_gpu_id
@@ -166,6 +173,9 @@ async def validate_model_in(
     if model_in.gpu_selector is not None and model_in.replicas > 0:
         await validate_gpu_ids(session, model_in)
 
+    if isinstance(model_in, ModelUpdate) and model_in.placement_override:
+        await validate_placement_override(session, model_in)
+
     if model_in.backend_parameters:
         param_gpu_layers = find_parameter(
             model_in.backend_parameters, ["ngl", "gpu-layers", "n-gpu-layers"]
@@ -197,6 +207,25 @@ async def validate_model_in(
             raise BadRequestException(
                 message="Setting the port using --port is not supported."
             )
+
+
+async def validate_placement_override(session: SessionDep, model_in: ModelUpdate):
+    replica_groups = model_in.placement_override.groups_for_new_replicas()
+    if not replica_groups:
+        return
+
+    for replica_group in replica_groups:
+        if replica_group.gpu_selector is None:
+            continue
+
+        if not replica_group.gpu_selector.gpu_ids:
+            continue
+
+        model_in_for_validation = model_in.model_copy(deep=True)
+        model_in_for_validation.gpu_selector = GPUSelector(
+            gpu_ids=replica_group.gpu_selector.gpu_ids
+        )
+        await validate_gpu_ids(session, model_in_for_validation)
 
 
 async def validate_gpu_ids(  # noqa: C901
@@ -240,9 +269,12 @@ async def validate_gpu_ids(  # noqa: C901
             if worker.labels is not None
             else "unknown"
         )
-        if model_backend == BackendEnum.VLLM and worker_os != "linux":
+        if (
+            model_backend in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI)
+            and worker_os != "linux"
+        ):
             raise BadRequestException(
-                message=f'vLLM backend is only supported on Linux, but the selected worker "{worker.name}" is running on {worker_os.capitalize()}.'
+                message=f'{model_backend} backend is only supported on Linux, but the selected worker "{worker.name}" is running on {worker_os.capitalize()}.'
             )
 
         if model_backend == BackendEnum.VLLM and len(worker_name_set) > 1:
@@ -286,11 +318,12 @@ def validate_gpu(
             f"Ascend MindIE backend requires Ascend NPUs. Selected {gpu_device.vendor} GPU is not supported."
         )
 
-    if model_backend == BackendEnum.VLLM and gpu_device.vendor in [
-        VendorEnum.Apple.value,
-    ]:
+    if (
+        model_backend in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI)
+        and gpu_device.vendor in [VendorEnum.Apple.value]
+    ):
         raise BadRequestException(
-            f"vLLM backend is not supported on {gpu_device.vendor} GPUs."
+            f"{model_backend} backend is not supported on {gpu_device.vendor} GPUs."
         )
 
 
@@ -310,6 +343,25 @@ async def validate_distributed_vllm_limit_per_worker(
             raise BadRequestException(
                 message=f"Each worker can run only one distributed vLLM instance. Worker '{worker.name}' already has '{instance.name}'."
             )
+
+
+async def save_request_scoped_model_update(
+    session: SessionDep, model: Model, source: dict
+) -> Model:
+    model_id = model.id
+    model_name = model.name
+    for key, value in source.items():
+        setattr(model, key, value)
+    await model.save(session)
+
+    model_service = ModelService(session)
+    await delete_cache_by_key(model_service.get_by_id, model_id)
+    await delete_cache_by_key(model_service.get_by_name, model_name)
+
+    refreshed_model = await Model.one_by_id(session, model_id)
+    if not refreshed_model:
+        raise ValueError("Model not found after update")
+    return refreshed_model
 
 
 @router.post("", response_model=ModelPublic)
@@ -340,7 +392,43 @@ async def update_model(session: SessionDep, id: int, model_in: ModelUpdate):
     await validate_model_in(session, model_in)
 
     try:
-        await ModelService(session).update(model, model_in)
+        source = model_in.model_dump(
+            exclude_unset=True,
+            exclude={"placement_override", "scale_in_instance_ids"},
+        )
+        if model_in.scale_in_instance_ids:
+            target_replicas = source.get("replicas", model.replicas)
+            instances = await ModelInstance.all_by_field(session, "model_id", model.id)
+            scale_down_count = len(instances) - target_replicas
+            specified_scale_down_instances(
+                instances,
+                model,
+                model_in.scale_in_instance_ids,
+                scale_down_count,
+            )
+            model = await save_request_scoped_model_update(session, model, source)
+            await sync_replicas(
+                session,
+                model,
+                get_global_config(),
+                placement_override=model_in.placement_override,
+                scale_in_instance_ids=model_in.scale_in_instance_ids,
+            )
+            await Model._publish_event(EventType.UPDATED, model)
+        elif model_in.placement_override:
+            model = await save_request_scoped_model_update(session, model, source)
+            await sync_replicas(
+                session,
+                model,
+                get_global_config(),
+                placement_override=model_in.placement_override,
+                scale_in_instance_ids=model_in.scale_in_instance_ids,
+            )
+            await Model._publish_event(EventType.UPDATED, model)
+        else:
+            await ModelService(session).update(model, source)
+    except ValueError as e:
+        raise BadRequestException(message=str(e))
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to update model: {e}")
 

@@ -29,6 +29,7 @@ from gpustack.scheduler.model_registry import (
     vllm_supported_llm_architectures,
     vllm_supported_reranker_architectures,
 )
+from gpustack.scheduler.placement_override import get_model_for_instance_scheduling
 from gpustack.scheduler.queue import AsyncUniqueQueue
 from gpustack.policies.worker_filters.status_filter import StatusFilter
 from gpustack.schemas.workers import Worker
@@ -87,7 +88,7 @@ class Scheduler:
 
         try:
             # scheduler queue.
-            asyncio.create_task(self._schedule_cycle())
+            asyncio.create_task(self._run_schedule_cycle())
 
             # scheduler job trigger by time interval.
             trigger = IntervalTrigger(
@@ -106,12 +107,31 @@ class Scheduler:
 
         logger.info("Scheduler started.")
 
-        # scheduler job trigger by event.
-        async for event in ModelInstance.subscribe(self._engine):
-            if event.type != EventType.CREATED:
-                continue
+        await self._run_event_trigger()
 
-            await self._enqueue_pending_instances()
+    async def _run_schedule_cycle(self):
+        while True:
+            try:
+                await self._schedule_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Scheduler cycle failed: {e}")
+                await asyncio.sleep(5)
+
+    async def _run_event_trigger(self):
+        while True:
+            try:
+                async for event in ModelInstance.subscribe(self._engine):
+                    if event.type != EventType.CREATED:
+                        continue
+
+                    await self._enqueue_pending_instances()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Scheduler event trigger failed: {e}")
+                await asyncio.sleep(5)
 
     async def _enqueue_pending_instances(self):
         """
@@ -156,21 +176,30 @@ class Scheduler:
 
                 should_update_model = False
                 try:
-                    if is_gguf_model(model):
+                    evaluation_model = get_model_for_instance_scheduling(
+                        model, instance
+                    )
+                    if is_gguf_model(evaluation_model):
                         should_update_model = await evaluate_gguf_model(
-                            self._config, model
+                            self._config, evaluation_model
                         )
                         if await self.check_model_distributability(
-                            session, model, instance
+                            session, evaluation_model, instance
                         ):
                             return
-                    elif is_audio_model(model):
+                    elif is_audio_model(evaluation_model):
                         should_update_model = await evaluate_audio_model(
-                            self._config, model
+                            self._config, evaluation_model
                         )
+                    elif get_backend(evaluation_model) == BackendEnum.VLLM_OMNI:
+                        # vLLM-Omni can serve models that do not expose a standard
+                        # transformers config, such as diffusion-format models.
+                        evaluation_model.categories = evaluation_model.categories or [
+                            CategoryEnum.LLM
+                        ]
                     else:
                         should_update_model = await evaluate_pretrained_config(
-                            model, raise_raw=True
+                            evaluation_model, raise_raw=True
                         )
                 except Exception as e:
                     # Even if the evaluation failed, we still want to proceed to deployment.
@@ -289,8 +318,11 @@ class Scheduler:
             messages = []
             if workers and model:
                 try:
+                    scheduling_model = get_model_for_instance_scheduling(
+                        model, model_instance
+                    )
                     candidate, messages = await find_candidate(
-                        self._config, model, workers
+                        self._config, scheduling_model, workers
                     )
                 except Exception as e:
                     state_message = f"Failed to find candidate: {e}"
@@ -600,6 +632,11 @@ def should_skip_architecture_check(model: Model) -> bool:
 
     if model.backend_version:
         # New model architectures may be added with custom backend version.
+        return True
+
+    if model.backend == BackendEnum.VLLM_OMNI:
+        # vllm-omni supports diffusion models (Flux, Z-Image, etc.) that use diffusers-format
+        # configs without standard transformers architecture fields.
         return True
 
     if model.backend_parameters and find_parameter(

@@ -31,7 +31,7 @@ class LabelMatchingFilter(WorkerFilter):
             messages = [
                 f"Matched {len(candidates)}/{len(workers)} workers by label selector: {self._model.worker_selector}."
             ]
-            if get_backend(self._model) == BackendEnum.VLLM:
+            if get_backend(self._model) in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI):
                 messages[0] += " (Note: The vLLM backend supports Linux only.)"
             elif get_backend(self._model) == BackendEnum.ASCEND_MINDIE:
                 messages[0] += " (Note: The Ascend MindIE backend supports Linux only.)"
@@ -43,6 +43,8 @@ def label_matching(required_labels: Dict[str, str], current_labels) -> bool:
     """
     Check if the current labels matched the required labels.
     """
+    if current_labels is None:
+        return False
 
     for key, value in required_labels.items():
         if key not in current_labels or current_labels[key] != value:

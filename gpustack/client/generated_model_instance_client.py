@@ -104,6 +104,15 @@ class ModelInstanceClient:
         raise_if_response_error(response)
         return ModelInstancePublic.model_validate(response.json())
 
+    def internal_update(self, id: int, model_update: ModelInstanceInternalUpdate):
+        response = self._client.get_httpx_client().put(
+            f"{self._url}/{id}/internal",
+            content=model_update.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+        raise_if_response_error(response)
+        return ModelInstancePublic.model_validate(response.json())
+
     def delete(self, id: int):
         response = self._client.get_httpx_client().delete(f"{self._url}/{id}")
         raise_if_response_error(response)

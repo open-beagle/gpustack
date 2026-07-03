@@ -60,7 +60,7 @@ async def get_current_user(
         jwt_manager: JWTManager = request.app.state.jwt_manager
         user = await get_user_from_jwt_token(session, jwt_manager, cookie_token)
     elif bearer_token:
-        user = await get_user_from_bearer_token(session, bearer_token)
+        user = await get_user_from_bearer_token(request, session, bearer_token)
 
     if user is None and request.client.host == "127.0.0.1":
         server_config: Config = request.app.state.server_config
@@ -148,13 +148,16 @@ async def get_user_from_jwt_token(
 
 
 async def get_user_from_bearer_token(
-    session: AsyncSession, bearer_token: HTTPAuthorizationCredentials
+    request: Request,
+    session: AsyncSession,
+    bearer_token: HTTPAuthorizationCredentials,
 ) -> Optional[User]:
     try:
         parts = bearer_token.credentials.split("_")
-        if len(parts) == 3 and parts[0] == API_KEY_PREFIX:
-            access_key = parts[1]
-            secret_key = parts[2]
+        if len(parts) == 2:
+            # Format: {access_key}_{secret_key}
+            access_key = parts[0]
+            secret_key = parts[1]
             api_key = await APIKeyService(session).get_by_access_key(access_key)
             if (
                 api_key is not None
@@ -166,6 +169,9 @@ async def get_user_from_bearer_token(
             ):
                 user = await UserService(session).get_by_id(api_key.user_id)
                 if user is not None:
+                    request.state.api_key = api_key
+                    request.state.api_key_id = api_key.id
+                    request.state.api_key_access_key = api_key.access_key
                     return user
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to get user: {e}")

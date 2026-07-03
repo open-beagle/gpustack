@@ -3,7 +3,7 @@ from prometheus_client import make_asgi_app, REGISTRY
 from prometheus_client.core import GaugeMetricFamily, InfoMetricFamily
 from gpustack.client.generated_clientset import ClientSet
 from gpustack.config.config import Config
-from gpustack.logging import setup_logging
+from gpustack.logginglocal import setup_logging
 from gpustack.worker.collector import WorkerStatusCollector
 import uvicorn
 import logging

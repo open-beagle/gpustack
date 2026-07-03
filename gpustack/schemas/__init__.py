@@ -6,6 +6,8 @@ from gpustack.schemas.models import (
     ModelsPublic,
     ModelInstance,
     ModelInstanceCreate,
+    ModelInstanceInternalCreate,
+    ModelInstanceInternalUpdate,
     ModelInstanceUpdate,
     ModelInstancePublic,
     ModelInstancesPublic,
@@ -38,7 +40,12 @@ from gpustack.schemas.workers import (
 from gpustack.schemas.users import User, UserCreate, UserUpdate, UserPublic, UsersPublic
 from gpustack.schemas.api_keys import ApiKey, ApiKeyCreate, ApiKeyPublic, ApiKeysPublic
 from gpustack.schemas.system_load import SystemLoad
-from gpustack.schemas.model_usage import ModelUsage
+from gpustack.schemas.model_usage import (
+    ModelUsage,
+    ModelUsageDailyStat,
+    ModelUsageHourlyStat,
+    ModelUsageLog,
+)
 from gpustack.schemas.common import PaginatedList
 
 __all__ = [
@@ -58,6 +65,8 @@ __all__ = [
     "ModelsPublic",
     "ModelInstance",
     "ModelInstanceCreate",
+    "ModelInstanceInternalCreate",
+    "ModelInstanceInternalUpdate",
     "ModelInstanceUpdate",
     "ModelInstancePublic",
     "ModelInstancesPublic",
@@ -80,6 +89,9 @@ __all__ = [
     "MemoryInfo",
     "SystemLoad",
     "ModelUsage",
+    "ModelUsageLog",
+    "ModelUsageHourlyStat",
+    "ModelUsageDailyStat",
     "ModelFile",
     "ModelFileCreate",
     "ModelFileUpdate",

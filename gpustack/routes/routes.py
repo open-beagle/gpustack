@@ -9,9 +9,11 @@ from gpustack.routes import (
     model_evaluations,
     model_files,
     model_instances,
+    model_usage,
     model_sets,
     probes,
     proxy,
+    runtime,
     update,
     users,
     models,
@@ -19,6 +21,7 @@ from gpustack.routes import (
     voice,
     workers,
 )
+from gpustack.routes.admin import container_exec as admin_container_exec
 
 from gpustack.api.exceptions import error_responses, openai_api_error_responses
 from gpustack.routes import rerank
@@ -45,6 +48,7 @@ v1_admin_router.include_router(workers.router, prefix="/workers", tags=["Workers
 v1_admin_router.include_router(
     model_instances.router, prefix="/model-instances", tags=["Model Instances"]
 )
+v1_admin_router.include_router(runtime.router, prefix="/runtime", tags=["Runtime"])
 v1_admin_router.include_router(
     model_sets.router, prefix="/model-sets", tags=["Model Sets"]
 )
@@ -55,7 +59,15 @@ v1_admin_router.include_router(
     model_evaluations.router, prefix="/model-evaluations", tags=["Model Evaluations"]
 )
 v1_admin_router.include_router(
+    model_usage.router, prefix="/model-usage", tags=["Model Usage"]
+)
+v1_admin_router.include_router(
     gpu_devices.router, prefix="/gpu-devices", tags=["GPU Devices"]
+)
+v1_admin_router.include_router(
+    admin_container_exec.router,
+    prefix="/admin/container-exec",
+    tags=["Admin Container Exec"],
 )
 
 api_router.include_router(
@@ -63,6 +75,11 @@ api_router.include_router(
 )
 api_router.include_router(
     v1_admin_router, dependencies=[Depends(get_admin_user)], prefix="/v1"
+)
+api_router.include_router(
+    admin_container_exec.ws_router,
+    prefix="/v1/admin/container-exec",
+    tags=["Admin Container Exec"],
 )
 api_router.include_router(
     debug.router,

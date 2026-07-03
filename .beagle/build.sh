@@ -1,91 +1,83 @@
 #!/bin/bash
 
 git config --global --add safe.directory "$PWD"
-pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
+
+# 配置 PyPI 镜像源：优先阿里云内网，不可达则回退公网
+if curl -s --connect-timeout 2 http://mirrors.cloud.aliyuncs.com/pypi/simple/ > /dev/null 2>&1; then
+  PYPI_MIRROR="http://mirrors.cloud.aliyuncs.com/pypi/simple/"
+  PYPI_HOST="mirrors.cloud.aliyuncs.com"
+else
+  PYPI_MIRROR="https://mirrors.aliyun.com/pypi/simple/"
+  PYPI_HOST="mirrors.aliyun.com"
+fi
+pip config set global.index-url "$PYPI_MIRROR"
+pip config set global.trusted-host "$PYPI_HOST"
 
 set -ex
 
-VENV_DIR="$PWD/.venv"
-VERSION="${VERSION:-v0.7.1}"
+VERSION="${VERSION:-v0.7.5}"
+UI_VERSION="${UI_VERSION:-v0.7.5}"
+
+# 检查并安装 poetry
+if ! command -v poetry &> /dev/null; then
+  echo "Poetry not found, installing..."
+  pip3 install poetry
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+
+POETRY_CMD=(poetry)
+if ! command -v poetry &> /dev/null; then
+  POETRY_CMD=(python3 -m poetry)
+fi
 
 # 清理旧的构建产物
-rm -rf "$PWD/dist" "$PWD/gpustack/ui"
+rm -rf "$PWD/dist"
 
-# 检查 venv 是否与当前 Python 版本匹配
-CURRENT_PYTHON_VERSION=$(python3 --version | awk '{print $2}' | cut -d. -f1,2)
-if [ -e "$VENV_DIR/bin/python" ]; then
-  VENV_PYTHON_VERSION=$("$VENV_DIR/bin/python" --version 2>/dev/null | awk '{print $2}' | cut -d. -f1,2 || echo "")
-  if [ "$CURRENT_PYTHON_VERSION" != "$VENV_PYTHON_VERSION" ]; then
-    echo "Python version mismatch (current: $CURRENT_PYTHON_VERSION, venv: $VENV_PYTHON_VERSION), recreating venv..."
-    rm -rf "$VENV_DIR"
-  fi
-fi
-
-if ! [ -e "$VENV_DIR/bin/activate" ]; then
-  python3 -m venv "$VENV_DIR"
-fi
-
-# 使用虚拟环境中的 pip 和 poetry
-export PATH="$VENV_DIR/bin:$PATH"
-export VIRTUAL_ENV="$VENV_DIR"
-
-# 安装 poetry（如果不存在）
-if ! [ -e "$VENV_DIR/bin/poetry" ]; then
-  "$VENV_DIR/bin/pip" install --upgrade pip
-  "$VENV_DIR/bin/pip" install poetry==1.8.3
-fi
-
-# 下载 UI
+# UI 产物目录（打包进 wheel 的目录）
 UI_PATH="$PWD/gpustack/ui"
-rm -rf "$UI_PATH"
-mkdir -p "$UI_PATH/tmp/ui"
 
-echo "Downloading UI assets for ${VERSION}..."
-if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
-  "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/${VERSION}.tar.gz" | \
-  tar -xzf - --directory "$UI_PATH/tmp/ui" 2>/dev/null; then
-  echo "Failed to download ${VERSION}, trying latest..."
-  curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
-    "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/latest.tar.gz" | \
-    tar -xzf - --directory "$UI_PATH/tmp/ui"
-fi
-cp -a "$UI_PATH/tmp/ui/dist/." "$UI_PATH"
+# 优先级：本地 gpustack/ui > ../gpustack-ui/dist（本地构建） > 远程下载
+if [ -f "$UI_PATH/index.html" ]; then
+  echo "UI build artifacts already exist at $UI_PATH, skipping download."
+elif [ -f "$PWD/../gpustack-ui/dist/index.html" ]; then
+  echo "Found local UI build at ../gpustack-ui/dist, copying to $UI_PATH..."
+  rm -rf "$UI_PATH"
+  mkdir -p "$UI_PATH"
+  cp -a "$PWD/../gpustack-ui/dist/." "$UI_PATH"
+else
+  echo "Downloading UI assets for ${UI_VERSION}..."
+  rm -rf "$UI_PATH"
+  mkdir -p "$UI_PATH"
 
-# 复制自定义静态文件
-cp -r "$PWD/.beagle/static/"* "$UI_PATH/static/"
+  UI_TMP="$PWD/.tmp/ui-download"
+  rm -rf "$UI_TMP"
+  mkdir -p "$UI_TMP"
 
-# 修改版权信息
-UMI_JS="$(ls $UI_PATH/js/umi.*.js)"
-sed -i 's/数澈软件/北京比格/g' "$UMI_JS"
+  if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
+    "https://cache.ali.wodcloud.com/vscode/gpustack/gpustack-ui-${UI_VERSION}.tar.gz" | \
+    tar -xzf - --directory "$UI_TMP" 2>/dev/null; then
+    echo "Failed to download UI assets for ${UI_VERSION}."
+    exit 1
+  fi
 
-# 修改帮助超链接
-sed -i 's|https://docs.gpustack.ai|https://www.bc-cloud.com|g' "$UI_PATH/index.html"
-
-# 禁用 help & lang 菜单
-UMI_CSS="$(ls $UI_PATH/css/umi.*.css)"
-echo 'div[data-menu-id^="rc-menu-uuid-"][data-menu-id$="-help"]{display:none;}' >> "$UMI_CSS"
-echo 'div[data-menu-id^="rc-menu-uuid-"][data-menu-id$="-lang"]{display:none;}' >> "$UMI_CSS"
-
-rm -rf "$UI_PATH/tmp"
-
-# 复制额外静态文件
-if [ -d "$PWD/static" ]; then
-  cp -a "$PWD/static/." "$UI_PATH/static/"
+  cp -a "$UI_TMP/dist/." "$UI_PATH"
+  rm -rf "$UI_TMP"
 fi
 
-# 应用补丁
-git apply .beagle/v0.7.1-s3-project.patch
-git apply .beagle/v0.7.1-bugfix.patch
-git apply .beagle/v0.7.1-vllm.patch
-git apply .beagle/v0.7.1-apikey.patch
-git apply .beagle/v0.7.1-log-filter.patch
+# 验证 UI 目录
+if [ ! -f "$UI_PATH/index.html" ]; then
+  echo "ERROR: UI directory not found or incomplete!"
+  exit 1
+fi
+
+echo "UI directory contents:"
+ls -la "$UI_PATH/"
 
 # 设置版本号
 VERSION_FILE="$PWD/gpustack/__init__.py"
 GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "HEAD")
 GIT_COMMIT_SHORT="${GIT_COMMIT:0:7}"
 
-# 使用 Python 修改版本，避免 sed 引号问题
 python3 -c "
 import re
 with open('$VERSION_FILE', 'r') as f:
@@ -96,31 +88,62 @@ with open('$VERSION_FILE', 'w') as f:
     f.write(content)
 "
 
-"$VENV_DIR/bin/pip" install msgpack
-"$VENV_DIR/bin/poetry" version "${VERSION}"
+# 更新 pyproject.toml 中的版本号
+"${POETRY_CMD[@]}" version "${VERSION}"
 
-# 验证 UI 目录存在
-if [ ! -d "$PWD/gpustack/ui" ] || [ ! -f "$PWD/gpustack/ui/index.html" ]; then
-  echo "ERROR: UI directory not found or incomplete!"
-  exit 1
-fi
+# 使用 poetry build 构建 wheel 和 sdist
+echo "Building with poetry..."
+"${POETRY_CMD[@]}" build
 
-echo "UI directory contents:"
-ls -la "$PWD/gpustack/ui/"
+# 从 wheel 元数据导出 CUDA 镜像依赖清单，供 Dockerfile 先安装稳定依赖层。
+# 这样业务代码或 UI 变化只会重装 gpustack wheel，不会反复重建 vLLM 大依赖层。
+python3 - <<'PY'
+import email
+import glob
+import os
+import zipfile
 
-# 使用 poetry 构建
-"$VENV_DIR/bin/poetry" build
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
 
-# 验证 wheel 包含 UI
-echo "Checking wheel contents..."
-unzip -l dist/*.whl | head -50
+wheel_files = glob.glob("dist/*.whl")
+if len(wheel_files) != 1:
+    raise SystemExit(f"Expected exactly one wheel in dist, got {wheel_files}")
+
+env = default_environment()
+requirements = []
+
+with zipfile.ZipFile(wheel_files[0]) as wheel:
+    metadata_name = next(
+        name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")
+    )
+    metadata = email.message_from_bytes(wheel.read(metadata_name))
+
+for value in metadata.get_all("Requires-Dist") or []:
+    req = Requirement(value)
+    marker = req.marker
+    if marker is not None:
+        include = marker.evaluate({**env, "extra": ""}) or marker.evaluate(
+            {**env, "extra": "vllm"}
+        )
+        if not include:
+            continue
+        req.marker = None
+    requirements.append(str(req))
+
+requirements.append("argcomplete>=1.9.4")
+requirements = sorted(set(requirements), key=str.lower)
+
+requirements_path = os.path.join("dist", "requirements-vllm.txt")
+with open(requirements_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(requirements))
+    f.write("\n")
+
+print(f"Wrote {requirements_path} with {len(requirements)} requirements.")
+PY
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
+git checkout -- "$PWD/pyproject.toml"
 
-# 撤销补丁
-git apply -R .beagle/v0.7.1-log-filter.patch
-git apply -R .beagle/v0.7.1-apikey.patch
-git apply -R .beagle/v0.7.1-vllm.patch
-git apply -R .beagle/v0.7.1-bugfix.patch
-git apply -R .beagle/v0.7.1-s3-project.patch
+echo "Build completed successfully!"

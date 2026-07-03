@@ -16,6 +16,7 @@ from gpustack.server.deps import EngineDep, ListParamsDep, SessionDep
 from gpustack.schemas.models import (
     ModelInstance,
     ModelInstanceCreate,
+    ModelInstanceInternalUpdate,
     ModelInstancePublic,
     ModelInstanceUpdate,
     ModelInstancesPublic,
@@ -117,11 +118,17 @@ async def get_serving_logs(  # noqa: C901
                 async with client.get(model_instance_log_url, timeout=timeout) as resp:
                     if resp.status != 200:
                         body = await resp.read()
-                        yield body, resp.headers, resp.status
+                        resp_headers = dict(resp.headers)
+                        resp_headers.pop("server", None)
+                        resp_headers.pop("Server", None)
+                        yield body, resp_headers, resp.status
                         return
 
                     async for chunk in resp.content.iter_any():
-                        yield chunk, resp.headers, resp.status
+                        resp_headers = dict(resp.headers)
+                        resp_headers.pop("server", None)
+                        resp_headers.pop("Server", None)
+                        yield chunk, resp_headers, resp.status
             except Exception as e:
                 error_response = f"Error fetching serving logs: {str(e)}\n"
                 yield error_response, {}, status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -162,6 +169,27 @@ async def create_model_instance(
 @router.put("/{id}", response_model=ModelInstancePublic)
 async def update_model_instance(
     session: SessionDep, id: int, model_instance_in: ModelInstanceUpdate
+):
+    model_instance = await ModelInstance.one_by_id(session, id)
+    if not model_instance:
+        raise NotFoundException(message="Model instance not found")
+
+    try:
+        await ModelInstanceService(session).update(model_instance, model_instance_in)
+    except Exception as e:
+        raise InternalServerErrorException(
+            message=f"Failed to update model instance: {e}"
+        )
+    return model_instance
+
+
+@router.put(
+    "/{id}/internal",
+    response_model=ModelInstancePublic,
+    include_in_schema=False,
+)
+async def update_model_instance_internal(
+    session: SessionDep, id: int, model_instance_in: ModelInstanceInternalUpdate
 ):
     model_instance = await ModelInstance.one_by_id(session, id)
     if not model_instance:

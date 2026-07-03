@@ -2,6 +2,7 @@ import glob
 import logging
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Dict, List, Tuple
@@ -12,17 +13,26 @@ from gpustack.utils import platform
 from gpustack.schemas.models import (
     ModelInstance,
     ModelInstanceStateEnum,
+    get_gguf_runtime,
     is_embedding_model,
     is_image_model,
     is_renaker_model,
 )
-from gpustack.utils.command import find_parameter
+from gpustack.utils.command import (
+    ensure_bool_parameter,
+    find_parameter,
+    normalize_parameters,
+)
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.worker.backends.base import InferenceServer
 from gpustack.worker.tools_manager import (
+    BUILTIN_LLAMA_CPP_VERSION,
     get_llama_box_command,
+    get_llama_cpp_command,
+    get_llama_cpp_version_dir_name,
     is_disabled_dynamic_link,
     BUILTIN_LLAMA_BOX_VERSION,
+    ToolsManager,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,6 +40,12 @@ logger = logging.getLogger(__name__)
 
 class LlamaBoxServer(InferenceServer):
     def start(self):  # noqa: C901
+        if get_gguf_runtime(self._model) == "llama-cpp":
+            return self._start_llama_cpp()
+
+        return self._start_llama_box()
+
+    def _start_llama_box(self):  # noqa: C901
         # Launch llama-box from <third_party>/bin/llama-box/llama-box-default,
         # if allowing dynamic linking binary and builtin version is used,
         # otherwise use the user-provided binary path in the config,
@@ -91,6 +107,7 @@ class LlamaBoxServer(InferenceServer):
             "--no-mmap",
             "--no-warmup",
         ]
+        arguments = ensure_metrics_enabled(arguments, self._model.backend_parameters)
 
         if is_renaker_model(self._model):
             arguments.append("--rerank")
@@ -194,6 +211,179 @@ class LlamaBoxServer(InferenceServer):
                 logger.error(f"Failed to update model instance: {ue}")
             sys.exit(1)
 
+    def _start_llama_cpp(self):
+        try:
+            self._ensure_llama_cpp_supported()
+            command_path = self._get_llama_cpp_command_path()
+            arguments = self._build_llama_cpp_arguments()
+
+            logger.info("Starting llama.cpp server")
+            logger.debug(
+                f"Run llama.cpp: {command_path} with arguments: {' '.join(arguments)}"
+            )
+            if self._model.env:
+                logger.debug(
+                    f"Model environment variables: {', '.join(f'{key}={value}' for key, value in self._model.env.items())}"
+                )
+
+            env = self.get_inference_running_env()
+            cwd = str(command_path.parent)
+            if platform.system() == "linux":
+                ld_library_path = env.get("LD_LIBRARY_PATH", "")
+                env["LD_LIBRARY_PATH"] = (
+                    ":".join([cwd, ld_library_path]) if ld_library_path else cwd
+                )
+
+            proc = subprocess.Popen(
+                [command_path] + arguments,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+                env=env,
+                cwd=cwd,
+            )
+
+            set_priority(proc.pid)
+            exit_code = proc.wait()
+            self.exit_with_code(exit_code)
+
+        except Exception as e:
+            error_message = f"Failed to run the llama.cpp server: {e}"
+            logger.error(error_message)
+            try:
+                patch_dict = {
+                    "state_message": error_message,
+                    "state": ModelInstanceStateEnum.ERROR,
+                }
+                self._update_model_instance(self._model_instance.id, **patch_dict)
+            except Exception as ue:
+                logger.error(f"Failed to update model instance: {ue}")
+            sys.exit(1)
+
+    def _ensure_llama_cpp_supported(self):
+        if self._model.distributed_inference_across_workers:
+            raise RuntimeError(
+                "llama.cpp runtime does not support distributed inference across "
+                "workers. Please disable distributed_inference_across_workers or "
+                "use llama-box runtime."
+            )
+
+        subordinate_workers = (
+            self._model_instance.distributed_servers.subordinate_workers
+            if self._model_instance.distributed_servers
+            and self._model_instance.distributed_servers.subordinate_workers
+            else []
+        )
+        if subordinate_workers:
+            raise RuntimeError(
+                "llama.cpp runtime does not support llama-box RPC distributed "
+                "serving. Please disable distributed_inference_across_workers or "
+                "use llama-box runtime."
+            )
+
+    def _get_llama_cpp_command_path(self) -> Path:
+        configured_path = (self._model.env or {}).get("GPUSTACK_LLAMA_CPP_SERVER_PATH")
+        if configured_path:
+            command_path = Path(configured_path)
+            if not command_path.is_file():
+                raise FileNotFoundError(f"llama-server not found: {command_path}")
+            return command_path
+
+        version = (self._model.env or {}).get(
+            "GPUSTACK_LLAMA_CPP_VERSION", BUILTIN_LLAMA_CPP_VERSION
+        )
+        base_path = Path(
+            str(
+                pkg_resources.files("gpustack.third_party.bin")
+                .joinpath("llama.cpp")
+                .joinpath(
+                    get_llama_cpp_version_dir_name(
+                        version,
+                        platform.system(),
+                        platform.arch(),
+                        platform.device(),
+                    ),
+                )
+            )
+        )
+        command_path = get_llama_cpp_command(base_path)
+        if command_path.is_file():
+            return command_path
+
+        path_command = shutil.which("llama-server")
+        if path_command:
+            return Path(path_command)
+
+        tools_manager = ToolsManager(
+            tools_download_base_url=self._config.tools_download_base_url,
+            data_dir=self._config.data_dir,
+            bin_dir=self._config.bin_dir,
+            pipx_path=self._config.pipx_path,
+            device=platform.device(),
+        )
+        return tools_manager.install_llama_cpp(version)
+
+    def _build_llama_cpp_arguments(self) -> List[str]:
+        layers = -1
+        claim = self._model_instance.computed_resource_claim
+        if claim is not None and claim.offload_layers is not None:
+            layers = claim.offload_layers
+
+        default_parallel = "4"
+        if is_renaker_model(self._model) or is_embedding_model(self._model):
+            default_parallel = "1"
+
+        arguments = [
+            "--host",
+            "0.0.0.0",
+            "--gpu-layers",
+            str(layers),
+            "--parallel",
+            default_parallel,
+            "--ctx-size",
+            "8192",
+            "--port",
+            str(self._model_instance.port),
+            "--model",
+            self._model_path,
+            "--alias",
+            self._model.name,
+            "--no-mmap",
+        ]
+
+        mmproj = find_parameter(self._model.backend_parameters, ["mmproj"])
+        default_mmproj = get_mmproj_file(self._model_path)
+        if mmproj is None and default_mmproj:
+            arguments.extend(["--mmproj", default_mmproj])
+
+        tensor_split = []
+        if claim and claim.tensor_split:
+            tensor_split = claim.tensor_split
+        elif (
+            self._model_instance.gpu_indexes
+            and len(self._model_instance.gpu_indexes) > 1
+            and claim
+            and claim.vram
+        ):
+            tensor_split = list(claim.vram.values())
+
+        user_tensor_split = find_parameter(
+            self._model.backend_parameters, ["ts", "tensor-split"]
+        )
+        if user_tensor_split is None and tensor_split:
+            tensor_split_argument = ",".join(
+                [str(int(tensor / (1024 * 1024))) for tensor in tensor_split]
+            )
+            arguments.extend(["--tensor-split", tensor_split_argument])
+
+        self.normalize_mmproj_path()
+        user_parameters = normalize_llama_cpp_parameters(
+            self._model.backend_parameters or []
+        )
+        if user_parameters:
+            arguments.extend(user_parameters)
+
+        return arguments
+
     def normalize_mmproj_path(self):
         """
         We provide a syntax sugar for the user to specify the mmproj file relative to the model path.
@@ -241,6 +431,28 @@ def set_priority(pid: int):
         pass
     except Exception as e:
         logger.error(f"Failed to set priority for process {pid}: {e}")
+
+
+def ensure_metrics_enabled(arguments: List[str], backend_parameters: List[str]) -> List[str]:
+    return ensure_bool_parameter(
+        arguments,
+        "metrics",
+        existing_parameters=backend_parameters,
+    )
+
+
+def normalize_llama_cpp_parameters(parameters: List[str]) -> List[str]:
+    removes = [
+        "gpustack-runtime",
+        "rpc",
+        "embeddings",
+        "images",
+        "image-vae-tiling",
+        "max-projected-cache",
+        "no-warmup",
+        "metrics",
+    ]
+    return normalize_parameters(parameters, removes=removes)
 
 
 def get_rpc_servers(

@@ -31,8 +31,32 @@ from gpustack.utils.hub import (
     match_model_scope_file_paths,
     FileEntry,
 )
+from gpustack.worker.downloader_s3 import S3Downloader
+from gpustack.config.config import Config
 
 logger = logging.getLogger(__name__)
+s3Downloader = None
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(int(os.getenv(name, str(default))), minimum)
+    except ValueError:
+        logger.warning("Invalid integer value for %s, using default %s", name, default)
+        return default
+
+
+def init_s3_client(cfg: Config):
+    global s3Downloader
+    s3Downloader = S3Downloader(
+        host=cfg.worker_s3_host,
+        access_key=cfg.worker_s3_access_key,
+        secret_key=cfg.worker_s3_secret_key,
+        ssl=cfg.worker_s3_ssl,
+        use_virtual_hosted_style=cfg.worker_s3_use_virtual_hosted_style,
+        cache_dir=os.path.join(cfg.cache_dir, "beagle"),
+        region=cfg.worker_s3_region,
+    )
 
 
 def download_model(
@@ -41,6 +65,7 @@ def download_model(
     cache_dir: Optional[str] = None,
     ollama_library_base_url: Optional[str] = None,
     huggingface_token: Optional[str] = None,
+    cfg: Config = None,
 ) -> List[str]:
     if model.source == SourceEnum.HUGGING_FACE:
         return HfDownloader.download(
@@ -67,9 +92,15 @@ def download_model(
             extra_file_path=get_mmproj_filename(model),
             local_dir=local_dir,
             cache_dir=os.path.join(cache_dir, "model_scope"),
+            cfg=cfg,
         )
     elif model.source == SourceEnum.LOCAL_PATH:
-        return file.get_sharded_file_paths(model.local_path)
+        if model.local_path and model.local_path.startswith('s3://'):
+            if s3Downloader is None:
+                init_s3_client(cfg)
+            return file.get_sharded_file_paths(s3Downloader.download(model.local_path))
+        else:
+            return file.get_sharded_file_paths(model.local_path)
 
 
 def get_model_file_info(
@@ -77,6 +108,7 @@ def get_model_file_info(
     huggingface_token: Optional[str] = None,
     cache_dir: Optional[str] = None,
     ollama_library_base_url: Optional[str] = None,
+    cfg: Config = None,
 ) -> List[FileEntry]:
     if model.source == SourceEnum.HUGGING_FACE:
         return HfDownloader.get_model_file_info(
@@ -96,6 +128,12 @@ def get_model_file_info(
             cache_dir=os.path.join(cache_dir, "ollama"),
         )
     elif model.source == SourceEnum.LOCAL_PATH:
+        if model.local_path and model.local_path.startswith('s3://'):
+            if s3Downloader is None:
+                init_s3_client(cfg)
+            return s3Downloader.get_model_file_size(
+                model_instance=model,
+            )
         sharded_or_original_file_paths = file.get_sharded_file_paths(model.local_path)
         file_list = [
             FileEntry(f, file.getsize(f)) for f in sharded_or_original_file_paths
@@ -542,6 +580,11 @@ class OllamaLibraryDownloader:
 
 
 class ModelScopeDownloader:
+    _max_workers = _env_int("GPUSTACK_MODELSCOPE_MAX_WORKERS", 4)
+    _download_retries = _env_int("GPUSTACK_MODELSCOPE_DOWNLOAD_RETRIES", 5, 0)
+    _download_retry_interval = _env_int(
+        "GPUSTACK_MODELSCOPE_DOWNLOAD_RETRY_INTERVAL", 10
+    )
 
     @classmethod
     def get_model_file_info(cls, model: Model) -> List[FileEntry]:
@@ -551,6 +594,63 @@ class ModelScopeDownloader:
         return file_list
 
     @classmethod
+    def check_s3_model_exists(cls, model_id: str, cfg: Config) -> bool:
+        """检查本地 S3 是否存在指定的 ModelScope 模型
+        
+        Args:
+            model_id: ModelScope 模型 ID，如 "Qwen/Qwen3.5-35B-A3B-FP8"
+            cfg: 配置对象
+            
+        Returns:
+            bool: 模型是否存在
+        """
+        # 检查是否配置了 S3
+        if not cfg or not cfg.worker_s3_host:
+            return False
+            
+        try:
+            # 初始化 S3 客户端（如果还没有初始化）
+            global s3Downloader
+            if s3Downloader is None:
+                init_s3_client(cfg)
+            
+            # 构造 S3 路径
+            s3_path = f"s3://bd-wind/datamodel/{model_id}"
+            base_path = s3_path.removeprefix("s3://")
+            bucket_name = base_path.split("/")[0]
+            
+            if s3Downloader.use_virtual_hosted_style:
+                # removeprefix(bucket_name) 不带 /，保持和 S3Downloader.download() 一致
+                base_path = base_path.removeprefix(bucket_name)
+                # base_path = "/datamodel/nv-community/xxx"
+                # split("/")[1:] = ["datamodel", "nv-community", "xxx"]
+                object_prefix = "/".join(base_path.split("/")[1:])
+            else:
+                object_prefix = "/".join(base_path.split("/")[1:])
+            
+            # 检查是否存在对象
+            objects = []
+            for obj in s3Downloader._s3_client.list_objects(
+                bucket_name, 
+                prefix=object_prefix, 
+                recursive=False,
+            ):
+                objects.append(obj)
+                break  # 只需要检查是否有文件即可
+            
+            exists = len(objects) > 0
+            if exists:
+                logger.info(f"本地 S3 存在模型: {model_id}")
+            else:
+                logger.info(f"本地 S3 不存在模型: {model_id}")
+            
+            return exists
+            
+        except Exception as e:
+            logger.warning(f"检查本地 S3 模型存在性失败: {e}")
+            return False
+
+    @classmethod
     def download(
         cls,
         model_id: str,
@@ -558,6 +658,7 @@ class ModelScopeDownloader:
         extra_file_path: Optional[str],
         local_dir: Optional[Union[str, os.PathLike[str]]] = None,
         cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
+        cfg: Config = None,
     ) -> List[str]:
         """Download a model from Model Scope.
 
@@ -568,11 +669,63 @@ class ModelScopeDownloader:
                 A filename or glob pattern to match the model file in the repo.
             cache_dir:
                 The cache directory to save the model to.
+            cfg:
+                Configuration object for S3 settings.
 
         Returns:
             The path to the downloaded model.
         """
+        
+        # 检查本地 S3 是否存在该模型
+        if cfg and cls.check_s3_model_exists(model_id, cfg):
+            logger.info(f"检测到 ModelScope 模型: {model_id}")
+            logger.info(f"本地 S3 存在该模型，优先从本地 S3 下载")
+            
+            try:
+                # 构造 S3 路径
+                s3_path = f"s3://bd-wind/datamodel/{model_id}"
+                logger.info(f"下载源: {s3_path}")
+                
+                # 从本地 S3 下载
+                global s3Downloader
+                if s3Downloader is None:
+                    init_s3_client(cfg)
+                
+                # 下载到 ModelScope 的 local_dir，保持路径一致
+                group_or_owner, name = model_id_to_group_owner_name(model_id)
+                if local_dir is None:
+                    local_dir = os.path.join(cache_dir, group_or_owner, name)
+                
+                downloaded_path = s3Downloader.download(s3_path, cache_dir=cache_dir)
+                logger.info(f"从本地 S3 下载成功: {downloaded_path}")
+                
+                # 如果指定了 file_path，需要匹配文件
+                if file_path:
+                    import fnmatch
+                    all_files = []
+                    for root, dirs, files in os.walk(downloaded_path):
+                        for f in files:
+                            rel_path = os.path.relpath(os.path.join(root, f), downloaded_path)
+                            all_files.append(rel_path)
+                    
+                    matching_files = [f for f in all_files if fnmatch.fnmatch(f, file_path)]
+                    
+                    if len(matching_files) == 0:
+                        raise ValueError(f"No file found in S3 path that match {file_path}")
+                    
+                    return [os.path.join(downloaded_path, f) for f in matching_files]
+                
+                # 返回整个目录
+                return [downloaded_path]
+                
+            except Exception as e:
+                logger.warning(f"从本地 S3 下载失败: {e}")
+                logger.info(f"降级到 ModelScope 下载")
+                # 继续执行下面的 ModelScope 下载逻辑
 
+        # 从 ModelScope 下载（原有逻辑）
+        logger.info(f"从 ModelScope 下载模型: {model_id}")
+        
         group_or_owner, name = model_id_to_group_owner_name(model_id)
         lock_filename = os.path.join(cache_dir, group_or_owner, f"{name}.lock")
 
@@ -590,15 +743,43 @@ class ModelScopeDownloader:
                         f"No file found in {model_id} that match {file_path}"
                     )
 
-                model_dir = modelscope_snapshot_download(
+                model_dir = cls._snapshot_download_with_retry(
                     model_id=model_id,
                     local_dir=local_dir,
                     allow_patterns=matching_files,
+                    max_workers=cls._max_workers,
                 )
                 return [os.path.join(model_dir, file) for file in matching_files]
 
-            modelscope_snapshot_download(
+            cls._snapshot_download_with_retry(
                 model_id=model_id,
                 local_dir=local_dir,
+                max_workers=cls._max_workers,
             )
             return [local_dir]
+
+    @classmethod
+    def _snapshot_download_with_retry(cls, **kwargs):
+        last_error = None
+        for attempt in range(cls._download_retries + 1):
+            try:
+                return modelscope_snapshot_download(**kwargs)
+            except Exception as e:
+                last_error = e
+                if attempt >= cls._download_retries:
+                    break
+
+                sleep_seconds = cls._download_retry_interval * (attempt + 1)
+                model_id = kwargs.get("model_id")
+                logger.warning(
+                    "ModelScope download failed for %s, retrying in %s seconds "
+                    "(attempt %s/%s): %s",
+                    model_id,
+                    sleep_seconds,
+                    attempt + 1,
+                    cls._download_retries,
+                    e,
+                )
+                time.sleep(sleep_seconds)
+
+        raise last_error

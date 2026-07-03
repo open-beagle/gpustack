@@ -13,13 +13,28 @@ if "TRANSFORMERS_NO_ADVISORY_WARNINGS" not in os.environ:
 TRACE_LEVEL = 5
 
 
+class _RenameFilter(logging.Filter):
+    """将日志中 gpustack 替换为 stack"""
+
+    def filter(self, record):
+        if record.name.startswith("gpustack"):
+            record.name = "stack" + record.name[len("gpustack"):]
+        # 替换最终格式化后的消息，避免干扰 % 格式化
+        record.msg = record.getMessage().replace("gpustack", "stack")
+        record.args = None
+        return True
+
+
 def setup_logging(debug: bool = False):
     level = logging.DEBUG if debug else logging.INFO
+
+    handler = logging.StreamHandler()
+    handler.addFilter(_RenameFilter())
 
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler()],
+        handlers=[handler],
     )
     logging.addLevelName(TRACE_LEVEL, "TRACE")
     logging.Logger.trace = trace
@@ -67,10 +82,32 @@ def setup_logging(debug: bool = False):
         else:
             logger.disabled = True
 
+    # 替换标准输出流，处理子进程直接输出中的 gpustack
+    sys.stdout = _RenameStream(sys.stdout)
+    sys.stderr = _RenameStream(sys.stderr)
+
 
 def trace(self, message, *args, **kwargs):
     if self.isEnabledFor(TRACE_LEVEL):
         self._log(TRACE_LEVEL, message, args, **kwargs)
+
+
+class _RenameStream:
+    """包装标准输出流，将子进程直接输出中的 gpustack 替换为 stack"""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        if isinstance(text, str):
+            text = text.replace("gpustack", "stack")
+        return self._stream.write(text)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 class RedirectStdoutStderr:

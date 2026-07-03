@@ -27,6 +27,7 @@ from gpustack.schemas.models import (
     get_backend,
     is_audio_model,
     is_gguf_model,
+    model_categories,
 )
 from gpustack.utils.gpu import any_gpu_match
 from gpustack.utils.hub import (
@@ -235,19 +236,21 @@ async def evaluate_environment(
     workers: List[Worker],
 ) -> Tuple[bool, List[str]]:
     backend = get_backend(model)
-    has_linux_workers = any(worker.labels.get("os") == "linux" for worker in workers)
-    if backend == BackendEnum.VLLM and not has_linux_workers:
+    has_linux_workers = any(
+        (worker.labels or {}).get("os") == "linux" for worker in workers
+    )
+    if backend in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI) and not has_linux_workers:
         return False, [
-            "The model requires Linux workers but none are available. Use GGUF models instead."
+            f"The {backend} backend requires Linux workers but none are available. Use GGUF models instead."
         ]
 
     only_windows_workers = all(
-        worker.labels.get("os") == "windows" for worker in workers
+        (worker.labels or {}).get("os") == "windows" for worker in workers
     )
     if (
         only_windows_workers
         and backend == BackendEnum.VOX_BOX
-        and CategoryEnum.TEXT_TO_SPEECH.value in model.categories
+        and CategoryEnum.TEXT_TO_SPEECH.value in model_categories(model)
     ):
         return False, ["The model is not supported on Windows workers."]
 
@@ -266,6 +269,11 @@ async def evaluate_model_metadata(
     model: ModelSpec,
 ) -> Tuple[bool, List[str]]:
     try:
+        if model.local_path and model.local_path.startswith("s3://"):
+            # s3://beagle_wind/bd-wind/datamodel/4c3c6c88-912c-48da-910c-fea84da1fedc/q8/qwen2.5-3b-instruct-q8_0.gguf
+            # /var/lib/gpustack
+            arr = model.local_path.split("datamodel")
+            model.local_path = config.data_dir+"/cache"+"/beagle"+arr[1]
         if model.source == SourceEnum.LOCAL_PATH and not os.path.exists(
             model.local_path
         ):
@@ -294,6 +302,9 @@ async def evaluate_model_metadata(
             await scheduler.evaluate_gguf_model(config, model)
         elif is_audio_model(model):
             await scheduler.evaluate_audio_model(config, model)
+        elif get_backend(model) == BackendEnum.VLLM_OMNI:
+            # vLLM-Omni can auto-detect model type, skip architecture check
+            model.categories = model.categories or [CategoryEnum.LLM]
         else:
             await scheduler.evaluate_pretrained_config(model)
 
@@ -310,9 +321,9 @@ def set_default_worker_selector(
     if (
         not model.worker_selector
         and not model.gpu_selector
-        and get_backend(model) == BackendEnum.VLLM
+        and get_backend(model) in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI)
     ):
-        # vLLM models are only supported on Linux
+        # vLLM and vLLM-Omni models are only supported on Linux.
         model.worker_selector = {"os": "linux"}
     return model
 

@@ -9,6 +9,7 @@ from gpustack.policies.candidate_selectors import VLLMResourceFitSelector
 from gpustack.policies.scorers.placement_scorer import PlacementScorer
 from gpustack.scheduler import scheduler
 from gpustack.schemas.models import (
+    BackendEnum,
     CategoryEnum,
     ComputedResourceClaim,
     GPUSelector,
@@ -30,6 +31,37 @@ from tests.fixtures.workers.fixtures import (
     linux_nvidia_2_4080_16gx2,
 )
 from tests.utils.scheduler import compare_candidates
+
+
+def test_image_model_ignores_gpu_memory_utilization_parameter(config):
+    model = new_model(
+        1,
+        "qwen-image-2512",
+        1,
+        model_scope_model_id="Qwen/Qwen-Image-2512",
+        categories=[CategoryEnum.IMAGE],
+        backend_parameters=["--gpu-memory-utilization", "0.9"],
+    )
+
+    selector = VLLMResourceFitSelector(config, model)
+
+    assert selector._gpu_memory_utilization == 0
+
+
+def test_vllm_omni_backend_ignores_gpu_memory_utilization_parameter(config):
+    model = new_model(
+        1,
+        "qwen-image-2512",
+        1,
+        model_scope_model_id="Qwen/Qwen-Image-2512",
+        categories=[CategoryEnum.LLM],
+        backend_parameters=["--gpu-memory-utilization", "0.9"],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+
+    selector = VLLMResourceFitSelector(config, model)
+
+    assert selector._gpu_memory_utilization == 0
 
 
 @pytest.mark.asyncio

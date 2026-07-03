@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 BUILTIN_LLAMA_BOX_VERSION = "v0.0.171"
 BUILTIN_GGUF_PARSER_VERSION = "v0.22.1"
+BUILTIN_LLAMA_CPP_VERSION = "b8322"
+BUILTIN_LLAMA_CPP_CUDA_VERSION = "12.8.1"
 
 
 class ToolsManager:
@@ -130,6 +132,17 @@ class ToolsManager:
         self.download_llama_box()
         self.download_gguf_parser()
         self.download_fastfetch()
+        
+        # Only download llama.cpp for supported environments
+        if (
+            self._os == "linux"
+            and self._arch == "amd64"
+            and self._device == platform.DeviceTypeEnum.CUDA.value
+        ):
+            try:
+                self.install_llama_cpp()
+            except Exception as e:
+                logger.warning(f"Failed to download llama.cpp: {e}")
 
     def remove_cached_tools(self):
         """
@@ -177,6 +190,8 @@ class ToolsManager:
             self.install_versioned_llama_box(version)
         elif backend == BackendEnum.VLLM:
             self.install_versioned_vllm_with_deps(version)
+        elif backend == BackendEnum.VLLM_OMNI:
+            self.install_versioned_vllm_omni_with_deps(version)
         elif backend == BackendEnum.VOX_BOX:
             self.install_versioned_vox_box_with_deps(version)
         elif backend == BackendEnum.ASCEND_MINDIE:
@@ -185,6 +200,30 @@ class ToolsManager:
             raise NotImplementedError(
                 f"Auto-installation for versioned {backend} is not supported. Please install it manually."
             )
+
+    def install_llama_cpp(self, version: str = BUILTIN_LLAMA_CPP_VERSION) -> Path:
+        target_dir = (
+            self.third_party_bin_path
+            / "llama.cpp"
+            / get_llama_cpp_version_dir_name(
+                version,
+                self._os,
+                self._arch,
+                self._device,
+            )
+        )
+        target_file = get_llama_cpp_command(target_dir)
+        version_key = target_file.parent.name
+
+        if target_file.is_file():
+            if self._current_tools_version.get(version_key) != version:
+                self._update_versions_file(version_key, version)
+            logger.debug(f"{target_file.name} already exists, skipping download")
+            return target_file
+
+        self._download_llama_cpp(version, target_dir)
+        self._update_versions_file(version_key, version)
+        return target_file
 
     def download_llama_box(self):
         version = BUILTIN_LLAMA_BOX_VERSION
@@ -313,6 +352,15 @@ class ToolsManager:
         )
         self.install_versioned_package_by_pipx("vllm", version, *install_args)
 
+    def install_versioned_vllm_omni_with_deps(self, version: str):
+        # Get custom dependencies from dependency manager
+        install_args = (
+            self._dependency_manager.get_pipx_install_args()
+            if self._dependency_manager is not None
+            else []
+        )
+        self.install_versioned_package_by_pipx("vllm-omni", version, *install_args)
+
     def install_versioned_vox_box_with_deps(self, version: str):
         # Get custom dependencies from dependency manager
         install_args = (
@@ -378,8 +426,39 @@ class ToolsManager:
             logger.info(
                 f"{package} {version} successfully installed and linked to {target_path}"
             )
+            self._install_sitecustomize_for_versioned_package(target_path)
         except Exception as e:
             raise Exception(f"Failed to install {package} {version} using pipx: {e}")
+
+    def _install_sitecustomize_for_versioned_package(self, command_path: Path):
+        command_path = command_path.resolve()
+        venv_dir = command_path.parent.parent
+        python_path = venv_dir / "bin" / "python"
+        if not python_path.exists():
+            logger.warning(
+                f"Failed to install sitecustomize for {command_path}: {python_path} not found"
+            )
+            return
+
+        try:
+            result = subprocess.run(
+                [
+                    str(python_path),
+                    "-c",
+                    "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            site_packages = Path(result.stdout.strip())
+            site_packages.mkdir(parents=True, exist_ok=True)
+            source = Path(__file__).resolve().parents[1] / "_sitecustomize.py"
+            shutil.copyfile(source, site_packages / "sitecustomize.py")
+        except Exception as e:
+            logger.warning(
+                f"Failed to install sitecustomize for {command_path}: {e}"
+            )
 
     def _get_pipx_bin_dir(self, pipx_path: str) -> Path:
         """
@@ -505,6 +584,70 @@ class ToolsManager:
 
         # Clean up temporary directory
         shutil.rmtree(llama_box_tmp_dir)
+
+    def _download_llama_cpp(self, version: str, target_dir: Path):
+        if (
+            self._os != "linux"
+            or self._arch != "amd64"
+            or self._device != platform.DeviceTypeEnum.CUDA.value
+        ):
+            raise Exception(
+                "Auto-installation for llama.cpp is currently only supported "
+                "on linux/amd64 CUDA workers. Please install llama-server manually "
+                "and set GPUSTACK_LLAMA_CPP_SERVER_PATH."
+            )
+
+        if not self._download_base_url:
+            raise Exception(
+                "llama.cpp binary auto-installation requires tools_download_base_url. "
+                "Set --tools-download-base-url to the S3 mirror containing "
+                "gpustack/llama.cpp packages, or install llama-server manually and "
+                "set GPUSTACK_LLAMA_CPP_SERVER_PATH."
+            )
+
+        llama_cpp_tmp_dir = target_dir.joinpath("tmp-llama.cpp")
+
+        if os.path.exists(llama_cpp_tmp_dir):
+            shutil.rmtree(llama_cpp_tmp_dir)
+        os.makedirs(llama_cpp_tmp_dir, exist_ok=True)
+
+        package_name = get_llama_cpp_package_name(version)
+        tmp_file = llama_cpp_tmp_dir / f"{package_name}.tar.gz"
+        url_path = f"gpustack/llama.cpp/{package_name}.tar.gz"
+        logger.info(f"Downloading llama.cpp '{version}'")
+        self._download_file(url_path, tmp_file)
+
+        try:
+            shutil.unpack_archive(str(tmp_file), str(llama_cpp_tmp_dir))
+        except Exception as e:
+            raise Exception(f"error extracting {tmp_file}: {e}") from e
+
+        def ignore_archives(_, names):
+            return [
+                name
+                for name in names
+                if name.endswith(".zip") or name.endswith(".tar.gz")
+            ]
+
+        shutil.copytree(
+            llama_cpp_tmp_dir,
+            target_dir,
+            dirs_exist_ok=True,
+            ignore=ignore_archives,
+            symlinks=True,
+        )
+
+        target_file = get_llama_cpp_command(target_dir)
+        if not target_file.exists():
+            raise Exception(f"failed to find llama-server in {tmp_file}")
+
+        for binary in ["llama-server", "llama-cli", "rpc-server"]:
+            file = target_dir / binary
+            if file.exists() and self._os != "windows":
+                st = os.stat(file)
+                os.chmod(file, st.st_mode | stat.S_IEXEC)
+
+        shutil.rmtree(llama_cpp_tmp_dir)
 
     def _link_llama_box_rpc_server(self, target_dir: Path, src_file_name: str):
         """
@@ -988,6 +1131,37 @@ def get_llama_box_command(
     if isinstance(base_path, str):
         base_path = Path(base_path)
     return base_path.joinpath(command)
+
+
+def get_llama_cpp_command(
+    base_path: Union[
+        str,
+        Path,
+    ],
+) -> Path:
+    command = "llama-server"
+    if platform.system() == "windows":
+        command += ".exe"
+    if isinstance(base_path, str):
+        base_path = Path(base_path)
+    return base_path.joinpath(command)
+
+
+def get_llama_cpp_package_name(version: str = BUILTIN_LLAMA_CPP_VERSION) -> str:
+    return f"llama-cpp-cuda-{BUILTIN_LLAMA_CPP_CUDA_VERSION}-{version}-linux-x64"
+
+
+def get_llama_cpp_version_dir_name(
+    version: str,
+    system: str = None,
+    arch: str = None,
+    device: str = None,
+) -> str:
+    system = system or platform.system()
+    arch = arch or platform.arch()
+    device = device or platform.device()
+    device = f"-{device}" if device else ""
+    return os.path.join(f"llama.cpp-{version}-{system}-{arch}{device}")
 
 
 def get_llama_box_version_dir_name(

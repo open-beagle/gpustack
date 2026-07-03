@@ -1,7 +1,43 @@
 import pytest
 from tests.utils.model import new_model
+from tests.fixtures.workers.fixtures import macos_metal_1_m1pro_21g
+from gpustack.scheduler.evaluator import evaluate_environment, set_default_worker_selector
 from gpustack.scheduler.scheduler import evaluate_pretrained_config
 from gpustack.schemas.models import CategoryEnum, BackendEnum
+
+
+@pytest.mark.asyncio
+async def test_vllm_omni_requires_linux_workers(config):
+    model = new_model(
+        1,
+        "qwen-image",
+        1,
+        model_scope_model_id="Qwen/Qwen-Image",
+        backend_parameters=[],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+
+    is_compatible, messages = await evaluate_environment(
+        model, [macos_metal_1_m1pro_21g()]
+    )
+
+    assert is_compatible is False
+    assert "requires Linux workers" in messages[0]
+
+
+def test_set_default_worker_selector_for_vllm_omni():
+    model = new_model(
+        1,
+        "qwen-image",
+        1,
+        model_scope_model_id="Qwen/Qwen-Image",
+        backend_parameters=[],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+
+    set_default_worker_selector(model)
+
+    assert model.worker_selector == {"os": "linux"}
 
 
 @pytest.mark.asyncio

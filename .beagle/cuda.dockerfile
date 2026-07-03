@@ -3,7 +3,7 @@ ARG BASE=registry.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04
 FROM $BASE
 
 ARG AUTHOR=mengkzhaoyun@gmail.com
-ARG VERSION=v0.7.1
+ARG VERSION=dev
 
 LABEL maintainer=$AUTHOR version=$VERSION
 
@@ -15,6 +15,7 @@ RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu
 
 # 安装系统依赖 + 设置时区
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     git \
     curl \
     wget \
@@ -26,20 +27,61 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     gcc \
     g++ \
+    ffmpeg \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libxcb1 \
+    libxcb-xinerama0 \
+    libxcb-icccm4 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-randr0 \
+    libxcb-render-util0 \
+    libxcb-shape0 \
+    libxcb-xfixes0 \
+    libxcb-xkb1 \
+    libxkbcommon-x11-0 \
+    cuda-nvcc-12-8 \
+    libcurand-dev-12-8 \
+    cuda-nvrtc-dev-12-8 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
 
-# 安装 GPUStack 和 vLLM
+ARG PYPI_MIRROR=http://mirrors.cloud.aliyuncs.com/pypi/simple/
+ARG PYPI_HOST=mirrors.cloud.aliyuncs.com
+
+# 安装稳定依赖层。业务 wheel 或 UI 变化时，该层可以复用 Docker 缓存。
+COPY ./dist/requirements-vllm.txt /tmp/requirements-vllm.txt
+RUN python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --upgrade pip && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --upgrade 'pipx==1.7.1' 'argcomplete>=1.9.4' && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 -r /tmp/requirements-vllm.txt && \
+    # 修复 transformers RoPE 验证类型错误 (set -= list)
+    python3 -c "\
+import transformers.modeling_rope_utils as m; \
+p = m.__file__; \
+c = open(p, 'r').read(); \
+c = c.replace('received_keys -= ignore_keys', 'received_keys -= set(ignore_keys)'); \
+open(p, 'w').write(c)" && \
+    command -v vllm && \
+    command -v vllm-omni && \
+    python3 -c "\
+import importlib.metadata as m; \
+from packaging.version import Version; \
+assert Version(m.version('argcomplete')) >= Version('1.9.4'), m.version('argcomplete'); \
+print('argcomplete', m.version('argcomplete'))" && \
+    pipx --version && \
+    python3 -m pip show vllm vllm-omni && \
+    rm -f /tmp/requirements-vllm.txt
+
+# 安装 GPUStack 应用层。依赖已在上一层安装，避免 wheel 内容变化导致重建 vLLM 大层。
 COPY ./dist/*.whl /tmp/
-RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)[vllm]" && \
-    python3 -m pip install -i https://mirrors.aliyun.com/pypi/simple/ --upgrade pip && \
-    pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/ && \
-    pip3 install --no-cache-dir --default-timeout=12000 $WHEEL_PACKAGE && \
+RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
+    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --no-deps --force-reinstall "${WHEEL_PACKAGE}" && \
     rm -rf /tmp/*.whl
 
 # 下载工具
-RUN gpustack download-tools --device cuda
+RUN gpustack download-tools --device cuda --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
 # 设置目录
 RUN mkdir -p /var/lib/gpustack && \

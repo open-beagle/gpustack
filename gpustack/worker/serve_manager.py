@@ -10,7 +10,7 @@ import logging
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
-from gpustack.logging import (
+from gpustack.logginglocal import (
     RedirectStdoutStderr,
 )
 from gpustack.utils import network, platform
@@ -19,13 +19,14 @@ from gpustack.utils.process import terminate_process_tree, add_signal_handlers
 from gpustack.worker.backends.llama_box import LlamaBoxServer
 from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.vllm import VLLMServer
+from gpustack.worker.backends.vllm_omni import VLLMOmniServer
 from gpustack.worker.backends.ascend_mindie import AscendMindIEServer
 from gpustack.client import ClientSet
 from gpustack.schemas.models import (
     BackendEnum,
     Model,
     ModelInstance,
-    ModelInstanceUpdate,
+    ModelInstanceInternalUpdate,
     ModelInstanceStateEnum,
     get_backend,
     DistributedServerCoordinateModeEnum,
@@ -191,14 +192,21 @@ class ServeManager:
         sw_pos: Optional[int] = None
         sw: Optional[ModelInstanceSubordinateWorker] = None
         if not is_main_worker:
+            subordinate_workers = (
+                mi.distributed_servers.subordinate_workers
+                if mi.distributed_servers and mi.distributed_servers.subordinate_workers
+                else []
+            )
             sw_pos = next(
                 (
                     i
-                    for i, sw in enumerate(mi.distributed_servers.subordinate_workers)
+                    for i, sw in enumerate(subordinate_workers)
                     if sw.worker_id == self._worker_id
                 ),
+                None
             )
-            sw = mi.distributed_servers.subordinate_workers[sw_pos]
+            if sw_pos is not None:
+                sw = subordinate_workers[sw_pos]
 
         try:
             model = self._get_model_with_cache(mi)
@@ -329,17 +337,19 @@ class ServeManager:
                     VoxBoxServer(clientset, mi, cfg, worker_id).start()
                 elif backend == BackendEnum.ASCEND_MINDIE:
                     AscendMindIEServer(clientset, mi, cfg, worker_id).start()
+                elif backend == BackendEnum.VLLM_OMNI:
+                    VLLMOmniServer(clientset, mi, cfg, worker_id).start()
                 else:
                     raise ValueError(f"Unsupported backend {backend}")
 
     def _update_model_instance(self, id: str, **kwargs):
         mi_public = self._clientset.model_instances.get(id=id)
 
-        mi = ModelInstanceUpdate(**mi_public.model_dump())
+        mi = ModelInstanceInternalUpdate(**mi_public.model_dump())
         for key, value in kwargs.items():
             set_attr(mi, key, value)
 
-        self._clientset.model_instances.update(id=id, model_update=mi)
+        self._clientset.model_instances.internal_update(id=id, model_update=mi)
 
     def _get_model_with_cache(self, mi: ModelInstance) -> Model:
         """Get model from cache or fetch from clientset."""
@@ -433,25 +443,30 @@ class ServeManager:
                                 "state": ModelInstanceStateEnum.ERROR,
                                 "state_message": f"Inference server exited with code {process.exitcode}.",
                             }
-                        # Get patch dict for subordinate worker.
                         else:
+                            subordinate_workers = (
+                                mi.distributed_servers.subordinate_workers
+                                if mi.distributed_servers and mi.distributed_servers.subordinate_workers
+                                else []
+                            )
                             sw_pos = next(
                                 (
                                     i
-                                    for i, sw in enumerate(
-                                        mi.distributed_servers.subordinate_workers
-                                    )
+                                    for i, sw in enumerate(subordinate_workers)
                                     if sw.worker_id == self._worker_id
                                 ),
+                                None
                             )
-                            sw = mi.distributed_servers.subordinate_workers[sw_pos]
-                            sw.state = ModelInstanceStateEnum.ERROR
-                            sw.state_message = (
-                                f"Inference server exited with code {process.exitcode}."
-                            )
-                            patch_dict = {
-                                f"distributed_servers.subordinate_workers.{sw_pos}": sw,
-                            }
+                            patch_dict = {}
+                            if sw_pos is not None:
+                                sw = subordinate_workers[sw_pos]
+                                sw.state = ModelInstanceStateEnum.ERROR
+                                sw.state_message = (
+                                    f"Inference server exited with code {process.exitcode}."
+                                )
+                                patch_dict = {
+                                    f"distributed_servers.subordinate_workers.{sw_pos}": sw,
+                                }
                         # Update model instance.
                         self._update_model_instance(mi.id, **patch_dict)
                 except NotFoundException:
@@ -485,6 +500,10 @@ class ServeManager:
                         patch_dict = {
                             "state": ModelInstanceStateEnum.RUNNING,
                             "state_message": "",
+                            # The override is a one-shot scheduling constraint
+                            # for manual scale-up. Once the instance is running,
+                            # future restarts should use model-level placement.
+                            "placement_override": None,
                         }
                     # Otherwise, update the main worker state to ERROR.
                     else:
@@ -500,23 +519,29 @@ class ServeManager:
                         self._starting_model_instances.pop(mi.id, None)
                         continue
                     # Otherwise, update subordinate worker state to RUNNING.
+                    subordinate_workers = (
+                        mi.distributed_servers.subordinate_workers
+                        if mi.distributed_servers and mi.distributed_servers.subordinate_workers
+                        else []
+                    )
                     sw_pos = next(
                         (
                             i
-                            for i, sw in enumerate(
-                                mi.distributed_servers.subordinate_workers
-                            )
+                            for i, sw in enumerate(subordinate_workers)
                             if sw.worker_id == self._worker_id
                         ),
+                        None
                     )
-                    sw = mi.distributed_servers.subordinate_workers[sw_pos]
-                    if sw.state == ModelInstanceStateEnum.RUNNING:
-                        continue
-                    sw.state = ModelInstanceStateEnum.RUNNING
-                    sw.state_message = ""
-                    patch_dict = {
-                        f"distributed_servers.subordinate_workers.{sw_pos}": sw,
-                    }
+                    patch_dict = {}
+                    if sw_pos is not None:
+                        sw = subordinate_workers[sw_pos]
+                        if sw.state == ModelInstanceStateEnum.RUNNING:
+                            continue
+                        sw.state = ModelInstanceStateEnum.RUNNING
+                        sw.state_message = ""
+                        patch_dict = {
+                            f"distributed_servers.subordinate_workers.{sw_pos}": sw,
+                        }
                 # Update model instance.
                 self._update_model_instance(mi.id, **patch_dict)
                 # Remove from starting instances if it was started.
@@ -551,16 +576,29 @@ def is_ready(backend: str, mi: ModelInstance) -> bool:
             # Use worker IP instead.
             hostname = mi.worker_ip
 
-        # Check /v1/models by default if dedicated health check endpoint is not available.
-        # This is served by all backends (llama-box, vox-box, vllm, mindIE)
-        health_check_url = f"http://{hostname}:{mi.port}/v1/models"
         if backend == BackendEnum.LLAMA_BOX:
             # For llama-box, use /health to avoid printing error logs.
-            health_check_url = f"http://{hostname}:{mi.port}/health"
+            # The llama.cpp runtime also runs under the GGUF/llama-box control
+            # plane, so fall back to /v1/models for compatibility.
+            health_check_urls = [
+                f"http://{hostname}:{mi.port}/health",
+                f"http://{hostname}:{mi.port}/v1/models",
+            ]
+        elif backend == BackendEnum.VLLM_OMNI:
+            # For vllm-omni, use /health endpoint
+            health_check_urls = [f"http://{hostname}:{mi.port}/health"]
+        else:
+            # Check /v1/models by default if dedicated health check endpoint is not available.
+            # This is served by all backends (llama-box, vox-box, vllm, mindIE, vllm-omni)
+            health_check_urls = [f"http://{hostname}:{mi.port}/v1/models"]
 
-        response = requests.get(health_check_url, timeout=1)
-        if response.status_code == 200:
-            return True
+        for health_check_url in health_check_urls:
+            try:
+                response = requests.get(health_check_url, timeout=1)
+                if response.status_code == 200:
+                    return True
+            except Exception:
+                continue
     except Exception:
         pass
     return False

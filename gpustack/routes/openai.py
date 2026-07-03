@@ -27,6 +27,7 @@ from gpustack.schemas.models import (
     BackendEnum,
     CategoryEnum,
     Model,
+    get_backend,
 )
 from gpustack.server.db import get_engine
 from gpustack.server.deps import SessionDep
@@ -144,13 +145,17 @@ async def list_models(
     models = (await session.exec(statement)).all()
     result = SyncPage[OAIModel](data=[], object="list")
     for model in models:
+        meta = None
+        if with_meta:
+            meta = dict(model.meta) if model.meta else {}
+            meta["backend"] = model.backend or get_backend(model)
         result.data.append(
             OAIModel(
                 id=model.name,
                 object="model",
                 created=int(model.created_at.timestamp()),
                 owned_by="gpustack",
-                meta=model.meta if with_meta else None,
+                meta=meta,
             )
         )
     return result
@@ -182,6 +187,10 @@ async def proxy_request_by_model(request: Request, endpoint: str):
                 message=f"Worker with ID {instance.worker_id} not found",
                 is_openai_exception=True,
             )
+        request.state.model_instance_id = instance.id
+        request.state.worker_id = instance.worker_id
+        request.state.worker_name = instance.worker_name
+        request.state.worker_ip = instance.worker_ip
 
     url = f"http://{instance.worker_ip}:{worker.port}/proxy/v1/{endpoint}"
     token = request.app.state.server_config.token
@@ -343,11 +352,11 @@ async def handle_streaming_request(
                 timeout=timeout,
             ) as resp:
                 if resp.status >= 400:
-                    yield await resp.read(), resp.headers, resp.status
+                    yield await resp.read(), filter_response_headers(resp.headers), resp.status
                     return
 
                 async for chunk in _stream_response_chunks(resp):
-                    yield chunk, resp.headers, resp.status
+                    yield chunk, filter_response_headers(resp.headers), resp.status
         except aiohttp.ClientError as e:
             error_response = OpenAIAPIErrorResponse(
                 error=OpenAIAPIError(
@@ -396,7 +405,7 @@ async def handle_standard_request(
         content = await response.read()
         return Response(
             status_code=response.status,
-            headers=dict(response.headers),
+            headers=filter_response_headers(response.headers),
             content=content,
         )
 
@@ -410,6 +419,14 @@ def filter_headers(headers):
         and key.lower() != "content-type"
         and key.lower() != "transfer-encoding"
         and key.lower() != "authorization"
+    }
+
+
+def filter_response_headers(headers):
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in ["server", "date", "content-length", "content-encoding", "transfer-encoding"]
     }
 
 

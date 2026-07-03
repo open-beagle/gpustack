@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install /dist/*.whl && \
+    # 安装 vLLM-Omni 用于支持 Diffusion 模型（Z-Image、Flux 等）
+    pip install vllm-omni && \
     pip cache purge && \
     rm -rf /dist && \
     ln -s /usr/local/corex-4.3.0/lib64/python3/dist-packages/bin/vllm /usr/local/bin/vllm

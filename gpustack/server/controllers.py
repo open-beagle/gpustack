@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 import string
@@ -15,8 +16,10 @@ from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.models import (
     BackendEnum,
     Model,
+    ModelPlacementOverride,
     ModelInstance,
-    ModelInstanceCreate,
+    ModelInstanceInternalCreate,
+    ModelInstancePlacementOverride,
     ModelInstanceStateEnum,
     SourceEnum,
     get_backend,
@@ -31,6 +34,16 @@ from gpustack.server.services import (
 )
 
 logger = logging.getLogger(__name__)
+
+replica_sync_locks: Dict[int, asyncio.Lock] = {}
+
+
+def safe_event_attr(obj: Any, attr: str, default: str = "<unknown>"):
+    try:
+        value = getattr(obj, attr)
+    except Exception:
+        return default
+    return value if value is not None else default
 
 
 class ModelController:
@@ -57,12 +70,13 @@ class ModelController:
         """
 
         model: Model = event.data
+        model_name = safe_event_attr(model, "name")
         try:
             async with AsyncSession(self._engine) as session:
                 await set_default_worker_selector(session, model)
                 await sync_replicas(session, model, self._config)
         except Exception as e:
-            logger.error(f"Failed to reconcile model {model.name}: {e}")
+            logger.error(f"Failed to reconcile model {model_name}: {e}")
 
 
 class ModelInstanceController:
@@ -89,8 +103,15 @@ class ModelInstanceController:
         """
 
         model_instance: ModelInstance = event.data
+        model_instance_name = safe_event_attr(model_instance, "name")
         try:
             async with AsyncSession(self._engine) as session:
+                model_instance = await ModelInstance.one_by_id(
+                    session, model_instance.id
+                )
+                if not model_instance:
+                    return
+
                 model = await Model.one_by_id(session, model_instance.model_id)
                 if not model:
                     return
@@ -125,7 +146,7 @@ class ModelInstanceController:
 
         except Exception as e:
             logger.error(
-                f"Failed to reconcile model instance {model_instance.name}: {e}"
+                f"Failed to reconcile model instance {model_instance_name}: {e}"
             )
 
     async def get_meta_from_running_instance(
@@ -180,16 +201,44 @@ async def set_default_worker_selector(session: AsyncSession, model: Model):
     if (
         not model.worker_selector
         and not model.gpu_selector
-        and get_backend(model) == BackendEnum.VLLM
+        and get_backend(model) in (BackendEnum.VLLM, BackendEnum.VLLM_OMNI)
     ):
-        # vLLM models are only supported on Linux
+        # vLLM and vLLM-Omni models are only supported on Linux.
         model.worker_selector = {"os": "linux"}
         await ModelService(session).update(model)
 
 
-async def sync_replicas(session: AsyncSession, model: Model, cfg: Config):
+async def sync_replicas(
+    session: AsyncSession,
+    model: Model,
+    cfg: Config,
+    placement_override: ModelPlacementOverride = None,
+    scale_in_instance_ids: List[int] = None,
+):
     """
-    Synchronize the replicas.
+    同步模型副本数。
+    """
+
+    lock = replica_sync_locks.setdefault(model.id, asyncio.Lock())
+    async with lock:
+        await _sync_replicas_locked(
+            session,
+            model,
+            cfg,
+            placement_override=placement_override,
+            scale_in_instance_ids=scale_in_instance_ids,
+        )
+
+
+async def _sync_replicas_locked(
+    session: AsyncSession,
+    model: Model,
+    cfg: Config,
+    placement_override: ModelPlacementOverride = None,
+    scale_in_instance_ids: List[int] = None,
+):
+    """
+    已获取模型级锁后的副本同步逻辑。
     """
 
     if model.deleted_at is not None:
@@ -197,11 +246,26 @@ async def sync_replicas(session: AsyncSession, model: Model, cfg: Config):
 
     instances = await ModelInstance.all_by_field(session, "model_id", model.id)
     if len(instances) < model.replicas:
-        for _ in range(model.replicas - len(instances)):
+        # placement_override is request-scoped and applies only to instances
+        # created in this sync. Existing replicas keep their current placement.
+        replica_groups = (
+            placement_override.groups_for_new_replicas()
+            if placement_override
+            else []
+        )
+        for index in range(model.replicas - len(instances)):
             name_prefix = ''.join(
                 random.choices(string.ascii_letters + string.digits, k=5)
             )
-            instance = ModelInstanceCreate(
+            instance_placement_override = None
+            if index < len(replica_groups):
+                replica_group = replica_groups[index]
+                if replica_group.gpu_selector and replica_group.gpu_selector.gpu_ids:
+                    instance_placement_override = ModelInstancePlacementOverride(
+                        gpu_selector=replica_group.gpu_selector
+                    )
+
+            instance = ModelInstanceInternalCreate(
                 name=f"{model.name}-{name_prefix}",
                 model_id=model.id,
                 model_name=model.name,
@@ -213,20 +277,66 @@ async def sync_replicas(session: AsyncSession, model: Model, cfg: Config):
                 model_scope_file_path=model.model_scope_file_path,
                 local_path=model.local_path,
                 state=ModelInstanceStateEnum.PENDING,
+                placement_override=instance_placement_override,
             )
 
             await ModelInstanceService(session).create(instance)
             logger.debug(f"Created model instance for model {model.name}")
 
     elif len(instances) > model.replicas:
-        candidates = await find_scale_down_candidates(instances, model)
-
-        scale_down_count = len(candidates) - model.replicas
+        scale_down_count = len(instances) - model.replicas
         if scale_down_count > 0:
-            for candidate in candidates[:scale_down_count]:
-                instance = candidate.model_instance
+            if scale_in_instance_ids:
+                deleting_instances = specified_scale_down_instances(
+                    instances, model, scale_in_instance_ids, scale_down_count
+                )
+            else:
+                candidates = await find_scale_down_candidates(instances, model)
+                deleting_instances = [
+                    candidate.model_instance
+                    for candidate in candidates[:scale_down_count]
+                ]
+            for instance in deleting_instances:
+                current_instances = await ModelInstance.all_by_field(
+                    session, "model_id", model.id
+                )
+                if len(current_instances) <= model.replicas:
+                    break
+                current_instance_ids = {current.id for current in current_instances}
+                if instance.id not in current_instance_ids:
+                    continue
                 await ModelInstanceService(session).delete(instance)
                 logger.debug(f"Deleted model instance {instance.name}")
+
+
+def specified_scale_down_instances(
+    instances: List[ModelInstance],
+    model: Model,
+    scale_in_instance_ids: List[int],
+    scale_down_count: int,
+) -> List[ModelInstance]:
+    if len(scale_in_instance_ids) != scale_down_count:
+        raise ValueError(
+            "scale_in_instance_ids count must match scale down replica count"
+        )
+    seen_ids = set()
+    instance_map = {}
+    for instance in instances:
+        if instance.model_id == model.id:
+            instance_map[instance.id] = instance
+    deleting_instances = []
+    for instance_id in scale_in_instance_ids:
+        if instance_id in seen_ids:
+            raise ValueError("scale_in_instance_ids must not contain duplicates")
+        seen_ids.add(instance_id)
+        instance = instance_map.get(instance_id)
+        if not instance:
+            raise ValueError(
+                f"scale_in_instance_ids contains instance {instance_id} "
+                f"that does not belong to model {model.id}"
+            )
+        deleting_instances.append(instance)
+    return deleting_instances
 
 
 async def ensure_instance_model_file(session: AsyncSession, instance: ModelInstance):
@@ -376,6 +486,7 @@ async def find_scale_down_candidates(
             f"Failed to find scale down candidates for model {model.name}: {e}"
         )
         logger.error(state_message)
+        return []
 
 
 async def sync_ready_replicas(session: AsyncSession, model: Model):

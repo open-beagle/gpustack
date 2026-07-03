@@ -16,14 +16,14 @@ from gpustack.api import exceptions
 from gpustack.config import Config
 from gpustack.config.envs import TCP_CONNECTOR_LIMIT
 from gpustack.routes import debug, probes
-from gpustack.routes.worker import logs, proxy
+from gpustack.routes.worker import container_exec, logs, proxy
 from gpustack.schemas.workers import SystemReserved, WorkerUpdate
 from gpustack.server import catalog
 from gpustack.ray.manager import RayManager
 from gpustack.utils import platform
 from gpustack.utils.network import get_first_non_loopback_ip
 from gpustack.client import ClientSet
-from gpustack.logging import setup_logging
+from gpustack.logginglocal import setup_logging
 from gpustack.utils.process import add_signal_handlers_in_loop
 from gpustack.utils.system_check import check_glibc_version
 from gpustack.utils.task import run_periodically_in_thread
@@ -252,7 +252,9 @@ class Worker:
             app.state.http_client = aiohttp.ClientSession(
                 connector=connector, trust_env=True
             )
+            await container_exec.start_cleanup_task()
             yield
+            await container_exec.stop_cleanup_task()
             await app.state.http_client.close()
 
         app = FastAPI(
@@ -264,6 +266,7 @@ class Worker:
 
         app.include_router(debug.router, prefix="/debug")
         app.include_router(probes.router)
+        app.include_router(container_exec.router)
         app.include_router(logs.router)
         app.include_router(proxy.router)
         exceptions.register_handlers(app)

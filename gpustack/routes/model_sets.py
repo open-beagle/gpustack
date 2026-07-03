@@ -12,6 +12,7 @@ from gpustack.server.catalog import (
     get_model_set_specs,
 )
 from gpustack.server.deps import ListParamsDep
+from gpustack.schemas.models import model_categories
 
 router = APIRouter()
 
@@ -32,8 +33,7 @@ async def get_model_sets(
         model_catalog = [
             model
             for model in model_catalog
-            if model.categories is not None
-            and any(category in model.categories for category in categories)
+            if any(category in model_categories(model) for category in categories)
         ]
 
     count = len(model_catalog)
