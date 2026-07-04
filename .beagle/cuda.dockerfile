@@ -3,9 +3,8 @@ ARG BASE=registry.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04
 FROM $BASE
 
 ARG AUTHOR=mengkzhaoyun@gmail.com
-ARG VERSION=dev
 
-LABEL maintainer=$AUTHOR version=$VERSION
+LABEL maintainer=$AUTHOR
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -74,14 +73,17 @@ print('argcomplete', m.version('argcomplete'))" && \
     python3 -m pip show vllm vllm-omni && \
     rm -f /tmp/requirements-vllm.txt
 
+# 预置工具层。工具版本不变时，该层不会随业务 wheel 或 UI 变化重建。
+COPY ./dist/gpustack-tools-cuda.tar.gz /tmp/
+RUN mkdir -p /opt/gpustack/third_party/bin && \
+    tar -xzf /tmp/gpustack-tools-cuda.tar.gz -C /opt/gpustack/third_party/bin && \
+    rm -f /tmp/gpustack-tools-cuda.tar.gz
+
 # 安装 GPUStack 应用层。依赖已在上一层安装，避免 wheel 内容变化导致重建 vLLM 大层。
 COPY ./dist/*.whl /tmp/
 RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
     pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --no-deps --force-reinstall "${WHEEL_PACKAGE}" && \
     rm -rf /tmp/*.whl
-
-# 下载工具
-RUN gpustack download-tools --device cuda --tools-download-base-url 'https://cache.ali.wodcloud.com/vscode'
 
 # 设置目录
 RUN mkdir -p /var/lib/gpustack && \
@@ -91,6 +93,10 @@ RUN mkdir -p /var/lib/gpustack && \
 ENV PIPX_HOME=/var/lib/gpustack/pipx \
     PIPX_LOCAL_VENVS=/var/lib/gpustack/pipx/venvs \
     PIPX_BIN_DIR=/var/lib/gpustack/bin \
+    GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
+ARG VERSION=dev
+LABEL version=$VERSION
 
 ENTRYPOINT [ "tini", "--", "gpustack", "start" ]

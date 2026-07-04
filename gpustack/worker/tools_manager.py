@@ -47,17 +47,23 @@ class ToolsManager:
         system: Optional[str] = None,
         arch: Optional[str] = None,
     ):
-        with pkg_resources.path("gpustack.third_party", "bin") as third_party_bin_path:
-            self.third_party_bin_path: Path = third_party_bin_path
-            self.versions_file = third_party_bin_path.joinpath("versions.json")
+        third_party_bin_env = os.getenv("GPUSTACK_THIRD_PARTY_BIN")
+        if third_party_bin_env:
+            self.third_party_bin_path = Path(third_party_bin_env)
+        else:
+            with pkg_resources.path(
+                "gpustack.third_party", "bin"
+            ) as third_party_bin_path:
+                self.third_party_bin_path: Path = third_party_bin_path
 
-            self._current_tools_version = {}
-            if os.path.exists(self.versions_file):
-                try:
-                    with open(self.versions_file, 'r', encoding='utf-8') as file:
-                        self._current_tools_version = json.load(file)
-                except Exception as e:
-                    logger.warning(f"Failed to load versions.json: {e}")
+        self.versions_file = self.third_party_bin_path.joinpath("versions.json")
+        self._current_tools_version = {}
+        if os.path.exists(self.versions_file):
+            try:
+                with open(self.versions_file, 'r', encoding='utf-8') as file:
+                    self._current_tools_version = json.load(file)
+            except Exception as e:
+                logger.warning(f"Failed to load versions.json: {e}")
 
         self._os = system if system else platform.system()
         self._arch = arch if arch else platform.arch()
