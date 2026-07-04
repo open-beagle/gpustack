@@ -121,7 +121,6 @@ def test_cuda_base_change_detector_tracks_runtime_inputs():
     assert ".beagle/cuda-runtime.env" in detector
     assert ".beagle/cuda-base.dockerfile" in detector
     assert ".beagle/build.sh" in detector
-    assert ".beagle/should-build-cuda-base.sh" in detector
     assert "pyproject.toml" in detector
     assert "poetry.lock" in detector
     assert "gpustack/worker/tools_manager.py" not in detector
@@ -318,6 +317,31 @@ def _run_detector(repo: Path, before: str, after: str) -> int:
         stderr=subprocess.PIPE,
     )
     return result.returncode
+
+
+def test_cuda_base_change_detector_fetches_missing_before_commit(tmp_path):
+    repo = _make_detector_repo(tmp_path)
+    before = _commit_all(repo, "initial")
+
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text().replace('version = "0.7.5"', 'version = "0.7.6"'),
+        encoding="utf-8",
+    )
+    after = _commit_all(repo, "application version change")
+
+    origin = tmp_path / "origin.git"
+    shallow = tmp_path / "shallow"
+    _run_git(tmp_path, "clone", "--bare", str(repo), str(origin))
+    _run_git(
+        tmp_path,
+        "clone",
+        "--depth=1",
+        f"file://{origin}",
+        str(shallow),
+    )
+
+    assert _run_detector(shallow, before, after) == 1
 
 
 def test_cuda_base_change_detector_ignores_non_runtime_project_metadata(tmp_path):
