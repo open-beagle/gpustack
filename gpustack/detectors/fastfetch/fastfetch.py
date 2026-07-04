@@ -19,6 +19,7 @@ from gpustack.schemas.workers import (
 )
 from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils.platform import device_type_from_vendor
+from gpustack.utils.third_party import third_party_bin_path
 
 logger = logging.getLogger(__name__)
 
@@ -262,10 +263,7 @@ class Fastfetch(GPUDetector, SystemInfoDetector):
         if platform.system().lower() == "windows":
             command += ".exe"
 
-        with pkg_resources.path(
-            "gpustack.third_party.bin.fastfetch", command
-        ) as executable_path:
-            return str(executable_path)
+        return str(third_party_bin_path("fastfetch", command))
 
     def _command_version(self):
         executable_path = self._command_executable_path()

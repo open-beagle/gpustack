@@ -15,7 +15,7 @@ import requests
 
 from gpustack.schemas.models import BackendEnum
 from gpustack.utils.command import get_versioned_command
-from gpustack.utils.compat_importlib import pkg_resources
+from gpustack.utils.third_party import THIRD_PARTY_BIN_ENV, third_party_bin_path
 from gpustack.utils import platform, envs
 from gpustack.worker.backend_dependency_manager import BackendDependencyManager
 
@@ -47,14 +47,11 @@ class ToolsManager:
         system: Optional[str] = None,
         arch: Optional[str] = None,
     ):
-        third_party_bin_env = os.getenv("GPUSTACK_THIRD_PARTY_BIN")
+        third_party_bin_env = os.getenv(THIRD_PARTY_BIN_ENV)
         if third_party_bin_env:
             self.third_party_bin_path = Path(third_party_bin_env)
         else:
-            with pkg_resources.path(
-                "gpustack.third_party", "bin"
-            ) as third_party_bin_path:
-                self.third_party_bin_path: Path = third_party_bin_path
+            self.third_party_bin_path = third_party_bin_path()
 
         self.versions_file = self.third_party_bin_path.joinpath("versions.json")
         self._current_tools_version = {}

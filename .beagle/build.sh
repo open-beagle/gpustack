@@ -148,6 +148,7 @@ generate_tools_archive() {
   local archive="$PWD/dist/$2"
   local include_llama_box="$3"
   local tools_venv="$PWD/.tmp/tools-venv-${device}"
+  local tools_bin="$tools_venv/third_party/bin"
 
   rm -rf "$tools_venv" "$archive"
   python3 -m venv "$tools_venv"
@@ -161,7 +162,7 @@ generate_tools_archive() {
   "$tools_venv/bin/python" -m pip install \
     -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
     --no-deps "$WHEEL_PACKAGE"
-  "$tools_venv/bin/python" - <<PY
+  GPUSTACK_THIRD_PARTY_BIN="$tools_bin" "$tools_venv/bin/python" - <<PY
 from gpustack.worker.tools_manager import ToolsManager
 
 tools_manager = ToolsManager(
