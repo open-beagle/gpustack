@@ -142,6 +142,41 @@ with open(requirements_path, "w", encoding="utf-8") as f:
 print(f"Wrote {requirements_path} with {len(requirements)} requirements.")
 PY
 
+# 生成 CUDA 工具归档，供 Dockerfile 在业务 wheel 前解压成稳定工具层。
+TOOLS_ARCHIVE="$PWD/dist/gpustack-tools-cuda.tar.gz"
+TOOLS_VENV="$PWD/.tmp/tools-venv"
+rm -rf "$TOOLS_VENV" "$TOOLS_ARCHIVE"
+cleanup_tools_venv() {
+  rm -rf "$TOOLS_VENV"
+}
+trap cleanup_tools_venv EXIT
+python3 -m venv "$TOOLS_VENV"
+"$TOOLS_VENV/bin/python" -m pip install \
+  -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
+  --upgrade pip
+WHEEL_PACKAGE="$(ls "$PWD"/dist/*.whl)"
+"$TOOLS_VENV/bin/python" -m pip install \
+  -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
+  requests packaging fastapi pydantic sqlmodel sqlalchemy
+"$TOOLS_VENV/bin/python" -m pip install \
+  -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
+  --no-deps "$WHEEL_PACKAGE"
+"$TOOLS_VENV/bin/python" - <<PY
+from gpustack.worker.tools_manager import ToolsManager
+
+tools_manager = ToolsManager(
+    tools_download_base_url='https://cache.ali.wodcloud.com/vscode',
+    system='linux',
+    arch='amd64',
+    device='cuda',
+)
+tools_manager.remove_cached_tools()
+tools_manager.prepare_tools()
+tools_manager.save_archive('$TOOLS_ARCHIVE')
+PY
+cleanup_tools_venv
+trap - EXIT
+
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
 git checkout -- "$PWD/pyproject.toml"
