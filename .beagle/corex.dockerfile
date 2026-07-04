@@ -51,18 +51,6 @@ ENV PIPX_HOME=/var/lib/gpustack/pipx \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 # CoreX 不使用外置工具归档层，只预置调度和探测需要的轻量工具。
-RUN python3 - <<'PY'
-from gpustack.worker.tools_manager import ToolsManager
-
-tools_manager = ToolsManager(
-    tools_download_base_url="https://cache.ali.wodcloud.com/vscode",
-    system="linux",
-    arch="amd64",
-    device="corex",
-)
-tools_manager.remove_cached_tools()
-tools_manager.download_gguf_parser()
-tools_manager.download_fastfetch()
-PY
+RUN python3 -c "from gpustack.worker.tools_manager import ToolsManager; tools_manager = ToolsManager(tools_download_base_url='https://cache.ali.wodcloud.com/vscode', system='linux', arch='amd64', device='corex'); tools_manager.remove_cached_tools(); tools_manager.download_gguf_parser(); tools_manager.download_fastfetch()"
 
 ENTRYPOINT [ "tini", "--", "gpustack", "start" ]
