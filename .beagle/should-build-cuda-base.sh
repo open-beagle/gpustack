@@ -56,20 +56,6 @@ def normalized_lines(text: str) -> str:
     return "\n".join(lines)
 
 
-def extract_shell_function(text: str, name: str) -> str:
-    lines = text.splitlines()
-    collected = []
-    in_function = False
-    for line in lines:
-        if not in_function and line.startswith(f"{name}()"):
-            in_function = True
-        if in_function:
-            collected.append(line.rstrip())
-            if line.strip() == "}":
-                break
-    return normalized_lines("\n".join(collected))
-
-
 def extract_heredoc_containing(text: str, keyword: str) -> str:
     lines = text.splitlines()
     for index, line in enumerate(lines):
@@ -84,26 +70,6 @@ def extract_heredoc_containing(text: str, keyword: str) -> str:
                     return normalized_lines(block)
                 break
     return ""
-
-
-def extract_block_until_fi(text: str, start_text: str) -> str:
-    lines = text.splitlines()
-    collected = []
-    in_block = False
-    depth = 0
-    for line in lines:
-        if not in_block and start_text in line:
-            in_block = True
-        if in_block:
-            collected.append(line.rstrip())
-            stripped = line.strip()
-            if stripped.startswith("if ") or stripped.startswith("if ["):
-                depth += 1
-            if stripped == "fi":
-                depth -= 1
-            if depth <= 0:
-                break
-    return normalized_lines("\n".join(collected))
 
 
 def extract_pyproject_runtime(text: str) -> str:
@@ -180,61 +146,6 @@ def extract_poetry_lock_runtime(text: str) -> str:
     return "\n\n".join(selected)
 
 
-def extract_python_function(text: str, name: str) -> str:
-    lines = text.splitlines()
-    collected = []
-    in_function = False
-    indent = 0
-    for line in lines:
-        stripped = line.lstrip()
-        if not in_function and stripped.startswith(f"def {name}("):
-            in_function = True
-            indent = len(line) - len(stripped)
-        elif in_function:
-            current_indent = len(line) - len(stripped)
-            if (
-                stripped
-                and current_indent <= indent
-                and (stripped.startswith("def ") or stripped.startswith("class "))
-            ):
-                break
-        if in_function:
-            collected.append(line.rstrip())
-    return normalized_lines("\n".join(collected))
-
-
-def extract_tools_manager_runtime(text: str) -> str:
-    parts = []
-    for line in text.splitlines():
-        if re.match(
-            r"^BUILTIN_(LLAMA_BOX|GGUF_PARSER|LLAMA_CPP|LLAMA_CPP_CUDA)_VERSION\s*=",
-            line.strip(),
-        ):
-            parts.append(line.strip())
-
-    for function_name in [
-        "download_llama_box",
-        "_download_llama_box",
-        "_get_llama_box_platform_name",
-        "_link_llama_box_rpc_server",
-        "_link_llama_box_default_dir",
-        "get_llama_box_command",
-        "get_llama_box_version_dir_name",
-        "download_gguf_parser",
-        "_get_gguf_parser_platform_name",
-        "download_fastfetch",
-        "_get_fastfetch_platform_name",
-        "save_archive",
-        "remove_cached_tools",
-    ]:
-        body = extract_python_function(text, function_name)
-        if body:
-            parts.append(f"def {function_name}")
-            parts.append(body)
-
-    return "\n".join(parts)
-
-
 def extract_pipeline_runtime(text: str) -> str:
     selected = []
     for line in text.splitlines():
@@ -262,17 +173,8 @@ def runtime_signature(revision: str) -> dict[str, str]:
         ".beagle/cuda-base.dockerfile": normalized_lines(
             read_file(revision, ".beagle/cuda-base.dockerfile")
         ),
-        ".beagle/build.sh:runtime-assets-auto": extract_block_until_fi(
-            build_script, 'if [ "$BUILD_RUNTIME_ASSETS" = "auto" ]; then'
-        ),
         ".beagle/build.sh:requirements-vllm": extract_heredoc_containing(
             build_script, "requirements-vllm.txt"
-        ),
-        ".beagle/build.sh:generate-tools-archive": extract_shell_function(
-            build_script, "generate_tools_archive"
-        ),
-        ".beagle/build.sh:runtime-assets-build": extract_block_until_fi(
-            build_script, 'if [ "$BUILD_RUNTIME_ASSETS" = "true" ]; then'
         ),
         ".beagle/should-build-cuda-base.sh": normalized_lines(
             read_file(revision, ".beagle/should-build-cuda-base.sh")
@@ -285,9 +187,6 @@ def runtime_signature(revision: str) -> dict[str, str]:
         ),
         "poetry.lock:runtime-heavy-packages": extract_poetry_lock_runtime(
             read_file(revision, "poetry.lock")
-        ),
-        "gpustack/worker/tools_manager.py:runtime-tools": extract_tools_manager_runtime(
-            read_file(revision, "gpustack/worker/tools_manager.py")
         ),
     }
 

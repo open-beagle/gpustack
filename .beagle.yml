@@ -42,7 +42,6 @@ steps:
     environment:
       VERSION: v0.7.5
       UI_VERSION: v0.7.5
-      BUILD_RUNTIME_ASSETS: "auto"
     commands:
       - bash .beagle/build.sh
 

@@ -17,16 +17,6 @@ set -ex
 
 VERSION="${VERSION:-v0.7.5}"
 UI_VERSION="${UI_VERSION:-v0.7.5}"
-BUILD_RUNTIME_ASSETS="${BUILD_RUNTIME_ASSETS:-false}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-if [ "$BUILD_RUNTIME_ASSETS" = "auto" ]; then
-  if "$SCRIPT_DIR/should-build-cuda-base.sh"; then
-    BUILD_RUNTIME_ASSETS=true
-  else
-    BUILD_RUNTIME_ASSETS=false
-  fi
-fi
 
 # 检查并安装 poetry
 if ! command -v poetry &> /dev/null; then
@@ -150,49 +140,6 @@ with open(requirements_path, "w", encoding="utf-8") as f:
 
 print(f"Wrote {requirements_path} with {len(requirements)} requirements.")
 PY
-
-# 生成 CUDA 基础镜像工具归档。日常业务镜像不需要该归档。
-generate_tools_archive() {
-  local device="$1"
-  local archive="$PWD/dist/$2"
-  local include_llama_box="$3"
-  local tools_venv="$PWD/.tmp/tools-venv-${device}"
-  local tools_bin="$tools_venv/third_party/bin"
-
-  rm -rf "$tools_venv" "$archive"
-  python3 -m venv "$tools_venv"
-  "$tools_venv/bin/python" -m pip install \
-    -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
-    --upgrade pip
-  WHEEL_PACKAGE="$(ls "$PWD"/dist/*.whl)"
-  "$tools_venv/bin/python" -m pip install \
-    -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
-    requests packaging fastapi pydantic sqlmodel sqlalchemy
-  "$tools_venv/bin/python" -m pip install \
-    -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
-    --no-deps "$WHEEL_PACKAGE"
-  GPUSTACK_THIRD_PARTY_BIN="$tools_bin" "$tools_venv/bin/python" - <<PY
-from gpustack.worker.tools_manager import ToolsManager
-
-tools_manager = ToolsManager(
-    tools_download_base_url='https://cache.ali.wodcloud.com/vscode',
-    system='linux',
-    arch='amd64',
-    device='${device}',
-)
-tools_manager.remove_cached_tools()
-if '${include_llama_box}' == 'true':
-    tools_manager.download_llama_box()
-tools_manager.download_gguf_parser()
-tools_manager.download_fastfetch()
-tools_manager.save_archive('${archive}')
-PY
-  rm -rf "$tools_venv"
-}
-
-if [ "$BUILD_RUNTIME_ASSETS" = "true" ]; then
-  generate_tools_archive cuda gpustack-tools-cuda.tar.gz true
-fi
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"

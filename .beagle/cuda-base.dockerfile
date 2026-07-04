@@ -73,12 +73,6 @@ print('argcomplete', m.version('argcomplete'))" && \
     python3 -m pip show vllm vllm-omni && \
     rm -f /tmp/requirements-vllm.txt
 
-# 预置 GPUStack 运行时工具。工具版本变化时重打基础镜像，日常业务镜像不再重复推送该层。
-COPY ./dist/gpustack-tools-cuda.tar.gz /tmp/
-RUN mkdir -p /opt/gpustack/third_party/bin && \
-    tar -xzf /tmp/gpustack-tools-cuda.tar.gz -C /opt/gpustack/third_party/bin && \
-    rm -f /tmp/gpustack-tools-cuda.tar.gz
-
 # 设置目录
 RUN mkdir -p /var/lib/gpustack && \
     chmod -R 0755 /var/lib/gpustack
@@ -87,7 +81,6 @@ RUN mkdir -p /var/lib/gpustack && \
 ENV PIPX_HOME=/var/lib/gpustack/pipx \
     PIPX_LOCAL_VENVS=/var/lib/gpustack/pipx/venvs \
     PIPX_BIN_DIR=/var/lib/gpustack/bin \
-    GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 ARG VERSION=dev
