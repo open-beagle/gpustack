@@ -35,6 +35,7 @@ def test_cuda_app_dockerfile_uses_runtime_base_and_only_installs_wheel():
     assert "download_gguf_parser()" in dockerfile
     assert "download_fastfetch()" in dockerfile
     assert "install_llama_cpp()" in dockerfile
+    assert "RUN python3 - <<'PY'" not in dockerfile
 
 
 def test_cuda_base_dockerfile_keeps_only_stable_runtime_layers():
@@ -60,6 +61,7 @@ def test_corex_dockerfile_downloads_tools_without_tools_archive_layer():
     assert "download_fastfetch()" in dockerfile
     assert "GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin" in dockerfile
     assert "GPUSTACK_THIRD_PARTY_BIN=/var/lib/gpustack/third_party/bin" not in dockerfile
+    assert "RUN python3 - <<'PY'" not in dockerfile
 
 
 def test_cuda_runtime_base_tag_is_kept_in_sync():
