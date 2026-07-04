@@ -11,8 +11,8 @@ import setproctitle
 
 from gpustack.utils import platform
 from gpustack.utils.command import normalize_parameters
-from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils.process import add_signal_handlers
+from gpustack.utils.third_party import third_party_bin_path
 from gpustack.worker.backends.base import get_visible_devices_env_name
 from gpustack.worker.tools_manager import (
     is_disabled_dynamic_link,
@@ -70,17 +70,13 @@ class RPCServer:
             is_disabled_dynamic_link(version) and bin_dir is not None
         )
         if not disabled_dynamic_link:
-            base_path = str(
-                pkg_resources.files("gpustack.third_party.bin").joinpath(
-                    'llama-box/llama-box-default'
-                )
-            )
+            base_path = str(third_party_bin_path("llama-box/llama-box-default"))
         else:
             base_path = os.path.join(
                 bin_dir,
-                'llama-box',
-                'static',
-                f'llama-box-{version}',
+                "llama-box",
+                "static",
+                f"llama-box-{version}",
             )
         command_path = get_llama_box_command(base_path)
 

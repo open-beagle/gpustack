@@ -142,40 +142,47 @@ with open(requirements_path, "w", encoding="utf-8") as f:
 print(f"Wrote {requirements_path} with {len(requirements)} requirements.")
 PY
 
-# 生成 CUDA 工具归档，供 Dockerfile 在业务 wheel 前解压成稳定工具层。
-TOOLS_ARCHIVE="$PWD/dist/gpustack-tools-cuda.tar.gz"
-TOOLS_VENV="$PWD/.tmp/tools-venv"
-rm -rf "$TOOLS_VENV" "$TOOLS_ARCHIVE"
-cleanup_tools_venv() {
-  rm -rf "$TOOLS_VENV"
-}
-trap cleanup_tools_venv EXIT
-python3 -m venv "$TOOLS_VENV"
-"$TOOLS_VENV/bin/python" -m pip install \
-  -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
-  --upgrade pip
-WHEEL_PACKAGE="$(ls "$PWD"/dist/*.whl)"
-"$TOOLS_VENV/bin/python" -m pip install \
-  -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
-  requests packaging fastapi pydantic sqlmodel sqlalchemy
-"$TOOLS_VENV/bin/python" -m pip install \
-  -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
-  --no-deps "$WHEEL_PACKAGE"
-"$TOOLS_VENV/bin/python" - <<PY
+# 生成工具归档，供 Dockerfile 在业务 wheel 前解压成稳定工具层。
+generate_tools_archive() {
+  local device="$1"
+  local archive="$PWD/dist/$2"
+  local include_llama_box="$3"
+  local tools_venv="$PWD/.tmp/tools-venv-${device}"
+  local tools_bin="$tools_venv/third_party/bin"
+
+  rm -rf "$tools_venv" "$archive"
+  python3 -m venv "$tools_venv"
+  "$tools_venv/bin/python" -m pip install \
+    -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
+    --upgrade pip
+  WHEEL_PACKAGE="$(ls "$PWD"/dist/*.whl)"
+  "$tools_venv/bin/python" -m pip install \
+    -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
+    requests packaging fastapi pydantic sqlmodel sqlalchemy
+  "$tools_venv/bin/python" -m pip install \
+    -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
+    --no-deps "$WHEEL_PACKAGE"
+  GPUSTACK_THIRD_PARTY_BIN="$tools_bin" "$tools_venv/bin/python" - <<PY
 from gpustack.worker.tools_manager import ToolsManager
 
 tools_manager = ToolsManager(
     tools_download_base_url='https://cache.ali.wodcloud.com/vscode',
     system='linux',
     arch='amd64',
-    device='cuda',
+    device='${device}',
 )
 tools_manager.remove_cached_tools()
-tools_manager.prepare_tools()
-tools_manager.save_archive('$TOOLS_ARCHIVE')
+if '${include_llama_box}' == 'true':
+    tools_manager.download_llama_box()
+tools_manager.download_gguf_parser()
+tools_manager.download_fastfetch()
+tools_manager.save_archive('${archive}')
 PY
-cleanup_tools_venv
-trap - EXIT
+  rm -rf "$tools_venv"
+}
+
+generate_tools_archive cuda gpustack-tools-cuda.tar.gz true
+generate_tools_archive corex gpustack-tools-corex.tar.gz false
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"

@@ -16,7 +16,6 @@ from gpustack.schemas.models import (
     SourceEnum,
     get_mmproj_filename,
 )
-from gpustack.utils.compat_importlib import pkg_resources
 from gpustack.utils.convert import parse_duration, safe_int
 from gpustack.utils.hub import (
     filter_filename,
@@ -25,6 +24,7 @@ from gpustack.utils.hub import (
     match_model_scope_file_paths,
 )
 from gpustack.utils import platform
+from gpustack.utils.third_party import third_party_bin_path
 
 logger = logging.getLogger(__name__)
 fetch_file_timeout_in_seconds = 15
@@ -566,8 +566,9 @@ def add_parameter_with_value(
 async def _gguf_parser_command(  # noqa: C901
     model: Model, offload: GPUOffloadEnum = GPUOffloadEnum.Full, **kwargs
 ):
-    bin_path = pkg_resources.files("gpustack.third_party.bin.gguf-parser").joinpath(
-        "gguf-parser" + (".exe" if platform.system() == "windows" else "")
+    bin_path = third_party_bin_path(
+        "gguf-parser",
+        "gguf-parser" + (".exe" if platform.system() == "windows" else ""),
     )
 
     # Preset the command with immutable arguments.

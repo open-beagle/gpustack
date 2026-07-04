@@ -23,7 +23,7 @@ from gpustack.utils.command import (
     find_parameter,
     normalize_parameters,
 )
-from gpustack.utils.compat_importlib import pkg_resources
+from gpustack.utils.third_party import third_party_bin_path
 from gpustack.worker.backends.base import InferenceServer
 from gpustack.worker.tools_manager import (
     BUILTIN_LLAMA_CPP_VERSION,
@@ -59,17 +59,13 @@ class LlamaBoxServer(InferenceServer):
             is_disabled_dynamic_link(version) and self._config.bin_dir is not None
         )
         if not disabled_dynamic_link and version == BUILTIN_LLAMA_BOX_VERSION:
-            base_path = str(
-                pkg_resources.files("gpustack.third_party.bin").joinpath(
-                    'llama-box/llama-box-default'
-                )
-            )
+            base_path = str(third_party_bin_path("llama-box/llama-box-default"))
         else:
             base_path = os.path.join(
                 self._config.bin_dir,
-                'llama-box',
+                "llama-box",
                 f'{"static" if disabled_dynamic_link else ""}',
-                f'llama-box-{version}',
+                f"llama-box-{version}",
             )
         command_path = get_llama_box_command(base_path)
 
@@ -293,9 +289,8 @@ class LlamaBoxServer(InferenceServer):
         )
         base_path = Path(
             str(
-                pkg_resources.files("gpustack.third_party.bin")
-                .joinpath("llama.cpp")
-                .joinpath(
+                third_party_bin_path(
+                    "llama.cpp",
                     get_llama_cpp_version_dir_name(
                         version,
                         platform.system(),
