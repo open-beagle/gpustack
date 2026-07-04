@@ -35,6 +35,10 @@ case "$ARCH-$DEVICE" in
     # 动态链接版本
     LLAMA_BOX_FILE="dl-llama-box-linux-amd64-cuda-12.4.zip"
     ;;
+  amd64-corex|amd64-cpu)
+    # CoreX 目前没有 llama-box 专用构建，使用通用 CPU 动态链接版本
+    LLAMA_BOX_FILE="dl-llama-box-linux-amd64-cpu.zip"
+    ;;
   arm64-cann)
     # 静态链接版本（CANN 需要静态链接）
     LLAMA_BOX_FILE="llama-box-linux-arm64-cann-8.0.zip"
