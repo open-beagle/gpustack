@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 import logging
 from pathlib import Path
 from tenacity import RetryError
@@ -80,6 +81,14 @@ async def merge_async_generators(*generators):  # noqa: C901
         # Wait for all tasks to complete cancellation
         if pending_tasks:
             await asyncio.gather(*pending_tasks.keys(), return_exceptions=True)
+        for gen in tasks:
+            with suppress(Exception):
+                await gen.aclose()
+        for gen in generators:
+            close = getattr(gen, "aclose", None)
+            if close:
+                with suppress(Exception):
+                    await close()
 
 
 async def combined_log_generator(main_log_path: str, download_log_path: str, options):

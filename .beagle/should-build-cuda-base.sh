@@ -16,8 +16,8 @@ before="${DRONE_COMMIT_BEFORE:-}"
 after="${DRONE_COMMIT_AFTER:-${DRONE_COMMIT_SHA:-}}"
 
 if [ -z "$before" ] || [ -z "$after" ]; then
-  echo "Missing commit range, building CUDA runtime base." >&2
-  exit 0
+  echo "Missing commit range, skipping CUDA runtime base." >&2
+  exit 1
 fi
 
 case "$before" in
@@ -27,194 +27,217 @@ case "$before" in
     ;;
 esac
 
-if python3 - "$before" "$after" <<'PY'
-import re
-import subprocess
-import sys
+ensure_commit_available() {
+  revision="$1"
 
-before, after = sys.argv[1:3]
-
-
-def read_file(revision: str, path: str) -> str:
-    result = subprocess.run(
-        ["git", "show", f"{revision}:{path}"],
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    return result.stdout if result.returncode == 0 else ""
-
-
-def normalized_lines(text: str) -> str:
-    lines = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        lines.append(stripped)
-    return "\n".join(lines)
-
-
-def extract_heredoc_containing(text: str, keyword: str) -> str:
-    lines = text.splitlines()
-    for index, line in enumerate(lines):
-        if "python3 - <<'PY'" not in line:
-            continue
-        collected = [line.rstrip()]
-        for following_line in lines[index + 1 :]:
-            collected.append(following_line.rstrip())
-            if following_line.strip() == "PY":
-                block = "\n".join(collected)
-                if keyword in block:
-                    return normalized_lines(block)
-                break
-    return ""
-
-
-def extract_pyproject_runtime(text: str) -> str:
-    section = None
-    dependency_lines = []
-    extras_lines = []
-    extras_dependency_names = set()
-
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            section = stripped
-            continue
-        if section == "[tool.poetry.extras]":
-            name = stripped.split("=", 1)[0].strip()
-            if name in {"vllm", "all"}:
-                extras_lines.append(stripped)
-                extras_dependency_names.update(
-                    re.findall(r'"([^"]+)"', stripped)
-                )
-
-    section = None
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            section = stripped
-            continue
-        if section != "[tool.poetry.dependencies]" or "=" not in stripped:
-            continue
-        name = stripped.split("=", 1)[0].strip()
-        if name == "python":
-            dependency_lines.append(stripped)
-        elif "optional = true" not in stripped or name in extras_dependency_names:
-            dependency_lines.append(stripped)
-
-    return "\n".join(dependency_lines + extras_lines)
-
-
-def extract_poetry_lock_runtime(text: str) -> str:
-    tracked_names = {
-        "bitsandbytes",
-        "flashinfer-cubin",
-        "flashinfer-python",
-        "gguf",
-        "mistral-common",
-        "mistral_common",
-        "openai",
-        "openai-harmony",
-        "ray",
-        "timm",
-        "tokenizers",
-        "torch",
-        "torchaudio",
-        "torchvision",
-        "transformers",
-        "triton",
-        "vllm",
-        "vllm-omni",
-        "xformers",
-    }
-    blocks = re.split(r"(?=^\[\[package\]\])", text, flags=re.MULTILINE)
-    selected = []
-    for block in blocks:
-        name_match = re.search(r'^name = "([^"]+)"', block, flags=re.MULTILINE)
-        if not name_match:
-            continue
-        package_name = name_match.group(1)
-        if package_name in tracked_names or package_name.startswith("nvidia-"):
-            selected.append(normalized_lines(block))
-    return "\n\n".join(selected)
-
-
-def extract_pipeline_runtime(text: str) -> str:
-    selected = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if any(
-            token in stripped
-            for token in [
-                "docker-cuda-base",
-                "should-build-cuda-base.sh",
-                "cuda-base.dockerfile",
-                "wod/windstackbase",
-                "cuda12.",
-            ]
-        ):
-            selected.append(stripped)
-    return "\n".join(selected)
-
-
-def runtime_signature(revision: str) -> dict[str, str]:
-    build_script = read_file(revision, ".beagle/build.sh")
-    return {
-        ".beagle/cuda-runtime.env": normalized_lines(
-            read_file(revision, ".beagle/cuda-runtime.env")
-        ),
-        ".beagle/cuda-base.dockerfile": normalized_lines(
-            read_file(revision, ".beagle/cuda-base.dockerfile")
-        ),
-        ".beagle/build.sh:requirements-vllm": extract_heredoc_containing(
-            build_script, "requirements-vllm.txt"
-        ),
-        ".beagle/should-build-cuda-base.sh": normalized_lines(
-            read_file(revision, ".beagle/should-build-cuda-base.sh")
-        ),
-        ".beagle.yml:cuda-base": extract_pipeline_runtime(
-            read_file(revision, ".beagle.yml")
-        ),
-        "pyproject.toml:runtime-dependencies": extract_pyproject_runtime(
-            read_file(revision, "pyproject.toml")
-        ),
-        "poetry.lock:runtime-heavy-packages": extract_poetry_lock_runtime(
-            read_file(revision, "poetry.lock")
-        ),
-    }
-
-
-before_signature = runtime_signature(before)
-after_signature = runtime_signature(after)
-changed_sections = [
-    name
-    for name in sorted(before_signature.keys() | after_signature.keys())
-    if before_signature.get(name) != after_signature.get(name)
-]
-
-if changed_sections:
-    print("CUDA runtime base signature changed:", file=sys.stderr)
-    for section in changed_sections:
-        print(f"- {section}", file=sys.stderr)
-    sys.exit(0)
-
-print("CUDA runtime base signature unchanged.", file=sys.stderr)
-sys.exit(1)
-PY
-then
-  exit 0
-else
-  status=$?
-  if [ "$status" = "1" ]; then
-    exit 1
+  if git cat-file -e "$revision^{commit}" 2>/dev/null; then
+    return 0
   fi
-  echo "Failed to compare CUDA runtime base inputs, building CUDA runtime base." >&2
-  exit 0
+
+  echo "Commit $revision is missing from local git history, fetching it." >&2
+
+  branch="${DRONE_BRANCH:-}"
+  if [ -z "$branch" ]; then
+    branch="$(git branch --show-current 2>/dev/null || true)"
+  fi
+
+  if [ -n "$branch" ]; then
+    git fetch --no-tags --deepen=100 origin "$branch" >/dev/null 2>&1 || true
+  fi
+
+  if git cat-file -e "$revision^{commit}" 2>/dev/null; then
+    return 0
+  fi
+
+  git fetch --no-tags --depth=1 origin "$revision" >/dev/null 2>&1 || true
+  git cat-file -e "$revision^{commit}" 2>/dev/null
+}
+
+if ! ensure_commit_available "$before" || ! ensure_commit_available "$after"; then
+  echo "Failed to fetch commit range, skipping CUDA runtime base." >&2
+  exit 1
 fi
+
+normalize_revision_file() {
+  revision="$1"
+  path="$2"
+
+  git show "$revision:$path" 2>/dev/null | awk '
+    {
+      line = $0
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "" || line ~ /^#/) {
+        next
+      }
+      print line
+    }
+  '
+}
+
+extract_build_requirements_export() {
+  revision="$1"
+
+  git show "$revision:.beagle/build.sh" 2>/dev/null | awk '
+    function flush_block() {
+      if (in_block && block ~ /requirements-vllm.txt/) {
+        count = split(block, lines, "\n")
+        for (i = 1; i <= count; i++) {
+          line = lines[i]
+          gsub(/^[ \t]+|[ \t]+$/, "", line)
+          if (line != "" && line !~ /^#/) {
+            print line
+          }
+        }
+      }
+      in_block = 0
+      block = ""
+    }
+
+    index($0, "python3 - <<") && index($0, "PY") {
+      flush_block()
+      in_block = 1
+    }
+
+    in_block {
+      block = block $0 "\n"
+      if ($0 ~ /^[ \t]*PY[ \t]*$/) {
+        flush_block()
+      }
+    }
+
+    END {
+      flush_block()
+    }
+  '
+}
+
+extract_pyproject_runtime() {
+  revision="$1"
+
+  git show "$revision:pyproject.toml" 2>/dev/null | awk '
+    {
+      line = $0
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "" || line ~ /^#/) {
+        next
+      }
+      if (line ~ /^\[/) {
+        section = line
+        next
+      }
+      if (section == "[tool.poetry.dependencies]") {
+        name = line
+        sub(/[ \t]*=.*/, "", name)
+        if (name ~ /^(python|openai|ray|vllm|vllm-omni|mistral_common|transformers|bitsandbytes|flashinfer-cubin|flashinfer-python|gguf|mistral-common|openai-harmony|timm|tokenizers|torch|torchaudio|torchvision|triton|xformers)$/) {
+          print line
+        }
+      } else if (section == "[tool.poetry.extras]") {
+        name = line
+        sub(/[ \t]*=.*/, "", name)
+        if (name == "vllm" || name == "all") {
+          print line
+        }
+      }
+    }
+  '
+}
+
+extract_poetry_lock_runtime() {
+  revision="$1"
+
+  git show "$revision:poetry.lock" 2>/dev/null | awk '
+    function normalize_and_print(block_text) {
+      count = split(block_text, lines, "\n")
+      for (i = 1; i <= count; i++) {
+        line = lines[i]
+        gsub(/^[ \t]+|[ \t]+$/, "", line)
+        if (line != "" && line !~ /^#/) {
+          print line
+        }
+      }
+      print ""
+    }
+
+    function tracked(package_name) {
+      return package_name ~ /^nvidia-/ || package_name ~ /^(bitsandbytes|flashinfer-cubin|flashinfer-python|gguf|mistral-common|mistral_common|openai|openai-harmony|ray|timm|tokenizers|torch|torchaudio|torchvision|transformers|triton|vllm|vllm-omni|xformers)$/
+    }
+
+    /^\[\[package\]\]/ {
+      if (package_name != "" && tracked(package_name)) {
+        normalize_and_print(block)
+      }
+      block = $0 "\n"
+      package_name = ""
+      next
+    }
+
+    {
+      block = block $0 "\n"
+      if ($0 ~ /^name = "/) {
+        package_name = $0
+        sub(/^name = "/, "", package_name)
+        sub(/".*/, "", package_name)
+      }
+    }
+
+    END {
+      if (package_name != "" && tracked(package_name)) {
+        normalize_and_print(block)
+      }
+    }
+  '
+}
+
+extract_pipeline_runtime() {
+  revision="$1"
+
+  git show "$revision:.beagle.yml" 2>/dev/null | awk '
+    {
+      line = $0
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (index(line, "docker-cuda-base") || index(line, "should-build-cuda-base.sh") || index(line, "cuda-base.dockerfile") || index(line, "wod/windstackbase") || index(line, "cuda12.")) {
+        print line
+      }
+    }
+  '
+}
+
+write_runtime_signature() {
+  revision="$1"
+  output="$2"
+
+  {
+    echo "[.beagle/cuda-runtime.env]"
+    normalize_revision_file "$revision" ".beagle/cuda-runtime.env"
+    echo "[.beagle/cuda-base.dockerfile]"
+    normalize_revision_file "$revision" ".beagle/cuda-base.dockerfile"
+    echo "[.beagle/build.sh:requirements-vllm]"
+    extract_build_requirements_export "$revision"
+    echo "[.beagle.yml:cuda-base]"
+    extract_pipeline_runtime "$revision"
+    echo "[pyproject.toml:runtime-dependencies]"
+    extract_pyproject_runtime "$revision"
+    echo "[poetry.lock:runtime-heavy-packages]"
+    extract_poetry_lock_runtime "$revision"
+  } > "$output"
+}
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+before_signature="$tmp_dir/before.signature"
+after_signature="$tmp_dir/after.signature"
+
+if ! write_runtime_signature "$before" "$before_signature" || ! write_runtime_signature "$after" "$after_signature"; then
+  echo "Failed to compare CUDA runtime base inputs, skipping CUDA runtime base." >&2
+  exit 1
+fi
+
+if cmp -s "$before_signature" "$after_signature"; then
+  echo "CUDA runtime base signature unchanged." >&2
+  exit 1
+fi
+
+echo "CUDA runtime base signature changed:" >&2
+diff -u "$before_signature" "$after_signature" >&2 || true
+exit 0
