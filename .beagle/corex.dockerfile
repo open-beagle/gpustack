@@ -47,7 +47,7 @@ RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
 ENV PIPX_HOME=/var/lib/gpustack/pipx \
     PIPX_LOCAL_VENVS=/var/lib/gpustack/pipx/venvs \
     PIPX_BIN_DIR=/var/lib/gpustack/bin \
-    GPUSTACK_THIRD_PARTY_BIN=/var/lib/gpustack/third_party/bin \
+    GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 # CoreX 不使用外置工具归档层，只预置调度和探测需要的轻量工具。

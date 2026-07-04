@@ -8,7 +8,7 @@ RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
     pip3 install --no-cache-dir --no-deps --force-reinstall "${WHEEL_PACKAGE}" && \
     rm -rf /tmp/*.whl
 
-ENV GPUSTACK_THIRD_PARTY_BIN=/var/lib/gpustack/third_party/bin
+ENV GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin
 
 RUN python3 - <<'PY'
 from gpustack.worker.tools_manager import ToolsManager
@@ -23,6 +23,7 @@ tools_manager.remove_cached_tools()
 tools_manager.download_llama_box()
 tools_manager.download_gguf_parser()
 tools_manager.download_fastfetch()
+tools_manager.install_llama_cpp()
 PY
 
 ARG VERSION=dev
