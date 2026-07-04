@@ -145,7 +145,7 @@ PY
 # 生成工具归档，供 Dockerfile 在业务 wheel 前解压成稳定工具层。
 generate_tools_archive() {
   local device="$1"
-  local archive="$PWD/dist/gpustack-tools-${device}.tar.gz"
+  local archive="$PWD/dist/$2"
   local tools_venv="$PWD/.tmp/tools-venv-${device}"
 
   rm -rf "$tools_venv" "$archive"
@@ -176,8 +176,8 @@ PY
   rm -rf "$tools_venv"
 }
 
-generate_tools_archive cuda
-generate_tools_archive corex
+generate_tools_archive cuda gpustack-tools-cuda.tar.gz
+generate_tools_archive corex gpustack-tools-corex.tar.gz
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
