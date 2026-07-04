@@ -27,6 +27,37 @@ case "$before" in
     ;;
 esac
 
+ensure_commit_available() {
+  revision="$1"
+
+  if git cat-file -e "$revision^{commit}" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "Commit $revision is missing from local git history, fetching it." >&2
+
+  branch="${DRONE_BRANCH:-}"
+  if [ -z "$branch" ]; then
+    branch="$(git branch --show-current 2>/dev/null || true)"
+  fi
+
+  if [ -n "$branch" ]; then
+    git fetch --no-tags --deepen=100 origin "$branch" >/dev/null 2>&1 || true
+  fi
+
+  if git cat-file -e "$revision^{commit}" 2>/dev/null; then
+    return 0
+  fi
+
+  git fetch --no-tags --depth=1 origin "$revision" >/dev/null 2>&1 || true
+  git cat-file -e "$revision^{commit}" 2>/dev/null
+}
+
+if ! ensure_commit_available "$before" || ! ensure_commit_available "$after"; then
+  echo "Failed to fetch commit range, building CUDA runtime base." >&2
+  exit 0
+fi
+
 if python3 - "$before" "$after" <<'PY'
 import re
 import subprocess
@@ -175,9 +206,6 @@ def runtime_signature(revision: str) -> dict[str, str]:
         ),
         ".beagle/build.sh:requirements-vllm": extract_heredoc_containing(
             build_script, "requirements-vllm.txt"
-        ),
-        ".beagle/should-build-cuda-base.sh": normalized_lines(
-            read_file(revision, ".beagle/should-build-cuda-base.sh")
         ),
         ".beagle.yml:cuda-base": extract_pipeline_runtime(
             read_file(revision, ".beagle.yml")
