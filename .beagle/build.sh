@@ -17,6 +17,16 @@ set -ex
 
 VERSION="${VERSION:-v0.7.5}"
 UI_VERSION="${UI_VERSION:-v0.7.5}"
+BUILD_RUNTIME_ASSETS="${BUILD_RUNTIME_ASSETS:-false}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ "$BUILD_RUNTIME_ASSETS" = "auto" ]; then
+  if "$SCRIPT_DIR/should-build-cuda-base.sh"; then
+    BUILD_RUNTIME_ASSETS=true
+  else
+    BUILD_RUNTIME_ASSETS=false
+  fi
+fi
 
 # 检查并安装 poetry
 if ! command -v poetry &> /dev/null; then
@@ -95,8 +105,7 @@ with open('$VERSION_FILE', 'w') as f:
 echo "Building with poetry..."
 "${POETRY_CMD[@]}" build
 
-# 从 wheel 元数据导出 CUDA 镜像依赖清单，供 Dockerfile 先安装稳定依赖层。
-# 这样业务代码或 UI 变化只会重装 gpustack wheel，不会反复重建 vLLM 大依赖层。
+# 从 wheel 元数据导出运行时依赖清单，供 CUDA 基础镜像和 CoreX 镜像安装稳定依赖。
 python3 - <<'PY'
 import email
 import glob
@@ -142,7 +151,7 @@ with open(requirements_path, "w", encoding="utf-8") as f:
 print(f"Wrote {requirements_path} with {len(requirements)} requirements.")
 PY
 
-# 生成工具归档，供 Dockerfile 在业务 wheel 前解压成稳定工具层。
+# 生成 CUDA 基础镜像工具归档。日常业务镜像不需要该归档。
 generate_tools_archive() {
   local device="$1"
   local archive="$PWD/dist/$2"
@@ -181,8 +190,9 @@ PY
   rm -rf "$tools_venv"
 }
 
-generate_tools_archive cuda gpustack-tools-cuda.tar.gz true
-generate_tools_archive corex gpustack-tools-corex.tar.gz false
+if [ "$BUILD_RUNTIME_ASSETS" = "true" ]; then
+  generate_tools_archive cuda gpustack-tools-cuda.tar.gz true
+fi
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
