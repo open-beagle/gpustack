@@ -319,6 +319,21 @@ def _run_detector(repo: Path, before: str, after: str) -> int:
     return result.returncode
 
 
+def _run_detector_with_env(repo: Path, env_updates: dict[str, str]) -> int:
+    env = os.environ.copy()
+    env.pop("BUILD_RUNTIME_ASSETS", None)
+    env.update(env_updates)
+    result = subprocess.run(
+        [".beagle/should-build-cuda-base.sh"],
+        cwd=repo,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result.returncode
+
+
 def test_cuda_base_change_detector_fetches_missing_before_commit(tmp_path):
     repo = _make_detector_repo(tmp_path)
     before = _commit_all(repo, "initial")
@@ -342,6 +357,41 @@ def test_cuda_base_change_detector_fetches_missing_before_commit(tmp_path):
     )
 
     assert _run_detector(shallow, before, after) == 1
+
+
+def test_cuda_base_change_detector_skips_when_missing_commit_cannot_be_fetched(
+    tmp_path,
+):
+    repo = _make_detector_repo(tmp_path)
+    before = _commit_all(repo, "initial")
+
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text().replace('version = "0.7.5"', 'version = "0.7.6"'),
+        encoding="utf-8",
+    )
+    after = _commit_all(repo, "application version change")
+
+    origin = tmp_path / "origin.git"
+    shallow = tmp_path / "shallow"
+    _run_git(tmp_path, "clone", "--bare", str(repo), str(origin))
+    _run_git(
+        tmp_path,
+        "clone",
+        "--depth=1",
+        f"file://{origin}",
+        str(shallow),
+    )
+    _run_git(shallow, "remote", "remove", "origin")
+
+    assert _run_detector(shallow, before, after) == 1
+
+
+def test_cuda_base_change_detector_skips_when_commit_range_is_missing(tmp_path):
+    repo = _make_detector_repo(tmp_path)
+    _commit_all(repo, "initial")
+
+    assert _run_detector_with_env(repo, {}) == 1
 
 
 def test_cuda_base_change_detector_ignores_non_runtime_project_metadata(tmp_path):
