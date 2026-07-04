@@ -12,7 +12,13 @@ from gpustack.schemas.models import (
     ModelInstanceStateEnum,
 )
 from gpustack.schemas.workers import WorkerStateEnum
-from gpustack.server.controllers import find_scale_down_candidates, safe_event_attr, sync_replicas
+from gpustack.server.controllers import (
+    ModelInstanceController,
+    WorkerController,
+    find_scale_down_candidates,
+    safe_event_attr,
+    sync_replicas,
+)
 from gpustack.server.bus import Event, EventType
 from tests.fixtures.workers.fixtures import (
     linux_nvidia_19_4090_24gx2,
@@ -23,6 +29,91 @@ from tests.fixtures.workers.fixtures import (
 from unittest.mock import patch, AsyncMock
 
 from tests.utils.model import new_model, new_model_instance
+
+
+class FakeAsyncSessionContext:
+    def __init__(self, session):
+        self.session = session
+
+    async def __aenter__(self):
+        return self.session
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class ExpiredWorkerEventData:
+    def __bool__(self):
+        return True
+
+    @property
+    def name(self):
+        raise RuntimeError("expired worker name")
+
+
+def test_model_instance_deleted_event_reconciles_parent_model():
+    model = new_model(1, "test", 1, huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct")
+    deleted_instance = new_model_instance(
+        10,
+        "test-10",
+        model.id,
+        state=ModelInstanceStateEnum.RUNNING,
+    )
+    controller = ModelInstanceController.__new__(ModelInstanceController)
+    controller._engine = object()
+    controller._config = AsyncMock()
+    session = AsyncMock()
+
+    sync_replicas_mock = AsyncMock()
+    sync_ready_replicas_mock = AsyncMock()
+
+    with (
+        patch(
+            "gpustack.server.controllers.AsyncSession",
+            return_value=FakeAsyncSessionContext(session),
+        ),
+        patch(
+            "gpustack.server.controllers.ModelInstance.one_by_id",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "gpustack.server.controllers.Model.one_by_id",
+            new=AsyncMock(return_value=model),
+        ),
+        patch("gpustack.server.controllers.sync_replicas", new=sync_replicas_mock),
+        patch(
+            "gpustack.server.controllers.sync_ready_replicas",
+            new=sync_ready_replicas_mock,
+        ),
+    ):
+        asyncio.run(
+            controller._reconcile(Event(type=EventType.DELETED, data=deleted_instance))
+        )
+
+    sync_replicas_mock.assert_awaited_once_with(session, model, controller._config)
+    sync_ready_replicas_mock.assert_awaited_once_with(session, model)
+
+
+def test_worker_reconcile_skips_expired_event_data_without_implicit_io():
+    controller = WorkerController.__new__(WorkerController)
+    controller._engine = object()
+    session = AsyncMock()
+    list_mock = AsyncMock()
+
+    with (
+        patch(
+            "gpustack.server.controllers.AsyncSession",
+            return_value=FakeAsyncSessionContext(session),
+        ),
+        patch("gpustack.server.controllers.ModelInstance.all_by_field", new=list_mock),
+    ):
+        asyncio.run(
+            controller._reconcile(
+                Event(type=EventType.UPDATED, data=ExpiredWorkerEventData())
+            )
+        )
+
+    list_mock.assert_not_awaited()
 
 
 def test_find_scale_down_candidates():

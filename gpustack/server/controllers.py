@@ -106,6 +106,15 @@ class ModelInstanceController:
         model_instance_name = safe_event_attr(model_instance, "name")
         try:
             async with AsyncSession(self._engine) as session:
+                if event.type == EventType.DELETED:
+                    model = await Model.one_by_id(session, model_instance.model_id)
+                    if not model:
+                        return
+
+                    await sync_replicas(session, model, self._config)
+                    await sync_ready_replicas(session, model)
+                    return
+
                 model_instance = await ModelInstance.one_by_id(
                     session, model_instance.id
                 )
@@ -115,9 +124,6 @@ class ModelInstanceController:
                 model = await Model.one_by_id(session, model_instance.model_id)
                 if not model:
                     return
-
-                if event.type == EventType.DELETED:
-                    await sync_replicas(session, model, self._config)
 
                 if model_instance.state == ModelInstanceStateEnum.INITIALIZING:
                     await ensure_instance_model_file(session, model_instance)
@@ -530,19 +536,32 @@ class WorkerController:
         """
         Delete instances base on the worker state and event type.
         """
-        worker: Worker = event.data
-        if not worker:
+        event_worker: Worker = event.data
+        if not event_worker:
             return
 
+        worker_id = safe_event_attr(event_worker, "id", None)
+        worker_name = safe_event_attr(event_worker, "name", None)
+        worker_state = safe_event_attr(event_worker, "state", None)
+
         async with AsyncSession(self._engine) as session:
+            if event.type != EventType.DELETED and worker_id is not None:
+                current_worker = await Worker.one_by_id(session, worker_id)
+                if current_worker:
+                    worker_name = current_worker.name
+                    worker_state = current_worker.state
+
+            if not worker_name or worker_state is None:
+                return
+
             instances = await ModelInstance.all_by_field(
-                session, "worker_name", worker.name
+                session, "worker_name", worker_name
             )
             if not instances:
                 return
 
             instance_names = []
-            if worker.state == WorkerStateEnum.UNREACHABLE:
+            if worker_state == WorkerStateEnum.UNREACHABLE:
                 await self.update_instance_states(
                     session,
                     instances,
@@ -554,7 +573,7 @@ class WorkerController:
                 return
 
             if (
-                worker.state == WorkerStateEnum.NOT_READY
+                worker_state == WorkerStateEnum.NOT_READY
                 or event.type == EventType.DELETED
             ):
                 instance_names = [instance.name for instance in instances]
@@ -563,16 +582,16 @@ class WorkerController:
 
                 if instance_names:
                     state = (
-                        worker.state
-                        if worker.state == WorkerStateEnum.NOT_READY
+                        worker_state
+                        if worker_state == WorkerStateEnum.NOT_READY
                         else "deleted"
                     )
                     logger.debug(
                         f"Delete instance {', '.join(instance_names)} "
-                        f"since worker {worker.name} is {state}"
+                        f"since worker {worker_name} is {state}"
                     )
 
-            if worker.state == WorkerStateEnum.READY:
+            if worker_state == WorkerStateEnum.READY:
                 await self.update_instance_states(
                     session,
                     instances,

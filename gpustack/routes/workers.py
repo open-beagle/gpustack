@@ -19,6 +19,11 @@ from gpustack.server.services import WorkerService
 router = APIRouter()
 
 
+def normalize_worker_status_for_response(worker: Worker):
+    worker.normalize_status_for_state()
+    return worker
+
+
 @router.get("", response_model=WorkersPublic)
 async def get_workers(
     engine: EngineDep,
@@ -44,13 +49,17 @@ async def get_workers(
             media_type="text/event-stream",
         )
 
-    return await Worker.paginated_by_query(
+    result = await Worker.paginated_by_query(
         session=session,
         fields=fields,
         fuzzy_fields=fuzzy_fields,
         page=params.page,
         per_page=params.perPage,
     )
+    result.items = [
+        normalize_worker_status_for_response(worker) for worker in result.items
+    ]
+    return result
 
 
 @router.get("/{id}", response_model=WorkerPublic)
@@ -59,7 +68,7 @@ async def get_worker(session: SessionDep, id: int):
     if not worker:
         raise NotFoundException(message="worker not found")
 
-    return worker
+    return normalize_worker_status_for_response(worker)
 
 
 @router.post("", response_model=WorkerPublic)

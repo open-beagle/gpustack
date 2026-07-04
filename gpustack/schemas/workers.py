@@ -173,8 +173,24 @@ class WorkerBase(SQLModel):
     )
     worker_uuid: str
 
+    def clear_allocated_resources(self):
+        if self.status is None:
+            return
+
+        if self.status.memory is not None:
+            self.status.memory.allocated = 0
+
+        for gpu_device in self.status.gpu_devices or []:
+            if gpu_device.memory is not None:
+                gpu_device.memory.allocated = 0
+
+    def normalize_status_for_state(self):
+        if self.state == WorkerStateEnum.NOT_READY:
+            self.clear_allocated_resources()
+
     def compute_state(self, worker_offline_timeout=60):
         if self.state == WorkerStateEnum.NOT_READY and self.state_message is not None:
+            self.clear_allocated_resources()
             return
         now = int(datetime.now(timezone.utc).timestamp())
         heartbeat_timestamp = (
@@ -187,6 +203,7 @@ class WorkerBase(SQLModel):
         ):
             self.state = WorkerStateEnum.NOT_READY
             self.state_message = "Heartbeat lost, please <a href='https://docs.gpustack.ai/latest/troubleshooting/#view-gpustack-logs'>check the worker logs</a>. If everything proceeds smoothly, please verify that the clocks on both the worker and the server are properly synchronized."
+            self.clear_allocated_resources()
             return
 
         if self.unreachable:
