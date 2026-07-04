@@ -3,6 +3,7 @@ from typing import List, Union
 import pytest
 
 from gpustack.worker.logs import LogOptions, log_generator
+from gpustack.routes.worker.logs import merge_async_generators
 
 
 @pytest.fixture
@@ -127,3 +128,22 @@ async def test_log_generator_tail_larger_than_large_file(large_log_file):
         [line async for line in log_generator(log_path, options)]
     )
     assert result == ["line" * 256 + "\n", "line" * 256 + "\n"]
+
+
+@pytest.mark.asyncio
+async def test_merge_async_generators_closes_child_generators_on_cancel():
+    closed = asyncio.Event()
+
+    async def child_generator():
+        try:
+            yield "line1\n"
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    generator = merge_async_generators(child_generator())
+
+    assert await generator.__anext__() == "line1\n"
+    await generator.aclose()
+
+    assert closed.is_set()
