@@ -38,23 +38,31 @@ RUN grep -Ev '^(vllm|vllm-omni|torch|torchvision|torchaudio|triton|nvidia-|cuda-
     pip cache purge && \
     rm -rf /tmp/requirements-vllm.txt /tmp/requirements-corex.txt /tmp/corex-constraints.txt /tmp/corex-runtime-constraints.txt
 
-# 预置工具层。工具版本不变时，该层不会随业务 wheel 或 UI 变化重建。
-COPY ./dist/gpustack-tools-corex.tar.gz /tmp/
-RUN mkdir -p /opt/gpustack/third_party/bin && \
-    tar -xzf /tmp/gpustack-tools-corex.tar.gz -C /opt/gpustack/third_party/bin && \
-    rm -f /tmp/gpustack-tools-corex.tar.gz
-
-# 安装 GPUStack 应用层。依赖已在上一层安装，避免 wheel 内容变化导致重建 CoreX 运行时依赖大层。
+# 安装 GPUStack 应用层。CoreX 镜像推送体积主要来自厂商基础镜像，保持这里直接安装业务 wheel。
 COPY ./dist/*.whl /tmp/
 RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
     pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --no-deps --force-reinstall "${WHEEL_PACKAGE}" && \
     rm -rf /tmp/*.whl
 
-# 设置环境变量
 ENV PIPX_HOME=/var/lib/gpustack/pipx \
     PIPX_LOCAL_VENVS=/var/lib/gpustack/pipx/venvs \
     PIPX_BIN_DIR=/var/lib/gpustack/bin \
-    GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin \
+    GPUSTACK_THIRD_PARTY_BIN=/var/lib/gpustack/third_party/bin \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
+# CoreX 不使用外置工具归档层，只预置调度和探测需要的轻量工具。
+RUN python3 - <<'PY'
+from gpustack.worker.tools_manager import ToolsManager
+
+tools_manager = ToolsManager(
+    tools_download_base_url="https://cache.ali.wodcloud.com/vscode",
+    system="linux",
+    arch="amd64",
+    device="corex",
+)
+tools_manager.remove_cached_tools()
+tools_manager.download_gguf_parser()
+tools_manager.download_fastfetch()
+PY
 
 ENTRYPOINT [ "tini", "--", "gpustack", "start" ]

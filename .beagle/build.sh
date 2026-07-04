@@ -95,8 +95,7 @@ with open('$VERSION_FILE', 'w') as f:
 echo "Building with poetry..."
 "${POETRY_CMD[@]}" build
 
-# 从 wheel 元数据导出 CUDA 镜像依赖清单，供 Dockerfile 先安装稳定依赖层。
-# 这样业务代码或 UI 变化只会重装 gpustack wheel，不会反复重建 vLLM 大依赖层。
+# 从 wheel 元数据导出运行时依赖清单，供 CUDA 基础镜像和 CoreX 镜像安装稳定依赖。
 python3 - <<'PY'
 import email
 import glob
@@ -141,48 +140,6 @@ with open(requirements_path, "w", encoding="utf-8") as f:
 
 print(f"Wrote {requirements_path} with {len(requirements)} requirements.")
 PY
-
-# 生成工具归档，供 Dockerfile 在业务 wheel 前解压成稳定工具层。
-generate_tools_archive() {
-  local device="$1"
-  local archive="$PWD/dist/$2"
-  local include_llama_box="$3"
-  local tools_venv="$PWD/.tmp/tools-venv-${device}"
-  local tools_bin="$tools_venv/third_party/bin"
-
-  rm -rf "$tools_venv" "$archive"
-  python3 -m venv "$tools_venv"
-  "$tools_venv/bin/python" -m pip install \
-    -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
-    --upgrade pip
-  WHEEL_PACKAGE="$(ls "$PWD"/dist/*.whl)"
-  "$tools_venv/bin/python" -m pip install \
-    -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
-    requests packaging fastapi pydantic sqlmodel sqlalchemy
-  "$tools_venv/bin/python" -m pip install \
-    -i "$PYPI_MIRROR" --trusted-host "$PYPI_HOST" \
-    --no-deps "$WHEEL_PACKAGE"
-  GPUSTACK_THIRD_PARTY_BIN="$tools_bin" "$tools_venv/bin/python" - <<PY
-from gpustack.worker.tools_manager import ToolsManager
-
-tools_manager = ToolsManager(
-    tools_download_base_url='https://cache.ali.wodcloud.com/vscode',
-    system='linux',
-    arch='amd64',
-    device='${device}',
-)
-tools_manager.remove_cached_tools()
-if '${include_llama_box}' == 'true':
-    tools_manager.download_llama_box()
-tools_manager.download_gguf_parser()
-tools_manager.download_fastfetch()
-tools_manager.save_archive('${archive}')
-PY
-  rm -rf "$tools_venv"
-}
-
-generate_tools_archive cuda gpustack-tools-cuda.tar.gz true
-generate_tools_archive corex gpustack-tools-corex.tar.gz false
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
