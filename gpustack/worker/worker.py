@@ -29,6 +29,7 @@ from gpustack.utils.system_check import check_glibc_version
 from gpustack.utils.task import run_periodically_in_thread
 from gpustack.worker.model_file_manager import ModelFileManager
 from gpustack.worker.serve_manager import ServeManager
+from gpustack.worker.startup_cleanup import cleanup_stale_model_instances
 from gpustack.worker.exporter import MetricExporter
 from gpustack.worker.tools_manager import ToolsManager
 from gpustack.worker.worker_manager import WorkerManager
@@ -196,6 +197,9 @@ class Worker:
         add_signal_handlers_in_loop()
 
         self._get_current_worker_id()
+        cleanup_stale_model_instances(
+            self._clientset, self._worker_id, self._worker_name
+        )
         if self._exporter_enabled:
             # Start the metric exporter with retry.
             run_periodically_in_thread(self._exporter.start, 15)
