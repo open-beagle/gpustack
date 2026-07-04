@@ -16,5 +16,17 @@ def test_build_script_creates_cuda_tools_archive_before_docker_build():
     build_script = Path(".beagle/build.sh").read_text()
 
     assert "gpustack-tools-cuda.tar.gz" in build_script
+    assert "gpustack-tools-corex.tar.gz" in build_script
     assert "fastapi pydantic sqlmodel sqlalchemy" in build_script
     assert "save_archive" in build_script
+
+
+def test_build_script_skips_llama_box_for_corex_tools_archive():
+    build_script = Path(".beagle/build.sh").read_text()
+
+    assert "generate_tools_archive cuda gpustack-tools-cuda.tar.gz true" in build_script
+    assert (
+        "generate_tools_archive corex gpustack-tools-corex.tar.gz false"
+        in build_script
+    )
+    assert "if '${include_llama_box}' == 'true':" in build_script

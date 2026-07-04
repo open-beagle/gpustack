@@ -146,6 +146,7 @@ PY
 generate_tools_archive() {
   local device="$1"
   local archive="$PWD/dist/$2"
+  local include_llama_box="$3"
   local tools_venv="$PWD/.tmp/tools-venv-${device}"
 
   rm -rf "$tools_venv" "$archive"
@@ -170,14 +171,17 @@ tools_manager = ToolsManager(
     device='${device}',
 )
 tools_manager.remove_cached_tools()
-tools_manager.prepare_tools()
+if '${include_llama_box}' == 'true':
+    tools_manager.download_llama_box()
+tools_manager.download_gguf_parser()
+tools_manager.download_fastfetch()
 tools_manager.save_archive('${archive}')
 PY
   rm -rf "$tools_venv"
 }
 
-generate_tools_archive cuda gpustack-tools-cuda.tar.gz
-generate_tools_archive corex gpustack-tools-corex.tar.gz
+generate_tools_archive cuda gpustack-tools-cuda.tar.gz true
+generate_tools_archive corex gpustack-tools-corex.tar.gz false
 
 # 还原版本文件
 git checkout -- "$VERSION_FILE"
