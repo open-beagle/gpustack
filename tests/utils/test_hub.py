@@ -1,8 +1,10 @@
 from tenacity import retry, stop_after_attempt, wait_fixed
+from gpustack.utils import hub
 from gpustack.utils.hub import (
     get_hugging_face_model_min_gguf_path,
     get_model_scope_model_min_gguf_path,
     get_model_weight_size,
+    match_model_scope_file_paths,
 )
 from gpustack.schemas.models import (
     Model,
@@ -179,3 +181,52 @@ def test_get_ms_min_gguf_file():
         assert (
             got == expected_file_path
         ), f"min GGUF file path mismatch for modelscope model {model}, got: {got}, expected: {expected_file_path}"
+
+
+def test_match_model_scope_file_paths_does_not_pass_root(monkeypatch):
+    class MockHubApi:
+        def get_model_files(self, model_id, **kwargs):
+            assert model_id == "unsloth/Qwen3.6-35B-A3B-GGUF"
+            assert kwargs == {"recursive": True}
+            return [
+                {"Path": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"},
+                {"Path": "Qwen3.6-35B-A3B-mmproj-f32.gguf"},
+            ]
+
+    monkeypatch.setattr(hub, "HubApi", MockHubApi)
+
+    got = match_model_scope_file_paths(
+        "unsloth/Qwen3.6-35B-A3B-GGUF",
+        "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        "*mmproj*.gguf",
+    )
+
+    assert got == [
+        "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        "Qwen3.6-35B-A3B-mmproj-f32.gguf",
+    ]
+
+
+def test_match_model_scope_file_paths_filters_extra_file_to_same_root(monkeypatch):
+    class MockHubApi:
+        def get_model_files(self, model_id, **kwargs):
+            assert kwargs == {"recursive": True}
+            return [
+                {"Path": "Q4/model.gguf"},
+                {"Path": "Q4/mmproj-f16.gguf"},
+                {"Path": "Q8/model.gguf"},
+                {"Path": "Q8/mmproj-f32.gguf"},
+            ]
+
+    monkeypatch.setattr(hub, "HubApi", MockHubApi)
+
+    got = match_model_scope_file_paths(
+        "example/repo",
+        "Q4/model.gguf",
+        "*mmproj*.gguf",
+    )
+
+    assert got == [
+        "Q4/model.gguf",
+        "Q4/mmproj-f16.gguf",
+    ]
