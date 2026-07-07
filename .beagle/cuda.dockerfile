@@ -10,7 +10,13 @@ RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
 
 ENV GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin
 
-RUN python3 -c "from gpustack.worker.tools_manager import ToolsManager; tools_manager = ToolsManager(tools_download_base_url='https://cache.ali.wodcloud.com/vscode', system='linux', arch='amd64', device='cuda'); tools_manager.download_llama_box(); tools_manager.download_gguf_parser(); tools_manager.download_fastfetch()"
+COPY ./.beagle/tools-downloads.sh /tmp/gpustack-tools-downloads.sh
+RUN TOOLS_DOWNLOAD_BASE_URL=https://cache.ali.wodcloud.com/vscode \
+    SYSTEM=linux \
+    ARCH=amd64 \
+    DEVICE=cuda \
+    bash /tmp/gpustack-tools-downloads.sh && \
+    rm -f /tmp/gpustack-tools-downloads.sh
 
 ARG VERSION=dev
 LABEL version=$VERSION

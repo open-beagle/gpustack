@@ -47,28 +47,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
 
-ARG TOOLS_DOWNLOAD_BASE_URL=https://cache.ali.wodcloud.com/vscode
-ARG LLAMA_CPP_VERSION=b8322
-# Keep this at 12.8.1 until the matching cached llama.cpp package is available.
-ARG LLAMA_CPP_CUDA_VERSION=12.8.1
-
-# 预置 CUDA llama.cpp 大二进制包。该层只随 CUDA/llama.cpp 底层版本变化重建。
-RUN set -eux; \
-    third_party_bin=/opt/gpustack/third_party/bin; \
-    package_name="llama-cpp-cuda-${LLAMA_CPP_CUDA_VERSION}-${LLAMA_CPP_VERSION}-linux-x64"; \
-    version_dir="llama.cpp-${LLAMA_CPP_VERSION}-linux-amd64-cuda"; \
-    target_dir="${third_party_bin}/llama.cpp/${version_dir}"; \
-    tmp_dir="$(mktemp -d)"; \
-    mkdir -p "${target_dir}"; \
-    curl -fL --retry 5 --retry-delay 2 \
-      "${TOOLS_DOWNLOAD_BASE_URL}/gpustack/llama.cpp/${package_name}.tar.gz" \
-      -o "${tmp_dir}/${package_name}.tar.gz"; \
-    tar -xzf "${tmp_dir}/${package_name}.tar.gz" -C "${target_dir}"; \
-    rm -rf "${tmp_dir}"; \
-    test -x "${target_dir}/llama-server" || chmod +x "${target_dir}/llama-server"; \
-    chmod +x "${target_dir}/llama-server" "${target_dir}/llama-cli" "${target_dir}/rpc-server"; \
-    printf '{\n    "%s": "%s"\n}\n' "${version_dir}" "${LLAMA_CPP_VERSION}" > "${third_party_bin}/versions.json"
-
 ARG PYPI_MIRROR=https://mirrors.aliyun.com/pypi/simple/
 ARG PYPI_HOST=mirrors.aliyun.com
 ARG PYPI_EXTRA_INDEX_URL=https://pypi.org/simple/
