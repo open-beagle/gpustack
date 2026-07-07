@@ -191,6 +191,8 @@ class ToolsManager:
     def prepare_versioned_backend(self, backend: str, version: str):
         if backend == BackendEnum.LLAMA_BOX:
             self.install_versioned_llama_box(version)
+        elif backend == BackendEnum.LLAMA_CPP:
+            self.install_llama_cpp(version)
         elif backend == BackendEnum.VLLM:
             self.install_versioned_vllm_with_deps(version)
         elif backend == BackendEnum.VLLM_OMNI:

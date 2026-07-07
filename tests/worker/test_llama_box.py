@@ -84,6 +84,19 @@ def test_get_gguf_runtime_reads_backend_parameter():
     )
 
 
+def test_get_gguf_runtime_uses_llama_cpp_backend():
+    assert (
+        get_gguf_runtime(
+            SimpleNamespace(
+                backend=BackendEnum.LLAMA_CPP,
+                env=None,
+                backend_parameters=None,
+            )
+        )
+        == "llama-cpp"
+    )
+
+
 def test_llama_cpp_runtime_defaults_distributed_inference_to_false():
     model = Model(
         name="qwen-gguf",
@@ -97,12 +110,25 @@ def test_llama_cpp_runtime_defaults_distributed_inference_to_false():
     assert model.distributed_inference_across_workers is False
 
 
+def test_llama_cpp_backend_defaults_distributed_inference_to_false():
+    model = Model(
+        name="qwen-gguf",
+        source=SourceEnum.HUGGING_FACE,
+        huggingface_repo_id="unsloth/Qwen-GGUF",
+        huggingface_filename="qwen.gguf",
+        backend=BackendEnum.LLAMA_CPP,
+    )
+
+    assert model.cpu_offloading is True
+    assert model.distributed_inference_across_workers is False
+
+
 def test_llama_cpp_runtime_rejects_distributed_inference():
     with pytest.raises(
         ValueError,
         match=(
             "Distributed inference across workers is not supported "
-            "for the llama.cpp runtime"
+            "for the llama.cpp backend"
         ),
     ):
         Model(
@@ -112,6 +138,24 @@ def test_llama_cpp_runtime_rejects_distributed_inference():
             huggingface_filename="qwen.gguf",
             backend=BackendEnum.LLAMA_BOX,
             env={"GPUSTACK_GGUF_RUNTIME": "llama-cpp"},
+            distributed_inference_across_workers=True,
+        )
+
+
+def test_llama_cpp_backend_rejects_distributed_inference():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Distributed inference across workers is not supported "
+            "for the llama.cpp backend"
+        ),
+    ):
+        Model(
+            name="qwen-gguf",
+            source=SourceEnum.HUGGING_FACE,
+            huggingface_repo_id="unsloth/Qwen-GGUF",
+            huggingface_filename="qwen.gguf",
+            backend=BackendEnum.LLAMA_CPP,
             distributed_inference_across_workers=True,
         )
 
@@ -215,6 +259,34 @@ def test_llama_box_health_check_falls_back_after_health_exception(monkeypatch):
     assert (
         serve_manager.is_ready(
             BackendEnum.LLAMA_BOX,
+            SimpleNamespace(port=18080, worker_ip="10.0.0.10"),
+        )
+        is True
+    )
+    assert requested_urls == [
+        "http://127.0.0.1:18080/health",
+        "http://127.0.0.1:18080/v1/models",
+    ]
+
+
+def test_llama_cpp_health_check_uses_gguf_fallback(monkeypatch):
+    requested_urls = []
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    def fake_get(url, timeout):
+        requested_urls.append(url)
+        if url.endswith("/health"):
+            return Response(404)
+        return Response(200)
+
+    monkeypatch.setattr(serve_manager.requests, "get", fake_get)
+
+    assert (
+        serve_manager.is_ready(
+            BackendEnum.LLAMA_CPP,
             SimpleNamespace(port=18080, worker_ip="10.0.0.10"),
         )
         is True

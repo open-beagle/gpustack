@@ -134,6 +134,26 @@ def test_runtime_uses_llama_box_health_for_gguf_model():
     assert item.health_endpoint == "http://10.0.0.10:18080/health"
 
 
+def test_runtime_uses_llama_cpp_health_for_llama_cpp_backend():
+    session = RuntimeSession(
+        instances=[instance(model_name="gguf-llamacpp")],
+        models=[
+            model(
+                id=1,
+                name="gguf-llamacpp",
+                huggingface_filename="model.gguf",
+                backend=BackendEnum.LLAMA_CPP,
+            )
+        ],
+    )
+
+    response = run_get_runtime_model_instances(session)
+
+    item = response.instances[0]
+    assert item.backend == BackendEnum.LLAMA_CPP
+    assert item.health_endpoint == "http://10.0.0.10:18080/health"
+
+
 def test_runtime_uses_health_for_vllm_omni_backend():
     session = RuntimeSession(
         instances=[instance(model_name="omni")],

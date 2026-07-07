@@ -43,6 +43,7 @@ from gpustack.schemas.models import (
     SourceEnum,
     get_backend,
     is_gguf_model,
+    is_gguf_backend,
     is_audio_model,
     DistributedServerCoordinateModeEnum,
 )
@@ -363,7 +364,7 @@ class Scheduler:
                     model_instance.distributed_servers.mode = (
                         DistributedServerCoordinateModeEnum.INITIALIZE_LATER
                     )
-                elif get_backend(model) == BackendEnum.LLAMA_BOX:
+                elif is_gguf_backend(get_backend(model)):
                     model_instance.distributed_servers.download_model_files = False
 
                 await ModelInstanceService(session).update(model_instance)

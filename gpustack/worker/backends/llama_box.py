@@ -11,6 +11,7 @@ import psutil
 from gpustack.schemas.workers import Worker
 from gpustack.utils import platform
 from gpustack.schemas.models import (
+    BackendEnum,
     ModelInstance,
     ModelInstanceStateEnum,
     get_gguf_runtime,
@@ -284,8 +285,13 @@ class LlamaBoxServer(InferenceServer):
                 raise FileNotFoundError(f"llama-server not found: {command_path}")
             return command_path
 
-        version = (self._model.env or {}).get(
-            "GPUSTACK_LLAMA_CPP_VERSION", BUILTIN_LLAMA_CPP_VERSION
+        version = (
+            self._model.backend_version
+            if self._model.backend == BackendEnum.LLAMA_CPP
+            and self._model.backend_version
+            else (self._model.env or {}).get(
+                "GPUSTACK_LLAMA_CPP_VERSION", BUILTIN_LLAMA_CPP_VERSION
+            )
         )
         base_path = Path(
             str(
@@ -402,6 +408,11 @@ class LlamaBoxServer(InferenceServer):
                     value = self._model.backend_parameters[i + 1]
                     if value and not Path(value).is_absolute():
                         self._model.backend_parameters[i + 1] = str(model_dir / value)
+
+
+class LlamaCppServer(LlamaBoxServer):
+    def start(self):
+        return self._start_llama_cpp()
 
 
 def get_mmproj_file(model_path: str) -> str:
