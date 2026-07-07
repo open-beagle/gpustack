@@ -1,8 +1,8 @@
-ARG BASE=registry-vpc.cn-qingdao.aliyuncs.com/wod/windstackbase:cuda12.8.1-py3.10-vllm0.24.0-omni0.24.0
+ARG BASE=ghcr.io/open-beagle/gpustack:cuda12.8.2-vllm0.24.0-omni0.24.0
 
 FROM $BASE
 
-# 安装 GPUStack 应用层。底层运行时依赖已内置在 windstackbase 镜像中。
+# 安装 GPUStack 应用层。底层运行时依赖已内置在 CUDA runtime 镜像中。
 COPY ./dist/*.whl /tmp/
 RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
     pip3 install --no-cache-dir --no-deps --force-reinstall "${WHEEL_PACKAGE}" && \

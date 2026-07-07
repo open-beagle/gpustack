@@ -1,4 +1,4 @@
-ARG BASE=registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04
+ARG BASE=nvidia/cuda:12.8.2-runtime-ubuntu22.04
 
 FROM $BASE
 
@@ -49,6 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ARG TOOLS_DOWNLOAD_BASE_URL=https://cache.ali.wodcloud.com/vscode
 ARG LLAMA_CPP_VERSION=b8322
+# Keep this at 12.8.1 until the matching cached llama.cpp package is available.
 ARG LLAMA_CPP_CUDA_VERSION=12.8.1
 
 # 预置 CUDA llama.cpp 大二进制包。该层只随 CUDA/llama.cpp 底层版本变化重建。
