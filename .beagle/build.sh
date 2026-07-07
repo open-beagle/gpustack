@@ -2,26 +2,26 @@
 
 git config --global --add safe.directory "$PWD"
 
-# 配置 PyPI 镜像源：优先阿里云内网，不可达则回退公网
-if curl -s --connect-timeout 2 http://mirrors.cloud.aliyuncs.com/pypi/simple/ > /dev/null 2>&1; then
-  PYPI_MIRROR="http://mirrors.cloud.aliyuncs.com/pypi/simple/"
-  PYPI_HOST="mirrors.cloud.aliyuncs.com"
-else
-  PYPI_MIRROR="https://mirrors.aliyun.com/pypi/simple/"
-  PYPI_HOST="mirrors.aliyun.com"
-fi
-pip config set global.index-url "$PYPI_MIRROR"
-pip config set global.trusted-host "$PYPI_HOST"
-
 set -ex
 
 VERSION="${VERSION:-v0.7}"
 UI_VERSION="${UI_VERSION:-v0.7}"
 
+PIP_INSTALL_ARGS=()
+if [ -n "${PYPI_MIRROR:-}" ]; then
+  PIP_INSTALL_ARGS+=("-i" "$PYPI_MIRROR")
+fi
+if [ -n "${PYPI_EXTRA_INDEX_URL:-}" ]; then
+  PIP_INSTALL_ARGS+=("--extra-index-url" "$PYPI_EXTRA_INDEX_URL")
+fi
+if [ -n "${PYPI_HOST:-}" ]; then
+  PIP_INSTALL_ARGS+=("--trusted-host" "$PYPI_HOST")
+fi
+
 # 检查并安装 poetry
 if ! command -v poetry &> /dev/null; then
   echo "Poetry not found, installing..."
-  pip3 install poetry
+  python3 -m pip install "${PIP_INSTALL_ARGS[@]}" poetry
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
