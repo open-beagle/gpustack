@@ -45,32 +45,6 @@ steps:
     commands:
       - bash .beagle/build.sh
 
-  # Nvidia runtime base. The step is present on every release-cuda build, but
-  # the script exits before invoking the docker plugin unless runtime inputs changed.
-  - name: docker-cuda-base
-    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-    volumes:
-      - name: docker
-        path: /var/run/docker.sock
-    commands:
-      - |
-        if ! .beagle/should-build-cuda-base.sh; then
-          echo "CUDA runtime base inputs unchanged, skipping windstackbase build."
-          exit 0
-        fi
-        /opt/bin/devops-docker
-    settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04
-      dockerfile: .beagle/cuda-base.dockerfile
-      repo: wod/windstackbase
-      version: "cuda12.8.1-py3.10-vllm0.22.1-omni0.22.0"
-      args: "TARGETOS=linux,TARGETARCH=amd64"
-      registry: registry-vpc.cn-qingdao.aliyuncs.com
-      registry_user:
-        from_secret: REGISTRY_USER_ALIYUN
-      registry_password:
-        from_secret: REGISTRY_PASSWORD_ALIYUN
-
   # Nvidia
   - name: docker-cuda
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
@@ -78,7 +52,7 @@ steps:
       - name: docker
         path: /var/run/docker.sock
     settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstackbase:cuda12.8.1-py3.10-vllm0.22.1-omni0.22.0
+      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstackbase:cuda12.8.1-py3.10-vllm0.24.0-omni0.24.0
       dockerfile: .beagle/cuda.dockerfile
       repo: wod/windstack
       version: "v0.7.6-cuda"

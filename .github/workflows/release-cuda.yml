@@ -1,0 +1,76 @@
+name: release-cuda
+
+on:
+  push:
+    branches:
+      - release-cuda
+  workflow_dispatch:
+
+env:
+  VERSION: "v0.7.6"
+  UI_VERSION: "v0.7.6"
+  RUNTIME_IMG: ghcr.io/${{ github.repository_owner }}/gpustack
+  RUNTIME_TAG: "cuda12.8.2-vllm0.24.0-omni0.24.0"
+  WINDSTACK_IMAGE: registry.cn-qingdao.aliyuncs.com/wod/windstack
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker image prune --all --force
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build Python package
+        env:
+          VERSION: ${{ env.VERSION }}
+          UI_VERSION: ${{ env.UI_VERSION }}
+        run: bash .beagle/build.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Aliyun Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.cn-qingdao.aliyuncs.com
+          username: ${{ secrets.REGISTRY_USER_ALIYUN }}
+          password: ${{ secrets.REGISTRY_PASSWORD_ALIYUN }}
+
+      - name: Build and push CUDA image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./.beagle/cuda.dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.WINDSTACK_IMAGE }}:${{ env.VERSION }}-cuda
+          build-args: |
+            BASE=${{ env.RUNTIME_IMG }}:${{ env.RUNTIME_TAG }}
+            VERSION=${{ env.VERSION }}-cuda
+
+      - name: Image build success
+        run: echo "windstack:${{ env.VERSION }}-cuda built and pushed successfully."

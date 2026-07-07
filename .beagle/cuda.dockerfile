@@ -1,4 +1,4 @@
-ARG BASE=registry-vpc.cn-qingdao.aliyuncs.com/wod/windstackbase:cuda12.8.1-py3.10-vllm0.22.1-omni0.22.0
+ARG BASE=registry-vpc.cn-qingdao.aliyuncs.com/wod/windstackbase:cuda12.8.1-py3.10-vllm0.24.0-omni0.24.0
 
 FROM $BASE
 
