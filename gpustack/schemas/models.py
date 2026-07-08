@@ -92,6 +92,15 @@ class ModelSource(BaseModel):
     model_scope_file_path: Optional[str] = None
     local_path: Optional[str] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_model_scope_file_path_alias(cls, data):
+        if isinstance(data, dict):
+            file_path = data.get("file_path")
+            if file_path and not data.get("model_scope_file_path"):
+                data["model_scope_file_path"] = file_path
+        return data
+
     @property
     def model_source_key(self) -> str:
         """Returns a unique identifier for the model, independent of quantization."""
@@ -241,6 +250,10 @@ class ModelBase(ModelSpecBase):
                 raise ValueError(
                     "huggingface_filename must be provided when source is 'huggingface'"
                 )
+            if self.source == SourceEnum.MODEL_SCOPE and not self.model_scope_file_path:
+                raise ValueError(
+                    "file_path must be provided when source is 'model_scope'"
+                )
             if (
                 get_gguf_runtime(self) == "llama-cpp"
                 and self.distributed_inference_across_workers
@@ -289,6 +302,13 @@ class ModelPublic(
     id: int
     created_at: datetime
     updated_at: datetime
+    file_path: Optional[str] = None
+
+    @model_validator(mode="after")
+    def set_file_path_alias(self):
+        if self.source == SourceEnum.MODEL_SCOPE and not self.file_path:
+            self.file_path = self.model_scope_file_path
+        return self
 
 
 ModelsPublic = PaginatedList[ModelPublic]
