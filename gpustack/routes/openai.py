@@ -38,6 +38,17 @@ logger = logging.getLogger(__name__)
 
 load_balancer = LoadBalancer()
 
+OPTIONAL_OPENAI_NULL_FIELDS = {
+    "frequency_penalty",
+    "presence_penalty",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_completion_tokens",
+    "seed",
+    "stop",
+}
+
 
 aliasable_router = APIRouter()
 
@@ -287,6 +298,7 @@ async def parse_form_data(request: Request) -> Tuple[aiohttp.FormData, str, bool
 async def parse_json_body(request: Request):
     try:
         body_json = await request.json()
+        body_json = omit_null_openai_optional_params(body_json)
         model_name = body_json.get("model")
         stream = body_json.get("stream", False)
         return body_json, model_name, stream
@@ -295,6 +307,13 @@ async def parse_json_body(request: Request):
             message=f"We could not parse the JSON body of your request: {e}",
             is_openai_exception=True,
         )
+
+
+def omit_null_openai_optional_params(body_json: dict) -> dict:
+    for field in OPTIONAL_OPENAI_NULL_FIELDS:
+        if body_json.get(field) is None:
+            body_json.pop(field, None)
+    return body_json
 
 
 async def _stream_response_chunks(
