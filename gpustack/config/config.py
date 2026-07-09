@@ -25,6 +25,7 @@ from gpustack.utils import platform
 from gpustack.utils.platform import DeviceTypeEnum, device_type_from_vendor
 
 _config = None
+DEFAULT_LOCAL_S3_MODELSCOPE_PREFIX = "s3://bd-wind/modelscope"
 
 
 class Config(BaseSettings):
@@ -205,6 +206,10 @@ class Config(BaseSettings):
             )
         if not self.worker_center_s3_region and self.worker_s3_region:
             self.worker_center_s3_region = self.worker_s3_region
+        if self.worker_local_s3_host and not self.worker_local_s3_modelscope_prefix:
+            self.worker_local_s3_modelscope_prefix = (
+                DEFAULT_LOCAL_S3_MODELSCOPE_PREFIX
+            )
 
         # common options
         if self.data_dir is None:

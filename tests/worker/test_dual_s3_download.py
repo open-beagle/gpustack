@@ -26,6 +26,17 @@ def test_legacy_worker_s3_config_maps_to_center_s3(tmp_path):
     assert cfg.worker_center_s3_region == "cn-test"
 
 
+def test_local_s3_host_enables_default_modelscope_prefix(tmp_path):
+    cfg = Config(
+        data_dir=str(tmp_path),
+        worker_local_s3_host="local-minio.example.com",
+        worker_local_s3_access_key="access",
+        worker_local_s3_secret_key="secret",
+    )
+
+    assert cfg.worker_local_s3_modelscope_prefix == "s3://bd-wind/modelscope"
+
+
 def test_center_s3_legacy_uri_maps_to_beagle_cache_path():
     s3_path = S3Downloader.normalize_s3_path(
         "s3://beagle_wind/bd-wind/datamodel/model-id/v1/model.gguf"
