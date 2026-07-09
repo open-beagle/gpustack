@@ -3,6 +3,7 @@ import time
 import logging
 import os
 import re
+import fnmatch
 from filelock import SoftFileLock
 import requests
 from typing import List, Optional, Tuple, Union
@@ -35,7 +36,9 @@ from gpustack.worker.downloader_s3 import S3Downloader
 from gpustack.config.config import Config
 
 logger = logging.getLogger(__name__)
-s3Downloader = None
+S3_PROFILE_CENTER = "center"
+S3_PROFILE_LOCAL = "local"
+_s3_downloaders = {}
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -47,16 +50,54 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 
 
 def init_s3_client(cfg: Config):
-    global s3Downloader
-    s3Downloader = S3Downloader(
-        host=cfg.worker_s3_host,
-        access_key=cfg.worker_s3_access_key,
-        secret_key=cfg.worker_s3_secret_key,
-        ssl=cfg.worker_s3_ssl,
-        use_virtual_hosted_style=cfg.worker_s3_use_virtual_hosted_style,
-        cache_dir=os.path.join(cfg.cache_dir, "beagle"),
-        region=cfg.worker_s3_region,
-    )
+    return get_s3_downloader(cfg, S3_PROFILE_CENTER)
+
+
+def is_s3_profile_configured(cfg: Config, profile: str) -> bool:
+    if not cfg:
+        return False
+    if profile == S3_PROFILE_CENTER:
+        return bool(cfg.worker_center_s3_host)
+    if profile == S3_PROFILE_LOCAL:
+        return bool(cfg.worker_local_s3_host)
+    return False
+
+
+def get_s3_downloader(cfg: Config, profile: str) -> S3Downloader:
+    if not is_s3_profile_configured(cfg, profile):
+        raise ValueError(f"{profile} S3 is not configured")
+
+    key = (id(cfg), profile)
+    if key in _s3_downloaders:
+        return _s3_downloaders[key]
+
+    if profile == S3_PROFILE_CENTER:
+        downloader = S3Downloader(
+            host=cfg.worker_center_s3_host,
+            access_key=cfg.worker_center_s3_access_key,
+            secret_key=cfg.worker_center_s3_secret_key,
+            ssl=bool(cfg.worker_center_s3_ssl),
+            use_virtual_hosted_style=bool(
+                cfg.worker_center_s3_use_virtual_hosted_style
+            ),
+            cache_dir=os.path.join(cfg.cache_dir, "beagle"),
+            region=cfg.worker_center_s3_region,
+        )
+    elif profile == S3_PROFILE_LOCAL:
+        downloader = S3Downloader(
+            host=cfg.worker_local_s3_host,
+            access_key=cfg.worker_local_s3_access_key,
+            secret_key=cfg.worker_local_s3_secret_key,
+            ssl=cfg.worker_local_s3_ssl,
+            use_virtual_hosted_style=cfg.worker_local_s3_use_virtual_hosted_style,
+            cache_dir=os.path.join(cfg.cache_dir, "model_scope"),
+            region=cfg.worker_local_s3_region,
+        )
+    else:
+        raise ValueError(f"Unsupported S3 profile: {profile}")
+
+    _s3_downloaders[key] = downloader
+    return downloader
 
 
 def download_model(
@@ -96,9 +137,10 @@ def download_model(
         )
     elif model.source == SourceEnum.LOCAL_PATH:
         if model.local_path and model.local_path.startswith('s3://'):
-            if s3Downloader is None:
-                init_s3_client(cfg)
-            return file.get_sharded_file_paths(s3Downloader.download(model.local_path))
+            center_downloader = get_s3_downloader(cfg, S3_PROFILE_CENTER)
+            return file.get_sharded_file_paths(
+                center_downloader.download(model.local_path)
+            )
         else:
             return file.get_sharded_file_paths(model.local_path)
 
@@ -118,6 +160,7 @@ def get_model_file_info(
     elif model.source == SourceEnum.MODEL_SCOPE:
         return ModelScopeDownloader.get_model_file_info(
             model=model,
+            cfg=cfg,
         )
     elif model.source == SourceEnum.OLLAMA_LIBRARY:
         ollama_downloader = OllamaLibraryDownloader(
@@ -129,9 +172,8 @@ def get_model_file_info(
         )
     elif model.source == SourceEnum.LOCAL_PATH:
         if model.local_path and model.local_path.startswith('s3://'):
-            if s3Downloader is None:
-                init_s3_client(cfg)
-            return s3Downloader.get_model_file_size(
+            center_downloader = get_s3_downloader(cfg, S3_PROFILE_CENTER)
+            return center_downloader.get_model_file_size(
                 model_instance=model,
             )
         sharded_or_original_file_paths = file.get_sharded_file_paths(model.local_path)
@@ -587,11 +629,49 @@ class ModelScopeDownloader:
     )
 
     @classmethod
-    def get_model_file_info(cls, model: Model) -> List[FileEntry]:
+    def get_model_file_info(cls, model: Model, cfg: Config = None) -> List[FileEntry]:
+        if cls._use_local_s3_cache(cfg):
+            s3_path = cls._local_modelscope_s3_path(model.model_scope_model_id, cfg)
+            strip_prefix = cls._local_modelscope_model_strip_prefix(s3_path)
+            downloader = get_s3_downloader(cfg, S3_PROFILE_LOCAL)
+            file_list = downloader.list_file_entries(
+                s3_path,
+                strip_prefix=strip_prefix,
+            )
+            if not file_list:
+                raise ValueError(
+                    f"ModelScope local S3 cache not found for {model.model_scope_model_id}"
+                )
+            return file_list
+
         api = HubApi()
         repo_files = api.get_model_files(model.model_scope_model_id, recursive=True)
         file_list = [FileEntry(f.get("Path"), f.get("Size")) for f in repo_files]
         return file_list
+
+    @classmethod
+    def _use_local_s3_cache(cls, cfg: Config) -> bool:
+        return bool(
+            cfg
+            and cfg.worker_local_s3_host
+            and cfg.worker_local_s3_modelscope_prefix
+        )
+
+    @classmethod
+    def _local_modelscope_s3_path(cls, model_id: str, cfg: Config) -> str:
+        return f"{cfg.worker_local_s3_modelscope_prefix.rstrip('/')}/{model_id}"
+
+    @classmethod
+    def _local_modelscope_model_strip_prefix(cls, s3_path: str) -> str:
+        _, object_path = S3Downloader.parse_s3_path(s3_path)
+        return object_path.rstrip("/") + "/"
+
+    @classmethod
+    def _local_modelscope_cache_strip_prefix(cls, cfg: Config) -> str:
+        _, object_path = S3Downloader.parse_s3_path(
+            cfg.worker_local_s3_modelscope_prefix.rstrip("/")
+        )
+        return f"{object_path.rstrip('/')}/" if object_path else ""
 
     @classmethod
     def check_s3_model_exists(cls, model_id: str, cfg: Config) -> bool:
@@ -604,36 +684,20 @@ class ModelScopeDownloader:
         Returns:
             bool: 模型是否存在
         """
-        # 检查是否配置了 S3
-        if not cfg or not cfg.worker_s3_host:
+        if not cls._use_local_s3_cache(cfg):
             return False
-            
+
         try:
-            # 初始化 S3 客户端（如果还没有初始化）
-            global s3Downloader
-            if s3Downloader is None:
-                init_s3_client(cfg)
-            
-            # 构造 S3 路径
-            s3_path = f"s3://bd-wind/datamodel/{model_id}"
-            base_path = s3_path.removeprefix("s3://")
-            bucket_name = base_path.split("/")[0]
-            
-            if s3Downloader.use_virtual_hosted_style:
-                # removeprefix(bucket_name) 不带 /，保持和 S3Downloader.download() 一致
-                base_path = base_path.removeprefix(bucket_name)
-                # base_path = "/datamodel/nv-community/xxx"
-                # split("/")[1:] = ["datamodel", "nv-community", "xxx"]
-                object_prefix = "/".join(base_path.split("/")[1:])
-            else:
-                object_prefix = "/".join(base_path.split("/")[1:])
-            
+            downloader = get_s3_downloader(cfg, S3_PROFILE_LOCAL)
+            s3_path = cls._local_modelscope_s3_path(model_id, cfg)
+            bucket_name, object_prefix = S3Downloader.parse_s3_path(s3_path)
+
             # 检查是否存在对象
             objects = []
-            for obj in s3Downloader._s3_client.list_objects(
-                bucket_name, 
-                prefix=object_prefix, 
-                recursive=False,
+            for obj in downloader._s3_client.list_objects(
+                bucket_name,
+                prefix=object_prefix,
+                recursive=True,
             ):
                 objects.append(obj)
                 break  # 只需要检查是否有文件即可
@@ -675,53 +739,69 @@ class ModelScopeDownloader:
         Returns:
             The path to the downloaded model.
         """
-        
-        # 检查本地 S3 是否存在该模型
-        if cfg and cls.check_s3_model_exists(model_id, cfg):
+        if cfg and cls._use_local_s3_cache(cfg):
             logger.info(f"检测到 ModelScope 模型: {model_id}")
-            logger.info(f"本地 S3 存在该模型，优先从本地 S3 下载")
-            
-            try:
-                # 构造 S3 路径
-                s3_path = f"s3://bd-wind/datamodel/{model_id}"
-                logger.info(f"下载源: {s3_path}")
-                
-                # 从本地 S3 下载
-                global s3Downloader
-                if s3Downloader is None:
-                    init_s3_client(cfg)
-                
-                # 下载到 ModelScope 的 local_dir，保持路径一致
-                group_or_owner, name = model_id_to_group_owner_name(model_id)
-                if local_dir is None:
-                    local_dir = os.path.join(cache_dir, group_or_owner, name)
-                
-                downloaded_path = s3Downloader.download(s3_path, cache_dir=cache_dir)
-                logger.info(f"从本地 S3 下载成功: {downloaded_path}")
-                
-                # 如果指定了 file_path，需要匹配文件
-                if file_path:
-                    import fnmatch
-                    all_files = []
-                    for root, dirs, files in os.walk(downloaded_path):
-                        for f in files:
-                            rel_path = os.path.relpath(os.path.join(root, f), downloaded_path)
-                            all_files.append(rel_path)
-                    
-                    matching_files = [f for f in all_files if fnmatch.fnmatch(f, file_path)]
-                    
-                    if len(matching_files) == 0:
-                        raise ValueError(f"No file found in S3 path that match {file_path}")
-                    
-                    return [os.path.join(downloaded_path, f) for f in matching_files]
-                
-                # 返回整个目录
-                return [downloaded_path]
-                
-            except Exception as e:
-                logger.warning(f"从本地 S3 下载失败: {e}")
-                logger.info(f"降级到 ModelScope 下载")
-                # 继续执行下面的 ModelScope 下载逻辑
+            logger.info("ModelScope local S3 cache is enabled")
+
+            if not cls.check_s3_model_exists(model_id, cfg):
+                if not cfg.worker_local_s3_modelscope_fallback:
+                    raise ValueError(f"ModelScope local S3 cache miss for {model_id}")
+                logger.info("Fallback to public ModelScope download is enabled")
+            else:
+                try:
+                    s3_path = cls._local_modelscope_s3_path(model_id, cfg)
+                    logger.info(f"下载源: {s3_path}")
+
+                    local_downloader = get_s3_downloader(cfg, S3_PROFILE_LOCAL)
+
+                    # 下载到 ModelScope 的 local_dir，保持路径一致
+                    group_or_owner, name = model_id_to_group_owner_name(model_id)
+                    if local_dir is None:
+                        local_dir = os.path.join(cache_dir, group_or_owner, name)
+
+                    downloaded_path = local_downloader.download(
+                        s3_path,
+                        cache_dir=cache_dir,
+                        strip_prefix=cls._local_modelscope_cache_strip_prefix(cfg),
+                    )
+                    logger.info(f"从本地 S3 下载成功: {downloaded_path}")
+
+                    if file_path:
+                        all_files = []
+                        for root, _, files in os.walk(downloaded_path):
+                            for f in files:
+                                rel_path = os.path.relpath(
+                                    os.path.join(root, f), downloaded_path
+                                )
+                                all_files.append(rel_path)
+
+                        matching_files = [
+                            f for f in all_files if fnmatch.fnmatch(f, file_path)
+                        ]
+                        if len(matching_files) == 0:
+                            raise ValueError(
+                                f"No file found in local S3 path that match {file_path}"
+                            )
+
+                        if extra_file_path:
+                            matching_files.extend(
+                                f
+                                for f in all_files
+                                if fnmatch.fnmatch(f, extra_file_path)
+                                and f not in matching_files
+                            )
+
+                        return [
+                            os.path.join(downloaded_path, f) for f in matching_files
+                        ]
+
+                    return [downloaded_path]
+
+                except Exception as e:
+                    logger.warning(f"从本地 S3 下载失败: {e}")
+                    if not cfg.worker_local_s3_modelscope_fallback:
+                        raise
+                    logger.info("Fallback to public ModelScope download is enabled")
 
         # 从 ModelScope 下载（原有逻辑）
         logger.info(f"从 ModelScope 下载模型: {model_id}")

@@ -171,9 +171,40 @@ class Config(BaseSettings):
     worker_s3_ssl: bool = False
     worker_s3_use_virtual_hosted_style: bool = True
     worker_s3_region: Optional[str] = ""
+    worker_center_s3_host: Optional[str] = ""
+    worker_center_s3_access_key: Optional[str] = ""
+    worker_center_s3_secret_key: Optional[str] = ""
+    worker_center_s3_ssl: Optional[bool] = None
+    worker_center_s3_use_virtual_hosted_style: Optional[bool] = None
+    worker_center_s3_region: Optional[str] = ""
+    worker_local_s3_host: Optional[str] = ""
+    worker_local_s3_access_key: Optional[str] = ""
+    worker_local_s3_secret_key: Optional[str] = ""
+    worker_local_s3_ssl: bool = False
+    worker_local_s3_use_virtual_hosted_style: bool = True
+    worker_local_s3_region: Optional[str] = ""
+    worker_local_s3_modelscope_prefix: Optional[str] = ""
+    worker_local_s3_modelscope_fallback: bool = False
 
     def __init__(self, **values):
         super().__init__(**values)
+
+        # Existing worker_s3_* options remain the compatibility alias for the
+        # center S3 profile. The local profile is intentionally opt-in.
+        if not self.worker_center_s3_host and self.worker_s3_host:
+            self.worker_center_s3_host = self.worker_s3_host
+        if not self.worker_center_s3_access_key and self.worker_s3_access_key:
+            self.worker_center_s3_access_key = self.worker_s3_access_key
+        if not self.worker_center_s3_secret_key and self.worker_s3_secret_key:
+            self.worker_center_s3_secret_key = self.worker_s3_secret_key
+        if self.worker_center_s3_ssl is None:
+            self.worker_center_s3_ssl = self.worker_s3_ssl
+        if self.worker_center_s3_use_virtual_hosted_style is None:
+            self.worker_center_s3_use_virtual_hosted_style = (
+                self.worker_s3_use_virtual_hosted_style
+            )
+        if not self.worker_center_s3_region and self.worker_s3_region:
+            self.worker_center_s3_region = self.worker_s3_region
 
         # common options
         if self.data_dir is None:

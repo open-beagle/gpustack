@@ -128,15 +128,20 @@ class InferenceServer(ABC):
         sys.exit(exit_code)
 
     def init_s3_client(self, cfg):
+        if not cfg.worker_center_s3_host:
+            return
+
         global s3Downloader
         s3Downloader = S3Downloader(
-            cfg.worker_s3_host,
-            access_key=cfg.worker_s3_access_key,
-            secret_key=cfg.worker_s3_secret_key,
-            ssl=cfg.worker_s3_ssl,
+            cfg.worker_center_s3_host,
+            access_key=cfg.worker_center_s3_access_key,
+            secret_key=cfg.worker_center_s3_secret_key,
+            ssl=bool(cfg.worker_center_s3_ssl),
             cache_dir=os.path.join(cfg.cache_dir, "beagle"),
-            use_virtual_hosted_style=cfg.worker_s3_use_virtual_hosted_style,
-            region=cfg.worker_s3_region,
+            use_virtual_hosted_style=bool(
+                cfg.worker_center_s3_use_virtual_hosted_style
+            ),
+            region=cfg.worker_center_s3_region,
         )
 
     def _until_model_instance_starting(self):
