@@ -157,6 +157,16 @@ def test_get_model_weight_size_can_include_nested_diffusers_weights():
             root_dir_only=False,
         )
 
+    with patch.object(hub, "list_repo", side_effect=fake_list_repo):
+        assert (
+            get_model_weight_size(
+                model,
+                recursive=True,
+                file_name_prefixes=("transformer/", "vae/"),
+            )
+            == 20
+        )
+
 
 def test_get_hf_min_gguf_file():
     model_to_gguf_file_path = [

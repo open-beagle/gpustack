@@ -5,6 +5,7 @@ from unittest.mock import patch, AsyncMock
 
 from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
     VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD,
+    VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES,
     VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER,
     estimate_model_vram,
 )
@@ -87,7 +88,42 @@ async def test_vllm_omni_image_model_uses_recursive_weight_size():
     ) as get_model_weight_size:
         claim = await estimate_model_vram(model)
 
-    get_model_weight_size.assert_called_once_with(model, None, recursive=True)
+    get_model_weight_size.assert_called_once_with(
+        model,
+        None,
+        recursive=True,
+        file_name_prefixes=VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES,
+    )
+    assert claim == int(
+        weight_size * VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER
+        + VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD
+    )
+
+
+@pytest.mark.asyncio
+async def test_vllm_omni_omnigen_model_uses_recursive_weight_size_without_category():
+    model = new_model(
+        1,
+        "omnigen2",
+        1,
+        model_scope_model_id="OmniGen2/OmniGen2",
+        categories=[],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+    weight_size = 14 * 1024**3
+
+    with patch(
+        "gpustack.policies.candidate_selectors.vllm_resource_fit_selector.get_model_weight_size",
+        return_value=weight_size,
+    ) as get_model_weight_size:
+        claim = await estimate_model_vram(model)
+
+    get_model_weight_size.assert_called_once_with(
+        model,
+        None,
+        recursive=True,
+        file_name_prefixes=VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES,
+    )
     assert claim == int(
         weight_size * VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER
         + VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD

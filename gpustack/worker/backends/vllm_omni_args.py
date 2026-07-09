@@ -52,6 +52,8 @@ def detect_model_type(model_name: str, categories: list) -> str:
     categories = categories or []
 
     diffusion_keywords = [
+        "qwen-image",
+        "omnigen",
         "flux",
         "z-image",
         "stable-diffusion",

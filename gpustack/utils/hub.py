@@ -263,7 +263,10 @@ def match_model_scope_file_paths(
 
 
 def get_model_weight_size(
-    model: Model, token: Optional[str] = None, recursive: bool = False
+    model: Model,
+    token: Optional[str] = None,
+    recursive: bool = False,
+    file_name_prefixes: Optional[tuple[str, ...]] = None,
 ) -> int:
     """
     Get the size of the model weights. This is the sum of all the weight files with extensions
@@ -274,6 +277,9 @@ def get_model_weight_size(
         model: Model to get the weight size for
         token: Optional Hugging Face API token
         recursive: Include nested weight files
+        file_name_prefixes: When set, prefer weight files whose repository
+            paths start with one of these prefixes. If no matching weight files
+            are found, all discovered weight files are used as a fallback.
     Returns:
         int: The size of the model weights
     """
@@ -287,11 +293,21 @@ def get_model_weight_size(
     repo_file_infos = list_repo(
         repo_id, model.source, token=token, root_dir_only=not recursive
     )
-    return sum(
-        file.get("size", 0)
+    weight_files = [
+        file
         for file in repo_file_infos
         if file.get("name", "").endswith(weight_file_extensions)
-    )
+    ]
+    if file_name_prefixes:
+        preferred_weight_files = [
+            file
+            for file in weight_files
+            if file.get("name", "").startswith(file_name_prefixes)
+        ]
+        if preferred_weight_files:
+            weight_files = preferred_weight_files
+
+    return sum(file.get("size", 0) for file in weight_files)
 
 
 def get_pretrained_config(model: Model, **kwargs):

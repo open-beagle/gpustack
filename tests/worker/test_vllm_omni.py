@@ -49,5 +49,9 @@ def test_vllm_omni_detects_video_model_type():
     assert detect_model_type("Wan2.2-T2V", [CategoryEnum.VIDEO]) == "video"
 
 
+def test_vllm_omni_detects_omnigen_model_type_without_category():
+    assert detect_model_type("OmniGen2", []) == "diffusion"
+
+
 def test_vllm_omni_keeps_audio_model_type_when_explicitly_selected():
     assert detect_model_type("whisper-large", [CategoryEnum.SPEECH_TO_TEXT]) == "audio"

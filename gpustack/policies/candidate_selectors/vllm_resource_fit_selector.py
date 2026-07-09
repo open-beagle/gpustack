@@ -53,12 +53,36 @@ EVENT_ACTION_AUTO_SINGLE_WORKER_MULTI_GPU = (
 EVENT_ACTION_AUTO_SINGLE_GPU = "auto_single_gpu_scheduling_msg"
 VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER = 1.25
 VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD = 4 * 1024**3
+VLLM_OMNI_DIFFUSION_KEYWORDS = [
+    "qwen-image",
+    "omnigen",
+    "flux",
+    "z-image",
+    "stable-diffusion",
+    "sd3",
+    "sdxl",
+    "dit",
+    "lumina",
+    "hunyuan-dit",
+    "pixart",
+]
+VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES = ("transformer/", "unet/", "vae/")
 
 
 def is_vllm_omni_diffusion_model(model: Model) -> bool:
-    return get_backend(model) == BackendEnum.VLLM_OMNI and (
-        is_image_model(model) or is_video_model(model) or is_diffusers_model(model)
-    )
+    if get_backend(model) != BackendEnum.VLLM_OMNI:
+        return False
+    if is_image_model(model) or is_video_model(model) or is_diffusers_model(model):
+        return True
+
+    source_values = [
+        getattr(model, "name", None),
+        getattr(model, "huggingface_repo_id", None),
+        getattr(model, "model_scope_model_id", None),
+        getattr(model, "local_path", None),
+    ]
+    source_text = " ".join(value for value in source_values if value).lower()
+    return any(keyword in source_text for keyword in VLLM_OMNI_DIFFUSION_KEYWORDS)
 
 
 async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
@@ -112,11 +136,24 @@ async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
                     model,
                     token,
                     recursive=is_vllm_omni_diffusion,
+                    file_name_prefixes=(
+                        VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES
+                        if is_vllm_omni_diffusion
+                        else None
+                    ),
                 ),
                 timeout=timeout_in_seconds,
             )
         elif model.source == SourceEnum.LOCAL_PATH and os.path.exists(model.local_path):
-            weight_size = get_local_model_weight_size(model.local_path)
+            weight_size = get_local_model_weight_size(
+                model.local_path,
+                recursive=is_vllm_omni_diffusion,
+                file_name_prefixes=(
+                    VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES
+                    if is_vllm_omni_diffusion
+                    else None
+                ),
+            )
     except asyncio.TimeoutError:
         logger.warning(f"Timeout when getting weight size for model {model.name}")
     except Exception as e:
@@ -165,13 +202,40 @@ def parse_model_size_by_name(model_name: str) -> int:
         raise ValueError(f"Cannot parse model size from model name: {model_name}")
 
 
-def get_local_model_weight_size(local_path: str) -> int:
+def get_local_model_weight_size(
+    local_path: str,
+    recursive: bool = False,
+    file_name_prefixes: Optional[tuple[str, ...]] = None,
+) -> int:
     """
-    Get the local model weight size in bytes. Estimate by the total size of files in the top-level (depth 1) of the directory.
+    Get the local model weight size in bytes.
     """
+    weight_file_extensions = (".safetensors", ".bin", ".pt", ".pth")
     total_size = 0
 
     try:
+        if recursive:
+            weight_files = []
+            for root, _, files in os.walk(local_path):
+                for file in files:
+                    relative_name = os.path.relpath(
+                        os.path.join(root, file), local_path
+                    )
+                    if not relative_name.endswith(weight_file_extensions):
+                        continue
+                    weight_files.append((relative_name, os.path.join(root, file)))
+
+            if file_name_prefixes:
+                preferred_weight_files = [
+                    item
+                    for item in weight_files
+                    if item[0].startswith(file_name_prefixes)
+                ]
+                if preferred_weight_files:
+                    weight_files = preferred_weight_files
+
+            return sum(os.path.getsize(path) for _, path in weight_files)
+
         with os.scandir(local_path) as entries:
             for entry in entries:
                 if entry.is_file():

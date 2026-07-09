@@ -353,9 +353,10 @@ async def ensure_instance_model_file(session: AsyncSession, instance: ModelInsta
         # Not scheduled yet
         return
 
-    if len(instance.model_files) > 0:
+    existing_model_files = await get_model_files_for_instance(session, instance)
+    if len(existing_model_files) > 0:
         instance = await ModelInstance.one_by_id(session, instance.id)
-        await sync_instance_files_state(session, instance, instance.model_files)
+        await sync_instance_files_state(session, instance, existing_model_files)
         return
 
     model_files = await get_or_create_model_files_for_instance(session, instance)
@@ -374,9 +375,10 @@ async def ensure_instance_model_file(session: AsyncSession, instance: ModelInsta
     instance = await ModelInstance.one_by_id(session, instance.id)
     instance.model_files = model_files
     await sync_instance_files_state(session, instance, model_files)
-    logger.debug(
-        f"Associated model file {model_file.readable_source}(id: {model_file.id}) with model instance {instance.name}"
-    )
+    for model_file in model_files:
+        logger.debug(
+            f"Associated model file {model_file.readable_source}(id: {model_file.id}) with model instance {instance.name}"
+        )
 
 
 async def get_or_create_model_files_for_instance(
