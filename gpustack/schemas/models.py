@@ -44,7 +44,7 @@ class PlacementStrategyEnum(str, Enum):
 
 class BackendEnum(str, Enum):
     LLAMA_BOX = "llama-box"
-    LLAMA_CPP = "llama-cpp"
+    LLAMA_CPP = "llama.cpp"
     VLLM = "vllm"
     VOX_BOX = "vox-box"
     ASCEND_MINDIE = "ascend-mindie"
@@ -53,6 +53,12 @@ class BackendEnum(str, Enum):
 
 def is_gguf_backend(backend: Optional[str]) -> bool:
     return backend in (BackendEnum.LLAMA_BOX, BackendEnum.LLAMA_CPP)
+
+
+def is_supported_backend(backend: Optional[str]) -> bool:
+    if backend is None:
+        return True
+    return backend in {item.value for item in BackendEnum}
 
 
 class GPUSelector(BaseModel):
@@ -224,6 +230,9 @@ class ModelSpecBase(SQLModel, ModelSource):
 
     @model_validator(mode="after")
     def set_defaults(self):
+        if not is_supported_backend(self.backend):
+            raise ValueError(f"Unsupported backend {self.backend}")
+
         backend = get_backend(self)
         if self.cpu_offloading is None:
             self.cpu_offloading = True if is_gguf_backend(backend) else False
@@ -234,7 +243,7 @@ class ModelSpecBase(SQLModel, ModelSource):
                 if backend == BackendEnum.VLLM
                 or (
                     backend == BackendEnum.LLAMA_BOX
-                    and get_gguf_runtime(self) != "llama-cpp"
+                    and get_gguf_runtime(self) != BackendEnum.LLAMA_CPP
                 )
                 else False
             )
@@ -255,7 +264,7 @@ class ModelBase(ModelSpecBase):
                     "file_path must be provided when source is 'model_scope'"
                 )
             if (
-                get_gguf_runtime(self) == "llama-cpp"
+                get_gguf_runtime(self) == BackendEnum.LLAMA_CPP
                 and self.distributed_inference_across_workers
             ):
                 raise ValueError(
@@ -648,7 +657,7 @@ def get_backend(model: Model) -> str:
 
 def get_gguf_runtime(model: Model) -> str:
     if getattr(model, "backend", None) == BackendEnum.LLAMA_CPP:
-        return "llama-cpp"
+        return BackendEnum.LLAMA_CPP
 
     env = getattr(model, "env", None) or {}
     runtime = env.get("GPUSTACK_GGUF_RUNTIME")

@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 class LlamaBoxServer(InferenceServer):
     def start(self):  # noqa: C901
-        if get_gguf_runtime(self._model) == "llama-cpp":
+        if get_gguf_runtime(self._model) == BackendEnum.LLAMA_CPP:
             return self._start_llama_cpp()
 
         return self._start_llama_box()

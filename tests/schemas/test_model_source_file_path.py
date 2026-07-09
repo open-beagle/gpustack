@@ -3,7 +3,13 @@ from pydantic import ValidationError
 
 from datetime import datetime, timezone
 
-from gpustack.schemas.models import BackendEnum, ModelCreate, ModelPublic, SourceEnum
+from gpustack.schemas.models import (
+    BackendEnum,
+    ModelCreate,
+    ModelPublic,
+    SourceEnum,
+    get_backend,
+)
 
 
 def test_model_scope_accepts_file_path_alias_for_gguf_model():
@@ -16,6 +22,31 @@ def test_model_scope_accepts_file_path_alias_for_gguf_model():
     )
 
     assert model.model_scope_file_path == "Qwen3.6-27B-UD-Q4_K_XL.gguf"
+
+
+def test_model_scope_accepts_llama_cpp_backend_for_gguf_model():
+    model = ModelCreate(
+        name="qwen-gguf",
+        source=SourceEnum.MODEL_SCOPE,
+        model_scope_model_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+        model_scope_file_path="Qwen3.6-27B-UD-Q4_K_XL.gguf",
+        backend="llama.cpp",
+    )
+
+    assert get_backend(model) == BackendEnum.LLAMA_CPP
+    assert model.cpu_offloading is True
+    assert model.distributed_inference_across_workers is False
+
+
+def test_model_scope_rejects_legacy_llama_cpp_backend_name():
+    with pytest.raises(ValidationError, match="Unsupported backend llama-cpp"):
+        ModelCreate(
+            name="qwen-gguf",
+            source=SourceEnum.MODEL_SCOPE,
+            model_scope_model_id="unsloth/Qwen3.6-27B-MTP-GGUF",
+            model_scope_file_path="Qwen3.6-27B-UD-Q4_K_XL.gguf",
+            backend="llama-cpp",
+        )
 
 
 def test_model_scope_gguf_requires_file_path():
