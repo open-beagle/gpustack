@@ -262,13 +262,18 @@ def match_model_scope_file_paths(
     return matching_paths
 
 
-def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
+def get_model_weight_size(
+    model: Model, token: Optional[str] = None, recursive: bool = False
+) -> int:
     """
     Get the size of the model weights. This is the sum of all the weight files with extensions
-    .safetensors, .bin, .pt, .pth in the root directory only.
+    .safetensors, .bin, .pt, .pth. By default, only the root directory is
+    scanned. Set recursive=True for diffusers-style repositories whose weights
+    are stored in subdirectories.
     Args:
         model: Model to get the weight size for
         token: Optional Hugging Face API token
+        recursive: Include nested weight files
     Returns:
         int: The size of the model weights
     """
@@ -279,7 +284,9 @@ def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
         repo_id = model.model_scope_model_id
     else:
         raise ValueError(f"Unknown source {model.source}")
-    repo_file_infos = list_repo(repo_id, model.source, token=token, root_dir_only=True)
+    repo_file_infos = list_repo(
+        repo_id, model.source, token=token, root_dir_only=not recursive
+    )
     return sum(
         file.get("size", 0)
         for file in repo_file_infos

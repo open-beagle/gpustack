@@ -1,4 +1,8 @@
-from gpustack.utils.command import ensure_bool_parameter
+from gpustack.utils.command import (
+    ensure_bool_parameter,
+    find_bool_parameter,
+    find_parameter,
+)
 
 
 def build_vllm_omni_arguments(
@@ -8,6 +12,7 @@ def build_vllm_omni_arguments(
     model_categories: list,
     backend_parameters: list,
     port: int,
+    gpu_count: int = 0,
 ) -> list:
     arguments = [
         "serve",
@@ -16,7 +21,7 @@ def build_vllm_omni_arguments(
 
     model_type = detect_model_type(model_name, model_categories)
     if model_type == "diffusion":
-        arguments.extend(get_diffusion_arguments())
+        arguments.extend(get_diffusion_arguments(backend_parameters, gpu_count))
     elif model_type == "audio":
         arguments.extend(get_audio_arguments())
 
@@ -73,8 +78,17 @@ def detect_model_type(model_name: str, categories: list) -> str:
     return "llm"
 
 
-def get_diffusion_arguments() -> list:
-    return []
+def get_diffusion_arguments(backend_parameters: list, gpu_count: int = 0) -> list:
+    if (
+        gpu_count <= 1
+        or find_parameter(backend_parameters, ["num-gpus"]) is not None
+        or find_parameter(backend_parameters, ["tensor-parallel-size", "tp"])
+        is not None
+        or find_bool_parameter(backend_parameters, ["use-hsdp"])
+    ):
+        return []
+
+    return ["--num-gpus", str(gpu_count)]
 
 
 def get_audio_arguments() -> list:

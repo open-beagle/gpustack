@@ -5,7 +5,7 @@ from gpustack.worker.backends.vllm_omni_args import (
 )
 
 
-def _arguments(backend_parameters=None):
+def _arguments(backend_parameters=None, gpu_count=0):
     return build_vllm_omni_arguments(
         "/models/qwen-image",
         "qwen-image-2512",
@@ -13,6 +13,7 @@ def _arguments(backend_parameters=None):
         [CategoryEnum.IMAGE],
         backend_parameters,
         40000,
+        gpu_count,
     )
 
 
@@ -29,6 +30,19 @@ def test_vllm_omni_arguments_do_not_duplicate_user_omni_flag():
 
     assert arguments.count("--omni") == 1
     assert "--trust-remote-code" in arguments
+
+
+def test_vllm_omni_diffusion_arguments_add_num_gpus_for_multi_gpu():
+    arguments = _arguments(gpu_count=2)
+
+    assert arguments[arguments.index("--num-gpus") + 1] == "2"
+
+
+def test_vllm_omni_diffusion_arguments_keep_user_num_gpus():
+    arguments = _arguments(["--num-gpus=4"], gpu_count=2)
+
+    assert "--num-gpus=4" in arguments
+    assert "--num-gpus" not in arguments
 
 
 def test_vllm_omni_detects_video_model_type():

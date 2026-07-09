@@ -1,4 +1,5 @@
 from tenacity import retry, stop_after_attempt, wait_fixed
+from unittest.mock import patch
 from gpustack.utils import hub
 from gpustack.utils.hub import (
     get_hugging_face_model_min_gguf_path,
@@ -119,6 +120,42 @@ def test_get_hub_model_weight_size():
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def get_hub_model_weight_size_with_retry(model: Model) -> int:
     return get_model_weight_size(model)
+
+
+def test_get_model_weight_size_can_include_nested_diffusers_weights():
+    model = Model(
+        source=SourceEnum.MODEL_SCOPE,
+        model_scope_model_id="Qwen/Qwen-Image-2512",
+    )
+    files = [
+        {"name": "model.safetensors", "size": 10},
+        {"name": "transformer/diffusion_pytorch_model.safetensors", "size": 20},
+        {"name": "text_encoder/model.safetensors", "size": 30},
+        {"name": "README.md", "size": 40},
+    ]
+
+    def fake_list_repo(*args, **kwargs):
+        if kwargs.get("root_dir_only"):
+            return [file for file in files if "/" not in file["name"]]
+        return files
+
+    with patch.object(hub, "list_repo", side_effect=fake_list_repo) as list_repo:
+        assert get_model_weight_size(model) == 10
+        list_repo.assert_called_once_with(
+            "Qwen/Qwen-Image-2512",
+            SourceEnum.MODEL_SCOPE,
+            token=None,
+            root_dir_only=True,
+        )
+
+    with patch.object(hub, "list_repo", side_effect=fake_list_repo) as list_repo:
+        assert get_model_weight_size(model, recursive=True) == 60
+        list_repo.assert_called_once_with(
+            "Qwen/Qwen-Image-2512",
+            SourceEnum.MODEL_SCOPE,
+            token=None,
+            root_dir_only=False,
+        )
 
 
 def test_get_hf_min_gguf_file():

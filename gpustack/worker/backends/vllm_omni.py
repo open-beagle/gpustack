@@ -97,6 +97,7 @@ class VLLMOmniServer(InferenceServer):
             self._model.categories,
             self._model.backend_parameters,
             self._model_instance.port,
+            len(self._model_instance.gpu_indexes or []),
         )
 
     def _detect_model_type(self) -> str:
