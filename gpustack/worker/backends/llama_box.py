@@ -350,6 +350,7 @@ class LlamaBoxServer(InferenceServer):
             self._model.name,
             "--no-mmap",
         ]
+        arguments = ensure_metrics_enabled(arguments, self._model.backend_parameters)
 
         mmproj = find_parameter(self._model.backend_parameters, ["mmproj"])
         default_mmproj = get_mmproj_file(self._model_path)
@@ -439,7 +440,9 @@ def set_priority(pid: int):
         logger.error(f"Failed to set priority for process {pid}: {e}")
 
 
-def ensure_metrics_enabled(arguments: List[str], backend_parameters: List[str]) -> List[str]:
+def ensure_metrics_enabled(
+    arguments: List[str], backend_parameters: List[str]
+) -> List[str]:
     return ensure_bool_parameter(
         arguments,
         "metrics",
@@ -456,7 +459,6 @@ def normalize_llama_cpp_parameters(parameters: List[str]) -> List[str]:
         "image-vae-tiling",
         "max-projected-cache",
         "no-warmup",
-        "metrics",
     ]
     return normalize_parameters(parameters, removes=removes)
 

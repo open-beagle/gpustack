@@ -13,6 +13,7 @@ from gpustack.utils.command import ensure_bool_parameter
 from gpustack.worker import serve_manager
 from gpustack.worker.backends.llama_box import (
     LlamaBoxServer,
+    LlamaCppServer,
     normalize_llama_cpp_parameters,
 )
 from gpustack.worker.tools_manager import (
@@ -179,7 +180,7 @@ def test_llama_cpp_backend_rejects_distributed_inference():
         )
 
 
-def test_normalize_llama_cpp_parameters_removes_internal_and_unsupported_flags():
+def test_normalize_llama_cpp_parameters_preserves_metrics_flag():
     got = normalize_llama_cpp_parameters(
         [
             "--gpustack-runtime=llama.cpp",
@@ -193,7 +194,25 @@ def test_normalize_llama_cpp_parameters_removes_internal_and_unsupported_flags()
         ]
     )
 
-    assert got == ["--ctx-size", "16384", "--mmproj", "mmproj.gguf"]
+    assert got == ["--ctx-size", "16384", "--mmproj", "mmproj.gguf", "--metrics"]
+
+
+def test_llama_cpp_arguments_enable_metrics_by_default():
+    server = object.__new__(LlamaCppServer)
+    server._model = SimpleNamespace(
+        name="qwen-gguf",
+        backend_parameters=[],
+    )
+    server._model_instance = SimpleNamespace(
+        port=18080,
+        computed_resource_claim=None,
+        gpu_indexes=None,
+    )
+    server._model_path = "/models/qwen.gguf"
+
+    got = server._build_llama_cpp_arguments()
+
+    assert got.count("--metrics") == 1
 
 
 def test_normalize_llama_cpp_parameters_preserves_regular_runtime_flag():
@@ -209,8 +228,7 @@ def test_normalize_llama_cpp_parameters_preserves_regular_runtime_flag():
 
 def test_get_llama_cpp_package_name_matches_uploaded_artifact():
     assert (
-        get_llama_cpp_package_name("b8322")
-        == "llama-cpp-cuda-12.8.2-b8322-linux-x64"
+        get_llama_cpp_package_name("b8322") == "llama-cpp-cuda-12.8.2-b8322-linux-x64"
     )
 
 
