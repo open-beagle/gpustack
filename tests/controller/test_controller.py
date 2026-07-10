@@ -4,18 +4,24 @@ from typing import List
 import pytest
 from gpustack.policies.base import ModelInstanceScore
 
+from gpustack.schemas.links import ModelInstanceModelFileLink
+from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.models import (
     ComputedResourceClaim,
     GPUSelector,
     ModelPlacementOverride,
     PlacementOverrideReplicaGroup,
     ModelInstanceStateEnum,
+    SourceEnum,
 )
 from gpustack.schemas.workers import WorkerStateEnum
 from gpustack.server.controllers import (
     ModelInstanceController,
     WorkerController,
+    ensure_instance_model_file,
+    ensure_model_instance_file_links,
     find_scale_down_candidates,
+    get_model_instance_ids_for_model_file,
     safe_event_attr,
     sync_replicas,
 )
@@ -49,6 +55,31 @@ class ExpiredWorkerEventData:
     @property
     def name(self):
         raise RuntimeError("expired worker name")
+
+
+class FakeExecResult:
+    def __init__(self, items):
+        self.items = items
+
+    def all(self):
+        return self.items
+
+
+class FakeSession:
+    def __init__(self, exec_items=None):
+        self.exec_items = exec_items or []
+        self.added = []
+        self.flushed = False
+
+    async def exec(self, statement):
+        self.statement = statement
+        return FakeExecResult(self.exec_items)
+
+    def add(self, item):
+        self.added.append(item)
+
+    async def flush(self):
+        self.flushed = True
 
 
 def test_model_instance_deleted_event_reconciles_parent_model():
@@ -114,6 +145,101 @@ def test_worker_reconcile_skips_expired_event_data_without_implicit_io():
         )
 
     list_mock.assert_not_awaited()
+
+
+def test_ensure_model_instance_file_links_adds_missing_links():
+    session = FakeSession()
+    instance = new_model_instance(376, "test-376", 80)
+    model_files = [
+        ModelFile(id=149, source=SourceEnum.MODEL_SCOPE, worker_id=2),
+        ModelFile(id=150, source=SourceEnum.MODEL_SCOPE, worker_id=2),
+    ]
+
+    asyncio.run(ensure_model_instance_file_links(session, instance, model_files))
+
+    assert [(link.model_instance_id, link.model_file_id) for link in session.added] == [
+        (376, 149),
+        (376, 150),
+    ]
+    assert session.flushed is True
+
+
+def test_ensure_model_instance_file_links_skips_existing_links():
+    session = FakeSession(
+        [
+            ModelInstanceModelFileLink(
+                model_instance_id=376,
+                model_file_id=149,
+            )
+        ]
+    )
+    instance = new_model_instance(376, "test-376", 80)
+    model_files = [
+        ModelFile(id=149, source=SourceEnum.MODEL_SCOPE, worker_id=2),
+        ModelFile(id=150, source=SourceEnum.MODEL_SCOPE, worker_id=2),
+    ]
+
+    asyncio.run(ensure_model_instance_file_links(session, instance, model_files))
+
+    assert [(link.model_instance_id, link.model_file_id) for link in session.added] == [
+        (376, 150),
+    ]
+
+
+def test_get_model_instance_ids_for_model_file_reads_link_table():
+    session = FakeSession(
+        [
+            ModelInstanceModelFileLink(model_instance_id=376, model_file_id=149),
+            ModelInstanceModelFileLink(model_instance_id=None, model_file_id=149),
+        ]
+    )
+
+    instance_ids = asyncio.run(get_model_instance_ids_for_model_file(session, 149))
+
+    assert instance_ids == [376]
+
+
+def test_ensure_instance_model_file_links_existing_files_before_sync():
+    session = AsyncMock()
+    instance = new_model_instance(
+        376,
+        "test-376",
+        80,
+        worker_id=2,
+        state=ModelInstanceStateEnum.INITIALIZING,
+    )
+    model_file = ModelFile(
+        id=149,
+        source=SourceEnum.MODEL_SCOPE,
+        worker_id=2,
+        state=ModelFileStateEnum.READY,
+        resolved_paths=["/var/lib/gpustack/cache/test.gguf"],
+    )
+    link_mock = AsyncMock()
+    sync_mock = AsyncMock()
+
+    with (
+        patch(
+            "gpustack.server.controllers.get_model_files_for_instance",
+            new=AsyncMock(return_value=[model_file]),
+        ),
+        patch(
+            "gpustack.server.controllers.ModelInstance.one_by_id",
+            new=AsyncMock(return_value=instance),
+        ),
+        patch(
+            "gpustack.server.controllers.ensure_model_instance_file_links",
+            new=link_mock,
+        ),
+        patch(
+            "gpustack.server.controllers.sync_instance_files_state",
+            new=sync_mock,
+        ),
+    ):
+        asyncio.run(ensure_instance_model_file(session, instance))
+
+    link_mock.assert_awaited_once_with(session, instance, [model_file])
+    sync_mock.assert_awaited_once_with(session, instance, [model_file])
 
 
 def test_find_scale_down_candidates():

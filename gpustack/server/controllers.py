@@ -4,6 +4,7 @@ import random
 import string
 from typing import Any, Dict, List
 import httpx
+from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -12,6 +13,7 @@ from gpustack.policies.scorers.offload_layer_scorer import OffloadLayerScorer
 from gpustack.policies.scorers.placement_scorer import PlacementScorer, ScaleTypeEnum
 from gpustack.policies.base import ModelInstanceScore
 from gpustack.policies.scorers.status_scorer import StatusScorer
+from gpustack.schemas.links import ModelInstanceModelFileLink
 from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.models import (
     BackendEnum,
@@ -356,6 +358,7 @@ async def ensure_instance_model_file(session: AsyncSession, instance: ModelInsta
     existing_model_files = await get_model_files_for_instance(session, instance)
     if len(existing_model_files) > 0:
         instance = await ModelInstance.one_by_id(session, instance.id)
+        await ensure_model_instance_file_links(session, instance, existing_model_files)
         await sync_instance_files_state(session, instance, existing_model_files)
         return
 
@@ -373,12 +376,42 @@ async def ensure_instance_model_file(session: AsyncSession, instance: ModelInsta
         )
 
     instance = await ModelInstance.one_by_id(session, instance.id)
-    instance.model_files = model_files
+    await ensure_model_instance_file_links(session, instance, model_files)
     await sync_instance_files_state(session, instance, model_files)
     for model_file in model_files:
         logger.debug(
             f"Associated model file {model_file.readable_source}(id: {model_file.id}) with model instance {instance.name}"
         )
+
+
+async def ensure_model_instance_file_links(
+    session: AsyncSession, instance: ModelInstance, model_files: List[ModelFile]
+):
+    if not instance or instance.id is None or not model_files:
+        return
+
+    model_file_ids = [model_file.id for model_file in model_files if model_file.id]
+    if not model_file_ids:
+        return
+
+    statement = select(ModelInstanceModelFileLink).where(
+        ModelInstanceModelFileLink.model_instance_id == instance.id,
+        ModelInstanceModelFileLink.model_file_id.in_(model_file_ids),
+    )
+    result = await session.exec(statement)
+    existing_model_file_ids = {link.model_file_id for link in result.all()}
+
+    for model_file_id in model_file_ids:
+        if model_file_id in existing_model_file_ids:
+            continue
+        session.add(
+            ModelInstanceModelFileLink(
+                model_instance_id=instance.id,
+                model_file_id=model_file_id,
+            )
+        )
+
+    await session.flush()
 
 
 async def get_or_create_model_files_for_instance(
@@ -654,16 +687,37 @@ class ModelFileController:
         try:
             async with AsyncSession(self._engine) as session:
                 file = await ModelFile.one_by_id(session, file.id)
+                if not file:
+                    # In case the file is deleted
+                    return
 
-            if not file:
-                # In case the file is deleted
-                return
+                instance_ids = await get_model_instance_ids_for_model_file(
+                    session, file.id
+                )
 
-            for instance in file.instances:
+            for instance_id in instance_ids:
                 async with AsyncSession(self._engine) as session:
-                    await sync_instance_files_state(session, instance, [file])
+                    current_file = await ModelFile.one_by_id(session, file.id)
+                    instance = await ModelInstance.one_by_id(session, instance_id)
+                    if not current_file or not instance:
+                        continue
+                    await sync_instance_files_state(session, instance, [current_file])
         except Exception as e:
             logger.error(f"Failed to reconcile model file {file.id}: {e}")
+
+
+async def get_model_instance_ids_for_model_file(
+    session: AsyncSession, model_file_id: int
+) -> List[int]:
+    statement = select(ModelInstanceModelFileLink).where(
+        ModelInstanceModelFileLink.model_file_id == model_file_id
+    )
+    result = await session.exec(statement)
+    return [
+        link.model_instance_id
+        for link in result.all()
+        if link.model_instance_id is not None
+    ]
 
 
 async def sync_instance_files_state(
