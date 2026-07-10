@@ -25,7 +25,7 @@ from gpustack.utils import platform
 from gpustack.utils.platform import DeviceTypeEnum, device_type_from_vendor
 
 _config = None
-DEFAULT_LOCAL_S3_MODELSCOPE_PREFIX = "s3://bd-wind/modelscope"
+DEFAULT_LOCAL_S3_MODELSCOPE_PREFIX = "s3://bd-wind/datamodel"
 
 
 class Config(BaseSettings):
@@ -185,7 +185,7 @@ class Config(BaseSettings):
     worker_local_s3_use_virtual_hosted_style: bool = True
     worker_local_s3_region: Optional[str] = ""
     worker_local_s3_modelscope_prefix: Optional[str] = ""
-    worker_local_s3_modelscope_fallback: bool = False
+    worker_local_s3_modelscope_fallback: bool = True
 
     def __init__(self, **values):
         super().__init__(**values)

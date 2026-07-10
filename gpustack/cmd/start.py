@@ -501,8 +501,12 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         "--worker-local-s3-modelscope-fallback",
         action=OptionalBoolAction,
         help="Fallback to public ModelScope when local S3 cache misses.",
-        default=get_gpustack_env_bool("STACK_WORKER_LOCAL_S3_MODELSCOPE_FALLBACK")
-        or False,
+        default=(
+            get_gpustack_env_bool("STACK_WORKER_LOCAL_S3_MODELSCOPE_FALLBACK")
+            if get_gpustack_env_bool("STACK_WORKER_LOCAL_S3_MODELSCOPE_FALLBACK")
+            is not None
+            else True
+        ),
     )
     # External authentication settings
     group.add_argument(

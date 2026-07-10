@@ -638,11 +638,13 @@ class ModelScopeDownloader:
                 s3_path,
                 strip_prefix=strip_prefix,
             )
-            if not file_list:
+            if file_list:
+                return file_list
+            if not cfg.worker_local_s3_modelscope_fallback:
                 raise ValueError(
                     f"ModelScope local S3 cache not found for {model.model_scope_model_id}"
                 )
-            return file_list
+            logger.info("Fallback to public ModelScope file list is enabled")
 
         api = HubApi()
         repo_files = api.get_model_files(model.model_scope_model_id, recursive=True)
