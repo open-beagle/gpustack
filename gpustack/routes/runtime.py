@@ -11,6 +11,7 @@ from gpustack.schemas.models import (
     ModelInstance,
     ModelInstanceStateEnum,
     get_backend,
+    is_gguf_backend,
 )
 from gpustack.schemas.runtime import (
     RuntimeModelInstance,
@@ -147,7 +148,7 @@ def _health_endpoint(endpoint: Optional[str], backend: Optional[str]) -> Optiona
     if not endpoint:
         return None
 
-    if backend in (BackendEnum.LLAMA_BOX, BackendEnum.VLLM_OMNI):
+    if is_gguf_backend(backend) or backend == BackendEnum.VLLM_OMNI:
         return f"{endpoint}/health"
 
     return f"{endpoint}/v1/models"

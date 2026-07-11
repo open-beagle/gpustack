@@ -1,10 +1,10 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
 # 配置
 TOOLS_DIR="${TOOLS_DIR:-./.downloads/gpustack}"
-S3_BUCKET="aliyun/vscode/gpustack"
+S3_BUCKET="${S3_BUCKET:-aliyun/vscode/gpustack}"
 ARCH="${ARCH:-amd64}"
 DEVICE="${DEVICE:-cuda}"
 
@@ -12,6 +12,11 @@ DEVICE="${DEVICE:-cuda}"
 LLAMA_BOX_VERSION="v0.0.171"
 GGUF_PARSER_GO_VERSION="v0.22.1"
 FASTFETCH_VERSION="2.25.0.1"
+
+CURL_PROXY_ARGS=()
+if [ -n "${SOCKS5_PROXY_LOCAL:-}" ]; then
+  CURL_PROXY_ARGS=(-x "$SOCKS5_PROXY_LOCAL")
+fi
 
 # 标记是否有下载
 NEED_UPLOAD=0
@@ -52,7 +57,7 @@ esac
 echo "检查 S3 中是否已存在 $LLAMA_BOX_FILE..."
 if ! mc stat "$S3_BUCKET/llama-box/releases/download/$LLAMA_BOX_VERSION/$LLAMA_BOX_FILE" > /dev/null 2>&1; then
   echo "文件不存在，开始下载..."
-  curl -fL -x $SOCKS5_PROXY_LOCAL -o "$TOOLS_DIR/llama-box/releases/download/$LLAMA_BOX_VERSION/$LLAMA_BOX_FILE" \
+  curl -fL "${CURL_PROXY_ARGS[@]}" -o "$TOOLS_DIR/llama-box/releases/download/$LLAMA_BOX_VERSION/$LLAMA_BOX_FILE" \
     "https://github.com/gpustack/llama-box/releases/download/$LLAMA_BOX_VERSION/$LLAMA_BOX_FILE"
   NEED_UPLOAD=1
 else
@@ -69,7 +74,7 @@ case "$ARCH" in
     echo "检查 S3 中是否已存在 $GGUF_FILE..."
     if ! mc stat "$S3_BUCKET/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/$GGUF_FILE" > /dev/null 2>&1; then
       echo "文件不存在，开始下载..."
-      curl -fL -x $SOCKS5_PROXY_LOCAL -o "$TOOLS_DIR/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/$GGUF_FILE" \
+      curl -fL "${CURL_PROXY_ARGS[@]}" -o "$TOOLS_DIR/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/$GGUF_FILE" \
         "https://github.com/gpustack/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/$GGUF_FILE"
       NEED_UPLOAD=1
     else
@@ -81,7 +86,7 @@ case "$ARCH" in
     echo "检查 S3 中是否已存在 $GGUF_FILE..."
     if ! mc stat "$S3_BUCKET/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/$GGUF_FILE" > /dev/null 2>&1; then
       echo "文件不存在，开始下载..."
-      curl -fL -x $SOCKS5_PROXY_LOCAL -o "$TOOLS_DIR/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/$GGUF_FILE" \
+      curl -fL "${CURL_PROXY_ARGS[@]}" -o "$TOOLS_DIR/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/$GGUF_FILE" \
         "https://github.com/gpustack/gguf-parser-go/releases/download/$GGUF_PARSER_GO_VERSION/$GGUF_FILE"
       NEED_UPLOAD=1
     else
@@ -100,7 +105,7 @@ case "$ARCH" in
     echo "检查 S3 中是否已存在 $FASTFETCH_FILE..."
     if ! mc stat "$S3_BUCKET/fastfetch/releases/download/$FASTFETCH_VERSION/$FASTFETCH_FILE" > /dev/null 2>&1; then
       echo "文件不存在，开始下载..."
-      curl -fL -x $SOCKS5_PROXY_LOCAL -o "$TOOLS_DIR/fastfetch/releases/download/$FASTFETCH_VERSION/$FASTFETCH_FILE" \
+      curl -fL "${CURL_PROXY_ARGS[@]}" -o "$TOOLS_DIR/fastfetch/releases/download/$FASTFETCH_VERSION/$FASTFETCH_FILE" \
         "https://github.com/gpustack/fastfetch/releases/download/$FASTFETCH_VERSION/$FASTFETCH_FILE"
       NEED_UPLOAD=1
     else
@@ -112,7 +117,7 @@ case "$ARCH" in
     echo "检查 S3 中是否已存在 $FASTFETCH_FILE..."
     if ! mc stat "$S3_BUCKET/fastfetch/releases/download/$FASTFETCH_VERSION/$FASTFETCH_FILE" > /dev/null 2>&1; then
       echo "文件不存在，开始下载..."
-      curl -fL -x $SOCKS5_PROXY_LOCAL -o "$TOOLS_DIR/fastfetch/releases/download/$FASTFETCH_VERSION/$FASTFETCH_FILE" \
+      curl -fL "${CURL_PROXY_ARGS[@]}" -o "$TOOLS_DIR/fastfetch/releases/download/$FASTFETCH_VERSION/$FASTFETCH_FILE" \
         "https://github.com/gpustack/fastfetch/releases/download/$FASTFETCH_VERSION/$FASTFETCH_FILE"
       NEED_UPLOAD=1
     else

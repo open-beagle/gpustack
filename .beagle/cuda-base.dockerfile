@@ -1,4 +1,4 @@
-ARG BASE=registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04
+ARG BASE=nvidia/cuda:12.8.2-runtime-ubuntu22.04
 
 FROM $BASE
 
@@ -47,14 +47,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
 
-ARG PYPI_MIRROR=http://mirrors.cloud.aliyuncs.com/pypi/simple/
-ARG PYPI_HOST=mirrors.cloud.aliyuncs.com
+ARG PYPI_MIRROR=https://mirrors.aliyun.com/pypi/simple/
+ARG PYPI_HOST=mirrors.aliyun.com
+ARG PYPI_EXTRA_INDEX_URL=https://pypi.org/simple/
 
 # 安装稳定运行时依赖层。只有 CUDA/Python/vLLM/vLLM-Omni/transformers 等底层版本变化时才需要重打该基础镜像。
 COPY ./dist/requirements-vllm.txt /tmp/requirements-vllm.txt
-RUN python3 -m pip install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --upgrade pip && \
-    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --upgrade 'pipx==1.7.1' 'argcomplete>=1.9.4' && \
-    pip3 install -i ${PYPI_MIRROR} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 -r /tmp/requirements-vllm.txt && \
+RUN python3 -m pip install -i ${PYPI_MIRROR} --extra-index-url ${PYPI_EXTRA_INDEX_URL} --trusted-host ${PYPI_HOST} --upgrade pip && \
+    python3 -m pip install -i ${PYPI_MIRROR} --extra-index-url ${PYPI_EXTRA_INDEX_URL} --trusted-host ${PYPI_HOST} --no-cache-dir --upgrade 'pipx==1.7.1' 'argcomplete>=1.9.4' && \
+    python3 -m pip install -i ${PYPI_MIRROR} --extra-index-url ${PYPI_EXTRA_INDEX_URL} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 -r /tmp/requirements-vllm.txt && \
     # 修复 transformers RoPE 验证类型错误 (set -= list)
     python3 -c "\
 import transformers.modeling_rope_utils as m; \

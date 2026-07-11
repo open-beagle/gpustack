@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 
 BUILTIN_LLAMA_BOX_VERSION = "v0.0.171"
 BUILTIN_GGUF_PARSER_VERSION = "v0.22.1"
-BUILTIN_LLAMA_CPP_VERSION = "b8322"
-BUILTIN_LLAMA_CPP_CUDA_VERSION = "12.8.1"
+BUILTIN_LLAMA_CPP_VERSION = "b9897"
+BUILTIN_LLAMA_CPP_CUDA_VERSION = "12.8.2"
 
 
 class ToolsManager:
@@ -191,6 +191,8 @@ class ToolsManager:
     def prepare_versioned_backend(self, backend: str, version: str):
         if backend == BackendEnum.LLAMA_BOX:
             self.install_versioned_llama_box(version)
+        elif backend == BackendEnum.LLAMA_CPP:
+            self.install_llama_cpp(version)
         elif backend == BackendEnum.VLLM:
             self.install_versioned_vllm_with_deps(version)
         elif backend == BackendEnum.VLLM_OMNI:

@@ -51,7 +51,7 @@ def find_bool_parameter(parameters: List[str], param_names: List[str]) -> bool:
         if '=' in param:
             key, _ = param.split('=', 1)
             if key.lstrip('-') in param_names:
-                continue
+                return True
         elif param.lstrip('-') in param_names:
             return True
     return False

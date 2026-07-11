@@ -21,6 +21,7 @@ from gpustack.schemas.models import (
     ModelInstancesPublic,
     GPUSelector,
     get_backend,
+    is_gguf_backend,
     is_audio_model,
     BackendEnum,
 )
@@ -294,7 +295,12 @@ async def validate_gpu_ids(  # noqa: C901
                 message="Using custom backend version to run vLLM across multiple workers is not supported."
             )
 
-    if model_backend == BackendEnum.LLAMA_BOX:
+    if model_backend == BackendEnum.LLAMA_CPP and len(worker_name_set) > 1:
+        raise BadRequestException(
+            message="llama.cpp backend only supports GPUs on a single worker."
+        )
+
+    if is_gguf_backend(model_backend):
         ts = find_parameter(model_in.backend_parameters, ["ts", "tensor-split"])
         if ts:
             raise BadRequestException(

@@ -416,6 +416,98 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         help="Region to s3.",
         default=get_gpustack_env("STACK_WORKER_S3_REGION"),
     )
+    group.add_argument(
+        "--worker-center-s3-host",
+        type=str,
+        help="HOST to center S3.",
+        default=get_gpustack_env("STACK_WORKER_CENTER_S3_HOST"),
+    )
+    group.add_argument(
+        "--worker-center-s3-access-key",
+        type=str,
+        help="AccessKey to center S3.",
+        default=get_gpustack_env("STACK_WORKER_CENTER_S3_ACCESS_KEY"),
+    )
+    group.add_argument(
+        "--worker-center-s3-secret-key",
+        type=str,
+        help="SecretKey to center S3.",
+        default=get_gpustack_env("STACK_WORKER_CENTER_S3_SECRET_KEY"),
+    )
+    group.add_argument(
+        "--worker-center-s3-ssl",
+        action=OptionalBoolAction,
+        help="Use SSL for center S3.",
+        default=get_gpustack_env_bool("STACK_WORKER_CENTER_S3_SSL"),
+    )
+    group.add_argument(
+        "--worker-center-s3-use-virtual-hosted-style",
+        action=OptionalBoolAction,
+        help="Use virtual hosted style for center S3.",
+        default=get_gpustack_env_bool(
+            "STACK_WORKER_CENTER_S3_USE_VIRTUAL_HOSTED_STYLE"
+        ),
+    )
+    group.add_argument(
+        "--worker-center-s3-region",
+        type=str,
+        help="Region to center S3.",
+        default=get_gpustack_env("STACK_WORKER_CENTER_S3_REGION"),
+    )
+    group.add_argument(
+        "--worker-local-s3-host",
+        type=str,
+        help="HOST to local S3.",
+        default=get_gpustack_env("STACK_WORKER_LOCAL_S3_HOST"),
+    )
+    group.add_argument(
+        "--worker-local-s3-access-key",
+        type=str,
+        help="AccessKey to local S3.",
+        default=get_gpustack_env("STACK_WORKER_LOCAL_S3_ACCESS_KEY"),
+    )
+    group.add_argument(
+        "--worker-local-s3-secret-key",
+        type=str,
+        help="SecretKey to local S3.",
+        default=get_gpustack_env("STACK_WORKER_LOCAL_S3_SECRET_KEY"),
+    )
+    group.add_argument(
+        "--worker-local-s3-ssl",
+        action=OptionalBoolAction,
+        help="Use SSL for local S3.",
+        default=get_gpustack_env_bool("STACK_WORKER_LOCAL_S3_SSL") or False,
+    )
+    group.add_argument(
+        "--worker-local-s3-use-virtual-hosted-style",
+        action=OptionalBoolAction,
+        help="Use virtual hosted style for local S3.",
+        default=get_gpustack_env_bool("STACK_WORKER_LOCAL_S3_USE_VIRTUAL_HOSTED_STYLE")
+        or False,
+    )
+    group.add_argument(
+        "--worker-local-s3-region",
+        type=str,
+        help="Region to local S3.",
+        default=get_gpustack_env("STACK_WORKER_LOCAL_S3_REGION"),
+    )
+    group.add_argument(
+        "--worker-local-s3-modelscope-prefix",
+        type=str,
+        help="Local S3 prefix for ModelScope mirror cache.",
+        default=get_gpustack_env("STACK_WORKER_LOCAL_S3_MODELSCOPE_PREFIX"),
+    )
+    group.add_argument(
+        "--worker-local-s3-modelscope-fallback",
+        action=OptionalBoolAction,
+        help="Fallback to public ModelScope when local S3 cache misses.",
+        default=(
+            get_gpustack_env_bool("STACK_WORKER_LOCAL_S3_MODELSCOPE_FALLBACK")
+            if get_gpustack_env_bool("STACK_WORKER_LOCAL_S3_MODELSCOPE_FALLBACK")
+            is not None
+            else True
+        ),
+    )
     # External authentication settings
     group.add_argument(
         "--external-auth-name",
@@ -618,6 +710,20 @@ def set_common_options(args, config_data: dict):
         "worker_s3_ssl",
         "worker_s3_use_virtual_hosted_style",
         "worker_s3_region",
+        "worker_center_s3_host",
+        "worker_center_s3_access_key",
+        "worker_center_s3_secret_key",
+        "worker_center_s3_ssl",
+        "worker_center_s3_use_virtual_hosted_style",
+        "worker_center_s3_region",
+        "worker_local_s3_host",
+        "worker_local_s3_access_key",
+        "worker_local_s3_secret_key",
+        "worker_local_s3_ssl",
+        "worker_local_s3_use_virtual_hosted_style",
+        "worker_local_s3_region",
+        "worker_local_s3_modelscope_prefix",
+        "worker_local_s3_modelscope_fallback",
     ]
 
     for option in options:

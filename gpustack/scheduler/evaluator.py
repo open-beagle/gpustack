@@ -26,6 +26,7 @@ from gpustack.schemas.models import (
     SourceEnum,
     get_backend,
     is_audio_model,
+    is_gguf_backend,
     is_gguf_model,
     model_categories,
 )
@@ -210,7 +211,7 @@ def summarize_candidate_resource_claim(
 async def set_gguf_model_file_path(config: Config, model: ModelSpec):
     if (
         model.source == SourceEnum.HUGGING_FACE
-        and model.backend == BackendEnum.LLAMA_BOX
+        and is_gguf_backend(model.backend)
         and not model.huggingface_filename
     ):
         model.huggingface_filename = await run_in_thread(
@@ -221,7 +222,7 @@ async def set_gguf_model_file_path(config: Config, model: ModelSpec):
         )
     elif (
         model.source == SourceEnum.MODEL_SCOPE
-        and model.backend == BackendEnum.LLAMA_BOX
+        and is_gguf_backend(model.backend)
         and not model.model_scope_file_path
     ):
         model.model_scope_file_path = await run_in_thread(

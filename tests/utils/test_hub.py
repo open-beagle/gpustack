@@ -1,8 +1,11 @@
 from tenacity import retry, stop_after_attempt, wait_fixed
+from unittest.mock import patch
+from gpustack.utils import hub
 from gpustack.utils.hub import (
     get_hugging_face_model_min_gguf_path,
     get_model_scope_model_min_gguf_path,
     get_model_weight_size,
+    match_model_scope_file_paths,
 )
 from gpustack.schemas.models import (
     Model,
@@ -119,6 +122,52 @@ def get_hub_model_weight_size_with_retry(model: Model) -> int:
     return get_model_weight_size(model)
 
 
+def test_get_model_weight_size_can_include_nested_diffusers_weights():
+    model = Model(
+        source=SourceEnum.MODEL_SCOPE,
+        model_scope_model_id="Qwen/Qwen-Image-2512",
+    )
+    files = [
+        {"name": "model.safetensors", "size": 10},
+        {"name": "transformer/diffusion_pytorch_model.safetensors", "size": 20},
+        {"name": "text_encoder/model.safetensors", "size": 30},
+        {"name": "README.md", "size": 40},
+    ]
+
+    def fake_list_repo(*args, **kwargs):
+        if kwargs.get("root_dir_only"):
+            return [file for file in files if "/" not in file["name"]]
+        return files
+
+    with patch.object(hub, "list_repo", side_effect=fake_list_repo) as list_repo:
+        assert get_model_weight_size(model) == 10
+        list_repo.assert_called_once_with(
+            "Qwen/Qwen-Image-2512",
+            SourceEnum.MODEL_SCOPE,
+            token=None,
+            root_dir_only=True,
+        )
+
+    with patch.object(hub, "list_repo", side_effect=fake_list_repo) as list_repo:
+        assert get_model_weight_size(model, recursive=True) == 60
+        list_repo.assert_called_once_with(
+            "Qwen/Qwen-Image-2512",
+            SourceEnum.MODEL_SCOPE,
+            token=None,
+            root_dir_only=False,
+        )
+
+    with patch.object(hub, "list_repo", side_effect=fake_list_repo):
+        assert (
+            get_model_weight_size(
+                model,
+                recursive=True,
+                file_name_prefixes=("transformer/", "vae/"),
+            )
+            == 20
+        )
+
+
 def test_get_hf_min_gguf_file():
     model_to_gguf_file_path = [
         (
@@ -179,3 +228,52 @@ def test_get_ms_min_gguf_file():
         assert (
             got == expected_file_path
         ), f"min GGUF file path mismatch for modelscope model {model}, got: {got}, expected: {expected_file_path}"
+
+
+def test_match_model_scope_file_paths_does_not_pass_root(monkeypatch):
+    class MockHubApi:
+        def get_model_files(self, model_id, **kwargs):
+            assert model_id == "unsloth/Qwen3.6-35B-A3B-GGUF"
+            assert kwargs == {"recursive": True}
+            return [
+                {"Path": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"},
+                {"Path": "Qwen3.6-35B-A3B-mmproj-f32.gguf"},
+            ]
+
+    monkeypatch.setattr(hub, "HubApi", MockHubApi)
+
+    got = match_model_scope_file_paths(
+        "unsloth/Qwen3.6-35B-A3B-GGUF",
+        "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        "*mmproj*.gguf",
+    )
+
+    assert got == [
+        "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        "Qwen3.6-35B-A3B-mmproj-f32.gguf",
+    ]
+
+
+def test_match_model_scope_file_paths_filters_extra_file_to_same_root(monkeypatch):
+    class MockHubApi:
+        def get_model_files(self, model_id, **kwargs):
+            assert kwargs == {"recursive": True}
+            return [
+                {"Path": "Q4/model.gguf"},
+                {"Path": "Q4/mmproj-f16.gguf"},
+                {"Path": "Q8/model.gguf"},
+                {"Path": "Q8/mmproj-f32.gguf"},
+            ]
+
+    monkeypatch.setattr(hub, "HubApi", MockHubApi)
+
+    got = match_model_scope_file_paths(
+        "example/repo",
+        "Q4/model.gguf",
+        "*mmproj*.gguf",
+    )
+
+    assert got == [
+        "Q4/model.gguf",
+        "Q4/mmproj-f16.gguf",
+    ]

@@ -238,9 +238,12 @@ def match_model_scope_file_paths(
         root = None
 
     api = HubApi()
-    files = api.get_model_files(model_id, root=root, recursive=True)
+    files = api.get_model_files(model_id, recursive=True)
 
     file_paths = [file["Path"] for file in files]
+    if root is not None:
+        file_paths = [p for p in file_paths if fnmatch.fnmatch(p, f"{root}/*")]
+
     matching_paths = [p for p in file_paths if fnmatch.fnmatch(p, file_path)]
     matching_paths = sorted(matching_paths)
 
@@ -259,13 +262,24 @@ def match_model_scope_file_paths(
     return matching_paths
 
 
-def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
+def get_model_weight_size(
+    model: Model,
+    token: Optional[str] = None,
+    recursive: bool = False,
+    file_name_prefixes: Optional[tuple[str, ...]] = None,
+) -> int:
     """
     Get the size of the model weights. This is the sum of all the weight files with extensions
-    .safetensors, .bin, .pt, .pth in the root directory only.
+    .safetensors, .bin, .pt, .pth. By default, only the root directory is
+    scanned. Set recursive=True for diffusers-style repositories whose weights
+    are stored in subdirectories.
     Args:
         model: Model to get the weight size for
         token: Optional Hugging Face API token
+        recursive: Include nested weight files
+        file_name_prefixes: When set, prefer weight files whose repository
+            paths start with one of these prefixes. If no matching weight files
+            are found, all discovered weight files are used as a fallback.
     Returns:
         int: The size of the model weights
     """
@@ -276,12 +290,24 @@ def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
         repo_id = model.model_scope_model_id
     else:
         raise ValueError(f"Unknown source {model.source}")
-    repo_file_infos = list_repo(repo_id, model.source, token=token, root_dir_only=True)
-    return sum(
-        file.get("size", 0)
+    repo_file_infos = list_repo(
+        repo_id, model.source, token=token, root_dir_only=not recursive
+    )
+    weight_files = [
+        file
         for file in repo_file_infos
         if file.get("name", "").endswith(weight_file_extensions)
-    )
+    ]
+    if file_name_prefixes:
+        preferred_weight_files = [
+            file
+            for file in weight_files
+            if file.get("name", "").startswith(file_name_prefixes)
+        ]
+        if preferred_weight_files:
+            weight_files = preferred_weight_files
+
+    return sum(file.get("size", 0) for file in weight_files)
 
 
 def get_pretrained_config(model: Model, **kwargs):

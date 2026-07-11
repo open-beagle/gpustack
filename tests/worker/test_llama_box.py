@@ -1,12 +1,19 @@
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
-from gpustack.schemas.models import BackendEnum, Model, SourceEnum, get_gguf_runtime
+from gpustack.schemas.models import (
+    BackendEnum,
+    ModelCreate,
+    SourceEnum,
+    get_gguf_runtime,
+)
 from gpustack.utils.command import ensure_bool_parameter
 from gpustack.worker import serve_manager
 from gpustack.worker.backends.llama_box import (
     LlamaBoxServer,
+    LlamaCppServer,
     normalize_llama_cpp_parameters,
 )
 from gpustack.worker.tools_manager import (
@@ -67,59 +74,116 @@ def test_get_gguf_runtime_prefers_env():
     assert (
         get_gguf_runtime(
             SimpleNamespace(
-                env={"GPUSTACK_GGUF_RUNTIME": "llama-cpp"},
+                env={"GPUSTACK_GGUF_RUNTIME": "llama.cpp"},
                 backend_parameters=["--gpustack-runtime=llama-box"],
             )
         )
-        == "llama-cpp"
+        == "llama.cpp"
     )
 
 
 def test_get_gguf_runtime_reads_backend_parameter():
     assert (
         get_gguf_runtime(
-            SimpleNamespace(env={}, backend_parameters=["--gpustack-runtime=llama-cpp"])
+            SimpleNamespace(env={}, backend_parameters=["--gpustack-runtime=llama.cpp"])
         )
-        == "llama-cpp"
+        == "llama.cpp"
+    )
+
+
+def test_get_gguf_runtime_uses_llama_cpp_backend():
+    assert (
+        get_gguf_runtime(
+            SimpleNamespace(
+                backend=BackendEnum.LLAMA_CPP,
+                env=None,
+                backend_parameters=None,
+            )
+        )
+        == "llama.cpp"
+    )
+
+
+def test_get_gguf_runtime_uses_llama_cpp_backend_string():
+    assert (
+        get_gguf_runtime(
+            SimpleNamespace(
+                backend="llama.cpp",
+                env=None,
+                backend_parameters=None,
+            )
+        )
+        == "llama.cpp"
     )
 
 
 def test_llama_cpp_runtime_defaults_distributed_inference_to_false():
-    model = Model(
+    model = ModelCreate(
         name="qwen-gguf",
         source=SourceEnum.HUGGING_FACE,
         huggingface_repo_id="unsloth/Qwen-GGUF",
         huggingface_filename="qwen.gguf",
         backend=BackendEnum.LLAMA_BOX,
-        env={"GPUSTACK_GGUF_RUNTIME": "llama-cpp"},
+        env={"GPUSTACK_GGUF_RUNTIME": "llama.cpp"},
     )
 
     assert model.distributed_inference_across_workers is False
 
 
+def test_llama_cpp_backend_defaults_distributed_inference_to_false():
+    model = ModelCreate(
+        name="qwen-gguf",
+        source=SourceEnum.HUGGING_FACE,
+        huggingface_repo_id="unsloth/Qwen-GGUF",
+        huggingface_filename="qwen.gguf",
+        backend=BackendEnum.LLAMA_CPP,
+    )
+
+    assert model.cpu_offloading is True
+    assert model.distributed_inference_across_workers is False
+
+
 def test_llama_cpp_runtime_rejects_distributed_inference():
     with pytest.raises(
-        ValueError,
+        ValidationError,
         match=(
             "Distributed inference across workers is not supported "
-            "for the llama.cpp runtime"
+            "for the llama.cpp backend"
         ),
     ):
-        Model(
+        ModelCreate(
             name="qwen-gguf",
             source=SourceEnum.HUGGING_FACE,
             huggingface_repo_id="unsloth/Qwen-GGUF",
             huggingface_filename="qwen.gguf",
             backend=BackendEnum.LLAMA_BOX,
-            env={"GPUSTACK_GGUF_RUNTIME": "llama-cpp"},
+            env={"GPUSTACK_GGUF_RUNTIME": "llama.cpp"},
             distributed_inference_across_workers=True,
         )
 
 
-def test_normalize_llama_cpp_parameters_removes_internal_and_unsupported_flags():
+def test_llama_cpp_backend_rejects_distributed_inference():
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "Distributed inference across workers is not supported "
+            "for the llama.cpp backend"
+        ),
+    ):
+        ModelCreate(
+            name="qwen-gguf",
+            source=SourceEnum.HUGGING_FACE,
+            huggingface_repo_id="unsloth/Qwen-GGUF",
+            huggingface_filename="qwen.gguf",
+            backend=BackendEnum.LLAMA_CPP,
+            distributed_inference_across_workers=True,
+        )
+
+
+def test_normalize_llama_cpp_parameters_preserves_metrics_flag():
     got = normalize_llama_cpp_parameters(
         [
-            "--gpustack-runtime=llama-cpp",
+            "--gpustack-runtime=llama.cpp",
             "--ctx-size=16384",
             "--rpc",
             "10.0.0.1:40064",
@@ -130,7 +194,25 @@ def test_normalize_llama_cpp_parameters_removes_internal_and_unsupported_flags()
         ]
     )
 
-    assert got == ["--ctx-size", "16384", "--mmproj", "mmproj.gguf"]
+    assert got == ["--ctx-size", "16384", "--mmproj", "mmproj.gguf", "--metrics"]
+
+
+def test_llama_cpp_arguments_enable_metrics_by_default():
+    server = object.__new__(LlamaCppServer)
+    server._model = SimpleNamespace(
+        name="qwen-gguf",
+        backend_parameters=[],
+    )
+    server._model_instance = SimpleNamespace(
+        port=18080,
+        computed_resource_claim=None,
+        gpu_indexes=None,
+    )
+    server._model_path = "/models/qwen.gguf"
+
+    got = server._build_llama_cpp_arguments()
+
+    assert got.count("--metrics") == 1
 
 
 def test_normalize_llama_cpp_parameters_preserves_regular_runtime_flag():
@@ -146,8 +228,7 @@ def test_normalize_llama_cpp_parameters_preserves_regular_runtime_flag():
 
 def test_get_llama_cpp_package_name_matches_uploaded_artifact():
     assert (
-        get_llama_cpp_package_name("b8322")
-        == "llama-cpp-cuda-12.8.1-b8322-linux-x64"
+        get_llama_cpp_package_name("b8322") == "llama-cpp-cuda-12.8.2-b8322-linux-x64"
     )
 
 
@@ -215,6 +296,34 @@ def test_llama_box_health_check_falls_back_after_health_exception(monkeypatch):
     assert (
         serve_manager.is_ready(
             BackendEnum.LLAMA_BOX,
+            SimpleNamespace(port=18080, worker_ip="10.0.0.10"),
+        )
+        is True
+    )
+    assert requested_urls == [
+        "http://127.0.0.1:18080/health",
+        "http://127.0.0.1:18080/v1/models",
+    ]
+
+
+def test_llama_cpp_health_check_uses_gguf_fallback(monkeypatch):
+    requested_urls = []
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    def fake_get(url, timeout):
+        requested_urls.append(url)
+        if url.endswith("/health"):
+            return Response(404)
+        return Response(200)
+
+    monkeypatch.setattr(serve_manager.requests, "get", fake_get)
+
+    assert (
+        serve_manager.is_ready(
+            BackendEnum.LLAMA_CPP,
             SimpleNamespace(port=18080, worker_ip="10.0.0.10"),
         )
         is True

@@ -3,6 +3,12 @@ from typing import List
 import pytest
 from unittest.mock import patch, AsyncMock
 
+from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
+    VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD,
+    VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES,
+    VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER,
+    estimate_model_vram,
+)
 from gpustack.policies.utils import get_model_num_attention_heads
 from tests.utils.model import new_model, new_model_instance
 from gpustack.policies.candidate_selectors import VLLMResourceFitSelector
@@ -62,6 +68,103 @@ def test_vllm_omni_backend_ignores_gpu_memory_utilization_parameter(config):
     selector = VLLMResourceFitSelector(config, model)
 
     assert selector._gpu_memory_utilization == 0
+
+
+@pytest.mark.asyncio
+async def test_vllm_omni_image_model_uses_recursive_weight_size():
+    model = new_model(
+        1,
+        "qwen-image-2512",
+        1,
+        model_scope_model_id="Qwen/Qwen-Image-2512",
+        categories=[CategoryEnum.IMAGE],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+    weight_size = 10 * 1024**3
+
+    with patch(
+        "gpustack.policies.candidate_selectors.vllm_resource_fit_selector.get_model_weight_size",
+        return_value=weight_size,
+    ) as get_model_weight_size:
+        claim = await estimate_model_vram(model)
+
+    get_model_weight_size.assert_called_once_with(
+        model,
+        None,
+        recursive=True,
+        file_name_prefixes=VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES,
+    )
+    assert claim == int(
+        weight_size * VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER
+        + VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD
+    )
+
+
+@pytest.mark.asyncio
+async def test_vllm_omni_omnigen_model_uses_recursive_weight_size_without_category():
+    model = new_model(
+        1,
+        "omnigen2",
+        1,
+        model_scope_model_id="OmniGen2/OmniGen2",
+        categories=[],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+    weight_size = 14 * 1024**3
+
+    with patch(
+        "gpustack.policies.candidate_selectors.vllm_resource_fit_selector.get_model_weight_size",
+        return_value=weight_size,
+    ) as get_model_weight_size:
+        claim = await estimate_model_vram(model)
+
+    get_model_weight_size.assert_called_once_with(
+        model,
+        None,
+        recursive=True,
+        file_name_prefixes=VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES,
+    )
+    assert claim == int(
+        weight_size * VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER
+        + VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD
+    )
+
+
+def test_vllm_omni_num_gpus_parameter_sets_gpu_count(config):
+    model = new_model(
+        1,
+        "qwen-image-2512",
+        1,
+        model_scope_model_id="Qwen/Qwen-Image-2512",
+        categories=[CategoryEnum.IMAGE],
+        backend_parameters=["--num-gpus=2"],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+
+    selector = VLLMResourceFitSelector(config, model)
+
+    assert selector._gpu_count == 2
+
+
+def test_vllm_omni_hsdp_parameters_set_gpu_count(config):
+    model = new_model(
+        1,
+        "qwen-image-2512",
+        1,
+        model_scope_model_id="Qwen/Qwen-Image-2512",
+        categories=[CategoryEnum.IMAGE],
+        backend_parameters=[
+            "--use-hsdp",
+            "--hsdp-shard-size",
+            "2",
+            "--hsdp-replicate-size=1",
+        ],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+
+    selector = VLLMResourceFitSelector(config, model)
+
+    assert selector._gpu_count == 2
 
 
 @pytest.mark.asyncio

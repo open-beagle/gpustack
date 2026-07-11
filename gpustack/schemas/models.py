@@ -44,10 +44,21 @@ class PlacementStrategyEnum(str, Enum):
 
 class BackendEnum(str, Enum):
     LLAMA_BOX = "llama-box"
+    LLAMA_CPP = "llama.cpp"
     VLLM = "vllm"
     VOX_BOX = "vox-box"
     ASCEND_MINDIE = "ascend-mindie"
     VLLM_OMNI = "vllm-omni"
+
+
+def is_gguf_backend(backend: Optional[str]) -> bool:
+    return backend in (BackendEnum.LLAMA_BOX, BackendEnum.LLAMA_CPP)
+
+
+def is_supported_backend(backend: Optional[str]) -> bool:
+    if backend is None:
+        return True
+    return backend in {item.value for item in BackendEnum}
 
 
 class GPUSelector(BaseModel):
@@ -86,6 +97,15 @@ class ModelSource(BaseModel):
     model_scope_model_id: Optional[str] = None
     model_scope_file_path: Optional[str] = None
     local_path: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_model_scope_file_path_alias(cls, data):
+        if isinstance(data, dict):
+            file_path = data.get("file_path")
+            if file_path and not data.get("model_scope_file_path"):
+                data["model_scope_file_path"] = file_path
+        return data
 
     @property
     def model_source_key(self) -> str:
@@ -210,9 +230,12 @@ class ModelSpecBase(SQLModel, ModelSource):
 
     @model_validator(mode="after")
     def set_defaults(self):
+        if not is_supported_backend(self.backend):
+            raise ValueError(f"Unsupported backend {self.backend}")
+
         backend = get_backend(self)
         if self.cpu_offloading is None:
-            self.cpu_offloading = True if backend == BackendEnum.LLAMA_BOX else False
+            self.cpu_offloading = True if is_gguf_backend(backend) else False
 
         if self.distributed_inference_across_workers is None:
             self.distributed_inference_across_workers = (
@@ -220,7 +243,7 @@ class ModelSpecBase(SQLModel, ModelSource):
                 if backend == BackendEnum.VLLM
                 or (
                     backend == BackendEnum.LLAMA_BOX
-                    and get_gguf_runtime(self) != "llama-cpp"
+                    and get_gguf_runtime(self) != BackendEnum.LLAMA_CPP
                 )
                 else False
             )
@@ -231,17 +254,21 @@ class ModelBase(ModelSpecBase):
     @model_validator(mode="after")
     def validate(self):
         backend = get_backend(self)
-        if backend == BackendEnum.LLAMA_BOX:
+        if is_gguf_backend(backend):
             if self.source == SourceEnum.HUGGING_FACE and not self.huggingface_filename:
                 raise ValueError(
                     "huggingface_filename must be provided when source is 'huggingface'"
                 )
+            if self.source == SourceEnum.MODEL_SCOPE and not self.model_scope_file_path:
+                raise ValueError(
+                    "file_path must be provided when source is 'model_scope'"
+                )
             if (
-                get_gguf_runtime(self) == "llama-cpp"
+                get_gguf_runtime(self) == BackendEnum.LLAMA_CPP
                 and self.distributed_inference_across_workers
             ):
                 raise ValueError(
-                    "Distributed inference across workers is not supported for the llama.cpp runtime"
+                    "Distributed inference across workers is not supported for the llama.cpp backend"
                 )
         elif backend == BackendEnum.VLLM:
             if self.cpu_offloading:
@@ -284,6 +311,13 @@ class ModelPublic(
     id: int
     created_at: datetime
     updated_at: datetime
+    file_path: Optional[str] = None
+
+    @model_validator(mode="after")
+    def set_file_path_alias(self):
+        if self.source == SourceEnum.MODEL_SCOPE and not self.file_path:
+            self.file_path = self.model_scope_file_path
+        return self
 
 
 ModelsPublic = PaginatedList[ModelPublic]
@@ -513,7 +547,7 @@ def is_gguf_model(model: Union[Model, ModelSource]):
             and model.local_path
             and model.local_path.endswith(".gguf")
         )
-        or (hasattr(model, "backend") and model.backend == BackendEnum.LLAMA_BOX)
+        or (hasattr(model, "backend") and is_gguf_backend(model.backend))
     )
 
 
@@ -622,6 +656,9 @@ def get_backend(model: Model) -> str:
 
 
 def get_gguf_runtime(model: Model) -> str:
+    if getattr(model, "backend", None) == BackendEnum.LLAMA_CPP:
+        return BackendEnum.LLAMA_CPP
+
     env = getattr(model, "env", None) or {}
     runtime = env.get("GPUSTACK_GGUF_RUNTIME")
     if runtime:

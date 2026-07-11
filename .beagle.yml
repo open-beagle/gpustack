@@ -1,96 +1,4 @@
 kind: pipeline
-name: cuda
-
-trigger:
-  branch:
-    - release-cuda
-  event:
-    - push
-
-volumes:
-  - name: docker
-    host:
-      path: /var/run/docker.sock
-
-workspace:
-  path: /go/src/github.com/open-beagle/gpustack
-
-clone:
-  disable: true
-
-steps:
-  - name: s3-cache
-    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-s3-cache:1.0
-    settings:
-      restore: true
-      mount:
-        - ./.git
-      endpoint: https://cache.ali.wodcloud.com
-      access_key:
-        from_secret: S3_ACCESS_KEY_ALIYUN
-      secret_key:
-        from_secret: S3_SECRET_KEY_ALIYUN
-
-  - name: fetch
-    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-git:1.0
-    settings:
-      proxy:
-        from_secret: SOCKS5_PROXY
-
-  - name: python
-    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
-    environment:
-      VERSION: v0.7.5
-      UI_VERSION: v0.7.5
-    commands:
-      - bash .beagle/build.sh
-
-  # Nvidia runtime base. The step is present on every release-cuda build, but
-  # the script exits before invoking the docker plugin unless runtime inputs changed.
-  - name: docker-cuda-base
-    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-    volumes:
-      - name: docker
-        path: /var/run/docker.sock
-    commands:
-      - |
-        if ! .beagle/should-build-cuda-base.sh; then
-          echo "CUDA runtime base inputs unchanged, skipping windstackbase build."
-          exit 0
-        fi
-        /opt/bin/devops-docker
-    settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/cuda:12.8.1-runtime-ubuntu22.04
-      dockerfile: .beagle/cuda-base.dockerfile
-      repo: wod/windstackbase
-      version: "cuda12.8.1-py3.10-vllm0.22.1-omni0.22.0"
-      args: "TARGETOS=linux,TARGETARCH=amd64"
-      registry: registry-vpc.cn-qingdao.aliyuncs.com
-      registry_user:
-        from_secret: REGISTRY_USER_ALIYUN
-      registry_password:
-        from_secret: REGISTRY_PASSWORD_ALIYUN
-
-  # Nvidia
-  - name: docker-cuda
-    image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker:1.0
-    volumes:
-      - name: docker
-        path: /var/run/docker.sock
-    settings:
-      base: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstackbase:cuda12.8.1-py3.10-vllm0.22.1-omni0.22.0
-      dockerfile: .beagle/cuda.dockerfile
-      repo: wod/windstack
-      version: "v0.7.5-cuda"
-      args: "TARGETOS=linux,TARGETARCH=amd64"
-      registry: registry-vpc.cn-qingdao.aliyuncs.com
-      registry_user:
-        from_secret: REGISTRY_USER_ALIYUN
-      registry_password:
-        from_secret: REGISTRY_PASSWORD_ALIYUN
-
----
-kind: pipeline
 name: cann
 
 platform:
@@ -134,8 +42,8 @@ steps:
   - name: python
     image: registry.cn-qingdao.aliyuncs.com/wod/python:3.11
     environment:
-      VERSION: v0.7.5
-      UI_VERSION: v0.7.5
+      VERSION: v0.7.6
+      UI_VERSION: v0.7.6
     commands:
       - bash .beagle/build.sh
 
@@ -149,7 +57,7 @@ steps:
       base: registry.cn-qingdao.aliyuncs.com/wod/cann:8.5.1-910b-ubuntu22.04-py3.11
       dockerfile: .beagle/cann.dockerfile
       repo: wod/windstack
-      version: "v0.7.5-cann-910b"
+      version: "v0.7.6-cann-910b"
       args: "TARGETOS=linux,TARGETARCH=arm64"
       registry: registry.cn-qingdao.aliyuncs.com
       registry_user:
@@ -160,8 +68,8 @@ steps:
   - name: tag-cann
     image: registry.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.5-cann-910b
-      target: registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.5-cann
+      source: registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.6-cann-910b
+      target: registry.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.6-cann
       registry: registry.cn-qingdao.aliyuncs.com
       registry_user:
         from_secret: REGISTRY_USER_ALIYUN
@@ -178,7 +86,7 @@ steps:
       base: registry.cn-qingdao.aliyuncs.com/wod/cann:8.5.1-310p-ubuntu22.04-py3.11
       dockerfile: .beagle/cann.dockerfile
       repo: wod/windstack
-      version: "v0.7.5-cann-310p"
+      version: "v0.7.6-cann-310p"
       args: "TARGETOS=linux,TARGETARCH=arm64"
       registry: registry.cn-qingdao.aliyuncs.com
       registry_user:
@@ -227,8 +135,8 @@ steps:
   - name: python
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/python:3.10-bookworm
     environment:
-      VERSION: v0.7.5
-      UI_VERSION: v0.7.5
+      VERSION: v0.7.6
+      UI_VERSION: v0.7.6
       POETRY_PYPI_MIRROR_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple/
     commands:
       - bash .beagle/build.sh
@@ -243,7 +151,7 @@ steps:
       base: registry-vpc.cn-qingdao.aliyuncs.com/wod/corex:mr-bi150-4.3.0-x86-ubuntu20.04-py3.10-poc-llm-infer-v1.2.3
       dockerfile: .beagle/corex.dockerfile
       repo: wod/windstack
-      version: "v0.7.5-corex"
+      version: "v0.7.6-corex"
       args: "TARGETOS=linux,TARGETARCH=amd64"
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -266,7 +174,7 @@ steps:
   - name: harbor-cuda
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.5-cuda
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.6-cuda
       target: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7-cuda
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -277,7 +185,7 @@ steps:
   - name: harbor-cann
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.5-cann
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.6-cann
       target: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7-cann
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -288,7 +196,7 @@ steps:
   - name: harbor-cann-910b
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.5-cann-910b
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.6-cann-910b
       target: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7-cann-910b
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -299,7 +207,7 @@ steps:
   - name: harbor-cann-310p
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.5-cann-310p
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.6-cann-310p
       target: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7-cann-310p
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -310,7 +218,7 @@ steps:
   - name: harbor-musa
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.5-musa
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.6-musa
       target: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7-musa
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:
@@ -321,7 +229,7 @@ steps:
   - name: harbor-corex
     image: registry-vpc.cn-qingdao.aliyuncs.com/wod/devops-docker-tag:1.0
     settings:
-      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.5-corex
+      source: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7.6-corex
       target: registry-vpc.cn-qingdao.aliyuncs.com/wod/windstack:v0.7-corex
       registry: registry-vpc.cn-qingdao.aliyuncs.com
       registry_user:

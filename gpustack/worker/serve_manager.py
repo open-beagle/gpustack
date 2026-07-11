@@ -16,7 +16,7 @@ from gpustack.logginglocal import (
 from gpustack.utils import network, platform
 from gpustack.utils.attrs import set_attr
 from gpustack.utils.process import terminate_process_tree, add_signal_handlers
-from gpustack.worker.backends.llama_box import LlamaBoxServer
+from gpustack.worker.backends.llama_box import LlamaBoxServer, LlamaCppServer
 from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.vllm import VLLMServer
 from gpustack.worker.backends.vllm_omni import VLLMOmniServer
@@ -331,6 +331,8 @@ class ServeManager:
             with RedirectStdoutStderr(log_file):
                 if backend == BackendEnum.LLAMA_BOX:
                     LlamaBoxServer(clientset, mi, cfg, worker_id).start()
+                elif backend == BackendEnum.LLAMA_CPP:
+                    LlamaCppServer(clientset, mi, cfg, worker_id).start()
                 elif backend == BackendEnum.VLLM:
                     VLLMServer(clientset, mi, cfg, worker_id).start()
                 elif backend == BackendEnum.VOX_BOX:
@@ -576,10 +578,9 @@ def is_ready(backend: str, mi: ModelInstance) -> bool:
             # Use worker IP instead.
             hostname = mi.worker_ip
 
-        if backend == BackendEnum.LLAMA_BOX:
-            # For llama-box, use /health to avoid printing error logs.
-            # The llama.cpp runtime also runs under the GGUF/llama-box control
-            # plane, so fall back to /v1/models for compatibility.
+        if backend in (BackendEnum.LLAMA_BOX, BackendEnum.LLAMA_CPP):
+            # For GGUF backends, use /health first and fall back to /v1/models
+            # for llama.cpp versions that do not expose /health.
             health_check_urls = [
                 f"http://{hostname}:{mi.port}/health",
                 f"http://{hostname}:{mi.port}/v1/models",

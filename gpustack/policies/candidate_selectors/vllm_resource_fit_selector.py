@@ -27,12 +27,16 @@ from gpustack.schemas.models import (
     Model,
     ModelInstanceSubordinateWorker,
     SourceEnum,
+    get_backend,
+    is_diffusers_model,
+    is_image_model,
+    is_video_model,
     model_categories,
 )
 from gpustack.schemas.workers import GPUDevicesInfo, Worker
 from gpustack.config import Config
 from gpustack.server.db import get_engine
-from gpustack.utils.command import find_parameter
+from gpustack.utils.command import find_bool_parameter, find_parameter
 from gpustack.utils.convert import safe_int
 from gpustack.utils.gpu import parse_gpu_id, parse_gpu_ids_by_worker
 from gpustack.utils.hub import get_model_weight_size, get_pretrained_config
@@ -47,6 +51,38 @@ EVENT_ACTION_AUTO_SINGLE_WORKER_MULTI_GPU = (
     "auto_single_worker_multi_gpu_scheduling_msg"
 )
 EVENT_ACTION_AUTO_SINGLE_GPU = "auto_single_gpu_scheduling_msg"
+VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER = 1.25
+VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD = 4 * 1024**3
+VLLM_OMNI_DIFFUSION_KEYWORDS = [
+    "qwen-image",
+    "omnigen",
+    "flux",
+    "z-image",
+    "stable-diffusion",
+    "sd3",
+    "sdxl",
+    "dit",
+    "lumina",
+    "hunyuan-dit",
+    "pixart",
+]
+VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES = ("transformer/", "unet/", "vae/")
+
+
+def is_vllm_omni_diffusion_model(model: Model) -> bool:
+    if get_backend(model) != BackendEnum.VLLM_OMNI:
+        return False
+    if is_image_model(model) or is_video_model(model) or is_diffusers_model(model):
+        return True
+
+    source_values = [
+        getattr(model, "name", None),
+        getattr(model, "huggingface_repo_id", None),
+        getattr(model, "model_scope_model_id", None),
+        getattr(model, "local_path", None),
+    ]
+    source_text = " ".join(value for value in source_values if value).lower()
+    return any(keyword in source_text for keyword in VLLM_OMNI_DIFFUSION_KEYWORDS)
 
 
 async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
@@ -72,15 +108,20 @@ async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
         # Use as a potential workaround if the empirical vram estimation is far beyond the expected value.
         return int(model.env['GPUSTACK_MODEL_VRAM_CLAIM'])
 
+    is_vllm_omni_diffusion = is_vllm_omni_diffusion_model(model)
+
     # CUDA graphs can take additional 1~3 GiB memory
     # https://github.com/vllm-project/vllm/blob/v0.6.1/vllm/worker/model_runner.py#L1313
     # For non-LLM models like embedding, set a smaller overhead
-    categories = model_categories(model)
-    framework_overhead = (
-        2 * 1024**3
-        if not categories or CategoryEnum.LLM in categories
-        else 512 * 1024**2
-    )
+    if is_vllm_omni_diffusion:
+        framework_overhead = VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD
+    else:
+        categories = model_categories(model)
+        framework_overhead = (
+            2 * 1024**3
+            if not categories or CategoryEnum.LLM in categories
+            else 512 * 1024**2
+        )
     weight_size = 0
     timeout_in_seconds = 15
 
@@ -90,18 +131,63 @@ async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
             or model.source == SourceEnum.MODEL_SCOPE
         ):
             weight_size = await asyncio.wait_for(
-                asyncio.to_thread(get_model_weight_size, model, token),
+                asyncio.to_thread(
+                    get_model_weight_size,
+                    model,
+                    token,
+                    recursive=is_vllm_omni_diffusion,
+                    file_name_prefixes=(
+                        VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES
+                        if is_vllm_omni_diffusion
+                        else None
+                    ),
+                ),
                 timeout=timeout_in_seconds,
             )
         elif model.source == SourceEnum.LOCAL_PATH and os.path.exists(model.local_path):
-            weight_size = get_local_model_weight_size(model.local_path)
+            weight_size = get_local_model_weight_size(
+                model.local_path,
+                recursive=is_vllm_omni_diffusion,
+                file_name_prefixes=(
+                    VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES
+                    if is_vllm_omni_diffusion
+                    else None
+                ),
+            )
     except asyncio.TimeoutError:
         logger.warning(f"Timeout when getting weight size for model {model.name}")
     except Exception as e:
         logger.warning(f"Cannot get weight size for model {model.name}: {e}")
 
+    if is_vllm_omni_diffusion:
+        return int(
+            weight_size * VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER
+            + framework_overhead
+        )
+
     # Reference: https://blog.eleuther.ai/transformer-math/#total-inference-memory
     return weight_size * 1.2 + framework_overhead
+
+
+def get_vllm_omni_requested_gpu_count(model: Model) -> Optional[int]:
+    if get_backend(model) != BackendEnum.VLLM_OMNI:
+        return None
+
+    num_gpus = find_parameter(model.backend_parameters, ["num-gpus"])
+    if num_gpus:
+        return int(num_gpus)
+
+    if not find_bool_parameter(model.backend_parameters, ["use-hsdp"]):
+        return None
+
+    hsdp_shard_size = find_parameter(model.backend_parameters, ["hsdp-shard-size"])
+    if not hsdp_shard_size:
+        return None
+
+    hsdp_replicate_size = find_parameter(
+        model.backend_parameters, ["hsdp-replicate-size"]
+    )
+    return int(hsdp_shard_size) * int(hsdp_replicate_size or 1)
 
 
 def parse_model_size_by_name(model_name: str) -> int:
@@ -116,13 +202,40 @@ def parse_model_size_by_name(model_name: str) -> int:
         raise ValueError(f"Cannot parse model size from model name: {model_name}")
 
 
-def get_local_model_weight_size(local_path: str) -> int:
+def get_local_model_weight_size(
+    local_path: str,
+    recursive: bool = False,
+    file_name_prefixes: Optional[tuple[str, ...]] = None,
+) -> int:
     """
-    Get the local model weight size in bytes. Estimate by the total size of files in the top-level (depth 1) of the directory.
+    Get the local model weight size in bytes.
     """
+    weight_file_extensions = (".safetensors", ".bin", ".pt", ".pth")
     total_size = 0
 
     try:
+        if recursive:
+            weight_files = []
+            for root, _, files in os.walk(local_path):
+                for file in files:
+                    relative_name = os.path.relpath(
+                        os.path.join(root, file), local_path
+                    )
+                    if not relative_name.endswith(weight_file_extensions):
+                        continue
+                    weight_files.append((relative_name, os.path.join(root, file)))
+
+            if file_name_prefixes:
+                preferred_weight_files = [
+                    item
+                    for item in weight_files
+                    if item[0].startswith(file_name_prefixes)
+                ]
+                if preferred_weight_files:
+                    weight_files = preferred_weight_files
+
+            return sum(os.path.getsize(path) for _, path in weight_files)
+
         with os.scandir(local_path) as entries:
             for entry in entries:
                 if entry.is_file():
@@ -189,13 +302,14 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         # Otherwise, estimate gpu count by vram requirement heuristically.
         tp = find_parameter(model.backend_parameters, ["tensor-parallel-size", "tp"])
         pp = find_parameter(model.backend_parameters, ["pipeline-parallel-size", "pp"])
-        if tp or pp:
-            world_size = int(tp or 1) * int(pp or 1)
+        vllm_omni_gpu_count = get_vllm_omni_requested_gpu_count(model)
+        if tp or pp or vllm_omni_gpu_count:
+            world_size = vllm_omni_gpu_count or int(tp or 1) * int(pp or 1)
 
             if self._gpu_count and self._gpu_count != world_size:
                 # Both gpu selector and tp/pp are set, validate they match.
                 raise ValueError(
-                    f"Model {model.name} has -tp/-pp set, but the selected gpu count ({self._gpu_count}) does not match the world size ({world_size})."
+                    f"Model {model.name} has parallelism parameters set, but the selected gpu count ({self._gpu_count}) does not match the world size ({world_size})."
                 )
             else:
                 self._gpu_count = world_size

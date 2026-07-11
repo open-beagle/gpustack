@@ -34,7 +34,9 @@ def test_cuda_app_dockerfile_uses_runtime_base_and_only_installs_wheel():
     assert "download_llama_box()" in dockerfile
     assert "download_gguf_parser()" in dockerfile
     assert "download_fastfetch()" in dockerfile
-    assert "install_llama_cpp()" in dockerfile
+    assert "install_llama_cpp()" not in dockerfile
+    assert "llama-cpp-cuda" not in dockerfile
+    assert "remove_cached_tools()" not in dockerfile
     assert "RUN python3 - <<'PY'" not in dockerfile
 
 
@@ -47,6 +49,13 @@ def test_cuda_base_dockerfile_keeps_only_stable_runtime_layers():
     assert deps_layer < env_layer
     assert "COPY ./dist/gpustack-tools-cuda.tar.gz" not in dockerfile
     assert "GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin" not in dockerfile
+    assert "LLAMA_CPP_VERSION=b8322" in dockerfile
+    assert "LLAMA_CPP_CUDA_VERSION=12.8.1" in dockerfile
+    assert "llama-cpp-cuda-${LLAMA_CPP_CUDA_VERSION}-${LLAMA_CPP_VERSION}-linux-x64" in dockerfile
+    assert "third_party_bin=/opt/gpustack/third_party/bin" in dockerfile
+    assert 'target_dir="${third_party_bin}/llama.cpp/${version_dir}"' in dockerfile
+    assert "llama-server" in dockerfile
+    assert "versions.json" in dockerfile
 
 
 def test_corex_dockerfile_downloads_tools_without_tools_archive_layer():

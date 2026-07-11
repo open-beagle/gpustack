@@ -64,10 +64,13 @@ async def get_worker_allocatable_resource(  # noqa: C901
 
             if gpu.memory is None or gpu.memory.total is None:
                 continue
+            allocated_vram = allocated.vram.get(gpu_index, 0)
+            used_vram = gpu.memory.used or 0
+            accounted_vram = max(allocated_vram, used_vram)
             allocatable_vram = max(
                 (
                     gpu.memory.total
-                    - allocated.vram.get(gpu_index, 0)
+                    - accounted_vram
                     - worker.system_reserved.vram
                 ),
                 0,

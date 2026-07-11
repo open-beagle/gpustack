@@ -11,6 +11,7 @@ import psutil
 from gpustack.schemas.workers import Worker
 from gpustack.utils import platform
 from gpustack.schemas.models import (
+    BackendEnum,
     ModelInstance,
     ModelInstanceStateEnum,
     get_gguf_runtime,
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 class LlamaBoxServer(InferenceServer):
     def start(self):  # noqa: C901
-        if get_gguf_runtime(self._model) == "llama-cpp":
+        if get_gguf_runtime(self._model) == BackendEnum.LLAMA_CPP:
             return self._start_llama_cpp()
 
         return self._start_llama_box()
@@ -284,8 +285,13 @@ class LlamaBoxServer(InferenceServer):
                 raise FileNotFoundError(f"llama-server not found: {command_path}")
             return command_path
 
-        version = (self._model.env or {}).get(
-            "GPUSTACK_LLAMA_CPP_VERSION", BUILTIN_LLAMA_CPP_VERSION
+        version = (
+            self._model.backend_version
+            if self._model.backend == BackendEnum.LLAMA_CPP
+            and self._model.backend_version
+            else (self._model.env or {}).get(
+                "GPUSTACK_LLAMA_CPP_VERSION", BUILTIN_LLAMA_CPP_VERSION
+            )
         )
         base_path = Path(
             str(
@@ -344,6 +350,7 @@ class LlamaBoxServer(InferenceServer):
             self._model.name,
             "--no-mmap",
         ]
+        arguments = ensure_metrics_enabled(arguments, self._model.backend_parameters)
 
         mmproj = find_parameter(self._model.backend_parameters, ["mmproj"])
         default_mmproj = get_mmproj_file(self._model_path)
@@ -404,6 +411,11 @@ class LlamaBoxServer(InferenceServer):
                         self._model.backend_parameters[i + 1] = str(model_dir / value)
 
 
+class LlamaCppServer(LlamaBoxServer):
+    def start(self):
+        return self._start_llama_cpp()
+
+
 def get_mmproj_file(model_path: str) -> str:
     directory = os.path.dirname(model_path)
     pattern = os.path.join(directory, '*mmproj*.gguf')
@@ -428,7 +440,9 @@ def set_priority(pid: int):
         logger.error(f"Failed to set priority for process {pid}: {e}")
 
 
-def ensure_metrics_enabled(arguments: List[str], backend_parameters: List[str]) -> List[str]:
+def ensure_metrics_enabled(
+    arguments: List[str], backend_parameters: List[str]
+) -> List[str]:
     return ensure_bool_parameter(
         arguments,
         "metrics",
@@ -445,7 +459,6 @@ def normalize_llama_cpp_parameters(parameters: List[str]) -> List[str]:
         "image-vae-tiling",
         "max-projected-cache",
         "no-warmup",
-        "metrics",
     ]
     return normalize_parameters(parameters, removes=removes)
 
