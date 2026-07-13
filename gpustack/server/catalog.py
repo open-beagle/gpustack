@@ -122,13 +122,18 @@ def prepare_chat_templates(data_dir: str):
 
 
 def get_builtin_model_catalog_file() -> str:
-    huggingface_url = "https://huggingface.co"
+    huggingface_url = (os.getenv("HF_ENDPOINT") or "https://huggingface.co").rstrip(
+        "/"
+    )
     modelscope_url = "https://modelscope.cn"
 
     model_catalog_file_name = "model-catalog.yaml"
     if not can_access(huggingface_url) and can_access(modelscope_url):
         model_catalog_file_name = "model-catalog-modelscope.yaml"
-        logger.info(f"Cannot access {huggingface_url}, using ModelScope model catalog.")
+        logger.info(
+            f"Cannot access Hugging Face endpoint {huggingface_url}, "
+            "using ModelScope model catalog."
+        )
 
     return str(pkg_resources.files("gpustack.assets").joinpath(model_catalog_file_name))
 

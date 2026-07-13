@@ -2,12 +2,30 @@ import os
 import time
 import pytest
 from tenacity import retry, stop_after_attempt, wait_fixed
-from gpustack.scheduler.scheduler import SourceEnum
+from gpustack.schemas.models import SourceEnum
+from gpustack.server import catalog
 from gpustack.server.catalog import get_model_set_specs, init_model_catalog
 from gpustack.utils.hub import match_hugging_face_files, match_model_scope_file_paths
 from gpustack.utils.compat_importlib import pkg_resources
 from huggingface_hub import HfApi
 from modelscope.hub.api import HubApi
+
+
+def test_builtin_model_catalog_uses_hf_endpoint_for_connectivity(monkeypatch):
+    checked_urls = []
+
+    def fake_can_access(url):
+        checked_urls.append(url)
+        return url == "https://hf-mirror.com"
+
+    monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com")
+    monkeypatch.setattr(catalog, "can_access", fake_can_access)
+
+    catalog_file = catalog.get_builtin_model_catalog_file()
+
+    assert catalog_file.endswith("model-catalog.yaml")
+    assert "https://hf-mirror.com" in checked_urls
+    assert "https://huggingface.co" not in checked_urls
 
 
 @pytest.mark.skipif(
