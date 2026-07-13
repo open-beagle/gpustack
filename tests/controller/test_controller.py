@@ -22,6 +22,7 @@ from gpustack.server.controllers import (
     ensure_model_instance_file_links,
     find_scale_down_candidates,
     get_model_instance_ids_for_model_file,
+    get_model_files_for_instance,
     safe_event_attr,
     sync_replicas,
 )
@@ -197,6 +198,37 @@ def test_get_model_instance_ids_for_model_file_reads_link_table():
     instance_ids = asyncio.run(get_model_instance_ids_for_model_file(session, 149))
 
     assert instance_ids == [376]
+
+
+def test_get_model_files_for_instance_filters_same_source():
+    class FakeModelFileService:
+        def __init__(self, session):
+            pass
+
+        async def get_by_source_index(self, source_index):
+            return [
+                ModelFile(
+                    id=89,
+                    source=SourceEnum.MODEL_SCOPE,
+                    model_scope_model_id="BAAI/bge-reranker-v2-m3",
+                    worker_id=1,
+                ),
+                ModelFile(
+                    id=113,
+                    source=SourceEnum.HUGGING_FACE,
+                    huggingface_repo_id="BAAI/bge-reranker-v2-m3",
+                    worker_id=1,
+                ),
+            ]
+
+    instance = new_model_instance(1, "bge-reranker", 6, worker_id=1)
+    instance.source = SourceEnum.HUGGING_FACE
+    instance.huggingface_repo_id = "BAAI/bge-reranker-v2-m3"
+
+    with patch("gpustack.server.controllers.ModelFileService", FakeModelFileService):
+        model_files = asyncio.run(get_model_files_for_instance(FakeSession(), instance))
+
+    assert [model_file.id for model_file in model_files] == [113]
 
 
 def test_ensure_instance_model_file_links_existing_files_before_sync():

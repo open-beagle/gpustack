@@ -467,7 +467,9 @@ async def get_model_files_for_instance(
         instance.model_source_index
     )
     model_files = [
-        model_file for model_file in model_files if model_file.worker_id in worker_ids
+        model_file
+        for model_file in model_files
+        if model_file.worker_id in worker_ids and model_file.source == instance.source
     ]
 
     if instance.source == SourceEnum.LOCAL_PATH and instance.local_path:
