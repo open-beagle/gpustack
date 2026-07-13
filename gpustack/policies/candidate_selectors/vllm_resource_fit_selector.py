@@ -173,21 +173,31 @@ def get_vllm_omni_requested_gpu_count(model: Model) -> Optional[int]:
     if get_backend(model) != BackendEnum.VLLM_OMNI:
         return None
 
+    hsdp_gpu_count = None
+    if find_bool_parameter(model.backend_parameters, ["use-hsdp"]):
+        hsdp_shard_size = find_parameter(
+            model.backend_parameters, ["hsdp-shard-size"]
+        )
+        if hsdp_shard_size:
+            hsdp_replicate_size = find_parameter(
+                model.backend_parameters, ["hsdp-replicate-size"]
+            )
+            hsdp_gpu_count = int(hsdp_shard_size) * int(hsdp_replicate_size or 1)
+
     num_gpus = find_parameter(model.backend_parameters, ["num-gpus"])
     if num_gpus:
-        return int(num_gpus)
+        num_gpus = int(num_gpus)
+        if hsdp_gpu_count and num_gpus != hsdp_gpu_count:
+            raise ValueError(
+                "vLLM-Omni HSDP GPU count mismatch: "
+                f"--num-gpus={num_gpus}, but --hsdp-shard-size * "
+                f"--hsdp-replicate-size = {hsdp_gpu_count}. "
+                "Align these parameters so the scheduler reserves the same number "
+                "of GPUs that vLLM-Omni will use."
+            )
+        return num_gpus
 
-    if not find_bool_parameter(model.backend_parameters, ["use-hsdp"]):
-        return None
-
-    hsdp_shard_size = find_parameter(model.backend_parameters, ["hsdp-shard-size"])
-    if not hsdp_shard_size:
-        return None
-
-    hsdp_replicate_size = find_parameter(
-        model.backend_parameters, ["hsdp-replicate-size"]
-    )
-    return int(hsdp_shard_size) * int(hsdp_replicate_size or 1)
+    return hsdp_gpu_count
 
 
 def parse_model_size_by_name(model_name: str) -> int:

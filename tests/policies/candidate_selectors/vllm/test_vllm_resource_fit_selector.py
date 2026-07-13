@@ -8,6 +8,7 @@ from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
     VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES,
     VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER,
     estimate_model_vram,
+    get_vllm_omni_requested_gpu_count,
 )
 from gpustack.policies.utils import get_model_num_attention_heads
 from tests.utils.model import new_model, new_model_instance
@@ -165,6 +166,47 @@ def test_vllm_omni_hsdp_parameters_set_gpu_count(config):
     selector = VLLMResourceFitSelector(config, model)
 
     assert selector._gpu_count == 2
+
+
+def test_vllm_omni_hsdp_parameters_must_match_num_gpus():
+    model = new_model(
+        1,
+        "qwen-image-2512",
+        1,
+        model_scope_model_id="Qwen/Qwen-Image-2512",
+        categories=[CategoryEnum.IMAGE],
+        backend_parameters=[
+            "--num-gpus=4",
+            "--use-hsdp",
+            "--hsdp-shard-size=2",
+            "--hsdp-replicate-size=1",
+        ],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+
+    with pytest.raises(ValueError, match="HSDP GPU count mismatch"):
+        get_vllm_omni_requested_gpu_count(model)
+
+
+def test_vllm_omni_hsdp_parameters_match_num_gpus(config):
+    model = new_model(
+        1,
+        "qwen-image-2512",
+        1,
+        model_scope_model_id="Qwen/Qwen-Image-2512",
+        categories=[CategoryEnum.IMAGE],
+        backend_parameters=[
+            "--num-gpus=4",
+            "--use-hsdp",
+            "--hsdp-shard-size=4",
+            "--hsdp-replicate-size=1",
+        ],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+
+    selector = VLLMResourceFitSelector(config, model)
+
+    assert selector._gpu_count == 4
 
 
 @pytest.mark.asyncio
