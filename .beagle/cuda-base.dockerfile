@@ -53,33 +53,24 @@ ARG PYPI_EXTRA_INDEX_URL=https://pypi.org/simple/
 
 # 安装稳定运行时依赖层。只有 CUDA/Python/vLLM/vLLM-Omni/transformers 等底层版本变化时才需要重打该基础镜像。
 COPY ./dist/requirements-vllm.txt /tmp/requirements-vllm.txt
+COPY ./.beagle/prepare_cuda_base.py /tmp/prepare_cuda_base.py
 RUN python3 -m pip install -i ${PYPI_MIRROR} --extra-index-url ${PYPI_EXTRA_INDEX_URL} --trusted-host ${PYPI_HOST} --upgrade pip && \
     python3 -m pip install -i ${PYPI_MIRROR} --extra-index-url ${PYPI_EXTRA_INDEX_URL} --trusted-host ${PYPI_HOST} --no-cache-dir --upgrade 'pipx==1.7.1' 'argcomplete>=1.9.4' && \
     python3 -m pip install -i ${PYPI_MIRROR} --extra-index-url ${PYPI_EXTRA_INDEX_URL} --trusted-host ${PYPI_HOST} --no-cache-dir --default-timeout=12000 -r /tmp/requirements-vllm.txt && \
-    # 修复 transformers RoPE 验证类型错误 (set -= list)
-    python3 -c "\
-import transformers.modeling_rope_utils as m; \
-p = m.__file__; \
-c = open(p, 'r').read(); \
-c = c.replace('received_keys -= ignore_keys', 'received_keys -= set(ignore_keys)'); \
-open(p, 'w').write(c)" && \
     command -v vllm && \
     command -v vllm-omni && \
-    python3 -c "\
-import importlib.metadata as m; \
-from packaging.version import Version; \
-assert Version(m.version('argcomplete')) >= Version('1.9.4'), m.version('argcomplete'); \
-print('argcomplete', m.version('argcomplete'))" && \
     pipx --version && \
     python3 -m pip show vllm vllm-omni && \
-    rm -f /tmp/requirements-vllm.txt
+    python3 /tmp/prepare_cuda_base.py && \
+    rm -f /tmp/requirements-vllm.txt /tmp/prepare_cuda_base.py
 
 # 设置目录
 RUN mkdir -p /var/lib/gpustack && \
     chmod -R 0755 /var/lib/gpustack
 
 # 设置环境变量
-ENV PIPX_HOME=/var/lib/gpustack/pipx \
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/nccl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/cuda/compat \
+    PIPX_HOME=/var/lib/gpustack/pipx \
     PIPX_LOCAL_VENVS=/var/lib/gpustack/pipx/venvs \
     PIPX_BIN_DIR=/var/lib/gpustack/bin \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
