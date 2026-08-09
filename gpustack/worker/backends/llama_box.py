@@ -27,7 +27,6 @@ from gpustack.utils.command import (
 from gpustack.utils.third_party import third_party_bin_path
 from gpustack.worker.backends.base import InferenceServer
 from gpustack.worker.tools_manager import (
-    BUILTIN_LLAMA_CPP_VERSION,
     get_llama_box_command,
     get_llama_cpp_command,
     get_llama_cpp_version_dir_name,
@@ -289,26 +288,25 @@ class LlamaBoxServer(InferenceServer):
             self._model.backend_version
             if self._model.backend == BackendEnum.LLAMA_CPP
             and self._model.backend_version
-            else (self._model.env or {}).get(
-                "GPUSTACK_LLAMA_CPP_VERSION", BUILTIN_LLAMA_CPP_VERSION
-            )
+            else (self._model.env or {}).get("GPUSTACK_LLAMA_CPP_VERSION")
         )
-        base_path = Path(
-            str(
-                third_party_bin_path(
-                    "llama.cpp",
-                    get_llama_cpp_version_dir_name(
-                        version,
-                        platform.system(),
-                        platform.arch(),
-                        platform.device(),
-                    ),
+        if version:
+            base_path = Path(
+                str(
+                    third_party_bin_path(
+                        "llama.cpp",
+                        get_llama_cpp_version_dir_name(
+                            version,
+                            platform.system(),
+                            platform.arch(),
+                            platform.device(),
+                        ),
+                    )
                 )
             )
-        )
-        command_path = get_llama_cpp_command(base_path)
-        if command_path.is_file():
-            return command_path
+            command_path = get_llama_cpp_command(base_path)
+            if command_path.is_file():
+                return command_path
 
         path_command = shutil.which("llama-server")
         if path_command:

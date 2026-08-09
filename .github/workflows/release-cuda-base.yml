@@ -7,9 +7,10 @@ on:
   workflow_dispatch:
 
 env:
+  CUDA_VERSION: "13.0.3"
   RUNTIME_IMG: ghcr.io/${{ github.repository_owner }}/gpustack
-  RUNTIME_TAG: "cuda12.8.2-vllm0.24.0-omni0.24.0"
-  BASE_IMG: nvidia/cuda:12.8.2-runtime-ubuntu22.04
+  RUNTIME_TAG: "cuda13.0.3-vllm0.26.0-omni0.26.0"
+  BASE_IMG: nvidia/cuda:13.0.3-runtime-ubuntu24.04
 
 jobs:
   build-and-push:
@@ -35,9 +36,17 @@ jobs:
 
       - name: Build Python package
         env:
-          VERSION: "v0.7.6"
-          UI_VERSION: "v0.7.6"
+          VERSION: "v0.7.7"
+          UI_VERSION: "v0.7.7"
         run: bash .beagle/build.sh
+
+      - name: Download CUDA llama.cpp package
+        run: |
+          mkdir -p dist
+          . .beagle/llama.cpp.lock
+          echo "Downloading ${LLAMA_CPP_PACKAGE}.tar.gz..."
+          curl -fsSL "https://cache.ali.wodcloud.com/vscode/gpustack/llama.cpp/${LLAMA_CPP_PACKAGE}.tar.gz" -o dist/llama.cpp.tar.gz
+          ls -lh dist/llama.cpp.tar.gz
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -64,6 +73,7 @@ jobs:
           build-args: |
             BASE=${{ env.BASE_IMG }}
             VERSION=${{ env.RUNTIME_TAG }}
+            CUDA_VERSION=${{ env.CUDA_VERSION }}
 
       - name: Image build success
         run: echo "${{ env.RUNTIME_IMG }}:${{ env.RUNTIME_TAG }} built and pushed successfully."

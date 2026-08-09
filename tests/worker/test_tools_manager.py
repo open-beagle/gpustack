@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -5,6 +6,24 @@ from unittest.mock import patch
 
 from gpustack.schemas.models import BackendEnum
 from gpustack.worker.tools_manager import ToolsManager
+
+
+def test_install_llama_cpp_discovers_built_in_version(tmp_path, monkeypatch):
+    third_party_bin = tmp_path / "third-party"
+    version = "b8322"
+    version_dir = f"llama.cpp-{version}-linux-amd64-cuda"
+    command = third_party_bin / "llama.cpp" / version_dir / "llama-server"
+    command.parent.mkdir(parents=True)
+    command.write_text("#!/bin/sh\n", encoding="utf-8")
+    (third_party_bin / "versions.json").write_text(
+        json.dumps({version_dir: version}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GPUSTACK_THIRD_PARTY_BIN", str(third_party_bin))
+
+    manager = ToolsManager(system="linux", arch="amd64", device="cuda")
+
+    assert manager.install_llama_cpp() == command
 
 
 def test_prepare_versioned_backend_supports_vllm_omni():

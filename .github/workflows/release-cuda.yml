@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
 
 env:
-  VERSION: "v0.7.6"
-  UI_VERSION: "v0.7.6"
+  VERSION: "v0.7.7"
+  UI_VERSION: "v0.7.7"
   RUNTIME_IMG: ghcr.io/${{ github.repository_owner }}/gpustack
-  RUNTIME_TAG: "cuda12.8.2-vllm0.24.0-omni0.24.0"
+  RUNTIME_TAG: "cuda13.0.3-vllm0.26.0-omni0.26.0"
   WINDSTACK_IMAGE: registry.cn-qingdao.aliyuncs.com/wod/windstack
 
 jobs:

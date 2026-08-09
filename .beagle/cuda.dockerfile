@@ -1,4 +1,4 @@
-ARG BASE=ghcr.io/open-beagle/gpustack:cuda12.8.2-vllm0.24.0-omni0.24.0
+ARG BASE=ghcr.io/open-beagle/gpustack:cuda13.0.3-vllm0.26.0-omni0.26.0
 
 FROM $BASE
 

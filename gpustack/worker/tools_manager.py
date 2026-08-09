@@ -24,8 +24,7 @@ logger = logging.getLogger(__name__)
 
 BUILTIN_LLAMA_BOX_VERSION = "v0.0.171"
 BUILTIN_GGUF_PARSER_VERSION = "v0.22.1"
-BUILTIN_LLAMA_CPP_VERSION = "b9897"
-BUILTIN_LLAMA_CPP_CUDA_VERSION = "12.8.2"
+BUILTIN_LLAMA_CPP_CUDA_VERSION = "13.0.3"
 
 
 class ToolsManager:
@@ -135,17 +134,6 @@ class ToolsManager:
         self.download_llama_box()
         self.download_gguf_parser()
         self.download_fastfetch()
-        
-        # Only download llama.cpp for supported environments
-        if (
-            self._os == "linux"
-            and self._arch == "amd64"
-            and self._device == platform.DeviceTypeEnum.CUDA.value
-        ):
-            try:
-                self.install_llama_cpp()
-            except Exception as e:
-                logger.warning(f"Failed to download llama.cpp: {e}")
 
     def remove_cached_tools(self):
         """
@@ -206,7 +194,9 @@ class ToolsManager:
                 f"Auto-installation for versioned {backend} is not supported. Please install it manually."
             )
 
-    def install_llama_cpp(self, version: str = BUILTIN_LLAMA_CPP_VERSION) -> Path:
+    def install_llama_cpp(self, version: Optional[str] = None) -> Path:
+        if version is None:
+            version = self._get_installed_llama_cpp_version()
         target_dir = (
             self.third_party_bin_path
             / "llama.cpp"
@@ -229,6 +219,21 @@ class ToolsManager:
         self._download_llama_cpp(version, target_dir)
         self._update_versions_file(version_key, version)
         return target_file
+
+    def _get_installed_llama_cpp_version(self) -> str:
+        for version_key, version in self._current_tools_version.items():
+            expected_key = get_llama_cpp_version_dir_name(
+                version,
+                self._os,
+                self._arch,
+                self._device,
+            )
+            if version_key == expected_key:
+                return version
+        raise RuntimeError(
+            "No built-in llama.cpp version is installed. Specify a backend version "
+            "or set GPUSTACK_LLAMA_CPP_SERVER_PATH."
+        )
 
     def download_llama_box(self):
         version = BUILTIN_LLAMA_BOX_VERSION
@@ -461,9 +466,7 @@ class ToolsManager:
             source = Path(__file__).resolve().parents[1] / "_sitecustomize.py"
             shutil.copyfile(source, site_packages / "sitecustomize.py")
         except Exception as e:
-            logger.warning(
-                f"Failed to install sitecustomize for {command_path}: {e}"
-            )
+            logger.warning(f"Failed to install sitecustomize for {command_path}: {e}")
 
     def _get_pipx_bin_dir(self, pipx_path: str) -> Path:
         """
@@ -646,7 +649,7 @@ class ToolsManager:
         if not target_file.exists():
             raise Exception(f"failed to find llama-server in {tmp_file}")
 
-        for binary in ["llama-server", "llama-cli", "rpc-server"]:
+        for binary in ["llama-server", "llama-cli", "ggml-rpc-server"]:
             file = target_dir / binary
             if file.exists() and self._os != "windows":
                 st = os.stat(file)
@@ -1152,7 +1155,7 @@ def get_llama_cpp_command(
     return base_path.joinpath(command)
 
 
-def get_llama_cpp_package_name(version: str = BUILTIN_LLAMA_CPP_VERSION) -> str:
+def get_llama_cpp_package_name(version: str) -> str:
     return f"llama-cpp-cuda-{BUILTIN_LLAMA_CPP_CUDA_VERSION}-{version}-linux-x64"
 
 

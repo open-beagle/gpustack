@@ -228,7 +228,7 @@ def test_normalize_llama_cpp_parameters_preserves_regular_runtime_flag():
 
 def test_get_llama_cpp_package_name_matches_uploaded_artifact():
     assert (
-        get_llama_cpp_package_name("b8322") == "llama-cpp-cuda-12.8.2-b8322-linux-x64"
+        get_llama_cpp_package_name("b8322") == "llama-cpp-cuda-13.0.3-b8322-linux-x64"
     )
 
 

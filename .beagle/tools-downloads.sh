@@ -27,16 +27,8 @@ tools_manager = ToolsManager(
     arch=os.environ["TOOLS_ARCH"],
     device=os.environ["TOOLS_DEVICE"],
 )
-tools_manager.download_llama_box()
 tools_manager.download_gguf_parser()
 tools_manager.download_fastfetch()
-
-if (
-    os.environ["TOOLS_SYSTEM"] == "linux"
-    and os.environ["TOOLS_ARCH"] == "amd64"
-    and os.environ["TOOLS_DEVICE"] == "cuda"
-):
-    tools_manager.install_llama_cpp()
 PY
 
 echo "=========================================="

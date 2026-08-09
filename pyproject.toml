@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "gpustack"
-version = "0.7.6"
+version = "0.7.7"
 description = "GPUStack"
 authors = ["GPUStack Authors <contact@gpustack.ai>"]
 readme = "README.md"
@@ -44,13 +44,13 @@ pytest-asyncio = "^0.23.7"
 truststore = "^0.9.1"
 cryptography = "^43.0.0"
 tzdata = "^2024.1"
-modelscope = "^1.28"
+modelscope = ">=1.28,<1.38"
 ray = {version = "2.48.0", extras = ["default"]}
-vllm = {version = "0.24.0", optional = true}
-vllm-omni = {version = "0.24.0", optional = true}
+vllm = {version = "0.26.0", optional = true}
+vllm-omni = {version = "0.26.0", optional = true}
 mistral_common = {version = "^1.4.3", optional = true, extras = ["opencv"]}
 uvicorn = "^0.32.0"
-transformers = ">=5.6.0,<5.9.0"
+transformers = ">=5.6.0"
 fastapi-cdn-host = "^0.8.0"
 wmi = { version="^1.5.1", markers = "platform_system == 'Windows'" }
 pywin32 = { version="^308", markers = "platform_system == 'Windows'" }
@@ -65,7 +65,7 @@ cachetools = "*"
 aiocache = "^0.12.3"
 aiofiles = "^23.2.1"
 aiohttp = ">=3.13.3"
-bitsandbytes = {version = "^0.45.2", optional = true}
+bitsandbytes = {version = ">=0.46.1", optional = true}
 python-json-logger = "^3.3.0"
 hf-transfer = "^0.1.9"
 asyncmy = "^0.2.10"
@@ -75,7 +75,7 @@ minio = "^7.2.0"
 pyarrow = "*"
 pandas = "*"
 blobfile = "^3.0.0"
-timm = {version = "^1.0.15", optional = true}
+timm = {version = ">=1.0.17,<2.0.0", optional = true}
 aiolimiter = "^1.2.1"
 python3-saml="1.16.0"
 lxml="5.2.1"
