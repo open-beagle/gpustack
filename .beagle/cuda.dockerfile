@@ -18,6 +18,23 @@ RUN TOOLS_DOWNLOAD_BASE_URL=https://cache.ali.wodcloud.com/vscode \
     bash /tmp/gpustack-tools-downloads.sh && \
     rm -f /tmp/gpustack-tools-downloads.sh
 
+# 配置容器运行时镜像源为阿里云（Apt 与 Pip）
+RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+        sed -i \
+            -e 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' \
+            -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' \
+            /etc/apt/sources.list.d/ubuntu.sources; \
+    fi && \
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i \
+            -e 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' \
+            -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' \
+            -e 's|http://ports.ubuntu.com/ubuntu-ports|https://mirrors.aliyun.com/ubuntu-ports|g' \
+            /etc/apt/sources.list; \
+    fi
+
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
 ARG VERSION=dev
 LABEL version=$VERSION
 
