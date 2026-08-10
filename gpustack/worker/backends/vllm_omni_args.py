@@ -19,7 +19,12 @@ def build_vllm_omni_arguments(
         model_path,
     ]
 
-    model_type = detect_model_type(model_name, model_categories)
+    model_type = detect_model_type(
+        model_name,
+        model_categories,
+        model_path,
+        served_model_name,
+    )
     if model_type == "diffusion":
         arguments.extend(get_diffusion_arguments(backend_parameters, gpu_count))
     elif model_type == "audio":
@@ -47,9 +52,13 @@ def build_vllm_omni_arguments(
     return arguments
 
 
-def detect_model_type(model_name: str, categories: list) -> str:
-    model_name = model_name.lower()
-    categories = categories or []
+def detect_model_type(model_name: str, categories: list, *model_identifiers: str) -> str:
+    model_names = [model_name, *model_identifiers]
+    model_name = " ".join(name for name in model_names if name).lower()
+    categories = {
+        str(getattr(category, "value", category)).lower()
+        for category in (categories or [])
+    }
 
     diffusion_keywords = [
         "qwen-image",
@@ -80,17 +89,27 @@ def detect_model_type(model_name: str, categories: list) -> str:
     return "llm"
 
 
-def get_diffusion_arguments(backend_parameters: list, gpu_count: int = 0) -> list:
+def get_diffusion_arguments(
+    backend_parameters: list = None,
+    gpu_count: int = 0,
+) -> list:
     if (
         gpu_count <= 1
         or find_parameter(backend_parameters, ["num-gpus"]) is not None
+        or find_parameter(backend_parameters, ["hsdp-shard-size"]) is not None
         or find_parameter(backend_parameters, ["tensor-parallel-size", "tp"])
         is not None
         or find_bool_parameter(backend_parameters, ["use-hsdp"])
     ):
         return []
 
-    return ["--num-gpus", str(gpu_count)]
+    return [
+        "--num-gpus",
+        str(gpu_count),
+        "--use-hsdp",
+        "--hsdp-shard-size",
+        str(gpu_count),
+    ]
 
 
 def get_audio_arguments() -> list:

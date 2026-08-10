@@ -107,7 +107,12 @@ class VLLMOmniServer(InferenceServer):
         Returns:
             str: Model type ('diffusion', 'audio', 'llm', etc.)
         """
-        return detect_model_type(self._model.name, self._model.categories)
+        return detect_model_type(
+            self._model.name,
+            self._model.categories,
+            self._model_path,
+            self._model_instance.model_name,
+        )
 
     def _get_diffusion_arguments(self) -> list:
         """Get arguments specific to diffusion models."""

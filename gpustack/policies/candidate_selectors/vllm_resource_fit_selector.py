@@ -51,7 +51,7 @@ EVENT_ACTION_AUTO_SINGLE_WORKER_MULTI_GPU = (
     "auto_single_worker_multi_gpu_scheduling_msg"
 )
 EVENT_ACTION_AUTO_SINGLE_GPU = "auto_single_gpu_scheduling_msg"
-VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER = 1.25
+VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER = 1.8
 VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD = 4 * 1024**3
 VLLM_OMNI_DIFFUSION_KEYWORDS = [
     "qwen-image",
@@ -66,7 +66,6 @@ VLLM_OMNI_DIFFUSION_KEYWORDS = [
     "hunyuan-dit",
     "pixart",
 ]
-VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES = ("transformer/", "unet/", "vae/")
 
 
 def is_vllm_omni_diffusion_model(model: Model) -> bool:
@@ -136,11 +135,7 @@ async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
                     model,
                     token,
                     recursive=is_vllm_omni_diffusion,
-                    file_name_prefixes=(
-                        VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES
-                        if is_vllm_omni_diffusion
-                        else None
-                    ),
+                    file_name_prefixes=None,
                 ),
                 timeout=timeout_in_seconds,
             )
@@ -148,11 +143,7 @@ async def estimate_model_vram(model: Model, token: Optional[str] = None) -> int:
             weight_size = get_local_model_weight_size(
                 model.local_path,
                 recursive=is_vllm_omni_diffusion,
-                file_name_prefixes=(
-                    VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES
-                    if is_vllm_omni_diffusion
-                    else None
-                ),
+                file_name_prefixes=None,
             )
     except asyncio.TimeoutError:
         logger.warning(f"Timeout when getting weight size for model {model.name}")

@@ -36,12 +36,38 @@ def test_vllm_omni_diffusion_arguments_add_num_gpus_for_multi_gpu():
     arguments = _arguments(gpu_count=2)
 
     assert arguments[arguments.index("--num-gpus") + 1] == "2"
+    assert "--use-hsdp" in arguments
+    assert arguments[arguments.index("--hsdp-shard-size") + 1] == "2"
+
+
+def test_vllm_omni_detects_diffusion_from_model_path_for_multi_gpu():
+    arguments = build_vllm_omni_arguments(
+        "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-Image-2512",
+        "plain-model",
+        "image-model",
+        [],
+        [],
+        40000,
+        3,
+    )
+
+    assert arguments[arguments.index("--num-gpus") + 1] == "3"
+    assert "--use-hsdp" in arguments
+    assert arguments[arguments.index("--hsdp-shard-size") + 1] == "3"
 
 
 def test_vllm_omni_diffusion_arguments_keep_user_num_gpus():
     arguments = _arguments(["--num-gpus=4"], gpu_count=2)
 
     assert "--num-gpus=4" in arguments
+    assert "--num-gpus" not in arguments
+
+
+def test_vllm_omni_diffusion_arguments_keep_user_hsdp():
+    arguments = _arguments(["--use-hsdp", "--hsdp-shard-size=2"], gpu_count=3)
+
+    assert arguments.count("--use-hsdp") == 1
+    assert "--hsdp-shard-size=2" in arguments
     assert "--num-gpus" not in arguments
 
 

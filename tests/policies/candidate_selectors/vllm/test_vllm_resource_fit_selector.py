@@ -1,11 +1,11 @@
 from typing import List
 
 import pytest
+from transformers import PretrainedConfig
 from unittest.mock import patch, AsyncMock
 
 from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
     VLLM_OMNI_DIFFUSION_FRAMEWORK_OVERHEAD,
-    VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES,
     VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER,
     estimate_model_vram,
     get_vllm_omni_requested_gpu_count,
@@ -40,17 +40,25 @@ from tests.fixtures.workers.fixtures import (
 from tests.utils.scheduler import compare_candidates
 
 
+def _patch_pretrained_config():
+    return patch(
+        "gpustack.policies.candidate_selectors.vllm_resource_fit_selector.get_pretrained_config",
+        return_value=PretrainedConfig(),
+    )
+
+
 def test_image_model_ignores_gpu_memory_utilization_parameter(config):
     model = new_model(
         1,
-        "qwen-image-2512",
+        "large-diffusion-image-model",
         1,
-        model_scope_model_id="Qwen/Qwen-Image-2512",
+        model_scope_model_id="Example/Large-Diffusion-Image-Model",
         categories=[CategoryEnum.IMAGE],
         backend_parameters=["--gpu-memory-utilization", "0.9"],
     )
 
-    selector = VLLMResourceFitSelector(config, model)
+    with _patch_pretrained_config():
+        selector = VLLMResourceFitSelector(config, model)
 
     assert selector._gpu_memory_utilization == 0
 
@@ -58,26 +66,27 @@ def test_image_model_ignores_gpu_memory_utilization_parameter(config):
 def test_vllm_omni_backend_ignores_gpu_memory_utilization_parameter(config):
     model = new_model(
         1,
-        "qwen-image-2512",
+        "large-diffusion-image-model",
         1,
-        model_scope_model_id="Qwen/Qwen-Image-2512",
+        model_scope_model_id="Example/Large-Diffusion-Image-Model",
         categories=[CategoryEnum.LLM],
         backend_parameters=["--gpu-memory-utilization", "0.9"],
     )
     model.backend = BackendEnum.VLLM_OMNI
 
-    selector = VLLMResourceFitSelector(config, model)
+    with _patch_pretrained_config():
+        selector = VLLMResourceFitSelector(config, model)
 
     assert selector._gpu_memory_utilization == 0
 
 
 @pytest.mark.asyncio
-async def test_vllm_omni_image_model_uses_recursive_weight_size():
+async def test_vllm_omni_image_model_uses_all_recursive_weight_size():
     model = new_model(
         1,
-        "qwen-image-2512",
+        "large-diffusion-image-model",
         1,
-        model_scope_model_id="Qwen/Qwen-Image-2512",
+        model_scope_model_id="Example/Large-Diffusion-Image-Model",
         categories=[CategoryEnum.IMAGE],
     )
     model.backend = BackendEnum.VLLM_OMNI
@@ -93,7 +102,7 @@ async def test_vllm_omni_image_model_uses_recursive_weight_size():
         model,
         None,
         recursive=True,
-        file_name_prefixes=VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES,
+        file_name_prefixes=None,
     )
     assert claim == int(
         weight_size * VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER
@@ -102,7 +111,29 @@ async def test_vllm_omni_image_model_uses_recursive_weight_size():
 
 
 @pytest.mark.asyncio
-async def test_vllm_omni_omnigen_model_uses_recursive_weight_size_without_category():
+async def test_vllm_omni_large_diffusion_estimate_exceeds_four_24g_gpus():
+    model = new_model(
+        1,
+        "large-diffusion-image-model",
+        1,
+        model_scope_model_id="Example/Large-Diffusion-Image-Model",
+        categories=[CategoryEnum.IMAGE],
+    )
+    model.backend = BackendEnum.VLLM_OMNI
+    large_diffusion_weight_size = int(54 * 1024**3)
+    four_24g_gpu_allocatable_vram = 4 * 24682430464
+
+    with patch(
+        "gpustack.policies.candidate_selectors.vllm_resource_fit_selector.get_model_weight_size",
+        return_value=large_diffusion_weight_size,
+    ):
+        claim = await estimate_model_vram(model)
+
+    assert claim > four_24g_gpu_allocatable_vram
+
+
+@pytest.mark.asyncio
+async def test_vllm_omni_omnigen_model_uses_all_recursive_weight_size_without_category():
     model = new_model(
         1,
         "omnigen2",
@@ -123,7 +154,7 @@ async def test_vllm_omni_omnigen_model_uses_recursive_weight_size_without_catego
         model,
         None,
         recursive=True,
-        file_name_prefixes=VLLM_OMNI_DIFFUSION_GPU_WEIGHT_PREFIXES,
+        file_name_prefixes=None,
     )
     assert claim == int(
         weight_size * VLLM_OMNI_DIFFUSION_WEIGHT_MULTIPLIER
@@ -131,18 +162,45 @@ async def test_vllm_omni_omnigen_model_uses_recursive_weight_size_without_catego
     )
 
 
+@pytest.mark.asyncio
+async def test_vllm_model_estimate_keeps_non_recursive_formula():
+    model = new_model(
+        1,
+        "qwen2.5-7b",
+        1,
+        huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct",
+        categories=[CategoryEnum.LLM],
+    )
+    weight_size = 10 * 1024**3
+
+    with patch(
+        "gpustack.policies.candidate_selectors.vllm_resource_fit_selector.get_model_weight_size",
+        return_value=weight_size,
+    ) as get_model_weight_size:
+        claim = await estimate_model_vram(model)
+
+    get_model_weight_size.assert_called_once_with(
+        model,
+        None,
+        recursive=False,
+        file_name_prefixes=None,
+    )
+    assert claim == weight_size * 1.2 + 2 * 1024**3
+
+
 def test_vllm_omni_num_gpus_parameter_sets_gpu_count(config):
     model = new_model(
         1,
-        "qwen-image-2512",
+        "large-diffusion-image-model",
         1,
-        model_scope_model_id="Qwen/Qwen-Image-2512",
+        model_scope_model_id="Example/Large-Diffusion-Image-Model",
         categories=[CategoryEnum.IMAGE],
         backend_parameters=["--num-gpus=2"],
     )
     model.backend = BackendEnum.VLLM_OMNI
 
-    selector = VLLMResourceFitSelector(config, model)
+    with _patch_pretrained_config():
+        selector = VLLMResourceFitSelector(config, model)
 
     assert selector._gpu_count == 2
 
@@ -150,9 +208,9 @@ def test_vllm_omni_num_gpus_parameter_sets_gpu_count(config):
 def test_vllm_omni_hsdp_parameters_set_gpu_count(config):
     model = new_model(
         1,
-        "qwen-image-2512",
+        "large-diffusion-image-model",
         1,
-        model_scope_model_id="Qwen/Qwen-Image-2512",
+        model_scope_model_id="Example/Large-Diffusion-Image-Model",
         categories=[CategoryEnum.IMAGE],
         backend_parameters=[
             "--use-hsdp",
@@ -163,7 +221,8 @@ def test_vllm_omni_hsdp_parameters_set_gpu_count(config):
     )
     model.backend = BackendEnum.VLLM_OMNI
 
-    selector = VLLMResourceFitSelector(config, model)
+    with _patch_pretrained_config():
+        selector = VLLMResourceFitSelector(config, model)
 
     assert selector._gpu_count == 2
 
@@ -171,9 +230,9 @@ def test_vllm_omni_hsdp_parameters_set_gpu_count(config):
 def test_vllm_omni_hsdp_parameters_must_match_num_gpus():
     model = new_model(
         1,
-        "qwen-image-2512",
+        "large-diffusion-image-model",
         1,
-        model_scope_model_id="Qwen/Qwen-Image-2512",
+        model_scope_model_id="Example/Large-Diffusion-Image-Model",
         categories=[CategoryEnum.IMAGE],
         backend_parameters=[
             "--num-gpus=4",
@@ -191,9 +250,9 @@ def test_vllm_omni_hsdp_parameters_must_match_num_gpus():
 def test_vllm_omni_hsdp_parameters_match_num_gpus(config):
     model = new_model(
         1,
-        "qwen-image-2512",
+        "large-diffusion-image-model",
         1,
-        model_scope_model_id="Qwen/Qwen-Image-2512",
+        model_scope_model_id="Example/Large-Diffusion-Image-Model",
         categories=[CategoryEnum.IMAGE],
         backend_parameters=[
             "--num-gpus=4",
@@ -204,7 +263,8 @@ def test_vllm_omni_hsdp_parameters_match_num_gpus(config):
     )
     model.backend = BackendEnum.VLLM_OMNI
 
-    selector = VLLMResourceFitSelector(config, model)
+    with _patch_pretrained_config():
+        selector = VLLMResourceFitSelector(config, model)
 
     assert selector._gpu_count == 4
 
