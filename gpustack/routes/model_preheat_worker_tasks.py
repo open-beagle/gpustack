@@ -22,6 +22,8 @@ from gpustack.model_preheat_credentials import (
 )
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
 from gpustack.schemas.model_preheats import (
+    ModelPreheatDesiredStateEnum,
+    ModelPreheatExecutionStateEnum,
     ModelPreheatExecutionProfile,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatTask,
@@ -490,8 +492,26 @@ async def _validate_active_lease(
     lease: ModelPreheatWorkerTaskLease,
     idempotent_state: Optional[ModelPreheatWorkerTaskStateEnum] = None,
 ):
-    await _validate_current_registration(session, lease.worker_uuid, lease.worker_id)
     task = await _task_or_404(session, worker_task_id)
+    if task.task_id is not None:
+        parent = await session.get(ModelPreheatTask, task.task_id)
+        if parent is None:
+            _conflict("parent_not_running")
+        if task.parent_attempt != parent.attempt:
+            _conflict("stale_parent_attempt")
+        if (
+            parent.desired_state != ModelPreheatDesiredStateEnum.RUNNING
+            or parent.execution_state
+            in {
+                ModelPreheatExecutionStateEnum.PAUSED,
+                ModelPreheatExecutionStateEnum.CANCELED,
+                ModelPreheatExecutionStateEnum.READY,
+                ModelPreheatExecutionStateEnum.PARTIAL,
+                ModelPreheatExecutionStateEnum.ERROR,
+            }
+        ):
+            _conflict("parent_not_running")
+    await _validate_current_registration(session, lease.worker_uuid, lease.worker_id)
     if task.worker_uuid != lease.worker_uuid:
         _conflict("worker_mismatch")
     if task.worker_id != lease.worker_id:

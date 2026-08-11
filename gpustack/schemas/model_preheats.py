@@ -93,6 +93,7 @@ class ModelPreheatTask(SQLModel, BaseModelMixin, table=True):
     execution_state: ModelPreheatExecutionStateEnum = (
         ModelPreheatExecutionStateEnum.PENDING
     )
+    paused_from_state: Optional[ModelPreheatExecutionStateEnum] = None
     state_message: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
@@ -141,7 +142,11 @@ class ModelPreheatWorkerTask(SQLModel, BaseModelMixin, table=True):
     __tablename__ = "model_preheat_worker_tasks"
     __table_args__ = (
         UniqueConstraint(
-            "task_id", "worker_uuid", "role", name="uix_preheat_task_worker_role"
+            "task_id",
+            "parent_attempt",
+            "worker_uuid",
+            "role",
+            name="uix_preheat_task_attempt_worker_role",
         ),
         UniqueConstraint(
             "connectivity_check_id",
@@ -166,6 +171,7 @@ class ModelPreheatWorkerTask(SQLModel, BaseModelMixin, table=True):
             nullable=True,
         ),
     )
+    parent_attempt: int = 1
     worker_uuid: str
     worker_id: Optional[int] = None
     role: ModelPreheatWorkerTaskRoleEnum
@@ -202,6 +208,7 @@ class ModelPreheatWorkerTaskPublic(SQLModel):
     id: int
     task_id: Optional[int] = None
     connectivity_check_id: Optional[int] = None
+    parent_attempt: int = 1
     worker_uuid: str
     worker_id: Optional[int] = None
     role: ModelPreheatWorkerTaskRoleEnum
@@ -480,6 +487,7 @@ class ModelPreheatCreate(SQLModel):
 
 class ModelPreheatTaskPublic(SQLModel):
     id: int
+    attempt: int
     source: str
     model_id: str
     requested_revision: Optional[str] = None
@@ -491,6 +499,7 @@ class ModelPreheatTaskPublic(SQLModel):
     generation_id: str
     desired_state: ModelPreheatDesiredStateEnum
     execution_state: ModelPreheatExecutionStateEnum
+    paused_from_state: Optional[ModelPreheatExecutionStateEnum] = None
     target_scope: ModelPreheatTargetScopeEnum
     target_worker_uuids: list[str]
     target_worker_snapshot: list[dict]

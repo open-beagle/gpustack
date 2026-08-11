@@ -24,6 +24,10 @@ from gpustack.scheduler.scheduler import Scheduler
 from gpustack.ray.manager import RayManager
 from gpustack.server.system_load import SystemLoadCollector
 from gpustack.server.update_check import UpdateChecker
+from gpustack.server.model_preheat_controller import (
+    ModelPreheatController,
+    StrictS3ReadyProbe,
+)
 from gpustack.server.usage_buffer import flush_usage_to_db
 from gpustack.server.worker_syncer import WorkerSyncer
 from gpustack.utils.process import add_signal_handlers_in_loop
@@ -188,11 +192,21 @@ class Server:
         )
 
         worker_controller = WorkerController()
-        self._create_restartable_async_task(worker_controller.start, "worker controller")
+        self._create_restartable_async_task(
+            worker_controller.start, "worker controller"
+        )
 
         model_file_controller = ModelFileController()
         self._create_restartable_async_task(
             model_file_controller.start, "model file controller"
+        )
+
+        model_preheat_controller = ModelPreheatController(
+            get_engine(),
+            ready_probe=StrictS3ReadyProbe(self._config),
+        )
+        self._create_restartable_async_task(
+            model_preheat_controller.start, "model preheat controller"
         )
 
         logger.debug("Controllers started.")

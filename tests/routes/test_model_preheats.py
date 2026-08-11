@@ -448,11 +448,7 @@ def test_selected_workers_uses_explicit_online_seed_worker(tmp_path):
     assert response.status_code == 200, response.text
     assert task.seed_worker_id == workers[0].id
     assert task.seed_worker_uuid == workers[0].worker_uuid
-    assert {
-        worker_task.worker_uuid
-        for worker_task in worker_tasks
-        if worker_task.role == ModelPreheatWorkerTaskRoleEnum.SEED
-    } == {workers[0].worker_uuid}
+    assert worker_tasks == []
 
 
 def test_seed_worker_scope_targets_only_seed_and_creates_no_distribute_task(tmp_path):
@@ -491,9 +487,7 @@ def test_seed_worker_scope_targets_only_seed_and_creates_no_distribute_task(tmp_
 
     assert response.status_code == 200, response.text
     assert response.json()["target_worker_uuids"] == [seed_worker.worker_uuid]
-    assert [
-        (worker_task.worker_uuid, worker_task.role) for worker_task in worker_tasks
-    ] == [(seed_worker.worker_uuid, ModelPreheatWorkerTaskRoleEnum.SEED)]
+    assert worker_tasks == []
 
 
 def test_same_gpu_model_scope_snapshots_ready_workers_with_matching_gpu_names(tmp_path):
@@ -579,11 +573,7 @@ def test_same_gpu_model_scope_snapshots_ready_workers_with_matching_gpu_names(tm
     assert task.target_gpu_names == ["nvidia a100"]
     assert task.target_worker_uuids == ["a-uuid", "z-uuid"]
     assert other.worker_uuid not in task.target_worker_uuids
-    assert {
-        worker_task.worker_uuid
-        for worker_task in worker_tasks
-        if worker_task.role == ModelPreheatWorkerTaskRoleEnum.SEED
-    } == {workers[0].worker_uuid}
+    assert worker_tasks == []
 
 
 def test_same_gpu_model_scope_requires_identifiable_seed_gpu(tmp_path):
@@ -702,20 +692,31 @@ def test_sqlite_enforces_model_preheat_unique_constraints(tmp_path):
         async with AsyncSession(engine) as session:
             task = await session.get(ModelPreheatTask, created.json()["id"])
             lock = (await session.exec(select(ModelPreheatTaskLock))).one()
-            worker_task = (
-                await session.exec(
-                    select(ModelPreheatWorkerTask).where(
-                        ModelPreheatWorkerTask.task_id == task.id
-                    )
-                )
-            ).first()
             task_id = task.id
+            parent_attempt = task.attempt
             operation_key = lock.operation_key
-            worker_uuid = worker_task.worker_uuid
-            worker_role = worker_task.role
             profile_id = profile.id
             profile_config_version = profile.config_version
             connectivity_worker_uuid = workers[0].worker_uuid
+            session.add(
+                ModelPreheatWorkerTask(
+                    task_id=task_id,
+                    parent_attempt=parent_attempt,
+                    worker_uuid=workers[0].worker_uuid,
+                    worker_id=workers[0].id,
+                    role=ModelPreheatWorkerTaskRoleEnum.SEED,
+                )
+            )
+            await session.commit()
+            worker_task = (
+                await session.exec(
+                    select(ModelPreheatWorkerTask).where(
+                        ModelPreheatWorkerTask.task_id == task_id
+                    )
+                )
+            ).first()
+            worker_uuid = worker_task.worker_uuid
+            worker_role = worker_task.role
 
             record = ModelPreheatIdempotencyRecord(
                 user_id=1,
@@ -768,6 +769,7 @@ def test_sqlite_enforces_model_preheat_unique_constraints(tmp_path):
             session.add(
                 ModelPreheatWorkerTask(
                     task_id=task_id,
+                    parent_attempt=parent_attempt,
                     worker_uuid=worker_uuid,
                     role=worker_role,
                 )
@@ -780,6 +782,16 @@ def test_sqlite_enforces_model_preheat_unique_constraints(tmp_path):
                 raise AssertionError(
                     "task worker role unique constraint was not enforced"
                 )
+
+            session.add(
+                ModelPreheatWorkerTask(
+                    task_id=task_id,
+                    parent_attempt=parent_attempt + 1,
+                    worker_uuid=worker_uuid,
+                    role=worker_role,
+                )
+            )
+            await session.commit()
 
             check = ModelPreheatS3ConnectivityCheck(
                 profile_id=profile_id,
@@ -831,13 +843,33 @@ def test_schema_and_migration_use_regular_unique_constraints_for_postgresql():
     for table, name in (
         (ModelPreheatTaskLock.__table__, "uix_preheat_operation"),
         (ModelPreheatIdempotencyRecord.__table__, "uix_preheat_idempotency"),
-        (ModelPreheatWorkerTask.__table__, "uix_preheat_task_worker_role"),
+        (
+            ModelPreheatWorkerTask.__table__,
+            "uix_preheat_task_attempt_worker_role",
+        ),
         (ModelPreheatWorkerTask.__table__, "uix_preheat_check_worker_role"),
     ):
         assert any(
             isinstance(constraint, UniqueConstraint) and constraint.name == name
             for constraint in table.constraints
         )
+
+
+def test_parent_attempt_uses_successor_portable_migration():
+    core = Path(
+        "gpustack/migrations/versions/2026_08_10_1000-f6a7b8c9d0e1_add_model_preheat_core.py"
+    ).read_text()
+    successor = Path(
+        "gpustack/migrations/versions/2026_08_11_1100-a7b8c9d0e1f2_add_preheat_parent_attempt.py"
+    ).read_text()
+
+    assert "paused_from_state" not in core
+    assert "parent_attempt" not in core
+    assert 'down_revision: Union[str, None] = "f6a7b8c9d0e1"' in successor
+    assert 'batch_alter_table("model_preheat_tasks")' in successor
+    assert 'batch_alter_table("model_preheat_worker_tasks")' in successor
+    assert "UPDATE model_preheat_worker_tasks" in successor
+    assert "postgresql_where" not in successor
 
 
 def test_postgresql_enforces_model_preheat_unique_constraints():
