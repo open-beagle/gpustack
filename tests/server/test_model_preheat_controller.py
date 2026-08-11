@@ -74,6 +74,44 @@ class BlockingReadyProbe:
         return self.result
 
 
+class TrackingModelPreheatController(ModelPreheatController):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reconcile_all_calls = 0
+
+    async def reconcile_all(self):
+        self.reconcile_all_calls += 1
+        await super().reconcile_all()
+
+
+class TwoPartyReadyProbe:
+    def __init__(self, result):
+        self.result = result
+        self.arrived_task_ids = {}
+        self._lock = asyncio.Lock()
+        self._both_arrived = asyncio.Event()
+
+    def participant(self, name):
+        return ReadyProbeParticipant(self, name)
+
+    async def wait(self, name, task):
+        async with self._lock:
+            self.arrived_task_ids[name] = task.id
+            if set(self.arrived_task_ids) == {"first", "second"}:
+                self._both_arrived.set()
+        await asyncio.wait_for(self._both_arrived.wait(), timeout=5)
+        return self.result
+
+
+class ReadyProbeParticipant:
+    def __init__(self, barrier, name):
+        self._barrier = barrier
+        self._name = name
+
+    async def probe(self, task):
+        return await self._barrier.wait(self._name, task)
+
+
 async def _database(tmp_path):
     tmp_path.mkdir(parents=True, exist_ok=True)
     engine = create_async_engine(
@@ -482,6 +520,155 @@ def test_two_controllers_reconcile_to_one_seed(tmp_path):
     children = asyncio.run(run())
     assert len(children) == 1
     assert children[0].role == ModelPreheatWorkerTaskRoleEnum.SEED
+
+
+def test_server_restart_recovers_controller_state_and_deduplicates_distribution(
+    tmp_path,
+):
+    async def run():
+        first_engine = await _database(tmp_path)
+        async with AsyncSession(first_engine) as session:
+            session.add(
+                ModelPreheatS3Profile(
+                    name="profile",
+                    endpoint="https://s3.example.com",
+                    bucket="models",
+                    access_key_encrypted={"ciphertext": "encrypted"},
+                    secret_key_encrypted={"ciphertext": "encrypted"},
+                    encryption_key_version="v1",
+                )
+            )
+            await session.commit()
+        task_id, _ = await _seed(first_engine)
+        first_inventory = ModelPreheatS3Inventory(first_engine)
+        first_controller = ModelPreheatController(
+            first_engine,
+            FakeReadyProbe(),
+            FakeInventoryProbe({}),
+            s3_inventory=first_inventory,
+        )
+        await first_controller.reconcile_task(task_id)
+        async with AsyncSession(first_engine) as session:
+            marker = (await session.exec(select(ModelPreheatPublicationMarker))).one()
+            await session.delete(marker)
+            await session.commit()
+        await first_engine.dispose()
+
+        second_engine = await _database(tmp_path)
+        second_inventory = ModelPreheatS3Inventory(second_engine)
+        recovered_controller = TrackingModelPreheatController(
+            second_engine,
+            FakeReadyProbe(),
+            FakeInventoryProbe({}),
+            s3_inventory=second_inventory,
+        )
+        await asyncio.wait_for(recovered_controller.reconcile_all(), timeout=10)
+        async with AsyncSession(second_engine) as session:
+            markers_after_restart = (
+                await session.exec(select(ModelPreheatPublicationMarker))
+            ).all()
+            seed = (await session.exec(select(ModelPreheatWorkerTask))).one()
+            seed.state = ModelPreheatWorkerTaskStateEnum.READY
+            seed.resumable_cursor = {
+                "state": "ready",
+                "manifest_digest": "d" * 64,
+                "generation_id": GENERATION_ID,
+                "local_cache_state": "valid",
+                "uploaded": 1,
+                "skipped": 0,
+                "downloaded": 0,
+                "total_size": 10,
+            }
+            session.add(seed)
+            await session.commit()
+        await second_engine.dispose()
+
+        third_engine = await _database(tmp_path)
+        identity = ModelPreheatIdentity(
+            source="huggingface",
+            model_id="org/model",
+            revision="a" * 40,
+            file_patterns=[],
+        )
+        path_client = ModelPreheatS3Client(None)
+        selection_prefix = path_client._selection_prefix("", identity, "b" * 64)
+        ready = ReadyProbeResult(
+            manifest_digest="d" * 64,
+            generation_id=GENERATION_ID,
+            ready_path=path_client._join_object_name(selection_prefix, "ready.json"),
+            manifest_path=path_client._join_object_name(
+                selection_prefix,
+                "generations",
+                GENERATION_ID,
+                ".gpustack-manifest.json",
+            ),
+            cache_key="c" * 64,
+            selection_digest="b" * 64,
+            profile_config_version=1,
+            file_count=1,
+            total_size=10,
+        )
+        ready_probe = TwoPartyReadyProbe(ready)
+        first = TrackingModelPreheatController(
+            third_engine,
+            ready_probe.participant("first"),
+            FakeInventoryProbe({}),
+            s3_inventory=ModelPreheatS3Inventory(third_engine),
+        )
+        second = TrackingModelPreheatController(
+            third_engine,
+            ready_probe.participant("second"),
+            FakeInventoryProbe({}),
+            s3_inventory=ModelPreheatS3Inventory(third_engine),
+        )
+        await asyncio.wait_for(
+            asyncio.gather(first.reconcile_all(), second.reconcile_all()), timeout=10
+        )
+        children = await _tasks(third_engine, task_id)
+        async with AsyncSession(third_engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+            final_markers = (
+                await session.exec(select(ModelPreheatPublicationMarker))
+            ).all()
+            cached_models = (await session.exec(select(ModelPreheatCachedModel))).all()
+        await third_engine.dispose()
+        return (
+            markers_after_restart,
+            final_markers,
+            cached_models,
+            parent,
+            children,
+            recovered_controller.reconcile_all_calls,
+            first.reconcile_all_calls,
+            second.reconcile_all_calls,
+            ready_probe.arrived_task_ids,
+        )
+
+    (
+        markers_after_restart,
+        final_markers,
+        cached_models,
+        parent,
+        children,
+        recovered_reconcile_all_calls,
+        first_reconcile_all_calls,
+        second_reconcile_all_calls,
+        arrived_task_ids,
+    ) = asyncio.run(run())
+    assert recovered_reconcile_all_calls == 1
+    assert first_reconcile_all_calls == 1
+    assert second_reconcile_all_calls == 1
+    assert arrived_task_ids == {"first": parent.id, "second": parent.id}
+    assert len(markers_after_restart) == 1
+    assert final_markers == []
+    assert len(cached_models) == 1
+    assert [child.role for child in children].count(
+        ModelPreheatWorkerTaskRoleEnum.SEED
+    ) == 1
+    assert [child.role for child in children].count(
+        ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE
+    ) == 1
+    assert parent.execution_state == ModelPreheatExecutionStateEnum.DISTRIBUTING
 
 
 def test_old_parent_attempt_results_are_not_aggregated(tmp_path):

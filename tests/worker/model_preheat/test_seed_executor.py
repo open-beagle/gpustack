@@ -98,6 +98,47 @@ class InMemoryMinio:
         ]
 
 
+class InterruptedTransferMinio(InMemoryMinio):
+    def __init__(self):
+        super().__init__()
+        self.file_puts = 0
+        self.interrupt_put = False
+        self.interrupt_get = False
+
+    def put_object_if_absent(
+        self, bucket, name, data, length, content_type=None, metadata=None
+    ):
+        if "/files/" in name:
+            self.file_puts += 1
+            if self.interrupt_put and self.file_puts == 2:
+                data.read(max(1, length // 2))
+                self.interrupt_put = False
+                raise OSError("injected upload interruption")
+        return super().put_object_if_absent(
+            bucket, name, data, length, content_type, metadata
+        )
+
+    def get_object(self, bucket, name):
+        response = super().get_object(bucket, name)
+        if not self.interrupt_get or "/files/" not in name:
+            return response
+        self.interrupt_get = False
+        return InterruptedResponse(response._data)
+
+
+class InterruptedResponse(Response):
+    def __init__(self, data):
+        super().__init__(data)
+        self._interrupted = False
+
+    def read(self, length=None):
+        if self._interrupted:
+            raise OSError("injected download interruption")
+        self._interrupted = True
+        chunk_size = max(1, len(self._data) // 2)
+        return super().read(chunk_size)
+
+
 def _identity():
     return ModelPreheatIdentity(
         source="modelscope",
@@ -262,6 +303,103 @@ def test_seed_new_attempt_prefills_previous_partial_before_hub_resume(tmp_path):
 
     assert seen == [("resolved-commit", b"config", "resume")]
     assert result["state"] == "ready"
+
+
+def test_seed_upload_interruption_is_reclaimed_without_publishing_partial_ready(
+    tmp_path,
+):
+    request = _request(tmp_path)
+    minio = InterruptedTransferMinio()
+    minio.interrupt_put = True
+    client = ModelPreheatS3Client(minio)
+
+    def initial_download(identity, staging, exclude_patterns):
+        del identity, exclude_patterns
+        _write_model(staging)
+
+    interrupted = execute_seed_preheat(
+        request,
+        client,
+        download_to_staging=initial_download,
+    )
+
+    assert interrupted["state"] == "error"
+    assert interrupted["error_code"] == "worker_execution_failed"
+    assert interrupted["cursor"]["staging_exists"] is True
+    assert len([name for _, name in minio.objects if "/files/" in name]) == 1
+    assert not any(
+        name.endswith(".gpustack-manifest.json") for _, name in minio.objects
+    )
+    assert not any(name.endswith("ready.json") for _, name in minio.objects)
+
+    resumed_request = SeedExecutionRequest(**{**request.__dict__, "attempt": 2})
+
+    def resumed_download(identity, staging, exclude_patterns):
+        del identity, exclude_patterns
+        assert (staging / "config.json").read_bytes() == b"config"
+        assert (staging / "weights" / "model.bin").read_bytes() == b"weights"
+
+    resumed = execute_seed_preheat(
+        resumed_request,
+        client,
+        download_to_staging=resumed_download,
+    )
+
+    assert resumed["state"] == "ready"
+    assert any(name.endswith(".gpustack-manifest.json") for _, name in minio.objects)
+    assert any(name.endswith("ready.json") for _, name in minio.objects)
+
+
+def test_s3_download_stream_interruption_keeps_staging_for_next_attempt(tmp_path):
+    source_request = _request(tmp_path)
+    _write_model(source_request.target_dir)
+    source_manifest = build_model_preheat_manifest(
+        source_request.target_dir,
+        source_request.identity,
+        cache_key=source_request.cache_key,
+        selection_digest=source_request.selection_digest,
+        generation_id=source_request.generation_id,
+        exclude_patterns=source_request.exclude_patterns,
+    )
+    write_trusted_manifest(
+        source_request.cache_dir, source_request.cache_key, source_manifest
+    )
+    minio = InterruptedTransferMinio()
+    client = ModelPreheatS3Client(minio)
+    assert execute_seed_preheat(source_request, client)["state"] == "ready"
+
+    target_request = TargetExecutionRequest(
+        **{
+            **source_request.__dict__,
+            "cache_dir": tmp_path / "target-cache",
+            "target_dir": tmp_path / "target-cache" / "model",
+            "task_id": 9,
+        }
+    )
+    minio.interrupt_get = True
+
+    interrupted = execute_target_preheat(target_request, client)
+
+    assert interrupted["state"] == "error"
+    assert interrupted["error_code"] == "worker_execution_failed"
+    assert interrupted["cursor"]["staging_exists"] is True
+    assert not target_request.target_dir.exists()
+
+    resumed_request = TargetExecutionRequest(
+        **{**target_request.__dict__, "attempt": 2}
+    )
+    resumed = execute_target_preheat(resumed_request, client)
+
+    assert resumed["state"] == "ready"
+    assert (
+        inspect_local_cache(
+            resumed_request.cache_dir,
+            resumed_request.target_dir,
+            resumed_request.cache_key,
+            source_manifest,
+        ).state.value
+        == "valid"
+    )
 
 
 def test_seed_reports_s3_conflict_when_cancel_cleanup_never_succeeds(tmp_path):

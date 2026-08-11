@@ -364,3 +364,146 @@ def test_reused_check_pointer_cas_miss_refreshes_profile_for_route_serialization
             await engine.dispose()
 
     asyncio.run(run())
+
+
+def test_profile_patch_races_old_connectivity_matrix_aggregation(tmp_path, monkeypatch):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'profile-patch-race.db'}",
+            poolclass=NullPool,
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(SQLModel.metadata.create_all)
+        app = FastAPI()
+        app.state.server_config = SimpleNamespace(
+            model_preheat_credential_key=generate_model_preheat_credential_key(),
+            model_preheat_credential_key_version="v1",
+            model_preheat_credential_old_keys=None,
+        )
+
+        async def session_override():
+            async with AsyncSession(engine) as session:
+                yield session
+
+        async def admin_override():
+            return User(id=1, username="admin", is_admin=True, hashed_password="")
+
+        app.dependency_overrides[get_session] = session_override
+        app.dependency_overrides[get_admin_user] = admin_override
+        router = APIRouter(dependencies=[Depends(get_admin_user)])
+        router.include_router(
+            model_preheat_s3_profiles.router,
+            prefix="/model-preheat-s3-profiles",
+        )
+        app.include_router(router, prefix="/v1")
+        exceptions.register_handlers(app)
+
+        try:
+            async with AsyncSession(engine) as session:
+                session.add(
+                    Worker(
+                        name="worker",
+                        hostname="worker",
+                        ip="127.0.0.1",
+                        port=10150,
+                        worker_uuid="worker-uuid",
+                        state=WorkerStateEnum.READY,
+                    )
+                )
+                await session.commit()
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                created = await client.post(
+                    "/v1/model-preheat-s3-profiles",
+                    json={
+                        "name": "profile",
+                        "endpoint": "https://s3.example.com",
+                        "bucket": "models",
+                        "access_key": "plain-access-key",
+                        "secret_key": "plain-secret-key",
+                    },
+                )
+                assert created.status_code == 200, created.text
+                profile = created.json()
+                old_check_id = profile["last_connectivity_check_id"]
+
+                async with AsyncSession(engine) as session:
+                    old_task = (
+                        await session.exec(
+                            select(ModelPreheatWorkerTask).where(
+                                ModelPreheatWorkerTask.connectivity_check_id
+                                == old_check_id
+                            )
+                        )
+                    ).one()
+                    old_task.state = ModelPreheatWorkerTaskStateEnum.READY
+                    old_task.resumable_cursor = {
+                        "state": "ready",
+                        "readable": True,
+                        "writable": True,
+                        "deletable": True,
+                        "cleanup_failed": False,
+                        "latency_ms": 12,
+                    }
+                    session.add(old_task)
+                    await session.commit()
+
+                aggregation_started = asyncio.Event()
+                release_aggregation = asyncio.Event()
+                original_aggregate = (
+                    model_preheat_s3_profiles.aggregate_connectivity_check
+                )
+
+                async def aggregate_with_barrier(session, check_id):
+                    aggregation_started.set()
+                    await asyncio.wait_for(release_aggregation.wait(), timeout=5)
+                    return await original_aggregate(session, check_id)
+
+                monkeypatch.setattr(
+                    model_preheat_s3_profiles,
+                    "aggregate_connectivity_check",
+                    aggregate_with_barrier,
+                )
+                old_detail_request = asyncio.create_task(
+                    client.get(
+                        "/v1/model-preheat-s3-profiles/"
+                        f"{profile['id']}/connectivity-checks/{old_check_id}"
+                    )
+                )
+                await asyncio.wait_for(aggregation_started.wait(), timeout=5)
+                try:
+                    patched = await client.patch(
+                        f"/v1/model-preheat-s3-profiles/{profile['id']}",
+                        json={"endpoint": "https://s3-new.example.com"},
+                    )
+                finally:
+                    release_aggregation.set()
+                old_detail = await old_detail_request
+                current = await client.get(
+                    f"/v1/model-preheat-s3-profiles/{profile['id']}"
+                )
+
+            assert patched.status_code == 200, patched.text
+            assert patched.json()["config_version"] == 2
+            assert patched.json()["connectivity_state"] == "checking"
+            assert patched.json()["last_connectivity_check_id"] != old_check_id
+            assert old_detail.status_code == 200, old_detail.text
+            assert old_detail.json()["profile_config_version"] == 1
+            assert old_detail.json()["state"] == "available"
+            assert old_detail.json()["workers"][0]["readable"] is True
+            assert current.status_code == 200, current.text
+            assert current.json()["config_version"] == 2
+            assert current.json()["connectivity_state"] == "checking"
+            assert (
+                current.json()["last_connectivity_check_id"]
+                == patched.json()["last_connectivity_check_id"]
+            )
+        finally:
+            async with engine.begin() as connection:
+                await connection.run_sync(SQLModel.metadata.drop_all)
+            await engine.dispose()
+
+    asyncio.run(run())
