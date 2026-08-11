@@ -21,6 +21,9 @@ from gpustack.model_preheat_credentials import (
     ModelPreheatCredentialError,
 )
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_preheat_distribution_policies import (
+    ModelPreheatDistributionPolicy,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatDesiredStateEnum,
     ModelPreheatExecutionStateEnum,
@@ -200,6 +203,8 @@ async def claim_model_preheat_worker_task(
     task = await _task_or_404(session, worker_task_id)
     if task.worker_uuid != claim.worker_uuid:
         _conflict("worker_mismatch")
+    if task.distribution_policy_id is not None:
+        await _active_distribution_source(session, task.distribution_policy_id)
 
     now = _utcnow()
     lease_token = secrets.token_urlsafe(32)
@@ -443,6 +448,15 @@ async def _execution_source(session, worker_task: ModelPreheatWorkerTask):
         )
         return payload, task.s3_profile_snapshot_encrypted
 
+    if worker_task.distribution_policy_id is not None:
+        _, task = await _active_distribution_source(
+            session, worker_task.distribution_policy_id
+        )
+        payload = task.model_dump(
+            exclude={"s3_profile_snapshot_encrypted", "encryption_key_version"}
+        )
+        return payload, task.s3_profile_snapshot_encrypted
+
     check = await session.get(
         ModelPreheatS3ConnectivityCheck, worker_task.connectivity_check_id
     )
@@ -493,7 +507,9 @@ async def _validate_active_lease(
     idempotent_state: Optional[ModelPreheatWorkerTaskStateEnum] = None,
 ):
     task = await _task_or_404(session, worker_task_id)
-    if task.task_id is not None:
+    if task.distribution_policy_id is not None:
+        await _active_distribution_source(session, task.distribution_policy_id)
+    elif task.task_id is not None:
         parent = await session.get(ModelPreheatTask, task.task_id)
         if parent is None:
             _conflict("parent_not_running")
@@ -531,6 +547,24 @@ async def _validate_active_lease(
     if task.lease_expires_at is None or task.lease_expires_at <= _utcnow():
         _conflict("lease_expired")
     return task
+
+
+async def _active_distribution_source(session, policy_id):
+    policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
+    if policy is None or policy.created_by_task_id is None or not policy.enabled:
+        _conflict("distribution_policy_not_active")
+    source_task = await session.get(ModelPreheatTask, policy.created_by_task_id)
+    profile = await session.get(ModelPreheatS3Profile, policy.profile_id)
+    if (
+        source_task is None
+        or profile is None
+        or profile.config_version != policy.profile_config_version
+        or source_task.s3_profile_config_version != policy.profile_config_version
+        or source_task.execution_state != ModelPreheatExecutionStateEnum.READY
+        or source_task.cache_key != policy.cache_key
+    ):
+        _conflict("distribution_source_not_ready")
+    return policy, source_task
 
 
 async def _validate_current_registration(session, worker_uuid: str, worker_id: int):

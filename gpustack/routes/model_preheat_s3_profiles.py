@@ -25,6 +25,9 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ProfilesPublic,
     ModelPreheatS3ProfileUpdate,
 )
+from gpustack.schemas.model_preheat_distribution_policies import (
+    ModelPreheatDistributionPolicy,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatConnectivityCheckPublic,
     ModelPreheatConnectivityWorkerPublic,
@@ -336,6 +339,15 @@ async def delete_profile(request: Request, session: SessionDep, id: int):
             message=f"credential_encryption_unavailable: {exc}"
         )
     profile = await _get_profile(session, id)
+    policy = (
+        await session.exec(
+            select(ModelPreheatDistributionPolicy).where(
+                ModelPreheatDistributionPolicy.profile_id == profile.id
+            )
+        )
+    ).first()
+    if policy is not None:
+        raise HTTPException(409, "Conflict", "distribution_policy_uses_profile")
     try:
         await profile.delete(session)
     except Exception as exc:

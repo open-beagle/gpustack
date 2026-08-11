@@ -44,6 +44,7 @@ async def create_or_reuse_connectivity_check(
     *,
     idempotency_scope_key: str | None = None,
     request_hash: str | None = None,
+    scope_discriminator: str | None = None,
 ):
     profile_identity = inspect(profile).identity
     if profile_identity is None:
@@ -98,7 +99,9 @@ async def create_or_reuse_connectivity_check(
         await session.refresh(profile)
         return None
 
-    active_key = _connectivity_scope_key(profile, ready_workers)
+    active_key = _connectivity_scope_key(
+        profile, ready_workers, scope_discriminator=scope_discriminator
+    )
     statement = select(ModelPreheatS3ConnectivityCheck).where(
         ModelPreheatS3ConnectivityCheck.active_key == active_key
     )
@@ -355,10 +358,15 @@ def _expire_profile_after_failed_cas(session, profile, rowcount: int):
         raise RuntimeError("unexpected_profile_connectivity_update_count")
 
 
-def _connectivity_scope_key(profile, workers: list[Worker]) -> str:
+def _connectivity_scope_key(
+    profile, workers: list[Worker], *, scope_discriminator: str | None = None
+) -> str:
     snapshot = sorted((worker.worker_uuid, worker.id) for worker in workers)
+    payload_items = [profile.id, profile.config_version, snapshot]
+    if scope_discriminator is not None:
+        payload_items.append(scope_discriminator)
     payload = json.dumps(
-        [profile.id, profile.config_version, snapshot],
+        payload_items,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

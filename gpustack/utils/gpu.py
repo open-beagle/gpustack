@@ -1,10 +1,23 @@
+from collections.abc import Iterable
 import re
-
-from typing import Tuple, Union, List, Callable
+from typing import Callable, List, Tuple, Union
 
 from gpustack.schemas.workers import GPUDeviceInfo, WorkerBase
 
+
 pattern = r"^(?P<worker_name>.+):(?P<device>[^:]+):(?P<gpu_index>\d+)$"
+
+
+def normalize_gpu_name(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split()).casefold()
+
+
+def normalize_gpu_names(values: Iterable[str]) -> set[str]:
+    normalized = {normalize_gpu_name(value) for value in values}
+    normalized.discard("")
+    return normalized
 
 
 def parse_gpu_id(input: str) -> Tuple[bool, dict]:

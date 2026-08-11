@@ -154,6 +154,9 @@ class ModelPreheatWorkerTask(SQLModel, BaseModelMixin, table=True):
             "role",
             name="uix_preheat_check_worker_role",
         ),
+        UniqueConstraint(
+            "operation_key", name="uix_preheat_worker_distribution_operation"
+        ),
         Index("ix_preheat_worker_uuid_state", "worker_uuid", "state"),
     )
 
@@ -171,6 +174,14 @@ class ModelPreheatWorkerTask(SQLModel, BaseModelMixin, table=True):
             nullable=True,
         ),
     )
+    distribution_policy_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            ForeignKey("model_preheat_distribution_policies.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+    )
+    operation_key: Optional[str] = None
     parent_attempt: int = 1
     worker_uuid: str
     worker_id: Optional[int] = None
@@ -208,6 +219,7 @@ class ModelPreheatWorkerTaskPublic(SQLModel):
     id: int
     task_id: Optional[int] = None
     connectivity_check_id: Optional[int] = None
+    distribution_policy_id: Optional[int] = None
     parent_attempt: int = 1
     worker_uuid: str
     worker_id: Optional[int] = None
@@ -561,3 +573,9 @@ def is_terminal_task(task: ModelPreheatTask) -> bool:
         ModelPreheatExecutionStateEnum.ERROR,
         ModelPreheatExecutionStateEnum.CANCELED,
     }
+
+
+# 注册 worker task 外键引用的 Task 9 表，兼容仅导入本模块后 create_all。
+from gpustack.schemas import (
+    model_preheat_distribution_policies as _distribution_policies,
+)  # noqa: E402,F401

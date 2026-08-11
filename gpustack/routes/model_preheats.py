@@ -54,6 +54,7 @@ from gpustack.server.model_preheat_connectivity import (
     latest_connectivity_results_for_workers,
     mark_profile_stale_if_expired,
 )
+from gpustack.utils.gpu import normalize_gpu_names
 
 
 router = APIRouter()
@@ -447,11 +448,7 @@ async def _resolve_target_workers(session, task_in: ModelPreheatCreate):
 
 def _normalized_gpu_names(worker: Worker) -> set[str]:
     gpu_devices = getattr(worker.status, "gpu_devices", None) or []
-    return {
-        " ".join(gpu.name.split()).casefold()
-        for gpu in gpu_devices
-        if gpu.name and gpu.name.strip()
-    }
+    return normalize_gpu_names(gpu.name for gpu in gpu_devices)
 
 
 async def _ensure_profile_available_on_workers(
