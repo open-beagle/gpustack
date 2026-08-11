@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -6,6 +6,7 @@ import httpx
 from pydantic import BaseModel
 
 HTTP_422_STATUS_CODE = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
+SENSITIVE_VALIDATION_KEYS = {"access_key", "secret_key"}
 
 
 class HTTPException(Exception):
@@ -193,7 +194,7 @@ def register_handlers(app: FastAPI):
     async def validation_exception_handler(request, exc: RequestValidationError):
         message = f"{len(exc.errors())} validation errors:\n"
         for err in exc.errors():
-            message += f"  {err}\n"
+            message += f"  {_scrub_validation_error(err)}\n"
         return JSONResponse(
             status_code=HTTP_422_STATUS_CODE,
             content=ErrorResponse(
@@ -202,3 +203,38 @@ def register_handlers(app: FastAPI):
                 message=message,
             ).model_dump(),
         )
+
+
+def _scrub_validation_error(error: dict[str, Any]) -> dict[str, Any]:
+    scrubbed = _scrub_sensitive_value(error)
+    if _has_sensitive_validation_location(error.get("loc")) and isinstance(
+        scrubbed, dict
+    ):
+        scrubbed["input"] = "***"
+    return scrubbed
+
+
+def _has_sensitive_validation_location(loc: Any) -> bool:
+    if not isinstance(loc, (list, tuple)):
+        return False
+    return any(
+        isinstance(segment, str) and segment.lower() in SENSITIVE_VALIDATION_KEYS
+        for segment in loc
+    )
+
+
+def _scrub_sensitive_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                "***"
+                if isinstance(key, str) and key.lower() in SENSITIVE_VALIDATION_KEYS
+                else _scrub_sensitive_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_scrub_sensitive_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub_sensitive_value(item) for item in value)
+    return value

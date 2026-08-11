@@ -9,6 +9,8 @@ from gpustack.routes import (
     model_evaluations,
     model_files,
     model_instances,
+    model_preheats,
+    model_preheat_s3_profiles,
     model_usage,
     model_sets,
     probes,
@@ -60,6 +62,14 @@ v1_admin_router.include_router(
 )
 v1_admin_router.include_router(
     model_usage.router, prefix="/model-usage", tags=["Model Usage"]
+)
+v1_admin_router.include_router(
+    model_preheats.router, prefix="/model-preheats", tags=["Model Preheats"]
+)
+v1_admin_router.include_router(
+    model_preheat_s3_profiles.router,
+    prefix="/model-preheat-s3-profiles",
+    tags=["Model Preheat S3 Profiles"],
 )
 v1_admin_router.include_router(
     gpu_devices.router, prefix="/gpu-devices", tags=["GPU Devices"]

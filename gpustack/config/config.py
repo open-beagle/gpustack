@@ -1,7 +1,7 @@
 import os
 import secrets
 from typing import List, Optional
-from pydantic import model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings
 import requests
 from gpustack.utils import validators
@@ -186,6 +186,35 @@ class Config(BaseSettings):
     worker_local_s3_region: Optional[str] = ""
     worker_local_s3_modelscope_prefix: Optional[str] = ""
     worker_local_s3_modelscope_fallback: bool = True
+    model_preheat_credential_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "model_preheat_credential_key",
+            "GPUSTACK_MODEL_PREHEAT_CREDENTIAL_KEY",
+        ),
+    )
+    model_preheat_credential_key_version: Optional[str] = Field(
+        default="v1",
+        validation_alias=AliasChoices(
+            "model_preheat_credential_key_version",
+            "GPUSTACK_MODEL_PREHEAT_CREDENTIAL_KEY_VERSION",
+        ),
+    )
+    model_preheat_credential_old_keys: Optional[dict[str, str]] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "model_preheat_credential_old_keys",
+            "GPUSTACK_MODEL_PREHEAT_CREDENTIAL_OLD_KEYS",
+        ),
+    )
+    model_preheat_connectivity_ttl_seconds: int = Field(
+        default=600,
+        validation_alias=AliasChoices(
+            "model_preheat_connectivity_ttl_seconds",
+            "GPUSTACK_MODEL_PREHEAT_CONNECTIVITY_TTL_SECONDS",
+            "GPU_STACK_MODEL_PREHEAT_CONNECTIVITY_TTL_SECONDS",
+        ),
+    )
 
     def __init__(self, **values):
         super().__init__(**values)
@@ -207,9 +236,7 @@ class Config(BaseSettings):
         if not self.worker_center_s3_region and self.worker_s3_region:
             self.worker_center_s3_region = self.worker_s3_region
         if self.worker_local_s3_host and not self.worker_local_s3_modelscope_prefix:
-            self.worker_local_s3_modelscope_prefix = (
-                DEFAULT_LOCAL_S3_MODELSCOPE_PREFIX
-            )
+            self.worker_local_s3_modelscope_prefix = DEFAULT_LOCAL_S3_MODELSCOPE_PREFIX
 
         # common options
         if self.data_dir is None:
