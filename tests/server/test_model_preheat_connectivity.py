@@ -6,6 +6,7 @@ from pathlib import Path
 from sqlalchemy import (
     Column,
     Enum as SAEnum,
+    Index,
     Integer,
     MetaData,
     String,
@@ -16,7 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects import mysql
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
-from sqlalchemy.schema import CreateTable
+from sqlalchemy.schema import CreateIndex, CreateTable
 import pytest
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -360,13 +361,21 @@ def test_model_preheat_core_migration_compiles_for_mysql(monkeypatch):
     metadata = MetaData()
     Table("users", metadata, Column("id", Integer, primary_key=True))
     created_tables = []
+    created_indexes = []
 
     def capture_table(name, *elements, **kwargs):
         table = Table(name, metadata, *elements, **kwargs)
         created_tables.append(table)
         return table
 
+    def capture_index(name, table_name, columns, **kwargs):
+        table = metadata.tables[table_name]
+        index = Index(name, *(table.c[column] for column in columns), **kwargs)
+        created_indexes.append(index)
+        return index
+
     monkeypatch.setattr(migration.op, "create_table", capture_table)
+    monkeypatch.setattr(migration.op, "create_index", capture_index)
     migration.upgrade()
 
     assert created_tables
@@ -385,6 +394,12 @@ def test_model_preheat_core_migration_compiles_for_mysql(monkeypatch):
                 assert column.type.length == orm_mysql_type.length
         ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
         assert f"CREATE TABLE {table.name}" in ddl
+    assert any(
+        index.name == "ix_preheat_worker_uuid_state" for index in created_indexes
+    )
+    for index in created_indexes:
+        ddl = str(CreateIndex(index).compile(dialect=mysql.dialect()))
+        assert f"CREATE INDEX {index.name}" in ddl
 
 
 def test_terminal_connectivity_check_retains_stable_scope_key(tmp_path):

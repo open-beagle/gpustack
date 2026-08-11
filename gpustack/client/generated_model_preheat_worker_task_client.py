@@ -10,16 +10,16 @@ from gpustack.schemas import *
 from .generated_http_client import HTTPClient
 
 
-class {{ class_name }}Client:
+class ModelPreheatWorkerTaskClient:
     def __init__(self, client: HTTPClient):
         self._client = client
-        self._url = f"{client._base_url}/v1/{{ class_name | to_dash_plural }}"
+        self._url = f"{client._base_url}/v1/model-preheat-worker-tasks"
 
-    def list(self, params: Dict[str, Any] = None) -> {{ class_name | to_plural }}Public:
+    def list(self, params: Dict[str, Any] = None) -> ModelPreheatWorkerTasksPublic:
         response = self._client.get_httpx_client().get(self._url, params=params)
         raise_if_response_error(response)
 
-        return {{ class_name | to_plural }}Public.model_validate(response.json())
+        return ModelPreheatWorkerTasksPublic.model_validate(response.json())
 
     def watch(
         self,
@@ -81,11 +81,11 @@ class {{ class_name }}Client:
                 except asyncio.TimeoutError:
                     raise Exception("watch timeout")
 
-    def get(self, id: int) -> {{ class_name }}Public:
+    def get(self, id: int) -> ModelPreheatWorkerTaskPublic:
         response = self._client.get_httpx_client().get(f"{self._url}/{id}")
         raise_if_response_error(response)
-        return {{ class_name }}Public.model_validate(response.json())
-{% if class_name == "ModelPreheatWorkerTask" %}
+        return ModelPreheatWorkerTaskPublic.model_validate(response.json())
+
     def claim(self, id: int, claim: ModelPreheatWorkerTaskClaim):
         response = self._client.get_httpx_client().post(
             f"{self._url}/{id}/claim",
@@ -215,36 +215,3 @@ class {{ class_name }}Client:
         )
         raise_if_response_error(response)
         return ModelPreheatWorkerTaskExecutionPayload.model_validate(response.json())
-{% else %}
-    def create(self, model_create: {{ class_name }}Create):
-        response = self._client.get_httpx_client().post(
-            self._url,
-            content=model_create.model_dump_json(),
-            headers={"Content-Type": "application/json"},
-        )
-        raise_if_response_error(response)
-        return {{ class_name }}Public.model_validate(response.json())
-
-    def update(self, id: int, model_update: {{ class_name }}Update):
-        response = self._client.get_httpx_client().put(
-            f"{self._url}/{id}",
-            content=model_update.model_dump_json(),
-            headers={"Content-Type": "application/json"},
-        )
-        raise_if_response_error(response)
-        return {{ class_name }}Public.model_validate(response.json())
-{% if class_name == "ModelInstance" %}
-    def internal_update(self, id: int, model_update: ModelInstanceInternalUpdate):
-        response = self._client.get_httpx_client().put(
-            f"{self._url}/{id}/internal",
-            content=model_update.model_dump_json(),
-            headers={"Content-Type": "application/json"},
-        )
-        raise_if_response_error(response)
-        return ModelInstancePublic.model_validate(response.json())
-{% endif %}
-    def delete(self, id: int):
-        response = self._client.get_httpx_client().delete(f"{self._url}/{id}")
-        raise_if_response_error(response)
-{% endif -%}
-{# A comment to ensure the last line has a newline character #}

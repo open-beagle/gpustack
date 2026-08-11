@@ -6,7 +6,7 @@ import httpx
 from pydantic import BaseModel
 
 HTTP_422_STATUS_CODE = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
-SENSITIVE_VALIDATION_KEYS = {"access_key", "secret_key"}
+SENSITIVE_VALIDATION_KEYS = {"access_key", "secret_key", "lease_token"}
 
 
 class HTTPException(Exception):

@@ -20,6 +20,18 @@ from gpustack.schemas.model_files import (
     ModelFilePublic,
     ModelFilesPublic,
 )
+from gpustack.schemas.model_preheats import (
+    ModelPreheatWorkerTask,
+    ModelPreheatWorkerTaskClaim,
+    ModelPreheatWorkerTaskClaimed,
+    ModelPreheatWorkerTaskComplete,
+    ModelPreheatWorkerTaskExecutionPayload,
+    ModelPreheatWorkerTaskFail,
+    ModelPreheatWorkerTaskLease,
+    ModelPreheatWorkerTaskProgress,
+    ModelPreheatWorkerTaskPublic,
+    ModelPreheatWorkerTasksPublic,
+)
 from gpustack.schemas.workers import (
     Worker,
     WorkerCreate,
@@ -97,4 +109,14 @@ __all__ = [
     "ModelFileUpdate",
     "ModelFilePublic",
     "ModelFilesPublic",
+    "ModelPreheatWorkerTask",
+    "ModelPreheatWorkerTaskClaim",
+    "ModelPreheatWorkerTaskClaimed",
+    "ModelPreheatWorkerTaskComplete",
+    "ModelPreheatWorkerTaskExecutionPayload",
+    "ModelPreheatWorkerTaskFail",
+    "ModelPreheatWorkerTaskLease",
+    "ModelPreheatWorkerTaskProgress",
+    "ModelPreheatWorkerTaskPublic",
+    "ModelPreheatWorkerTasksPublic",
 ]

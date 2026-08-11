@@ -8,6 +8,7 @@ from .generated_model_client import ModelClient
 from .generated_model_instance_client import ModelInstanceClient
 from .generated_model_file_client import ModelFileClient
 from .generated_user_client import UserClient
+from .generated_model_preheat_worker_task_client import ModelPreheatWorkerTaskClient
 
 
 class ClientSet:
@@ -48,3 +49,4 @@ class ClientSet:
         self.model_instances = ModelInstanceClient(http_client)
         self.model_files = ModelFileClient(http_client)
         self.users = UserClient(http_client)
+        self.model_preheat_worker_tasks = ModelPreheatWorkerTaskClient(http_client)

@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Optional
 
 from pydantic import field_validator, model_validator
-from sqlalchemy import Column, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, ForeignKey, Index, UniqueConstraint
 from sqlmodel import Field, SQLModel, Text
 
 from gpustack.mixins import BaseModelMixin
@@ -149,6 +149,7 @@ class ModelPreheatWorkerTask(SQLModel, BaseModelMixin, table=True):
             "role",
             name="uix_preheat_check_worker_role",
         ),
+        Index("ix_preheat_worker_uuid_state", "worker_uuid", "state"),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -195,6 +196,85 @@ class ModelPreheatWorkerTask(SQLModel, BaseModelMixin, table=True):
     finished_at: Optional[datetime] = Field(
         default=None, sa_column=Column(UTCDateTime, nullable=True)
     )
+
+
+class ModelPreheatWorkerTaskPublic(SQLModel):
+    id: int
+    task_id: Optional[int] = None
+    connectivity_check_id: Optional[int] = None
+    worker_uuid: str
+    worker_id: Optional[int] = None
+    role: ModelPreheatWorkerTaskRoleEnum
+    state: ModelPreheatWorkerTaskStateEnum
+    attempt: int
+    last_heartbeat_at: Optional[datetime] = None
+    state_message: Optional[str] = None
+    error_code: Optional[str] = None
+    progress: float
+    downloaded_size: int
+    total_size: int
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+ModelPreheatWorkerTasksPublic = PaginatedList[ModelPreheatWorkerTaskPublic]
+
+
+class ModelPreheatWorkerTaskClaim(SQLModel):
+    worker_uuid: str
+    worker_id: int
+
+
+class ModelPreheatWorkerTaskClaimed(ModelPreheatWorkerTaskPublic):
+    lease_token: str = Field(repr=False)
+    lease_expires_at: datetime
+
+
+class ModelPreheatWorkerTaskLease(SQLModel):
+    worker_uuid: str
+    worker_id: int
+    attempt: int
+    lease_token: str = Field(repr=False)
+
+
+class ModelPreheatWorkerTaskProgress(ModelPreheatWorkerTaskLease):
+    progress: float = Field(ge=0, le=100)
+    downloaded_size: Optional[int] = Field(default=None, ge=0)
+    total_size: Optional[int] = Field(default=None, ge=0)
+    resumable_cursor: Optional[dict] = None
+    state_message: Optional[str] = None
+
+
+class ModelPreheatWorkerTaskComplete(ModelPreheatWorkerTaskLease):
+    result: dict = Field(default_factory=dict)
+
+
+class ModelPreheatWorkerTaskFail(ModelPreheatWorkerTaskLease):
+    error_code: str
+    state_message: Optional[str] = None
+    result: dict = Field(default_factory=dict)
+
+
+class ModelPreheatExecutionProfile(SQLModel):
+    endpoint: str
+    bucket: str
+    prefix: str = ""
+    tls_enabled: bool = True
+    tls_verify: bool = True
+    region: str = ""
+    use_virtual_hosted_style: bool = True
+    access_key: str = Field(repr=False)
+    secret_key: str = Field(repr=False)
+
+
+class ModelPreheatWorkerTaskExecutionPayload(SQLModel):
+    worker_task_id: int
+    attempt: int
+    role: ModelPreheatWorkerTaskRoleEnum
+    task: dict
+    profile: ModelPreheatExecutionProfile = Field(repr=False)
 
 
 class ModelPreheatS3ConnectivityCheck(SQLModel, BaseModelMixin, table=True):
