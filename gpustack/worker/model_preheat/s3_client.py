@@ -318,12 +318,26 @@ class ModelPreheatS3Client:
         }
 
     def list_objects(self, bucket_name: str, prefix: str) -> list[str]:
+        return sorted(self.iter_objects(bucket_name, prefix))
+
+    def iter_objects(self, bucket_name: str, prefix: str, *, max_objects=None):
         objects = self._client.list_objects(bucket_name, prefix=prefix, recursive=True)
-        return sorted(
-            object_name
-            for item in objects
-            if (object_name := getattr(item, "object_name", None)) is not None
-        )
+        count = 0
+        for item in objects:
+            object_name = getattr(item, "object_name", None)
+            if object_name is None:
+                continue
+            count += 1
+            if max_objects is not None and count > max_objects:
+                raise ModelPreheatS3ManifestError("s3_inventory_object_limit")
+            yield object_name
+
+    def remove_object(self, bucket_name: str, object_name: str):
+        try:
+            self._client.remove_object(bucket_name, object_name)
+        except Exception as exc:
+            if not self._is_not_found(exc):
+                raise
 
     def stream_object(
         self,

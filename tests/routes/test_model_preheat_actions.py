@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+import hashlib
 
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -20,11 +21,18 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatTargetScopeEnum,
     ModelPreheatTask,
     ModelPreheatTaskLock,
+    ModelPreheatPublicationMarker,
     ModelPreheatWorkerTask,
     ModelPreheatWorkerTaskLease,
     ModelPreheatWorkerTaskRoleEnum,
     ModelPreheatWorkerTaskStateEnum,
 )
+from gpustack.server.model_preheat_controller import ModelPreheatController
+from gpustack.server.model_preheat_s3_inventory import ModelPreheatS3Inventory
+from gpustack.server.model_preheat_worker_identity import (
+    ModelPreheatWorkerPrincipal,
+)
+from gpustack.schemas.workers import Worker, WorkerStateEnum
 
 
 async def _seed(tmp_path):
@@ -36,6 +44,17 @@ async def _seed(tmp_path):
     async with engine.begin() as connection:
         await connection.run_sync(SQLModel.metadata.create_all)
     async with AsyncSession(engine) as session:
+        session.add(
+            Worker(
+                id=10,
+                name="worker-a",
+                hostname="worker-a",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="worker-a",
+                state=WorkerStateEnum.READY,
+            )
+        )
         task = ModelPreheatTask(
             source="huggingface",
             model_id="org/model",
@@ -66,10 +85,20 @@ async def _seed(tmp_path):
             state=ModelPreheatWorkerTaskStateEnum.RUNNING,
             attempt=3,
             lease_owner="worker-a",
-            lease_token_hash="token-hash",
+            lease_token_hash=hashlib.sha256(b"token").hexdigest(),
             lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
         )
         session.add(child)
+        session.add(
+            ModelPreheatPublicationMarker(
+                profile_id=task.s3_profile_id,
+                selection_key=task.cache_key,
+                generation_id=task.generation_id,
+                task_id=task.id,
+                parent_attempt=task.attempt,
+                profile_config_version=task.s3_profile_config_version,
+            )
+        )
         await session.commit()
         await session.refresh(task)
         await session.refresh(child)
@@ -139,6 +168,26 @@ def test_cancel_clears_all_active_child_leases_and_is_idempotent(tmp_path):
     assert children[0].lease_expires_at is None
 
 
+def test_cancel_blocked_seed_marks_marker_terminated_without_deleting_it(tmp_path):
+    async def run():
+        engine, task_id, _ = await _seed(tmp_path)
+        await _invoke(engine, cancel_model_preheat, task_id)
+        controller = ModelPreheatController(
+            engine, s3_inventory=ModelPreheatS3Inventory(engine)
+        )
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            marker = (await session.exec(select(ModelPreheatPublicationMarker))).one()
+            child = (await session.exec(select(ModelPreheatWorkerTask))).one()
+            result = marker.terminated_at, child.lease_expires_at
+        await engine.dispose()
+        return result
+
+    terminated_at, lease_expires_at = asyncio.run(run())
+    assert terminated_at is not None
+    assert lease_expires_at is None
+
+
 def test_retry_increments_parent_attempt_keeps_generation_and_history(tmp_path):
     async def run():
         engine, task_id, _ = await _seed(tmp_path)
@@ -188,8 +237,14 @@ def test_late_result_is_rejected_when_parent_paused_or_retried(tmp_path):
                 attempt=child_attempt,
                 lease_token="token",
             )
+            identity = ModelPreheatWorkerPrincipal(
+                worker_id=10,
+                worker_uuid="worker-a",
+                credential_id=1,
+                token_version=1,
+            )
             try:
-                await _validate_active_lease(session, child_id, lease)
+                await _validate_active_lease(session, child_id, lease, identity)
             except Exception as exc:
                 paused_error = getattr(exc, "reason", None) or getattr(
                     exc, "message", str(exc)
@@ -200,7 +255,7 @@ def test_late_result_is_rejected_when_parent_paused_or_retried(tmp_path):
             session.add(parent)
             await session.commit()
             try:
-                await _validate_active_lease(session, child_id, lease)
+                await _validate_active_lease(session, child_id, lease, identity)
             except Exception as exc:
                 retried_error = getattr(exc, "reason", None) or getattr(
                     exc, "message", str(exc)

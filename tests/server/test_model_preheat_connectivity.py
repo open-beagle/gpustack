@@ -394,12 +394,18 @@ def test_model_preheat_core_migration_compiles_for_mysql(monkeypatch):
                 assert column.type.length == orm_mysql_type.length
         ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
         assert f"CREATE TABLE {table.name}" in ddl
-    assert any(
+    assert not any(
         index.name == "ix_preheat_worker_uuid_state" for index in created_indexes
     )
     for index in created_indexes:
         ddl = str(CreateIndex(index).compile(dialect=mysql.dialect()))
         assert f"CREATE INDEX {index.name}" in ddl
+
+    successor = Path(
+        "gpustack/migrations/versions/"
+        "2026_08_11_2100-d0e1f2a3b4c5_add_preheat_worker_identity.py"
+    ).read_text()
+    assert '"ix_preheat_worker_uuid_state"' in successor
 
 
 def test_terminal_connectivity_check_retains_stable_scope_key(tmp_path):

@@ -51,6 +51,10 @@ class WorkerManager:
         self._gpu_devices = cfg.get_gpu_devices()
         self._system_info = cfg.get_system_info()
         self._worker_uuid = worker_uuid
+        self._preheat_credential_path = os.path.join(
+            cfg.data_dir, "model_preheat_worker_credential"
+        )
+        self._load_preheat_credential()
 
         self._worker_name_from_config = cfg.worker_name is not None
 
@@ -123,18 +127,45 @@ class WorkerManager:
             if existing:
                 # keep labels from the existing worker
                 worker.labels = same_worker.labels
-                self._clientset.workers.update(id=same_worker.id, model_update=worker)
+                self._clientset.workers.update(
+                    id=same_worker.id, model_update=worker, registration=True
+                )
             else:
                 self._clientset.workers.create(worker)
         except Exception as e:
             logger.error(f"Failed to register worker: {e}")
             raise
 
+        credential = self._clientset.workers.last_model_preheat_credential
+        if not credential:
+            raise RuntimeError("worker_preheat_credential_unavailable")
+        self._clientset.set_model_preheat_worker_credential(credential)
+        self._store_preheat_credential(credential)
+
         if update_name_file:
             # Modify files only after successful registration to avoid inconsistency problem
             asyncio.create_task(self._update_local_worker_name_file())
 
         logger.info(f"Worker {worker.name} registered.")
+
+    def _load_preheat_credential(self):
+        try:
+            with open(self._preheat_credential_path, "r", encoding="utf-8") as file:
+                credential = file.read().strip()
+            if credential:
+                self._clientset.set_model_preheat_worker_credential(credential)
+        except FileNotFoundError:
+            return
+
+    def _store_preheat_credential(self, credential):
+        os.makedirs(os.path.dirname(self._preheat_credential_path), exist_ok=True)
+        descriptor = os.open(
+            self._preheat_credential_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            file.write(credential)
 
     def _check_same_worker(self) -> tuple[Worker | None, bool]:
         def _get_worker(params: dict) -> Worker | None:

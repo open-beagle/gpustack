@@ -31,6 +31,7 @@ from gpustack.server.model_preheat_controller import (
 from gpustack.server.model_preheat_worker_reconciler import (
     ModelPreheatWorkerReconciler,
 )
+from gpustack.server.model_preheat_s3_inventory import ModelPreheatS3Inventory
 from gpustack.server.usage_buffer import flush_usage_to_db
 from gpustack.server.worker_syncer import WorkerSyncer
 from gpustack.utils.process import add_signal_handlers_in_loop
@@ -47,6 +48,7 @@ class Server:
         self._sub_processes = sub_processes
         self._async_tasks = []
         self._model_preheat_worker_reconciler = None
+        self._model_preheat_s3_inventory = None
 
     @property
     def all_processes(self):
@@ -117,6 +119,7 @@ class Server:
         app.state.model_preheat_worker_reconciler = (
             self._model_preheat_worker_reconciler
         )
+        app.state.model_preheat_s3_inventory = self._model_preheat_s3_inventory
         if self._config.enable_cors:
             app.add_middleware(
                 CORSMiddleware,
@@ -208,9 +211,13 @@ class Server:
             model_file_controller.start, "model file controller"
         )
 
+        self._model_preheat_s3_inventory = ModelPreheatS3Inventory(
+            get_engine(), config=self._config
+        )
         model_preheat_controller = ModelPreheatController(
             get_engine(),
             ready_probe=StrictS3ReadyProbe(self._config),
+            s3_inventory=self._model_preheat_s3_inventory,
         )
         self._create_restartable_async_task(
             model_preheat_controller.start, "model preheat controller"
@@ -223,6 +230,11 @@ class Server:
         self._create_restartable_async_task(
             self._model_preheat_worker_reconciler.start,
             "model preheat worker reconciler",
+        )
+
+        self._create_restartable_async_task(
+            self._model_preheat_s3_inventory.start,
+            "model preheat S3 inventory",
         )
 
         logger.debug("Controllers started.")

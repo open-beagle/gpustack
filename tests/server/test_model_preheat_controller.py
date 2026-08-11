@@ -9,6 +9,8 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
+    ModelPreheatCachedModel,
+    ModelPreheatPublicationMarker,
     ModelPreheatDesiredStateEnum,
     ModelPreheatExecutionStateEnum,
     ModelPreheatTargetScopeEnum,
@@ -26,6 +28,9 @@ from gpustack.server.model_preheat_controller import (
     ModelPreheatController,
     ReadyProbeResult,
 )
+from gpustack.server.model_preheat_s3_inventory import ModelPreheatS3Inventory
+from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
+from gpustack.worker.model_preheat.s3_client import ModelPreheatS3Client
 
 
 GENERATION_ID = "preheat-00000000-0000-4000-8000-000000000001"
@@ -164,6 +169,191 @@ def test_reconcile_creates_only_seed_before_s3_is_ready(tmp_path):
     ]
     assert children[0].parent_attempt == 1
     assert parent.execution_state == ModelPreheatExecutionStateEnum.STAGING
+
+
+def test_controller_persists_publication_marker_before_seed_is_claimable(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        async with AsyncSession(engine) as session:
+            session.add(
+                ModelPreheatS3Profile(
+                    id=1,
+                    name="marker-profile",
+                    endpoint="https://s3.example.com",
+                    bucket="models",
+                    prefix="cache",
+                    access_key_encrypted={"ciphertext": "x"},
+                    secret_key_encrypted={"ciphertext": "y"},
+                    encryption_key_version="v1",
+                    config_version=1,
+                )
+            )
+            await session.commit()
+        inventory = ModelPreheatS3Inventory(engine)
+        ready_probe = FakeReadyProbe()
+        controller = ModelPreheatController(
+            engine,
+            ready_probe=ready_probe,
+            inventory_probe=FakeInventoryProbe({}),
+            s3_inventory=inventory,
+        )
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            marker = (await session.exec(select(ModelPreheatPublicationMarker))).one()
+            seed = (
+                await session.exec(
+                    select(ModelPreheatWorkerTask).where(
+                        ModelPreheatWorkerTask.task_id == task_id,
+                        ModelPreheatWorkerTask.role
+                        == ModelPreheatWorkerTaskRoleEnum.SEED,
+                    )
+                )
+            ).one()
+            task = await session.get(ModelPreheatTask, task_id)
+            identity = ModelPreheatIdentity(
+                task.source,
+                task.model_id,
+                task.resolved_revision,
+                task.include_patterns,
+            )
+            client = ModelPreheatS3Client(None)
+            prefix = client._selection_prefix("cache", identity, task.selection_digest)
+            ready = ReadyProbeResult(
+                manifest_digest="e" * 64,
+                generation_id=task.generation_id,
+                ready_path=client._join_object_name(prefix, "ready.json"),
+                manifest_path=client._join_object_name(
+                    prefix,
+                    "generations",
+                    task.generation_id,
+                    ".gpustack-manifest.json",
+                ),
+                cache_key=task.cache_key,
+                selection_digest=task.selection_digest,
+                profile_config_version=1,
+                file_count=1,
+                total_size=10,
+            )
+            initial = marker.task_id, marker.parent_attempt, marker.generation_id
+            seed_reference = seed.task_id, seed.parent_attempt
+            seed.state = ModelPreheatWorkerTaskStateEnum.READY
+            seed.resumable_cursor = {
+                "manifest_digest": ready.manifest_digest,
+                "generation_id": ready.generation_id,
+                "local_cache_state": "valid",
+            }
+            session.add(seed)
+            await session.commit()
+        ready_probe.result = ready
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            marker_count = len(
+                (await session.exec(select(ModelPreheatPublicationMarker))).all()
+            )
+            cached_count = len(
+                (await session.exec(select(ModelPreheatCachedModel))).all()
+            )
+        await engine.dispose()
+        return initial, seed_reference, marker_count, cached_count
+
+    initial, seed_reference, marker_count, cached_count = asyncio.run(run())
+    assert initial == (*seed_reference, GENERATION_ID)
+    assert marker_count == 0
+    assert cached_count == 1
+
+
+def test_strict_ready_probe_upserts_valid_inventory_before_distribution(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        async with AsyncSession(engine) as session:
+            session.add(
+                ModelPreheatS3Profile(
+                    id=1,
+                    name="controller-profile",
+                    endpoint="https://s3.example.com",
+                    bucket="models",
+                    prefix="cache",
+                    access_key_encrypted={"ciphertext": "x"},
+                    secret_key_encrypted={"ciphertext": "y"},
+                    encryption_key_version="v1",
+                    config_version=1,
+                )
+            )
+            await session.commit()
+            task = await session.get(ModelPreheatTask, task_id)
+            identity = ModelPreheatIdentity(
+                task.source,
+                task.model_id,
+                task.resolved_revision,
+                task.include_patterns,
+            )
+            client = ModelPreheatS3Client(None)
+            prefix = client._selection_prefix("cache", identity, task.selection_digest)
+            ready = ReadyProbeResult(
+                manifest_digest="e" * 64,
+                generation_id=task.generation_id,
+                ready_path=client._join_object_name(prefix, "ready.json"),
+                manifest_path=client._join_object_name(
+                    prefix,
+                    "generations",
+                    task.generation_id,
+                    ".gpustack-manifest.json",
+                ),
+                cache_key=task.cache_key,
+                selection_digest=task.selection_digest,
+                profile_config_version=1,
+                file_count=1,
+                total_size=10,
+            )
+        inventory = ModelPreheatS3Inventory(engine)
+        controller = ModelPreheatController(
+            engine,
+            ready_probe=FakeReadyProbe(ready),
+            inventory_probe=FakeInventoryProbe({}),
+            s3_inventory=inventory,
+        )
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            rows = (await session.exec(select(ModelPreheatCachedModel))).all()
+        await engine.dispose()
+        return rows
+
+    rows = asyncio.run(run())
+    assert len(rows) == 1
+    assert rows[0].manifest_state == "valid"
+    assert rows[0].manifest_digest == "e" * 64
+
+
+def test_controller_restores_missing_marker_for_pending_seed_after_restart(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        inventory = ModelPreheatS3Inventory(engine)
+        controller = ModelPreheatController(
+            engine,
+            ready_probe=FakeReadyProbe(),
+            inventory_probe=FakeInventoryProbe({}),
+            s3_inventory=inventory,
+        )
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            marker = (await session.exec(select(ModelPreheatPublicationMarker))).one()
+            await session.delete(marker)
+            await session.commit()
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            marker = (await session.exec(select(ModelPreheatPublicationMarker))).one()
+            seed = (await session.exec(select(ModelPreheatWorkerTask))).one()
+            result = marker.task_id, marker.parent_attempt, seed.state
+        await engine.dispose()
+        return result
+
+    task_id, parent_attempt, seed_state = asyncio.run(run())
+    assert task_id is not None
+    assert parent_attempt == 1
+    assert seed_state == ModelPreheatWorkerTaskStateEnum.PENDING
 
 
 def test_seed_ready_then_creates_distribution_for_current_targets(tmp_path):

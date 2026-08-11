@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api import exceptions
@@ -22,6 +22,9 @@ from gpustack.model_preheat_credentials import (
 from gpustack.routes import model_preheat_worker_tasks
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
+    ModelPreheatCachedModel,
+    ModelPreheatExecutionStateEnum,
+    ModelPreheatPublicationMarker,
     ModelPreheatTargetScopeEnum,
     ModelPreheatTask,
     ModelPreheatWorkerTask,
@@ -30,13 +33,17 @@ from gpustack.schemas.model_preheats import (
 from gpustack.schemas.users import User
 from gpustack.schemas.workers import Worker, WorkerStateEnum
 from gpustack.server.db import get_session
+from gpustack.server.model_preheat_worker_identity import (
+    get_model_preheat_worker_identity,
+    issue_model_preheat_worker_credential,
+)
 
 
 API_PREFIX = "/v1/model-preheat-worker-tasks"
 GENERATION_ID = "preheat-00000000-0000-4000-8000-000000000001"
 
 
-def _test_app(tmp_path):
+def _test_app(tmp_path, *, secure_identity=False):
     key = generate_model_preheat_credential_key()
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'worker-tasks.db'}",
@@ -65,11 +72,120 @@ def _test_app(tmp_path):
 
     app.dependency_overrides[get_session] = session_override
     app.dependency_overrides[get_admin_user] = admin_override
+    if not secure_identity:
+
+        async def identity_override():
+            return SimpleNamespace(worker_id=1, worker_uuid="worker-uuid")
+
+        app.dependency_overrides[get_model_preheat_worker_identity] = identity_override
     router = APIRouter(dependencies=[Depends(get_admin_user)])
     router.include_router(model_preheat_worker_tasks.router, prefix=API_PREFIX)
     app.include_router(router)
     exceptions.register_handlers(app)
     return app, engine, key
+
+
+def test_worker_identity_blocks_impersonation_and_rotates_on_reregistration(tmp_path):
+    app, engine, key = _test_app(tmp_path, secure_identity=True)
+
+    async def seed_identities():
+        first_worker_id, first_task_id = await _seed(engine, key)
+        async with AsyncSession(engine) as session:
+            first_token = await issue_model_preheat_worker_credential(
+                session, first_worker_id, "worker-uuid"
+            )
+            other = Worker(
+                name="worker-b",
+                hostname="worker-b",
+                ip="127.0.0.2",
+                port=10150,
+                worker_uuid="worker-b-uuid",
+                state=WorkerStateEnum.READY,
+            )
+            session.add(other)
+            await session.flush()
+            other_task = ModelPreheatWorkerTask(
+                worker_uuid=other.worker_uuid,
+                worker_id=other.id,
+                role=ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK,
+            )
+            session.add(other_task)
+            await session.commit()
+            await session.refresh(other)
+            await session.refresh(other_task)
+            other_id = other.id
+            other_task_id = other_task.id
+            other_token = await issue_model_preheat_worker_credential(
+                session, other_id, "worker-b-uuid"
+            )
+            replacement = Worker(
+                name="worker-a-replacement",
+                hostname="worker-a",
+                ip="127.0.0.3",
+                port=10150,
+                worker_uuid="worker-uuid",
+                state=WorkerStateEnum.READY,
+            )
+            session.add(replacement)
+            await session.commit()
+            await session.refresh(replacement)
+            replacement_id = replacement.id
+            replacement_token = await issue_model_preheat_worker_credential(
+                session, replacement_id, "worker-uuid"
+            )
+            return (
+                first_worker_id,
+                first_task_id,
+                first_token,
+                other_id,
+                other_task_id,
+                other_token,
+                replacement_id,
+                replacement_token,
+            )
+
+    (
+        first_worker_id,
+        first_task_id,
+        first_token,
+        other_id,
+        other_task_id,
+        other_token,
+        replacement_id,
+        replacement_token,
+    ) = asyncio.run(seed_identities())
+    with TestClient(app) as client:
+        shared_admin = client.get(
+            API_PREFIX, headers={"Authorization": "Bearer shared-admin-token"}
+        )
+        old_registration = client.get(
+            API_PREFIX, headers={"X-GPUStack-Worker-Credential": first_token}
+        )
+        replacement = client.get(
+            API_PREFIX,
+            params={"worker_uuid": "worker-b-uuid", "worker_id": other_id},
+            headers={"X-GPUStack-Worker-Credential": replacement_token},
+        )
+        forged_claim = client.post(
+            f"{API_PREFIX}/{other_task_id}/claim",
+            json={"worker_uuid": "worker-b-uuid", "worker_id": other_id},
+            headers={"X-GPUStack-Worker-Credential": replacement_token},
+        )
+        own = client.get(
+            API_PREFIX, headers={"X-GPUStack-Worker-Credential": other_token}
+        )
+
+    assert shared_admin.status_code == 401
+    assert old_registration.status_code == 401
+    assert replacement.status_code == 200
+    assert replacement.json()["items"] == []
+    assert forged_claim.status_code == 409
+    assert [item["id"] for item in own.json()["items"]] == [other_task_id]
+    assert first_worker_id != replacement_id
+    assert first_token not in own.text
+    assert other_token not in own.text
+    assert replacement_token not in replacement.text
+    asyncio.run(engine.dispose())
 
 
 async def _seed(engine, key):
@@ -129,6 +245,16 @@ async def _seed(engine, key):
             role=ModelPreheatWorkerTaskRoleEnum.SEED,
         )
         session.add(worker_task)
+        session.add(
+            ModelPreheatPublicationMarker(
+                profile_id=task.s3_profile_id,
+                selection_key=task.cache_key,
+                generation_id=task.generation_id,
+                task_id=task.id,
+                parent_attempt=task.attempt,
+                profile_config_version=task.s3_profile_config_version,
+            )
+        )
         await session.commit()
         await session.refresh(worker)
         await session.refresh(worker_task)
@@ -205,6 +331,24 @@ def test_cas_claim_allows_only_one_concurrent_winner(tmp_path):
     assert winner.json()["attempt"] == 1
     assert winner.json()["lease_token"]
     assert "lease_token" not in responses[1 - responses.index(winner)].text
+    asyncio.run(engine.dispose())
+
+
+def test_seed_cannot_be_claimed_before_publication_marker_exists(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, task_id = asyncio.run(_seed(engine, key))
+
+    async def remove_marker():
+        async with AsyncSession(engine) as session:
+            marker = (await session.exec(select(ModelPreheatPublicationMarker))).one()
+            await session.delete(marker)
+            await session.commit()
+
+    asyncio.run(remove_marker())
+    with TestClient(app) as client:
+        response = _claim(client, task_id, worker_id)
+    assert response.status_code == 409
+    assert response.json()["message"] == "publication_marker_required"
     asyncio.run(engine.dispose())
 
 
@@ -380,6 +524,47 @@ def test_duplicate_complete_is_idempotent(tmp_path):
     asyncio.run(engine.dispose())
 
 
+def test_terminal_replay_validates_identity_attempt_and_token_before_parent_state(
+    tmp_path,
+):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, task_id, worker_id).json()
+        body = {
+            "worker_uuid": "worker-uuid",
+            "worker_id": worker_id,
+            "attempt": claimed["attempt"],
+            "lease_token": claimed["lease_token"],
+            "result": _ready_result(),
+        }
+        first = client.post(f"{API_PREFIX}/{task_id}/complete", json=body)
+
+        async def cancel_parent():
+            async with AsyncSession(engine) as session:
+                worker_task = await session.get(ModelPreheatWorkerTask, task_id)
+                parent = await session.get(ModelPreheatTask, worker_task.task_id)
+                parent.execution_state = ModelPreheatExecutionStateEnum.CANCELED
+                session.add(parent)
+                await session.commit()
+
+        asyncio.run(cancel_parent())
+        wrong_token = client.post(
+            f"{API_PREFIX}/{task_id}/complete",
+            json={**body, "lease_token": "wrong", "result": {}},
+        )
+        replay = client.post(
+            f"{API_PREFIX}/{task_id}/complete", json={**body, "result": {}}
+        )
+
+    assert first.status_code == 200
+    assert wrong_token.status_code == 409
+    assert wrong_token.json()["message"] == "invalid_lease_token"
+    assert replay.status_code == 200
+    assert replay.json()["state"] == "ready"
+    asyncio.run(engine.dispose())
+
+
 def test_execution_payload_is_claim_bound_no_store_and_public_data_is_sanitized(
     tmp_path,
 ):
@@ -478,6 +663,35 @@ def test_sensitive_worker_result_is_rejected_without_persistence(tmp_path):
     assert response.status_code == 422
     assert "secret-plain" not in response.text
     assert asyncio.run(persisted_cursor()) is None
+    asyncio.run(engine.dispose())
+
+
+def test_seed_complete_does_not_trust_worker_result_as_valid_inventory(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, task_id, worker_id).json()
+        body = {
+            "worker_uuid": "worker-uuid",
+            "worker_id": worker_id,
+            "attempt": claimed["attempt"],
+            "lease_token": claimed["lease_token"],
+            "result": _ready_result(),
+        }
+        assert (
+            client.post(f"{API_PREFIX}/{task_id}/complete", json=body).status_code
+            == 200
+        )
+        assert (
+            client.post(f"{API_PREFIX}/{task_id}/complete", json=body).status_code
+            == 200
+        )
+
+    async def inventory():
+        async with AsyncSession(engine) as session:
+            return (await session.exec(select(ModelPreheatCachedModel))).all()
+
+    assert asyncio.run(inventory()) == []
     asyncio.run(engine.dispose())
 
 

@@ -6,9 +6,9 @@ from uuid import UUID
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, func, or_, update
+from sqlalchemy import and_, exists, func, or_, update
 from sqlmodel import select
 
 from gpustack.api.exceptions import (
@@ -28,6 +28,7 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatDesiredStateEnum,
     ModelPreheatExecutionStateEnum,
     ModelPreheatExecutionProfile,
+    ModelPreheatPublicationMarker,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatTask,
     ModelPreheatWorkerTask,
@@ -47,6 +48,10 @@ from gpustack.schemas.workers import Worker
 from gpustack.server.bus import EventType
 from gpustack.server.deps import EngineDep, ListParamsDep, SessionDep
 from gpustack.server.model_preheat_connectivity import aggregate_connectivity_check
+from gpustack.server.model_preheat_worker_identity import (
+    ModelPreheatWorkerPrincipal,
+    get_model_preheat_worker_identity,
+)
 from gpustack.worker.model_preheat.identity import (
     ModelPreheatIdentityError,
     decode_path,
@@ -55,6 +60,9 @@ from gpustack.worker.model_preheat.identity import (
 
 
 router = APIRouter()
+WorkerIdentityDep = Annotated[
+    ModelPreheatWorkerPrincipal, Depends(get_model_preheat_worker_identity)
+]
 LEASE_TTL = timedelta(seconds=60)
 CONNECTIVITY_RESULT_FIELDS = {
     "state",
@@ -158,15 +166,15 @@ async def get_model_preheat_worker_tasks(
     engine: EngineDep,
     session: SessionDep,
     params: ListParamsDep,
+    identity: WorkerIdentityDep,
     worker_uuid: Optional[str] = None,
     worker_id: Optional[int] = None,
     state: list[ModelPreheatWorkerTaskStateEnum] = Query(default=[]),
 ):
-    fields = {}
-    if worker_uuid is not None:
-        fields["worker_uuid"] = worker_uuid
-    if worker_id is not None:
-        fields["worker_id"] = worker_id
+    fields = {
+        "worker_uuid": identity.worker_uuid,
+        "worker_id": identity.worker_id,
+    }
     if params.watch:
         return StreamingResponse(
             ModelPreheatWorkerTask.streaming(
@@ -189,8 +197,12 @@ async def get_model_preheat_worker_tasks(
 
 
 @router.get("/{worker_task_id}", response_model=ModelPreheatWorkerTaskPublic)
-async def get_model_preheat_worker_task(session: SessionDep, worker_task_id: int):
-    return await _task_or_404(session, worker_task_id)
+async def get_model_preheat_worker_task(
+    session: SessionDep, worker_task_id: int, identity: WorkerIdentityDep
+):
+    task = await _task_or_404(session, worker_task_id)
+    _validate_task_identity(task, identity)
+    return task
 
 
 @router.post("/{worker_task_id}/claim", response_model=ModelPreheatWorkerTaskClaimed)
@@ -198,13 +210,40 @@ async def claim_model_preheat_worker_task(
     session: SessionDep,
     worker_task_id: int,
     claim: ModelPreheatWorkerTaskClaim,
+    identity: WorkerIdentityDep,
 ):
-    await _validate_current_registration(session, claim.worker_uuid, claim.worker_id)
+    _validate_client_identity(claim, identity)
+    await _validate_current_registration(
+        session, identity.worker_uuid, identity.worker_id
+    )
     task = await _task_or_404(session, worker_task_id)
-    if task.worker_uuid != claim.worker_uuid:
-        _conflict("worker_mismatch")
+    _validate_task_identity(task, identity)
     if task.distribution_policy_id is not None:
         await _active_distribution_source(session, task.distribution_policy_id)
+    marker_conditions = []
+    if task.role == ModelPreheatWorkerTaskRoleEnum.SEED:
+        parent = await session.get(ModelPreheatTask, task.task_id)
+        if parent is None:
+            _conflict("publication_marker_required")
+        marker_filter = (
+            ModelPreheatPublicationMarker.profile_id == parent.s3_profile_id,
+            ModelPreheatPublicationMarker.selection_key == parent.cache_key,
+            ModelPreheatPublicationMarker.generation_id == parent.generation_id,
+            ModelPreheatPublicationMarker.task_id == parent.id,
+            ModelPreheatPublicationMarker.parent_attempt == task.parent_attempt,
+            ModelPreheatPublicationMarker.profile_config_version
+            == parent.s3_profile_config_version,
+        )
+        marker = (
+            await session.exec(
+                select(ModelPreheatPublicationMarker.id).where(*marker_filter)
+            )
+        ).first()
+        if marker is None:
+            _conflict("publication_marker_required")
+        marker_conditions.append(
+            exists(select(ModelPreheatPublicationMarker.id).where(*marker_filter))
+        )
 
     now = _utcnow()
     lease_token = secrets.token_urlsafe(32)
@@ -221,15 +260,16 @@ async def claim_model_preheat_worker_task(
         update(ModelPreheatWorkerTask)
         .where(
             ModelPreheatWorkerTask.id == worker_task_id,
-            ModelPreheatWorkerTask.worker_uuid == claim.worker_uuid,
-            _is_current_registration(claim.worker_uuid, claim.worker_id),
+            ModelPreheatWorkerTask.worker_uuid == identity.worker_uuid,
+            _is_current_registration(identity.worker_uuid, identity.worker_id),
             claimable,
+            *marker_conditions,
         )
         .values(
-            worker_id=claim.worker_id,
+            worker_id=identity.worker_id,
             state=ModelPreheatWorkerTaskStateEnum.RUNNING,
             attempt=ModelPreheatWorkerTask.attempt + 1,
-            lease_owner=claim.worker_uuid,
+            lease_owner=identity.worker_uuid,
             lease_token_hash=lease_token_hash,
             lease_expires_at=now + LEASE_TTL,
             last_heartbeat_at=now,
@@ -259,8 +299,9 @@ async def heartbeat_model_preheat_worker_task(
     session: SessionDep,
     worker_task_id: int,
     lease: ModelPreheatWorkerTaskLease,
+    identity: WorkerIdentityDep,
 ):
-    task = await _validate_active_lease(session, worker_task_id, lease)
+    task = await _validate_active_lease(session, worker_task_id, lease, identity)
     now = _utcnow()
     expiry = now + LEASE_TTL
     result = await session.exec(
@@ -284,8 +325,9 @@ async def update_model_preheat_worker_task_progress(
     session: SessionDep,
     worker_task_id: int,
     progress: ModelPreheatWorkerTaskProgress,
+    identity: WorkerIdentityDep,
 ):
-    task = await _validate_active_lease(session, worker_task_id, progress)
+    task = await _validate_active_lease(session, worker_task_id, progress, identity)
     cursor = _validated_cursor(task.role, progress.resumable_cursor)
     state_message = _validated_state_message(progress.state_message)
     values = {
@@ -315,11 +357,13 @@ async def complete_model_preheat_worker_task(
     session: SessionDep,
     worker_task_id: int,
     complete: ModelPreheatWorkerTaskComplete,
+    identity: WorkerIdentityDep,
 ):
     task = await _validate_active_lease(
         session,
         worker_task_id,
         complete,
+        identity,
         idempotent_state=ModelPreheatWorkerTaskStateEnum.READY,
     )
     if task.state == ModelPreheatWorkerTaskStateEnum.READY:
@@ -343,6 +387,7 @@ async def complete_model_preheat_worker_task(
             session,
             worker_task_id,
             complete,
+            identity,
             idempotent_state=ModelPreheatWorkerTaskStateEnum.READY,
         )
         await _aggregate_connectivity(session, task)
@@ -359,11 +404,13 @@ async def fail_model_preheat_worker_task(
     session: SessionDep,
     worker_task_id: int,
     failure: ModelPreheatWorkerTaskFail,
+    identity: WorkerIdentityDep,
 ):
     task = await _validate_active_lease(
         session,
         worker_task_id,
         failure,
+        identity,
         idempotent_state=ModelPreheatWorkerTaskStateEnum.ERROR,
     )
     if failure.error_code not in SAFE_ERROR_CODES:
@@ -390,6 +437,7 @@ async def fail_model_preheat_worker_task(
             session,
             worker_task_id,
             failure,
+            identity,
             idempotent_state=ModelPreheatWorkerTaskStateEnum.ERROR,
         )
         await _aggregate_connectivity(session, task)
@@ -410,6 +458,7 @@ async def get_model_preheat_worker_task_execution_payload(
     response: Response,
     session: SessionDep,
     worker_task_id: int,
+    identity: WorkerIdentityDep,
     worker_uuid: Annotated[str, Header(alias="X-Worker-UUID")],
     worker_id: Annotated[int, Header(alias="X-Worker-ID")],
     attempt: Annotated[int, Header(alias="X-Task-Attempt")],
@@ -421,7 +470,7 @@ async def get_model_preheat_worker_task_execution_payload(
         attempt=attempt,
         lease_token=lease_token,
     )
-    worker_task = await _validate_active_lease(session, worker_task_id, lease)
+    worker_task = await _validate_active_lease(session, worker_task_id, lease, identity)
     cipher = _cipher_from_request(request)
     try:
         task_payload, encrypted_profile = await _execution_source(session, worker_task)
@@ -504,9 +553,25 @@ async def _validate_active_lease(
     session,
     worker_task_id: int,
     lease: ModelPreheatWorkerTaskLease,
+    identity: ModelPreheatWorkerPrincipal,
     idempotent_state: Optional[ModelPreheatWorkerTaskStateEnum] = None,
 ):
     task = await _task_or_404(session, worker_task_id)
+    _validate_client_identity(lease, identity)
+    await _validate_current_registration(
+        session, identity.worker_uuid, identity.worker_id
+    )
+    _validate_task_identity(task, identity)
+    if task.worker_id != identity.worker_id:
+        _conflict("stale_worker_registration")
+    if task.attempt != lease.attempt:
+        _conflict("stale_attempt")
+    if not task.lease_token_hash or not hmac.compare_digest(
+        task.lease_token_hash, _hash_token(lease.lease_token)
+    ):
+        _conflict("invalid_lease_token")
+    if idempotent_state is not None and task.state == idempotent_state:
+        return task
     if task.distribution_policy_id is not None:
         await _active_distribution_source(session, task.distribution_policy_id)
     elif task.task_id is not None:
@@ -527,26 +592,28 @@ async def _validate_active_lease(
             }
         ):
             _conflict("parent_not_running")
-    await _validate_current_registration(session, lease.worker_uuid, lease.worker_id)
-    if task.worker_uuid != lease.worker_uuid:
-        _conflict("worker_mismatch")
-    if task.worker_id != lease.worker_id:
-        _conflict("stale_worker_registration")
-    if task.attempt != lease.attempt:
-        _conflict("stale_attempt")
-    if not task.lease_token_hash or not hmac.compare_digest(
-        task.lease_token_hash, _hash_token(lease.lease_token)
-    ):
-        _conflict("invalid_lease_token")
-    if idempotent_state is not None and task.state == idempotent_state:
-        return task
     if task.state != ModelPreheatWorkerTaskStateEnum.RUNNING:
         _conflict("task_not_running")
-    if task.lease_owner != lease.worker_uuid:
+    if task.lease_owner != identity.worker_uuid:
         _conflict("lease_not_owned")
     if task.lease_expires_at is None or task.lease_expires_at <= _utcnow():
         _conflict("lease_expired")
     return task
+
+
+def _validate_client_identity(value, identity):
+    if (
+        value.worker_uuid != identity.worker_uuid
+        or value.worker_id != identity.worker_id
+    ):
+        _conflict("worker_mismatch")
+
+
+def _validate_task_identity(task, identity):
+    if task.worker_uuid != identity.worker_uuid:
+        _conflict("worker_mismatch")
+    if task.worker_id is not None and task.worker_id != identity.worker_id:
+        _conflict("stale_worker_registration")
 
 
 async def _active_distribution_source(session, policy_id):

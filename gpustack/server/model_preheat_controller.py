@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
@@ -35,6 +36,11 @@ class ReadyProbeResult:
     generation_id: str
     ready_path: str
     manifest_path: str
+    cache_key: str | None = None
+    selection_digest: str | None = None
+    profile_config_version: int | None = None
+    file_count: int | None = None
+    total_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -99,15 +105,91 @@ class StrictS3ReadyProbe:
             generation_id=manifest.generation_id,
             ready_path=client.ready_object(profile.get("prefix", ""), manifest),
             manifest_path=client.manifest_object(profile.get("prefix", ""), manifest),
+            cache_key=manifest.cache_key,
+            selection_digest=manifest.selection_digest,
+            profile_config_version=task.s3_profile_config_version,
+            file_count=len(manifest.files),
+            total_size=manifest.total_size,
         )
 
 
 class ModelPreheatController:
-    def __init__(self, engine, ready_probe=None, inventory_probe=None, interval=15):
+    def __init__(
+        self,
+        engine,
+        ready_probe=None,
+        inventory_probe=None,
+        interval=15,
+        s3_inventory=None,
+    ):
         self._engine = engine
         self._ready_probe = ready_probe
         self._inventory_probe = inventory_probe or MissingLocalInventoryProbe()
         self._interval = interval
+        self._s3_inventory = s3_inventory
+
+    async def _record_verified_ready(
+        self,
+        session,
+        task,
+        observed_ready,
+        parent_state,
+        parent_values,
+    ):
+        if self._s3_inventory is None:
+            return True
+        task_snapshot = task.model_copy(deep=True)
+        task_id = task.id
+        task_attempt = task.attempt
+        task_state = task.execution_state
+        profile_id = task.s3_profile_id
+        cache_key = task.cache_key
+        await session.commit()
+        owner_token = uuid.uuid4().hex
+        async with self._s3_inventory.selection_guard(
+            profile_id,
+            cache_key,
+            owner_token,
+            "publication",
+        ) as lock_owner:
+            if lock_owner is None:
+                return None
+            verified = await self._ready_probe.probe(task_snapshot)
+            current = await _reload_running_task(
+                session, task_id, task_attempt, task_state
+            )
+            if current is None or verified != observed_ready:
+                await session.rollback()
+                return None
+            if not await _cas_parent_update(
+                session,
+                current,
+                execution_state=parent_state,
+                **parent_values,
+            ):
+                await session.rollback()
+                return None
+            current.execution_state = parent_state
+            from gpustack.server.model_preheat_s3_inventory import (
+                upsert_verified_publication,
+            )
+
+            recorded = await upsert_verified_publication(
+                session,
+                current,
+                verified,
+                expected_attempt=current.attempt,
+                expected_profile_version=current.s3_profile_config_version,
+                lock_owner=lock_owner,
+            )
+            if not recorded:
+                await session.rollback()
+                return None
+            await self._s3_inventory.release_verified_publication_marker(
+                session, current
+            )
+            await session.commit()
+            return True
 
     async def start(self):
         while True:
@@ -150,6 +232,10 @@ class ModelPreheatController:
                     ModelPreheatTask, task_id, populate_existing=True
                 )
                 if task is not None and is_terminal_task(task):
+                    if self._s3_inventory is not None:
+                        await self._s3_inventory.terminate_publication_marker(
+                            session, task
+                        )
                     await session.exec(
                         delete(ModelPreheatTaskLock).where(
                             ModelPreheatTaskLock.task_id == task_id
@@ -271,17 +357,31 @@ class ModelPreheatController:
                     if missing
                     else ModelPreheatExecutionStateEnum.READY
                 )
-                if not await _cas_parent_update(
-                    session,
-                    task,
-                    execution_state=new_state,
-                    local_cache_hit_worker_uuids=valid,
-                    manifest_digest=ready.manifest_digest,
-                    generation_id=ready.generation_id,
-                    s3_ready_path=ready.ready_path,
-                    s3_manifest_path=ready.manifest_path,
-                    progress=100 if not missing else task.progress,
-                    finished_at=datetime.now(timezone.utc) if not missing else None,
+                parent_values = {
+                    "local_cache_hit_worker_uuids": valid,
+                    "manifest_digest": ready.manifest_digest,
+                    "generation_id": ready.generation_id,
+                    "s3_ready_path": ready.ready_path,
+                    "s3_manifest_path": ready.manifest_path,
+                    "progress": 100 if not missing else task.progress,
+                    "finished_at": (
+                        datetime.now(timezone.utc) if not missing else None
+                    ),
+                }
+                if self._s3_inventory is not None:
+                    current_task_id = task.id
+                    if not await self._record_verified_ready(
+                        session, task, ready, new_state, parent_values
+                    ):
+                        return
+                    task = await session.get(
+                        ModelPreheatTask, current_task_id, populate_existing=True
+                    )
+                    current_workers = await _current_workers(
+                        session, task.target_worker_uuids
+                    )
+                elif not await _cas_parent_update(
+                    session, task, execution_state=new_state, **parent_values
                 ):
                     return
                 await _create_distribution_tasks(
@@ -289,6 +389,28 @@ class ModelPreheatController:
                 )
                 return
 
+            if self._s3_inventory is not None:
+                marker_task = task.model_copy(deep=True)
+                current_task_id = task.id
+                current_attempt = task.attempt
+                current_state = task.execution_state
+                await session.commit()
+                if not await self._s3_inventory.ensure_publication_marker(marker_task):
+                    return
+                task = await _reload_running_task(
+                    session,
+                    current_task_id,
+                    current_attempt,
+                    current_state,
+                )
+                if task is None:
+                    return
+                current_workers = await _current_workers(
+                    session, task.target_worker_uuids
+                )
+                valid = sorted(set(valid) & set(current_workers))
+                if not current_workers:
+                    return
             seed_uuid = _select_seed(task, current_workers, valid)
             worker = current_workers[seed_uuid]
             if not await _cas_parent_update(
@@ -321,6 +443,36 @@ class ModelPreheatController:
             ),
             None,
         )
+        if (
+            self._s3_inventory is not None
+            and active_seed is not None
+            and not distribute_tasks
+            and active_seed.state
+            in {
+                ModelPreheatWorkerTaskStateEnum.PENDING,
+                ModelPreheatWorkerTaskStateEnum.RUNNING,
+            }
+        ):
+            marker_task = task.model_copy(deep=True)
+            current_task_id = task.id
+            current_attempt = task.attempt
+            current_state = task.execution_state
+            active_seed_id = active_seed.id
+            await session.commit()
+            if not await self._s3_inventory.ensure_publication_marker(marker_task):
+                return
+            task = await _reload_running_task(
+                session,
+                current_task_id,
+                current_attempt,
+                current_state,
+            )
+            active_seed = await session.get(
+                ModelPreheatWorkerTask, active_seed_id, populate_existing=True
+            )
+            if task is None or active_seed is None:
+                return
+            current_workers = await _current_workers(session, task.target_worker_uuids)
         if active_seed is None and not distribute_tasks:
             await _replace_seed(session, task, seed_tasks, current_workers)
             return
@@ -384,17 +536,29 @@ class ModelPreheatController:
                 if missing
                 else ModelPreheatExecutionStateEnum.READY
             )
-            if not await _cas_parent_update(
-                session,
-                task,
-                execution_state=new_state,
-                local_cache_hit_worker_uuids=sorted(local_hits),
-                manifest_digest=ready.manifest_digest,
-                generation_id=ready.generation_id,
-                s3_ready_path=ready.ready_path,
-                s3_manifest_path=ready.manifest_path,
-                progress=100 if not missing else task.progress,
-                finished_at=datetime.now(timezone.utc) if not missing else None,
+            parent_values = {
+                "local_cache_hit_worker_uuids": sorted(local_hits),
+                "manifest_digest": ready.manifest_digest,
+                "generation_id": ready.generation_id,
+                "s3_ready_path": ready.ready_path,
+                "s3_manifest_path": ready.manifest_path,
+                "progress": 100 if not missing else task.progress,
+                "finished_at": datetime.now(timezone.utc) if not missing else None,
+            }
+            if self._s3_inventory is not None:
+                current_task_id = task.id
+                if not await self._record_verified_ready(
+                    session, task, ready, new_state, parent_values
+                ):
+                    return
+                task = await session.get(
+                    ModelPreheatTask, current_task_id, populate_existing=True
+                )
+                current_workers = await _current_workers(
+                    session, task.target_worker_uuids
+                )
+            elif not await _cas_parent_update(
+                session, task, execution_state=new_state, **parent_values
             ):
                 return
             await _create_distribution_tasks(

@@ -14,6 +14,7 @@ class WorkerClient:
     def __init__(self, client: HTTPClient):
         self._client = client
         self._url = f"{client._base_url}/v1/workers"
+        self.last_model_preheat_credential = None
 
     def list(self, params: Dict[str, Any] = None) -> WorkersPublic:
         response = self._client.get_httpx_client().get(self._url, params=params)
@@ -93,15 +94,25 @@ class WorkerClient:
             headers={"Content-Type": "application/json"},
         )
         raise_if_response_error(response)
+        self.last_model_preheat_credential = response.headers.get(
+            "X-GPUStack-Worker-Credential"
+        )
         return WorkerPublic.model_validate(response.json())
 
-    def update(self, id: int, model_update: WorkerUpdate):
+    def update(self, id: int, model_update: WorkerUpdate, *, registration=False):
+        headers = {"Content-Type": "application/json"}
+        if registration:
+            headers["X-GPUStack-Worker-Registration"] = "true"
         response = self._client.get_httpx_client().put(
             f"{self._url}/{id}",
             content=model_update.model_dump_json(),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
         raise_if_response_error(response)
+        if registration:
+            self.last_model_preheat_credential = response.headers.get(
+                "X-GPUStack-Worker-Credential"
+            )
         return WorkerPublic.model_validate(response.json())
 
     def delete(self, id: int):

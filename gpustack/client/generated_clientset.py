@@ -50,3 +50,10 @@ class ClientSet:
         self.model_files = ModelFileClient(http_client)
         self.users = UserClient(http_client)
         self.model_preheat_worker_tasks = ModelPreheatWorkerTaskClient(http_client)
+
+    def set_model_preheat_worker_credential(self, credential: str):
+        self.http_client = self.http_client.with_headers(
+            {"X-GPUStack-Worker-Credential": credential}
+        )
+        self.workers._client = self.http_client
+        self.model_preheat_worker_tasks._client = self.http_client

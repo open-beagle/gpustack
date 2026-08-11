@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -28,6 +29,7 @@ from gpustack.server.bus import Event, EventType
 from gpustack.server.model_preheat_controller import ReadyProbeResult
 from gpustack.server.model_preheat_worker_reconciler import (
     ModelPreheatWorkerReconciler,
+    _create_or_rebind_distribution_task,
 )
 
 
@@ -749,3 +751,75 @@ def test_periodic_reconcile_repairs_missing_current_profile_connectivity(tmp_pat
     checks = asyncio.run(run())
     assert len(checks) >= 1
     assert any(check.profile_config_version == 2 for check in checks)
+
+
+def test_distribution_error_retry_uses_classification_backoff_and_cas(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(
+            engine, ready_probe=FakeReadyProbe(_ready_result())
+        )
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine) as session:
+            worker = await _new_worker(session, worker_id_suffix="retry")
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            source = await session.get(ModelPreheatTask, task_id)
+            policy_id = policy.id
+            worker_id = worker.id
+            retryable = ModelPreheatWorkerTask(
+                distribution_policy_id=policy.id,
+                operation_key=distribution_operation_key(
+                    policy.id, worker.worker_uuid, policy.cache_key
+                ),
+                parent_attempt=source.attempt,
+                worker_uuid=worker.worker_uuid,
+                worker_id=worker.id,
+                role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                state=ModelPreheatWorkerTaskStateEnum.ERROR,
+                attempt=2,
+                error_code="network_timeout",
+                finished_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+            )
+            session.add(retryable)
+            await session.commit()
+            policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
+            source = await session.get(ModelPreheatTask, task_id)
+            worker = await session.get(Worker, worker_id)
+            await _create_or_rebind_distribution_task(session, policy, source, worker)
+            await session.commit()
+            await session.refresh(retryable)
+            retried_state = retryable.state
+
+            retryable.state = ModelPreheatWorkerTaskStateEnum.ERROR
+            retryable.error_code = "local_cache_conflict"
+            retryable.finished_at = datetime.now(timezone.utc) - timedelta(days=1)
+            session.add(retryable)
+            await session.commit()
+            policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
+            source = await session.get(ModelPreheatTask, task_id)
+            worker = await session.get(Worker, worker_id)
+            await _create_or_rebind_distribution_task(session, policy, source, worker)
+            await session.commit()
+            await session.refresh(retryable)
+            permanent_state = retryable.state
+
+            retryable.error_code = "s3_throttled"
+            retryable.finished_at = datetime.now(timezone.utc)
+            session.add(retryable)
+            await session.commit()
+            policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
+            source = await session.get(ModelPreheatTask, task_id)
+            worker = await session.get(Worker, worker_id)
+            await _create_or_rebind_distribution_task(session, policy, source, worker)
+            await session.commit()
+            await session.refresh(retryable)
+            backoff_state = retryable.state
+        await engine.dispose()
+        return retried_state, permanent_state, backoff_state
+
+    assert asyncio.run(run()) == (
+        ModelPreheatWorkerTaskStateEnum.PENDING,
+        ModelPreheatWorkerTaskStateEnum.ERROR,
+        ModelPreheatWorkerTaskStateEnum.ERROR,
+    )

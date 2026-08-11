@@ -202,12 +202,6 @@ def upgrade() -> None:
             name="uix_preheat_check_worker_role",
         ),
     )
-    op.create_index(
-        "ix_preheat_worker_uuid_state",
-        "model_preheat_worker_tasks",
-        ["worker_uuid", "state"],
-        unique=False,
-    )
     op.create_table(
         "model_preheat_idempotency_records",
         sa.Column("deleted_at", UTCDateTime(), nullable=True),

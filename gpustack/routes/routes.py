@@ -74,11 +74,6 @@ v1_admin_router.include_router(
     tags=["Model Preheat Distribution Policies"],
 )
 v1_admin_router.include_router(
-    model_preheat_worker_tasks.router,
-    prefix="/model-preheat-worker-tasks",
-    tags=["Model Preheat Worker Tasks"],
-)
-v1_admin_router.include_router(
     model_preheat_s3_profiles.router,
     prefix="/model-preheat-s3-profiles",
     tags=["Model Preheat S3 Profiles"],
@@ -97,6 +92,11 @@ api_router.include_router(
 )
 api_router.include_router(
     v1_admin_router, dependencies=[Depends(get_admin_user)], prefix="/v1"
+)
+api_router.include_router(
+    model_preheat_worker_tasks.router,
+    prefix="/v1/model-preheat-worker-tasks",
+    tags=["Model Preheat Worker Tasks"],
 )
 api_router.include_router(
     admin_container_exec.ws_router,

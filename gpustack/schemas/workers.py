@@ -251,4 +251,10 @@ class WorkerPublic(
     updated_at: datetime
 
 
+class ModelPreheatWorkerCredentialBootstrap(SQLModel):
+    worker_id: int
+    worker_uuid: str
+    credential: str
+
+
 WorkersPublic = PaginatedList[WorkerPublic]

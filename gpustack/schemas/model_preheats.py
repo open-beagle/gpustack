@@ -54,6 +54,27 @@ class ModelPreheatWorkerTaskStateEnum(str, Enum):
     SKIPPED_WORKER_REMOVED = "skipped_worker_removed"
 
 
+class ModelPreheatInventoryManifestStateEnum(str, Enum):
+    VALID = "valid"
+    MISSING = "missing"
+    INVALID = "invalid"
+
+
+class ModelPreheatInventoryJobStateEnum(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    READY = "ready"
+    ERROR = "error"
+
+
+class ModelPreheatInventoryGenerationStateEnum(str, Enum):
+    REFERENCED = "referenced"
+    ORPHAN = "orphan"
+    DELETING = "deleting"
+    DELETED = "deleted"
+    ERROR = "error"
+
+
 class ModelPreheatConnectivityCheckStateEnum(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -211,6 +232,29 @@ class ModelPreheatWorkerTask(SQLModel, BaseModelMixin, table=True):
         default=None, sa_column=Column(UTCDateTime, nullable=True)
     )
     finished_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+
+
+class ModelPreheatWorkerIdentity(SQLModel, BaseModelMixin, table=True):
+    __tablename__ = "model_preheat_worker_identities"
+    __table_args__ = (
+        UniqueConstraint("worker_id", name="uix_preheat_worker_identity_worker"),
+        Index("ix_preheat_worker_identity_uuid", "worker_uuid"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    worker_id: int = Field(
+        sa_column=Column(ForeignKey("workers.id", ondelete="CASCADE"), nullable=False)
+    )
+    worker_uuid: str
+    token_hash: Optional[str] = None
+    token_version: int = 0
+    bootstrap_required: bool = True
+    expires_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+    revoked_at: Optional[datetime] = Field(
         default=None, sa_column=Column(UTCDateTime, nullable=True)
     )
 
@@ -390,6 +434,274 @@ class ModelPreheatTaskLock(SQLModel, BaseModelMixin, table=True):
         )
     )
     lease_expires_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
+
+
+class ModelPreheatCachedModel(SQLModel, BaseModelMixin, table=True):
+    __tablename__ = "model_preheat_cached_models"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id", "cache_key", name="uix_preheat_cached_model_profile_key"
+        ),
+        Index(
+            "ix_preheat_cached_model_profile_state_key",
+            "profile_id",
+            "manifest_state",
+            "cache_key",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    profile_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_s3_profiles.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    profile_config_version: int
+    revision: int = 1
+    cache_key: str
+    source: str
+    model_id: str
+    resolved_revision: str
+    include_patterns: list[str] = Field(sa_column=Column(JSON, nullable=False))
+    exclude_patterns: list[str] = Field(sa_column=Column(JSON, nullable=False))
+    generation_id: str
+    ready_path: str = Field(sa_column=Column(Text, nullable=False))
+    manifest_path: str = Field(sa_column=Column(Text, nullable=False))
+    manifest_digest: str
+    file_count: int
+    total_size: int
+    manifest_state: ModelPreheatInventoryManifestStateEnum
+    last_verified_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
+    created_by_task_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            ForeignKey("model_preheat_tasks.id", ondelete="SET NULL"), nullable=True
+        ),
+    )
+    source_parent_attempt: Optional[int] = None
+
+
+class ModelPreheatInventoryJob(SQLModel, BaseModelMixin, table=True):
+    __tablename__ = "model_preheat_inventory_jobs"
+    __table_args__ = (
+        UniqueConstraint("active_key", name="uix_preheat_inventory_job_active"),
+        Index("ix_preheat_inventory_job_profile_created", "profile_id", "created_at"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    profile_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_s3_profiles.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    profile_config_version: int
+    kind: str = "refresh"
+    state: ModelPreheatInventoryJobStateEnum = ModelPreheatInventoryJobStateEnum.PENDING
+    active_key: Optional[str] = None
+    claim_token: Optional[str] = None
+    cursor: Optional[dict] = Field(default=None, sa_column=Column(JSON))
+    scanned_count: int = 0
+    valid_count: int = 0
+    invalid_count: int = 0
+    orphan_count: int = 0
+    deleted_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+    error_code: Optional[str] = None
+    error_message: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    started_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+    scan_started_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+    lease_expires_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+    finished_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+
+
+class ModelPreheatInventoryScanSnapshot(SQLModel, BaseModelMixin, table=True):
+    __tablename__ = "model_preheat_inventory_scan_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "cached_model_id",
+            name="uix_preheat_inventory_scan_snapshot_row",
+        ),
+        Index("ix_preheat_inventory_scan_snapshot_job", "job_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    job_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_inventory_jobs.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    cached_model_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_cached_models.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    revision: int
+
+
+class ModelPreheatInventoryGeneration(SQLModel, BaseModelMixin, table=True):
+    __tablename__ = "model_preheat_inventory_generations"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id",
+            "generation_key",
+            name="uix_preheat_inventory_generation_path",
+        ),
+        Index(
+            "ix_preheat_inventory_generation_gc",
+            "profile_id",
+            "state",
+            "orphaned_at",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    profile_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_s3_profiles.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    generation_key: str
+    selection_key: str
+    cache_key: Optional[str] = None
+    generation_path: str = Field(sa_column=Column(Text, nullable=False))
+    ready_path: str = Field(sa_column=Column(Text, nullable=False))
+    ready_fingerprint: Optional[str] = None
+    ready_generation_path: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    state: ModelPreheatInventoryGenerationStateEnum
+    first_seen_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
+    last_seen_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
+    orphaned_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+    deleted_at_s3: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+    error_code: Optional[str] = None
+
+
+class ModelPreheatInventorySelectionLock(SQLModel, BaseModelMixin, table=True):
+    __tablename__ = "model_preheat_inventory_selection_locks"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id",
+            "selection_key",
+            name="uix_preheat_inventory_selection_lock",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    profile_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_s3_profiles.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    selection_key: str
+    owner_token: str
+    operation: str
+    lease_expires_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
+
+
+class ModelPreheatPublicationMarker(SQLModel, BaseModelMixin, table=True):
+    __tablename__ = "model_preheat_publication_markers"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id",
+            "selection_key",
+            "generation_id",
+            name="uix_preheat_publication_marker_generation",
+        ),
+        Index(
+            "ix_preheat_publication_marker_task_attempt",
+            "task_id",
+            "parent_attempt",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    profile_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_s3_profiles.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    selection_key: str
+    generation_id: str
+    task_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            ForeignKey("model_preheat_tasks.id", ondelete="SET NULL"), nullable=True
+        ),
+    )
+    parent_attempt: int
+    profile_config_version: int
+    terminated_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+
+
+class ModelPreheatCachedModelPublic(SQLModel):
+    cache_key: str
+    source: str
+    model_id: str
+    resolved_revision: str
+    include_patterns: list[str]
+    exclude_patterns: list[str]
+    generation_id: str
+    ready_path: str
+    manifest_path: str
+    manifest_digest: str
+    file_count: int
+    total_size: int
+    manifest_state: ModelPreheatInventoryManifestStateEnum
+    last_verified_at: datetime
+    created_by_task_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ModelPreheatCachedModelsPage(SQLModel):
+    items: list[ModelPreheatCachedModelPublic]
+    next_cursor: Optional[str] = None
+
+
+class ModelPreheatInventoryJobPublic(SQLModel):
+    id: int
+    profile_id: int
+    profile_config_version: int
+    kind: str
+    state: ModelPreheatInventoryJobStateEnum
+    scanned_count: int
+    valid_count: int
+    invalid_count: int
+    orphan_count: int
+    deleted_count: int
+    skipped_count: int
+    failed_count: int
+    error_code: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
 
 
 class ModelPreheatPublishLock(SQLModel, BaseModelMixin, table=True):

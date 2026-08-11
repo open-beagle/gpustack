@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -32,6 +32,17 @@ from gpustack.server.model_preheat_connectivity import (
     latest_connectivity_results_for_workers,
 )
 from gpustack.utils.gpu import normalize_gpu_names
+
+
+RETRYABLE_DISTRIBUTION_ERRORS = {
+    "network_timeout",
+    "s3_throttled",
+    "s3_read_failed",
+    "s3_ready_not_found",
+    "worker_execution_failed",
+}
+MAX_DISTRIBUTION_ATTEMPTS = 5
+MAX_DISTRIBUTION_RETRY_DELAY = 300
 
 
 logger = logging.getLogger(__name__)
@@ -490,7 +501,46 @@ async def _create_or_rebind_distribution_task(session, policy, source_task, work
         task.state_message = None
         task.finished_at = None
         session.add(task)
+    elif task.state == ModelPreheatWorkerTaskStateEnum.ERROR:
+        await _retry_distribution_error(session, task, source_task, worker)
     return task
+
+
+async def _retry_distribution_error(session, task, source_task, worker):
+    if (
+        task.error_code not in RETRYABLE_DISTRIBUTION_ERRORS
+        or task.attempt >= MAX_DISTRIBUTION_ATTEMPTS
+        or task.finished_at is None
+    ):
+        return False
+    delay_seconds = min(
+        MAX_DISTRIBUTION_RETRY_DELAY,
+        5 * (2 ** max(task.attempt - 1, 0)),
+    )
+    if task.finished_at + timedelta(seconds=delay_seconds) > datetime.now(timezone.utc):
+        return False
+    result = await session.exec(
+        update(ModelPreheatWorkerTask)
+        .where(
+            ModelPreheatWorkerTask.id == task.id,
+            ModelPreheatWorkerTask.worker_id == worker.id,
+            ModelPreheatWorkerTask.parent_attempt == source_task.attempt,
+            ModelPreheatWorkerTask.state == ModelPreheatWorkerTaskStateEnum.ERROR,
+            ModelPreheatWorkerTask.error_code == task.error_code,
+            ModelPreheatWorkerTask.finished_at == task.finished_at,
+        )
+        .values(
+            state=ModelPreheatWorkerTaskStateEnum.PENDING,
+            lease_owner=None,
+            lease_token_hash=None,
+            lease_expires_at=None,
+            error_code=None,
+            state_message=None,
+            finished_at=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
 
 
 async def _latest_worker(session, worker_uuid):
