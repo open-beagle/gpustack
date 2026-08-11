@@ -28,6 +28,7 @@ from gpustack.utils.process import add_signal_handlers_in_loop
 from gpustack.utils.system_check import check_glibc_version
 from gpustack.utils.task import run_periodically_in_thread
 from gpustack.worker.model_file_manager import ModelFileManager
+from gpustack.worker.model_preheat.executor import build_preheat_role_handlers
 from gpustack.worker.model_preheat.manager import ModelPreheatManager
 from gpustack.worker.serve_manager import ServeManager
 from gpustack.worker.startup_cleanup import cleanup_stale_model_instances
@@ -245,6 +246,7 @@ class Worker:
             worker_id=self._worker_id,
             worker_uuid=self._worker_uuid,
             clientset=self._clientset,
+            role_handlers=build_preheat_role_handlers(self._config.cache_dir),
         )
         self._create_async_task(model_preheat_manager.watch_model_preheat_tasks())
 

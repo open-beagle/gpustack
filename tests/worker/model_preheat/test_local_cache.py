@@ -35,7 +35,13 @@ def _write_model(root, content=b"weights"):
 
 def _manifest(root, revision="main"):
     _write_model(root)
-    return build_model_preheat_manifest(root, _identity(revision))
+    return build_model_preheat_manifest(
+        root,
+        _identity(revision),
+        cache_key="cache-key",
+        selection_digest="selection-digest",
+        generation_id=f"generation-{revision}",
+    )
 
 
 def test_inspect_distinguishes_missing_candidate_valid_and_conflict(tmp_path):

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -45,6 +46,7 @@ from gpustack.server.model_preheat_idempotency import (
     get_idempotency_record,
     new_idempotency_record,
 )
+from gpustack.server.model_preheat_revision import resolve_model_preheat_revision
 from gpustack.server.model_preheat_connectivity import (
     connectivity_ttl_from_config,
     create_or_reuse_connectivity_check,
@@ -132,7 +134,21 @@ async def create_model_preheat(
     pattern_digest = selection_digest(
         task_in.include_patterns, task_in.exclude_patterns
     )
-    resolved_revision = task_in.revision
+    resolver = getattr(
+        request.app.state,
+        "model_preheat_revision_resolver",
+        resolve_model_preheat_revision,
+    )
+    try:
+        resolved_revision = await asyncio.to_thread(
+            resolver,
+            task_in.source,
+            task_in.model_id,
+            task_in.revision,
+            token=getattr(request.app.state.server_config, "huggingface_token", None),
+        )
+    except Exception:
+        raise InvalidException(message="remote_revision_resolution_failed") from None
     cache_key = cache_key_for(
         task_in.source, task_in.model_id, resolved_revision, pattern_digest
     )

@@ -6,12 +6,14 @@ from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api import exceptions
+from gpustack.api.exceptions import HTTPException
 from gpustack.api.auth import get_admin_user
 from gpustack.model_preheat_credentials import (
     ModelPreheatCredentialCipher,
@@ -31,6 +33,7 @@ from gpustack.server.db import get_session
 
 
 API_PREFIX = "/v1/model-preheat-worker-tasks"
+GENERATION_ID = "preheat-00000000-0000-4000-8000-000000000001"
 
 
 def _test_app(tmp_path):
@@ -105,7 +108,7 @@ async def _seed(engine, key):
             exclude_patterns=[],
             selection_digest="selection",
             cache_key="cache-key",
-            generation_id="generation-1",
+            generation_id=GENERATION_ID,
             seed_worker_uuid=worker.worker_uuid,
             seed_worker_id=worker.id,
             target_scope=ModelPreheatTargetScopeEnum.SEED_WORKER,
@@ -137,6 +140,53 @@ def _claim(client, task_id, worker_id):
         f"{API_PREFIX}/{task_id}/claim",
         json={"worker_uuid": "worker-uuid", "worker_id": worker_id},
     )
+
+
+def _ready_result():
+    return {
+        "state": "ready",
+        "manifest_digest": "a" * 64,
+        "ready_path": "model-cache/v1/source/model/revision/selection/ready.json",
+        "manifest_path": "model-cache/v1/source/model/revision/selection/generations/g/.gpustack-manifest.json",
+        "generation_id": GENERATION_ID,
+        "local_cache_state": "valid",
+        "uploaded": 1,
+        "skipped": 2,
+        "downloaded": 0,
+        "total_size": 3,
+    }
+
+
+def test_seed_result_and_cursor_use_strict_safe_fields_only():
+    result = {
+        "state": "ready",
+        "manifest_digest": "a" * 64,
+        "ready_path": "ready.json",
+        "manifest_path": "manifest.json",
+        "generation_id": GENERATION_ID,
+        "local_cache_state": "valid",
+        "uploaded": 1,
+        "skipped": 2,
+        "downloaded": 0,
+        "total_size": 3,
+        "cursor": {"completed_files": ["config.json"], "staging_exists": False},
+    }
+
+    sanitized = model_preheat_worker_tasks._validated_result(
+        ModelPreheatWorkerTaskRoleEnum.SEED, result
+    )
+    assert "ready_path" not in sanitized
+    assert "manifest_path" not in sanitized
+    assert "cursor" not in sanitized
+    assert model_preheat_worker_tasks._validated_cursor(
+        ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+        {"completed_files": ["config.json"], "staging_exists": True},
+    ) == {"staging_exists": True}
+    with pytest.raises(HTTPException, match="invalid_preheat_result"):
+        model_preheat_worker_tasks._validated_result(
+            ModelPreheatWorkerTaskRoleEnum.SEED,
+            {**result, "access_key": "plain"},
+        )
 
 
 def test_cas_claim_allows_only_one_concurrent_winner(tmp_path):
@@ -310,20 +360,19 @@ def test_duplicate_complete_is_idempotent(tmp_path):
     worker_id, task_id = asyncio.run(_seed(engine, key))
     with TestClient(app) as client:
         claimed = _claim(client, task_id, worker_id).json()
-    body = {
+    first_body = {
         "worker_uuid": "worker-uuid",
         "worker_id": worker_id,
         "attempt": claimed["attempt"],
         "lease_token": claimed["lease_token"],
-        "result": {},
+        "result": _ready_result(),
     }
-
-    def complete_once():
-        with TestClient(app) as client:
-            return client.post(f"{API_PREFIX}/{task_id}/complete", json=body)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first, second = list(pool.map(lambda _: complete_once(), range(2)))
+    with TestClient(app) as client:
+        first = client.post(f"{API_PREFIX}/{task_id}/complete", json=first_body)
+        second = client.post(
+            f"{API_PREFIX}/{task_id}/complete",
+            json={**first_body, "result": {}},
+        )
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -386,7 +435,7 @@ def test_list_can_filter_reconciliation_to_active_states(tmp_path):
                 "worker_id": worker_id,
                 "attempt": claimed["attempt"],
                 "lease_token": claimed["lease_token"],
-                "result": {},
+                "result": _ready_result(),
             },
         )
         active_after_complete = client.get(
@@ -429,4 +478,227 @@ def test_sensitive_worker_result_is_rejected_without_persistence(tmp_path):
     assert response.status_code == 422
     assert "secret-plain" not in response.text
     assert asyncio.run(persisted_cursor()) is None
+    asyncio.run(engine.dispose())
+
+
+def test_preheat_result_rejects_oversized_or_unsafe_paths():
+    valid = {
+        "state": "ready",
+        "manifest_digest": "a" * 64,
+        "ready_path": "cache/modelscope/org/model/revision/ready.json",
+        "manifest_path": "cache/modelscope/org/model/revision/generations/g/.gpustack-manifest.json",
+        "generation_id": GENERATION_ID,
+        "local_cache_state": "valid",
+        "uploaded": 0,
+        "skipped": 1,
+        "downloaded": 0,
+        "total_size": 1,
+    }
+
+    with pytest.raises(HTTPException, match="invalid_preheat_result"):
+        model_preheat_worker_tasks._validated_preheat_result(
+            {**valid, "ready_path": "x" * 4097}
+        )
+    with pytest.raises(HTTPException, match="invalid_preheat_result"):
+        model_preheat_worker_tasks._validated_preheat_result(
+            {**valid, "manifest_path": "cache/../secret"}
+        )
+
+
+def test_running_preheat_complete_rejects_empty_result(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, task_id, worker_id).json()
+        response = client.post(
+            f"{API_PREFIX}/{task_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": claimed["attempt"],
+                "lease_token": claimed["lease_token"],
+                "result": {},
+            },
+        )
+
+    assert response.status_code == 422
+    asyncio.run(engine.dispose())
+
+
+def test_progress_persists_validated_cursor_and_safe_state_message(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, task_id, worker_id).json()
+        response = client.patch(
+            f"{API_PREFIX}/{task_id}/progress",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": claimed["attempt"],
+                "lease_token": claimed["lease_token"],
+                "progress": 50,
+                "resumable_cursor": {
+                    "completed_files": ["config.json"],
+                    "staging_exists": True,
+                },
+                "state_message": "downloading",
+            },
+        )
+
+    async def persisted():
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatWorkerTask, task_id)
+            return task.resumable_cursor, task.state_message
+
+    assert response.status_code == 200
+    assert asyncio.run(persisted()) == (
+        {"staging_exists": True},
+        "downloading",
+    )
+    asyncio.run(engine.dispose())
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["token=plain-secret", "AKIAIOSFODNN7EXAMPLE", "x" * 257, "line\nbreak"],
+)
+def test_progress_rejects_sensitive_or_oversized_state_message(tmp_path, message):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, task_id, worker_id).json()
+        response = client.patch(
+            f"{API_PREFIX}/{task_id}/progress",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": claimed["attempt"],
+                "lease_token": claimed["lease_token"],
+                "progress": 50,
+                "state_message": message,
+            },
+        )
+
+    async def persisted_message():
+        async with AsyncSession(engine) as session:
+            return (await session.get(ModelPreheatWorkerTask, task_id)).state_message
+
+    assert response.status_code == 422
+    assert "plain-secret" not in response.text
+    assert asyncio.run(persisted_message()) is None
+    asyncio.run(engine.dispose())
+
+
+def test_preheat_result_rejects_generation_id_credential_disguise():
+    with pytest.raises(HTTPException, match="invalid_preheat_result"):
+        model_preheat_worker_tasks._validated_preheat_result(
+            {
+                **_ready_result(),
+                "generation_id": "preheat-123e4567-e89b-12d3-a456-token00000000",
+            }
+        )
+
+
+def test_generation_id_credential_disguise_is_not_persisted(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, task_id, worker_id).json()
+        response = client.post(
+            f"{API_PREFIX}/{task_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": claimed["attempt"],
+                "lease_token": claimed["lease_token"],
+                "result": {
+                    **_ready_result(),
+                    "generation_id": "preheat-123e4567-e89b-12d3-a456-AKIA00000000",
+                },
+            },
+        )
+
+    async def persisted_cursor():
+        async with AsyncSession(engine) as session:
+            return (await session.get(ModelPreheatWorkerTask, task_id)).resumable_cursor
+
+    assert response.status_code == 422
+    assert "AKIA" not in response.text
+    assert asyncio.run(persisted_cursor()) is None
+    asyncio.run(engine.dispose())
+
+
+def test_error_cursor_validates_but_does_not_persist_completed_file_paths(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, task_id, worker_id).json()
+        response = client.post(
+            f"{API_PREFIX}/{task_id}/fail",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": claimed["attempt"],
+                "lease_token": claimed["lease_token"],
+                "error_code": "checksum_mismatch",
+                "result": {
+                    "state": "error",
+                    "error_code": "checksum_mismatch",
+                    "local_cache_state": "error",
+                    "cursor": {
+                        "completed_files": [
+                            "access/AKIAIOSFODNN7EXAMPLE",
+                            "secret/plain-secret",
+                        ],
+                        "staging_exists": True,
+                    },
+                },
+            },
+        )
+
+    async def persisted_cursor():
+        async with AsyncSession(engine) as session:
+            return (await session.get(ModelPreheatWorkerTask, task_id)).resumable_cursor
+
+    cursor = asyncio.run(persisted_cursor())
+    assert response.status_code == 200, response.text
+    assert cursor["cursor"] == {"staging_exists": True}
+    assert "AKIA" not in json.dumps(cursor)
+    assert "plain-secret" not in json.dumps(cursor)
+    asyncio.run(engine.dispose())
+
+
+def test_ready_result_paths_are_not_persisted_even_when_they_look_like_credentials(
+    tmp_path,
+):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, task_id, worker_id).json()
+        result = {
+            **_ready_result(),
+            "ready_path": "token/plain-secret/ready.json",
+            "manifest_path": "credential/plain-secret/manifest.json",
+        }
+        response = client.post(
+            f"{API_PREFIX}/{task_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": claimed["attempt"],
+                "lease_token": claimed["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def persisted():
+        async with AsyncSession(engine) as session:
+            return (await session.get(ModelPreheatWorkerTask, task_id)).resumable_cursor
+
+    cursor = asyncio.run(persisted())
+    assert response.status_code == 200
+    assert "ready_path" not in cursor
+    assert "manifest_path" not in cursor
+    assert "plain-secret" not in json.dumps(cursor)
     asyncio.run(engine.dispose())

@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import fnmatch
+import shutil
 from filelock import SoftFileLock
 import requests
 from typing import List, Optional, Tuple, Union
@@ -34,6 +35,7 @@ from gpustack.utils.hub import (
 )
 from gpustack.worker.downloader_s3 import S3Downloader
 from gpustack.config.config import Config
+from gpustack.worker.model_preheat.identity import ModelPreheatIdentity, decode_path
 
 logger = logging.getLogger(__name__)
 S3_PROFILE_CENTER = "center"
@@ -145,6 +147,59 @@ def download_model(
             return file.get_sharded_file_paths(model.local_path)
 
 
+def download_resolved_revision_to_staging(
+    identity: ModelPreheatIdentity,
+    staging_dir: str | os.PathLike[str],
+    token: Optional[str] = None,
+    *,
+    exclude_patterns: Optional[list[str] | tuple[str, ...]] = None,
+) -> str:
+    """将固定 revision 下载到预热 staging，不读取 worker-local-S3 配置。"""
+    destination = Path(staging_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    model_id = decode_path(identity.model_path)
+    revision = decode_path(identity.revision_path)
+    patterns = [decode_path(pattern) for pattern in identity.file_patterns]
+    ignored_patterns = [decode_path(pattern) for pattern in exclude_patterns or []]
+
+    if identity.source == "huggingface":
+        snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            token=token,
+            local_dir=str(destination),
+            allow_patterns=patterns or None,
+            ignore_patterns=ignored_patterns or None,
+        )
+        shutil.rmtree(destination / ".cache", ignore_errors=True)
+        return str(destination)
+    if identity.source == "modelscope":
+        modelscope_snapshot_download(
+            model_id=model_id,
+            revision=revision,
+            local_dir=str(destination),
+            allow_patterns=patterns or None,
+            ignore_patterns=ignored_patterns or None,
+            max_workers=ModelScopeDownloader._max_workers,
+        )
+        return str(destination)
+    raise ValueError("unsupported_preheat_source")
+
+
+def preheat_model_target_dir(
+    cache_dir: str | os.PathLike[str], identity: ModelPreheatIdentity
+) -> Path:
+    source_dir = {"huggingface": "huggingface", "modelscope": "model_scope"}.get(
+        identity.source
+    )
+    if source_dir is None:
+        raise ValueError("unsupported_preheat_source")
+    group_or_owner, name = model_id_to_group_owner_name(
+        decode_path(identity.model_path)
+    )
+    return Path(cache_dir) / source_dir / group_or_owner / name
+
+
 def get_model_file_info(
     model: Model,
     huggingface_token: Optional[str] = None,
@@ -188,7 +243,7 @@ def get_model_file_info(
 class HfDownloader:
     # _registry_url = "https://huggingface.co"
     _registry_url = "https://hf-mirror.com"
-    
+
     @classmethod
     def get_model_file_info(cls, model: Model, token: Optional[str]) -> List[FileEntry]:
 
@@ -654,9 +709,7 @@ class ModelScopeDownloader:
     @classmethod
     def _use_local_s3_cache(cls, cfg: Config) -> bool:
         return bool(
-            cfg
-            and cfg.worker_local_s3_host
-            and cfg.worker_local_s3_modelscope_prefix
+            cfg and cfg.worker_local_s3_host and cfg.worker_local_s3_modelscope_prefix
         )
 
     @classmethod
@@ -678,11 +731,11 @@ class ModelScopeDownloader:
     @classmethod
     def check_s3_model_exists(cls, model_id: str, cfg: Config) -> bool:
         """检查本地 S3 是否存在指定的 ModelScope 模型
-        
+
         Args:
             model_id: ModelScope 模型 ID，如 "Qwen/Qwen3.5-35B-A3B-FP8"
             cfg: 配置对象
-            
+
         Returns:
             bool: 模型是否存在
         """
@@ -703,15 +756,15 @@ class ModelScopeDownloader:
             ):
                 objects.append(obj)
                 break  # 只需要检查是否有文件即可
-            
+
             exists = len(objects) > 0
             if exists:
                 logger.info(f"本地 S3 存在模型: {model_id}")
             else:
                 logger.info(f"本地 S3 不存在模型: {model_id}")
-            
+
             return exists
-            
+
         except Exception as e:
             logger.warning(f"检查本地 S3 模型存在性失败: {e}")
             return False
@@ -807,7 +860,7 @@ class ModelScopeDownloader:
 
         # 从 ModelScope 下载（原有逻辑）
         logger.info(f"从 ModelScope 下载模型: {model_id}")
-        
+
         group_or_owner, name = model_id_to_group_owner_name(model_id)
         lock_filename = os.path.join(cache_dir, group_or_owner, f"{name}.lock")
 

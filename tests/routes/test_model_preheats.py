@@ -75,6 +75,10 @@ def _test_app(tmp_path):
         model_preheat_credential_key=generate_model_preheat_credential_key(),
         model_preheat_credential_key_version="v1",
         model_preheat_credential_old_keys=None,
+        huggingface_token=None,
+    )
+    app.state.model_preheat_revision_resolver = (
+        lambda source, model_id, revision, token=None: revision
     )
 
     async def session_override():
@@ -218,6 +222,64 @@ def test_operation_lock_deduplicates_without_idempotency_key_and_snapshots_sorte
     ]
     assert created_task.seed_worker_uuid == "a-uuid"
     assert created_task.created_by_user_id == 1
+
+
+def test_creation_resolves_requested_revision_before_persisting(tmp_path):
+    app, engine = _test_app(tmp_path)
+
+    async def seed():
+        async with AsyncSession(engine) as session:
+            return await _seed(session)
+
+    profile, workers = asyncio.run(seed())
+    calls = []
+
+    def resolver(source, model_id, revision, token=None):
+        calls.append((source, model_id, revision, token))
+        return "a" * 40
+
+    app.state.model_preheat_revision_resolver = resolver
+    with TestClient(app) as client:
+        response = client.post(
+            API_PREFIX,
+            json=payload(
+                profile.id,
+                [workers[0].id],
+                source="huggingface",
+                revision="release-branch",
+            ),
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["requested_revision"] == "release-branch"
+    assert response.json()["resolved_revision"] == "a" * 40
+    assert calls == [("huggingface", "Qwen/Qwen-Image-2512", "release-branch", None)]
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+
+def test_creation_revision_resolution_failure_is_stable_and_sanitized(tmp_path):
+    app, engine = _test_app(tmp_path)
+
+    async def seed():
+        async with AsyncSession(engine) as session:
+            return await _seed(session)
+
+    profile, workers = asyncio.run(seed())
+    app.state.model_preheat_revision_resolver = lambda *args, **kwargs: (
+        _ for _ in ()
+    ).throw(RuntimeError("token=plain-secret upstream detail"))
+    with TestClient(app) as client:
+        response = client.post(
+            API_PREFIX,
+            json=payload(profile.id, [workers[0].id]),
+        )
+
+    assert response.status_code == 422
+    assert response.json()["message"] == "remote_revision_resolution_failed"
+    assert "plain-secret" not in response.text
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
 
 
 def test_expired_operation_lock_keeps_non_terminal_task_idempotent(tmp_path):
@@ -598,7 +660,7 @@ def test_selected_workers_rejects_seed_outside_online_target_scope(tmp_path):
     assert offline_seed.json()["message"] == "seed_worker_not_online"
 
 
-def test_creation_rejects_missing_resolved_revision(tmp_path):
+def test_creation_resolves_and_persists_default_revision(tmp_path):
     app, engine = _test_app(tmp_path)
 
     async def seed():
@@ -606,6 +668,9 @@ def test_creation_rejects_missing_resolved_revision(tmp_path):
             return await _seed(session)
 
     profile, workers = asyncio.run(seed())
+    app.state.model_preheat_revision_resolver = (
+        lambda source, model_id, revision, token=None: "c" * 40
+    )
     with TestClient(app) as client:
         response = client.post(
             API_PREFIX,
@@ -615,8 +680,9 @@ def test_creation_rejects_missing_resolved_revision(tmp_path):
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 
-    assert response.status_code == 422
-    assert "resolved_revision_required" in response.json()["message"]
+    assert response.status_code == 200, response.text
+    assert response.json()["requested_revision"] is None
+    assert response.json()["resolved_revision"] == "c" * 40
 
 
 def test_sqlite_enforces_model_preheat_unique_constraints(tmp_path):

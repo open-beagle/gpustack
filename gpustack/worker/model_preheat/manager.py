@@ -92,6 +92,7 @@ class ModelPreheatManager:
         worker_uuid: str,
         clientset,
         execution_handler: Optional[ModelPreheatExecutionHandler] = None,
+        role_handlers: Optional[dict] = None,
         *,
         reconnect_delay: float = 5,
         heartbeat_interval: float = 20,
@@ -102,7 +103,10 @@ class ModelPreheatManager:
         self._worker_uuid = worker_uuid
         self._client = clientset.model_preheat_worker_tasks
         self._uses_default_handler = execution_handler is None
-        self._execution_handler = execution_handler or self._execute_supported_task
+        self._role_handlers = {
+            ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK: self._execute_connectivity
+        } | (role_handlers or {})
+        self._execution_handler = execution_handler or self._execute_registered_task
         self._reconnect_delay = reconnect_delay
         self._heartbeat_interval = heartbeat_interval
         self._reconcile_interval = reconcile_interval
@@ -210,7 +214,7 @@ class ModelPreheatManager:
     def _supports_role(self, role):
         if not self._uses_default_handler:
             return True
-        return role == ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK
+        return role in self._role_handlers
 
     async def _claim_and_execute(self, worker_task_id: int):
         claim_request = ModelPreheatWorkerTaskClaim(
@@ -351,12 +355,13 @@ class ModelPreheatManager:
                 type(exc).__name__,
             )
 
-    async def _execute_supported_task(self, payload, context):
-        if payload.role != ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK:
-            return {
-                "state": "error",
-                "error_code": "worker_task_handler_unavailable",
-            }
+    async def _execute_registered_task(self, payload, context):
+        handler = self._role_handlers.get(payload.role)
+        if handler is None:
+            raise RuntimeError("worker_task_handler_unavailable")
+        return await handler(payload, context)
+
+    async def _execute_connectivity(self, payload, context):
         profile = payload.profile.model_dump()
         check_id = payload.task["connectivity_check_id"]
         execution_pool = ProcessPoolExecutor(max_workers=1)

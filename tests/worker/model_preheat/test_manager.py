@@ -208,3 +208,58 @@ def test_default_manager_does_not_claim_unimplemented_file_roles():
         return worker_tasks.claim_count
 
     assert asyncio.run(run()) == 0
+
+
+def test_registered_seed_handler_is_claimed_and_completed():
+    async def run():
+        worker_tasks = FakeWorkerTasksClient()
+        task = _public_task()
+
+        async def execution_payload(**kwargs):
+            return SimpleNamespace(
+                worker_task_id=7,
+                attempt=1,
+                role=ModelPreheatWorkerTaskRoleEnum.SEED,
+            )
+
+        worker_tasks.aget_execution_payload = execution_payload
+
+        async def seed_handler(payload, context):
+            del payload, context
+            return {
+                "state": "ready",
+                "manifest_digest": "a" * 64,
+                "ready_path": "ready.json",
+                "manifest_path": "manifest.json",
+                "generation_id": "a" * 64,
+                "local_cache_state": "valid",
+                "uploaded": 0,
+                "skipped": 2,
+                "downloaded": 0,
+                "total_size": 10,
+            }
+
+        async def awatch(callback, params):
+            callback(Event(EventType.CREATED, task.model_dump(mode="json")))
+            await asyncio.Event().wait()
+
+        worker_tasks.awatch = awatch
+        manager = ModelPreheatManager(
+            worker_id=11,
+            worker_uuid="worker-uuid",
+            clientset=SimpleNamespace(model_preheat_worker_tasks=worker_tasks),
+            role_handlers={ModelPreheatWorkerTaskRoleEnum.SEED: seed_handler},
+            reconcile_interval=60,
+        )
+        watch = asyncio.create_task(manager.watch_model_preheat_tasks())
+        await asyncio.sleep(0.05)
+        watch.cancel()
+        try:
+            await watch
+        except asyncio.CancelledError:
+            pass
+        return worker_tasks
+
+    worker_tasks = asyncio.run(run())
+    assert worker_tasks.claim_count == 1
+    assert worker_tasks.complete_count == 1

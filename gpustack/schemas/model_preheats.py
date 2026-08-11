@@ -461,8 +461,6 @@ class ModelPreheatCreate(SQLModel):
 
     @model_validator(mode="after")
     def validate_target_scope(self):
-        if self.revision is None:
-            raise ValueError("resolved_revision_required")
         if (
             self.target_scope == ModelPreheatTargetScopeEnum.SELECTED_WORKERS
             and not self.target_worker_ids

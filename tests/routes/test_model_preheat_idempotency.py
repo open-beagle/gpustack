@@ -112,6 +112,10 @@ def _test_app(tmp_path):
         model_preheat_credential_key=generate_model_preheat_credential_key(),
         model_preheat_credential_key_version="v1",
         model_preheat_credential_old_keys=None,
+        huggingface_token=None,
+    )
+    app.state.model_preheat_revision_resolver = (
+        lambda source, model_id, revision, token=None: revision
     )
 
     async def session_override():

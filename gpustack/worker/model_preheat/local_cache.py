@@ -14,6 +14,7 @@ from gpustack.worker.model_preheat.identity import (
     decode_path,
 )
 from gpustack.worker.model_preheat.manifest import (
+    MAX_MANIFEST_BYTES,
     ManifestFile,
     ModelPreheatManifest,
 )
@@ -97,6 +98,40 @@ def write_trusted_manifest(
                 return path
             with temporary.open("xb") as file:
                 file.write(manifest.to_json_bytes())
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, path)
+    except Timeout as exc:
+        raise LocalCacheError("local_manifest_lock_unavailable") from exc
+    except OSError as exc:
+        raise LocalCacheError("local_manifest_write_failed") from exc
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+    return path
+
+
+def replace_trusted_manifest(
+    cache_dir: str | Path,
+    cache_key: str,
+    expected: ModelPreheatManifest,
+    replacement: ModelPreheatManifest,
+) -> Path:
+    path = trusted_manifest_path(cache_dir, cache_key)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with SoftFileLock(f"{path}.lock", timeout=0):
+            existing = _read_trusted_manifest(cache_dir, cache_key)
+            if existing == replacement:
+                return path
+            if existing != expected:
+                raise LocalCacheError("local_manifest_conflict")
+            with temporary.open("xb") as file:
+                file.write(replacement.to_json_bytes())
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temporary, path)
@@ -317,7 +352,13 @@ def _read_trusted_manifest(
     if not path.exists():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        if path.stat().st_size > MAX_MANIFEST_BYTES:
+            raise LocalCacheError("local_manifest_invalid")
+        with path.open("rb") as file:
+            raw = file.read(MAX_MANIFEST_BYTES + 1)
+        if len(raw) > MAX_MANIFEST_BYTES:
+            raise LocalCacheError("local_manifest_invalid")
+        payload = json.loads(raw.decode("utf-8"))
         return _manifest_from_payload(payload)
     except (
         KeyError,
@@ -349,6 +390,15 @@ def _manifest_from_payload(payload: dict) -> ModelPreheatManifest:
     manifest = ModelPreheatManifest(
         identity=identity,
         files=files,
+        cache_key=payload["cache_key"],
+        selection_digest=payload["selection_digest"],
+        generation_id=payload["generation_id"],
+        exclude_patterns=tuple(
+            decode_path(pattern) for pattern in payload.get("exclude_patterns", [])
+        ),
+        requested_revision=decode_path(
+            payload.get("requested_revision", identity.revision_path)
+        ),
         schema_version=payload.get("schema_version", 1),
     )
     if payload != manifest.to_dict():

@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import secrets
+from uuid import UUID
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 
@@ -41,6 +42,11 @@ from gpustack.schemas.workers import Worker
 from gpustack.server.bus import EventType
 from gpustack.server.deps import EngineDep, ListParamsDep, SessionDep
 from gpustack.server.model_preheat_connectivity import aggregate_connectivity_check
+from gpustack.worker.model_preheat.identity import (
+    ModelPreheatIdentityError,
+    decode_path,
+    encode_path,
+)
 
 
 router = APIRouter()
@@ -82,6 +88,63 @@ SAFE_ERROR_CODES = {
     "execution_payload_unavailable",
     "worker_execution_failed",
     "lease_lost",
+    "validation_error",
+    "credential_error",
+    "remote_model_not_found",
+    "local_cache_conflict",
+    "local_cache_staging_cross_device",
+    "local_manifest_conflict",
+    "local_manifest_invalid",
+    "disk_space_insufficient",
+    "network_timeout",
+    "s3_throttled",
+    "checksum_mismatch",
+    "s3_ready_not_found",
+    "s3_manifest_invalid",
+    "s3_object_conflict",
+    "ready_generation_conflict",
+    "canceled",
+    "local_cache_invalid_cache_key",
+    "local_cache_invalid_staging_component",
+    "local_cache_lock_unavailable",
+    "local_cache_path_escape",
+    "local_cache_publish_failed",
+    "local_cache_scan_failed",
+    "local_cache_staging_cleanup_failed",
+    "local_cache_staging_conflict",
+    "local_cache_staging_create_failed",
+    "local_cache_staging_invalid",
+    "local_cache_staging_missing",
+    "local_manifest_lock_unavailable",
+    "local_manifest_write_failed",
+}
+PREHEAT_RESULT_FIELDS = {
+    "state",
+    "error_code",
+    "manifest_digest",
+    "ready_path",
+    "manifest_path",
+    "generation_id",
+    "local_cache_state",
+    "uploaded",
+    "skipped",
+    "downloaded",
+    "total_size",
+    "cursor",
+}
+PREHEAT_RESULT_STATES = {"ready", "error"}
+LOCAL_CACHE_STATES = {"valid", "candidate", "missing", "conflict", "error"}
+PREHEAT_CURSOR_FIELDS = {"completed_files", "staging_exists"}
+MAX_PREHEAT_OBJECT_PATH_LENGTH = 2048
+MAX_PREHEAT_CURSOR_FILES = 1024
+MAX_PREHEAT_CURSOR_PATH_LENGTH = 1024
+MAX_STATE_MESSAGE_LENGTH = 256
+STATE_MESSAGE_ALLOWLIST = {
+    "distributing",
+    "downloading",
+    "publishing",
+    "uploading",
+    "verifying",
 }
 
 
@@ -216,11 +279,13 @@ async def update_model_preheat_worker_task_progress(
     progress: ModelPreheatWorkerTaskProgress,
 ):
     task = await _validate_active_lease(session, worker_task_id, progress)
-    if progress.resumable_cursor not in (None, {}):
-        raise HTTPException(422, "Invalid", "resumable_cursor_not_supported")
+    cursor = _validated_cursor(task.role, progress.resumable_cursor)
+    state_message = _validated_state_message(progress.state_message)
     values = {
         "progress": progress.progress,
         "last_heartbeat_at": _utcnow(),
+        "resumable_cursor": cursor,
+        "state_message": state_message,
     }
     for field in (
         "downloaded_size",
@@ -250,10 +315,10 @@ async def complete_model_preheat_worker_task(
         complete,
         idempotent_state=ModelPreheatWorkerTaskStateEnum.READY,
     )
-    result_payload = _validated_result(task.role, complete.result)
     if task.state == ModelPreheatWorkerTaskStateEnum.READY:
         await _aggregate_connectivity(session, task)
         return task
+    result_payload = _validated_result(task.role, complete.result)
     now = _utcnow()
     result = await session.exec(
         _active_lease_update(worker_task_id, complete, now).values(
@@ -542,6 +607,11 @@ def _is_current_registration(worker_uuid, worker_id):
 
 
 def _validated_result(role, value):
+    if role in {
+        ModelPreheatWorkerTaskRoleEnum.SEED,
+        ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+    }:
+        return _validated_preheat_result(value)
     if role != ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK:
         if value:
             raise HTTPException(422, "Invalid", "worker_result_not_supported")
@@ -561,6 +631,159 @@ def _validated_result(role, value):
     if latency is not None and (not isinstance(latency, int) or latency < 0):
         raise HTTPException(422, "Invalid", "invalid_connectivity_result")
     return value
+
+
+def _validated_preheat_result(value):
+    if not isinstance(value, dict) or set(value) - PREHEAT_RESULT_FIELDS:
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    if value.get("state") not in PREHEAT_RESULT_STATES:
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    state = value.get("state")
+    if value.get("error_code") not in SAFE_ERROR_CODES | {None}:
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    if value.get("local_cache_state") not in LOCAL_CACHE_STATES | {None}:
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    if state == "ready":
+        required = {
+            "manifest_digest",
+            "ready_path",
+            "manifest_path",
+            "generation_id",
+            "local_cache_state",
+            "uploaded",
+            "skipped",
+            "downloaded",
+            "total_size",
+        }
+        if not required <= set(value) or value.get("error_code") is not None:
+            raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    else:
+        ready_only = {
+            "manifest_digest",
+            "ready_path",
+            "manifest_path",
+            "generation_id",
+            "uploaded",
+            "skipped",
+            "downloaded",
+            "total_size",
+        }
+        if value.get("error_code") is None or ready_only & set(value):
+            raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    if "manifest_digest" in value and not _is_sha256(value["manifest_digest"]):
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    for field in ("ready_path", "manifest_path"):
+        if field in value and not _is_canonical_object_path(value[field]):
+            raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    if "generation_id" in value and not _is_safe_generation_id(value["generation_id"]):
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    for field in ("uploaded", "skipped", "downloaded", "total_size"):
+        if field in value and (not isinstance(value[field], int) or value[field] < 0):
+            raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    cursor = _validated_cursor_value(value.get("cursor"))
+    if state == "ready":
+        return {
+            field: value[field]
+            for field in (
+                "state",
+                "manifest_digest",
+                "generation_id",
+                "local_cache_state",
+                "uploaded",
+                "skipped",
+                "downloaded",
+                "total_size",
+            )
+        }
+    sanitized = {
+        "state": value["state"],
+        "error_code": value["error_code"],
+        "local_cache_state": value.get("local_cache_state", "error"),
+    }
+    if cursor:
+        sanitized["cursor"] = cursor
+    return sanitized
+
+
+def _validated_cursor(role, value):
+    if value in (None, {}):
+        return None
+    if role not in {
+        ModelPreheatWorkerTaskRoleEnum.SEED,
+        ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+    }:
+        raise HTTPException(422, "Invalid", "resumable_cursor_not_supported")
+    return _validated_cursor_value(value)
+
+
+def _validated_cursor_value(value):
+    if value in (None, {}):
+        return value
+    if not isinstance(value, dict) or set(value) - PREHEAT_CURSOR_FIELDS:
+        raise HTTPException(422, "Invalid", "invalid_preheat_cursor")
+    files = value.get("completed_files", [])
+    if (
+        not isinstance(files, list)
+        or len(files) > MAX_PREHEAT_CURSOR_FILES
+        or not all(_is_canonical_cursor_path(path) for path in files)
+    ):
+        raise HTTPException(422, "Invalid", "invalid_preheat_cursor")
+    if "staging_exists" in value and not isinstance(value["staging_exists"], bool):
+        raise HTTPException(422, "Invalid", "invalid_preheat_cursor")
+    if "staging_exists" in value:
+        return {"staging_exists": value["staging_exists"]}
+    return {}
+
+
+def _validated_state_message(value):
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) > MAX_STATE_MESSAGE_LENGTH
+        or value not in STATE_MESSAGE_ALLOWLIST
+    ):
+        raise HTTPException(422, "Invalid", "invalid_state_message")
+    return value
+
+
+def _is_sha256(value) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _is_safe_generation_id(value) -> bool:
+    if not isinstance(value, str) or not value.startswith("preheat-"):
+        return False
+    raw_uuid = value.removeprefix("preheat-")
+    try:
+        return str(UUID(raw_uuid)) == raw_uuid
+    except ValueError:
+        return False
+
+
+def _is_canonical_object_path(value) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_PREHEAT_OBJECT_PATH_LENGTH
+    ):
+        return False
+    try:
+        return encode_path(decode_path(value)) == value
+    except ModelPreheatIdentityError:
+        return False
+
+
+def _is_canonical_cursor_path(value) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) <= MAX_PREHEAT_CURSOR_PATH_LENGTH
+        and _is_canonical_object_path(value)
+    )
 
 
 def _utcnow():
