@@ -5,6 +5,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
@@ -34,7 +35,8 @@ from gpustack.worker.model_preheat.manifest import (
 GENERATION_MANIFEST_OBJECT_NAME = ".gpustack-manifest.json"
 MAX_READY_BYTES = 64 * 1024
 CONDITIONAL_SINGLE_PUT_MAX_SIZE = 64 * 1024 * 1024
-CONDITIONAL_MULTIPART_PART_SIZE = 64 * 1024 * 1024
+CONDITIONAL_MULTIPART_PART_SIZE = 5 * 1024 * 1024
+RATE_LIMIT_CHUNK_SIZE = 64 * 1024
 
 
 class ReadyGenerationConflict(RuntimeError):
@@ -51,6 +53,93 @@ class ModelPreheatS3ManifestError(RuntimeError):
 
 class ModelPreheatCanceled(RuntimeError):
     pass
+
+
+class _BandwidthLimiter:
+    def __init__(self, bandwidth_limit_mbps: int | None):
+        self._bytes_per_second = (
+            bandwidth_limit_mbps * 1_000_000 / 8
+            if bandwidth_limit_mbps is not None
+            else None
+        )
+        self._started_at = time.monotonic()
+        self._transferred = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self._bytes_per_second is not None
+
+    def consume(self, size: int):
+        if self._bytes_per_second is None or size <= 0:
+            return
+        self._transferred += size
+        target_elapsed = self._transferred / self._bytes_per_second
+        delay = target_elapsed - (time.monotonic() - self._started_at)
+        if delay > 0:
+            time.sleep(delay)
+
+
+class _RateLimitedReader:
+    def __init__(self, source, limiter, expected_length):
+        self._source = source
+        self._limiter = limiter
+        self._expected_length = expected_length
+        self._transferred = 0
+
+    def read(self, size=-1):
+        remaining = self._expected_length - self._transferred
+        if remaining <= 0:
+            return b""
+        if size < 0 or size > remaining:
+            size = remaining
+        if self._limiter.enabled:
+            size = min(size, RATE_LIMIT_CHUNK_SIZE)
+        chunk = self._source.read(size)
+        self._limiter.consume(len(chunk))
+        self._transferred += len(chunk)
+        return chunk
+
+    def validate_complete(self):
+        if self._transferred != self._expected_length or self._source.read(1):
+            raise ModelPreheatS3Conflict("conditional_upload_source_size_mismatch")
+
+
+class _BoundedReader:
+    def __init__(self, source, length, cancel_check=None):
+        self._source = source
+        self._remaining = length
+        self._cancel_check = cancel_check
+
+    def read(self, size=-1):
+        if self._remaining <= 0:
+            return b""
+        if self._cancel_check is not None and self._cancel_check():
+            raise ModelPreheatCanceled("canceled")
+        if size < 0 or size > self._remaining:
+            size = self._remaining
+        chunk = self._source.read(size)
+        if not isinstance(chunk, bytes) or not chunk:
+            raise ModelPreheatS3Conflict("conditional_upload_source_size_mismatch")
+        self._remaining -= len(chunk)
+        return chunk
+
+    def validate_complete(self):
+        if self._remaining != 0:
+            raise ModelPreheatS3Conflict("conditional_upload_source_size_mismatch")
+
+
+def _read_exact(source, size, cancel_check=None):
+    chunks = []
+    remaining = size
+    while remaining:
+        if cancel_check is not None and cancel_check():
+            raise ModelPreheatCanceled("canceled")
+        chunk = source.read(remaining)
+        if not isinstance(chunk, bytes) or not chunk:
+            raise ModelPreheatS3Conflict("conditional_upload_source_size_mismatch")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 class CancelCleanupResult(str, Enum):
@@ -159,6 +248,7 @@ class ModelPreheatS3Client:
         root_dir: str | Path,
         *,
         cancel_check=None,
+        bandwidth_limit_mbps: int | None = None,
     ) -> PublishResult:
         root = Path(root_dir).resolve()
         uploaded = 0
@@ -197,6 +287,7 @@ class ModelPreheatS3Client:
                         "model-preheat-publish-attempt": publish_attempt,
                     },
                     cancel_check=cancel_check,
+                    bandwidth_limit_mbps=bandwidth_limit_mbps,
                 )
                 self._raise_if_cancelled(cancel_check)
                 if not written:
@@ -344,13 +435,18 @@ class ModelPreheatS3Client:
         bucket_name: str,
         object_name: str,
         chunk_size: int = 1024 * 1024,
+        bandwidth_limit_mbps: int | None = None,
     ):
         response = self._client.get_object(bucket_name, object_name)
+        limiter = _BandwidthLimiter(bandwidth_limit_mbps)
+        if limiter.enabled:
+            chunk_size = min(chunk_size, RATE_LIMIT_CHUNK_SIZE)
         try:
             while True:
                 chunk = response.read(chunk_size)
                 if not chunk:
                     return
+                limiter.consume(len(chunk))
                 yield chunk
         finally:
             self._close_response(response)
@@ -362,12 +458,18 @@ class ModelPreheatS3Client:
         manifest: ModelPreheatManifest,
         file: ManifestFile,
         target_path: str | Path,
+        *,
+        bandwidth_limit_mbps: int | None = None,
     ):
         target = Path(target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         object_name = self.generation_file_object(prefix, manifest, file)
         with target.open("wb") as output:
-            for chunk in self.stream_object(bucket_name, object_name):
+            for chunk in self.stream_object(
+                bucket_name,
+                object_name,
+                bandwidth_limit_mbps=bandwidth_limit_mbps,
+            ):
                 output.write(chunk)
 
     def read_ready(
@@ -638,6 +740,7 @@ class ModelPreheatS3Client:
         path: Path,
         metadata: dict[str, str],
         cancel_check=None,
+        bandwidth_limit_mbps: int | None = None,
     ) -> bool:
         with path.open("rb") as source:
             return self._put_stream_if_absent(
@@ -648,6 +751,7 @@ class ModelPreheatS3Client:
                 "application/octet-stream",
                 metadata,
                 cancel_check=cancel_check,
+                bandwidth_limit_mbps=bandwidth_limit_mbps,
             )
 
     def _put_bytes_if_absent(
@@ -677,7 +781,11 @@ class ModelPreheatS3Client:
         content_type,
         metadata,
         cancel_check=None,
+        bandwidth_limit_mbps: int | None = None,
     ) -> bool:
+        source = _RateLimitedReader(
+            source, _BandwidthLimiter(bandwidth_limit_mbps), length
+        )
         if length > CONDITIONAL_SINGLE_PUT_MAX_SIZE:
             return self._conditional_multipart_put(
                 bucket_name,
@@ -687,10 +795,11 @@ class ModelPreheatS3Client:
                 content_type,
                 metadata,
                 cancel_check=cancel_check,
+                stream_parts=bandwidth_limit_mbps is not None,
             )
         put_if_absent = getattr(self._client, "put_object_if_absent", None)
         if callable(put_if_absent):
-            return bool(
+            created = bool(
                 put_if_absent(
                     bucket_name,
                     object_name,
@@ -700,32 +809,44 @@ class ModelPreheatS3Client:
                     metadata=metadata,
                 )
             )
-        execute = getattr(self._client, "_execute", None)
-        if not callable(execute):
+            if created:
+                source.validate_complete()
+            return created
+        presign = getattr(self._client, "presigned_put_object", None)
+        http = getattr(self._client, "_http", None)
+        if not callable(presign) or http is None:
             raise ModelPreheatS3Conflict("conditional_create_unsupported")
-        payload = source.read(length + 1)
-        if not isinstance(payload, bytes) or len(payload) != length:
-            raise ModelPreheatS3Conflict("conditional_upload_source_size_mismatch")
         headers = {
             "Content-Length": str(length),
             "Content-Type": content_type,
             "If-None-Match": "*",
         }
         headers.update({f"x-amz-meta-{key}": value for key, value in metadata.items()})
+        response = None
         try:
-            execute(
-                "PUT",
+            url = presign(
                 bucket_name,
                 object_name,
-                body=payload,
-                headers=headers,
-                no_body_trace=True,
+                expires=timedelta(minutes=5),
             )
-            return True
-        except Exception as exc:
-            if self._is_precondition_failed(exc):
+            response = http.urlopen(
+                "PUT",
+                url,
+                body=source,
+                headers=headers,
+                preload_content=True,
+            )
+            if response.status == 412:
                 return False
-            raise
+            if response.status not in {200, 204}:
+                raise ModelPreheatS3Conflict(
+                    f"conditional_upload_failed:{response.status}"
+                )
+            source.validate_complete()
+            return True
+        finally:
+            if response is not None:
+                response.release_conn()
 
     def _conditional_multipart_put(
         self,
@@ -736,6 +857,7 @@ class ModelPreheatS3Client:
         content_type,
         metadata,
         cancel_check=None,
+        stream_parts=False,
     ) -> bool:
         if length > MAX_MULTIPART_OBJECT_SIZE:
             raise ModelPreheatS3Conflict("conditional_upload_too_large")
@@ -743,9 +865,10 @@ class ModelPreheatS3Client:
         upload_part = getattr(self._client, "_upload_part", None)
         abort = getattr(self._client, "_abort_multipart_upload", None)
         execute = getattr(self._client, "_execute", None)
-        if not all(
-            callable(method) for method in (create, upload_part, abort, execute)
-        ):
+        required_methods = (create, abort, execute)
+        if not stream_parts:
+            required_methods += (upload_part,)
+        if not all(callable(method) for method in required_methods):
             raise ModelPreheatS3Conflict("conditional_multipart_unsupported")
 
         part_size = max(
@@ -768,23 +891,32 @@ class ModelPreheatS3Client:
             while remaining:
                 self._raise_if_cancelled(cancel_check)
                 expected = min(part_size, remaining)
-                data = source.read(expected)
-                if not isinstance(data, bytes) or len(data) != expected:
-                    raise ModelPreheatS3Conflict(
-                        "conditional_upload_source_size_mismatch"
+                if stream_parts:
+                    etag = self._upload_streaming_part(
+                        bucket_name,
+                        object_name,
+                        source,
+                        expected,
+                        upload_id,
+                        part_number,
+                        cancel_check,
                     )
-                etag = upload_part(
-                    bucket_name,
-                    object_name,
-                    data,
-                    None,
-                    upload_id,
-                    part_number,
-                )
+                else:
+                    data = _read_exact(source, expected, cancel_check)
+                    etag = upload_part(
+                        bucket_name,
+                        object_name,
+                        data,
+                        None,
+                        upload_id,
+                        part_number,
+                    )
                 parts.append(Part(part_number, etag))
                 remaining -= expected
                 part_number += 1
                 self._raise_if_cancelled(cancel_check)
+
+            source.validate_complete()
 
             body = self._complete_multipart_body(parts)
             headers = {
@@ -815,6 +947,53 @@ class ModelPreheatS3Client:
                     abort(bucket_name, object_name, upload_id)
                 except Exception:
                     pass
+
+    def _upload_streaming_part(
+        self,
+        bucket_name,
+        object_name,
+        source,
+        length,
+        upload_id,
+        part_number,
+        cancel_check,
+    ):
+        presign = getattr(self._client, "get_presigned_url", None)
+        http = getattr(self._client, "_http", None)
+        if not callable(presign) or http is None:
+            raise ModelPreheatS3Conflict("conditional_multipart_stream_unsupported")
+        body = _BoundedReader(source, length, cancel_check)
+        response = None
+        try:
+            url = presign(
+                "PUT",
+                bucket_name,
+                object_name,
+                expires=timedelta(minutes=5),
+                extra_query_params={
+                    "uploadId": upload_id,
+                    "partNumber": str(part_number),
+                },
+            )
+            response = http.urlopen(
+                "PUT",
+                url,
+                body=body,
+                headers={"Content-Length": str(length)},
+                preload_content=True,
+            )
+            if response.status not in {200, 204}:
+                raise ModelPreheatS3Conflict(
+                    f"conditional_multipart_part_failed:{response.status}"
+                )
+            body.validate_complete()
+            etag = response.headers.get("etag") or response.headers.get("ETag")
+            if not etag:
+                raise ModelPreheatS3Conflict("conditional_multipart_etag_missing")
+            return etag.strip('"')
+        finally:
+            if response is not None:
+                response.release_conn()
 
     @staticmethod
     def _complete_multipart_body(parts: list[Part]) -> bytes:
@@ -877,49 +1056,19 @@ class ModelPreheatS3Client:
         metadata: dict[str, str],
         ready_payload: bytes,
     ) -> bool:
-        put_if_absent = getattr(self._client, "put_object_if_absent", None)
-        if callable(put_if_absent):
-            written = put_if_absent(
-                bucket_name,
-                object_name,
-                io.BytesIO(payload),
-                len(payload),
-                content_type="application/json",
-                metadata=metadata,
-            )
-            if written:
-                return True
-            existing_ready = self._read_ready(bucket_name, object_name)
-            if existing_ready == json.loads(ready_payload.decode("utf-8")):
-                return False
-            raise ReadyGenerationConflict("ready_generation_conflict")
-
-        execute = getattr(self._client, "_execute", None)
-        if callable(execute):
-            headers = {
-                "Content-Type": "application/json",
-                "If-None-Match": "*",
-            }
-            for key, value in metadata.items():
-                headers[f"x-amz-meta-{key}"] = value
-            try:
-                execute(
-                    "PUT",
-                    bucket_name,
-                    object_name,
-                    body=payload,
-                    headers=headers,
-                    no_body_trace=True,
-                )
-                return True
-            except Exception as exc:
-                if not self._is_precondition_failed(exc):
-                    raise
-                existing_ready = self._read_ready(bucket_name, object_name)
-                if existing_ready == json.loads(ready_payload.decode("utf-8")):
-                    return False
-            raise ReadyGenerationConflict("ready_generation_conflict")
-
+        written = self._put_stream_if_absent(
+            bucket_name,
+            object_name,
+            io.BytesIO(payload),
+            len(payload),
+            "application/json",
+            metadata,
+        )
+        if written:
+            return True
+        existing_ready = self._read_ready(bucket_name, object_name)
+        if existing_ready == json.loads(ready_payload.decode("utf-8")):
+            return False
         raise ReadyGenerationConflict("ready_generation_conflict")
 
     def _ready_payload(

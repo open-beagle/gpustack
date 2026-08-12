@@ -34,6 +34,10 @@ class ModelPreheatExecutionHandler(Protocol):
     ) -> Awaitable[dict]: ...
 
 
+class ModelPreheatYield(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class _LeaseIdentity:
     worker_task_id: int
@@ -55,6 +59,12 @@ class ModelPreheatExecutionContext:
     def __init__(self, client, lease: _LeaseIdentity):
         self._client = client
         self._lease = lease
+        self._last_progress = {
+            "progress": 0,
+            "downloaded_size": None,
+            "total_size": None,
+            "resumable_cursor": None,
+        }
 
     async def heartbeat(self):
         return await self._client.aheartbeat(
@@ -79,10 +89,20 @@ class ModelPreheatExecutionContext:
             resumable_cursor=resumable_cursor,
             state_message=state_message,
         )
-        return await self._client.aprogress(
+        result = await self._client.aprogress(
             id=self._lease.worker_task_id,
             progress=request,
         )
+        self._last_progress = {
+            "progress": progress,
+            "downloaded_size": downloaded_size,
+            "total_size": total_size,
+            "resumable_cursor": resumable_cursor,
+        }
+        return result
+
+    async def confirm_pause(self):
+        return await self.progress(**self._last_progress, state_message="paused")
 
 
 class ModelPreheatManager:
@@ -98,6 +118,7 @@ class ModelPreheatManager:
         heartbeat_interval: float = 20,
         reconcile_interval: float = 15,
         max_concurrent_tasks: int = 1,
+        idle_check: Optional[Callable[[], bool]] = None,
     ):
         self._worker_id = worker_id
         self._worker_uuid = worker_uuid
@@ -111,7 +132,9 @@ class ModelPreheatManager:
         self._heartbeat_interval = heartbeat_interval
         self._reconcile_interval = reconcile_interval
         self._max_concurrent_tasks = max_concurrent_tasks
+        self._idle_check = idle_check or (lambda: True)
         self._active_tasks: dict[int, asyncio.Task] = {}
+        self._pause_requested: set[int] = set()
 
     async def watch_model_preheat_tasks(self):
         reconciliation = asyncio.create_task(self._reconcile_loop())
@@ -148,14 +171,31 @@ class ModelPreheatManager:
                 type(exc).__name__,
             )
             return
+        if worker_task.worker_uuid != self._worker_uuid:
+            return
+        if worker_task.state == ModelPreheatWorkerTaskStateEnum.PAUSED:
+            self._pause_requested.discard(worker_task.id)
+            active = self._active_tasks.get(worker_task.id)
+            if active is not None:
+                active.cancel()
+            return
         if (
-            worker_task.worker_uuid != self._worker_uuid
-            or worker_task.state
+            worker_task.state == ModelPreheatWorkerTaskStateEnum.RUNNING
+            and worker_task.state_message == "pause_requested"
+        ):
+            active = self._active_tasks.get(worker_task.id)
+            if active is not None and worker_task.id not in self._pause_requested:
+                self._pause_requested.add(worker_task.id)
+                active.cancel()
+            return
+        if (
+            worker_task.state
             not in {
                 ModelPreheatWorkerTaskStateEnum.PENDING,
                 ModelPreheatWorkerTaskStateEnum.RUNNING,
             }
             or not self._supports_role(worker_task.role)
+            or not self._worker_is_idle_for(worker_task.role)
             or worker_task.id in self._active_tasks
             or len(self._active_tasks) >= self._max_concurrent_tasks
         ):
@@ -201,6 +241,7 @@ class ModelPreheatManager:
                     "state": [
                         ModelPreheatWorkerTaskStateEnum.PENDING.value,
                         ModelPreheatWorkerTaskStateEnum.RUNNING.value,
+                        ModelPreheatWorkerTaskStateEnum.PAUSED.value,
                     ],
                     "page": page,
                     "perPage": 100,
@@ -250,6 +291,7 @@ class ModelPreheatManager:
             attempt=claim.attempt,
             token=claim.lease_token,
         )
+        context = ModelPreheatExecutionContext(self._client, lease)
         try:
             payload = await self._client.aget_execution_payload(
                 id=worker_task_id,
@@ -258,6 +300,11 @@ class ModelPreheatManager:
                 attempt=claim.attempt,
                 token=claim.lease_token,
             )
+        except asyncio.CancelledError:
+            if worker_task_id in self._pause_requested:
+                await self._confirm_pause(worker_task_id, context)
+                return
+            raise
         except Exception as exc:
             logger.error(
                 "模型预热执行参数获取失败。worker_task_id=%s error_type=%s",
@@ -267,9 +314,10 @@ class ModelPreheatManager:
             await self._fail(lease, "execution_payload_unavailable")
             return
 
-        context = ModelPreheatExecutionContext(self._client, lease)
         execution = asyncio.create_task(self._execution_handler(payload, context))
-        heartbeat = asyncio.create_task(self._heartbeat_loop(context))
+        heartbeat = asyncio.create_task(
+            self._heartbeat_loop(context, getattr(payload, "role", claim.role))
+        )
         try:
             done, _ = await asyncio.wait(
                 {execution, heartbeat}, return_when=asyncio.FIRST_COMPLETED
@@ -283,6 +331,10 @@ class ModelPreheatManager:
             result = await execution
         except asyncio.CancelledError:
             execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+            if worker_task_id in self._pause_requested:
+                await self._confirm_pause(worker_task_id, context)
+                return
             raise
         except Exception as exc:
             logger.error(
@@ -325,10 +377,33 @@ class ModelPreheatManager:
                 type(exc).__name__,
             )
 
-    async def _heartbeat_loop(self, context: ModelPreheatExecutionContext):
+    async def _confirm_pause(self, worker_task_id, context):
+        try:
+            await asyncio.shield(context.confirm_pause())
+        except Exception as exc:
+            logger.warning(
+                "模型预热暂停确认失败。worker_task_id=%s error_type=%s",
+                worker_task_id,
+                type(exc).__name__,
+            )
+
+    async def _heartbeat_loop(self, context: ModelPreheatExecutionContext, role):
         while True:
             await asyncio.sleep(self._heartbeat_interval)
+            if not self._worker_is_idle_for(role):
+                raise ModelPreheatYield("worker_became_busy")
             await context.heartbeat()
+
+    def _worker_is_idle_for(self, role):
+        if role not in {
+            ModelPreheatWorkerTaskRoleEnum.SEED,
+            ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+        }:
+            return True
+        try:
+            return bool(self._idle_check())
+        except Exception:
+            return False
 
     async def _fail(self, lease, error_code, result=None):
         try:
@@ -395,3 +470,4 @@ class ModelPreheatManager:
     def _remove_active_task(self, task_id, completed):
         if self._active_tasks.get(task_id) is completed:
             self._active_tasks.pop(task_id, None)
+        self._pause_requested.discard(task_id)

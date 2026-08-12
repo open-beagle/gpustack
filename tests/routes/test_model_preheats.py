@@ -97,6 +97,17 @@ def _test_app(tmp_path):
     return app, engine
 
 
+def test_feature_flag_blocks_new_manual_task(tmp_path):
+    app, engine = _test_app(tmp_path)
+    app.state.server_config.model_preheat_enabled = False
+    with TestClient(app) as client:
+        response = client.post(API_PREFIX, json=payload(1, [1]))
+    assert response.status_code == 503
+    assert response.json()["reason"] == "model_preheat_disabled"
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+
 async def _seed(session, profile_state=ModelPreheatS3ConnectivityStateEnum.AVAILABLE):
     profile = ModelPreheatS3Profile(
         name="profile",

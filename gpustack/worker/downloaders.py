@@ -14,9 +14,11 @@ from tqdm.contrib.concurrent import thread_map
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from modelscope.hub.api import HubApi
+from modelscope_hub.api import HubApi as ModelScopeHubApi
 from modelscope.hub.snapshot_download import (
     snapshot_download as modelscope_snapshot_download,
 )
+from modelscope.hub.file_download import model_file_download
 from modelscope.hub.utils.utils import model_id_to_group_owner_name
 import base64
 import random
@@ -154,6 +156,8 @@ def download_resolved_revision_to_staging(
     token: Optional[str] = None,
     *,
     exclude_patterns: Optional[list[str] | tuple[str, ...]] = None,
+    cancel_check=None,
+    progress_callback=None,
 ) -> str:
     """将固定 revision 下载到预热 staging，不读取 worker-local-S3 配置。"""
     destination = Path(staging_dir)
@@ -164,27 +168,104 @@ def download_resolved_revision_to_staging(
     ignored_patterns = [decode_path(pattern) for pattern in exclude_patterns or []]
 
     if identity.source == "huggingface":
-        snapshot_download(
-            repo_id=model_id,
+        if cancel_check is None and progress_callback is None:
+            snapshot_download(
+                repo_id=model_id,
+                revision=revision,
+                token=token,
+                local_dir=str(destination),
+                allow_patterns=patterns or None,
+                ignore_patterns=ignored_patterns or None,
+            )
+            shutil.rmtree(destination / ".cache", ignore_errors=True)
+            return str(destination)
+        tree = HfApi().list_repo_tree(
+            model_id,
+            recursive=True,
+            expand=True,
             revision=revision,
             token=token,
-            local_dir=str(destination),
-            allow_patterns=patterns or None,
-            ignore_patterns=ignored_patterns or None,
+        )
+        files = sorted(
+            (item.path, int(item.size or 0))
+            for item in tree
+            if getattr(item, "size", None) is not None
+            and _preheat_file_selected(item.path, patterns, ignored_patterns)
+        )
+        _download_preheat_files(
+            files,
+            lambda path: hf_hub_download(
+                repo_id=model_id,
+                filename=path,
+                revision=revision,
+                token=token,
+                local_dir=str(destination),
+            ),
+            cancel_check,
+            progress_callback,
         )
         shutil.rmtree(destination / ".cache", ignore_errors=True)
         return str(destination)
     if identity.source == "modelscope":
-        modelscope_snapshot_download(
-            model_id=model_id,
-            revision=revision,
-            local_dir=str(destination),
-            allow_patterns=patterns or None,
-            ignore_patterns=ignored_patterns or None,
-            max_workers=ModelScopeDownloader._max_workers,
+        if cancel_check is None and progress_callback is None:
+            modelscope_snapshot_download(
+                model_id=model_id,
+                revision=revision,
+                local_dir=str(destination),
+                allow_patterns=patterns or None,
+                ignore_patterns=ignored_patterns or None,
+                max_workers=ModelScopeDownloader._max_workers,
+            )
+            return str(destination)
+        files = sorted(
+            (item.path, int(item.size or 0))
+            for item in ModelScopeHubApi().list_repo_files(
+                model_id,
+                "model",
+                revision=revision,
+                recursive=True,
+            )
+            if _preheat_file_selected(item.path, patterns, ignored_patterns)
+        )
+        _download_preheat_files(
+            files,
+            lambda path: model_file_download(
+                model_id=model_id,
+                file_path=path,
+                revision=revision,
+                local_dir=str(destination),
+            ),
+            cancel_check,
+            progress_callback,
         )
         return str(destination)
     raise ValueError("unsupported_preheat_source")
+
+
+def _preheat_file_selected(path, patterns, ignored_patterns):
+    if not path:
+        return False
+    included = not patterns or any(
+        fnmatch.fnmatch(path, pattern) for pattern in patterns
+    )
+    excluded = any(fnmatch.fnmatch(path, pattern) for pattern in ignored_patterns)
+    return included and not excluded
+
+
+def _download_preheat_files(files, download_file, cancel_check, progress_callback):
+    from gpustack.worker.model_preheat.s3_client import ModelPreheatCanceled
+
+    completed = []
+    downloaded_size = 0
+    total_size = sum(size for _, size in files)
+    for path, size in files:
+        if cancel_check is not None and cancel_check():
+            raise ModelPreheatCanceled("model_preheat_canceled")
+        download_file(path)
+        completed.append(path)
+        downloaded_size += size
+        if progress_callback is not None:
+            progress_callback(tuple(completed), downloaded_size, total_size)
 
 
 def preheat_model_target_dir(

@@ -31,6 +31,7 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ProfilesPublic,
     ModelPreheatS3ProfileUpdate,
 )
+from gpustack.schemas.model_preheat_schedules import ModelPreheatSchedule
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
 )
@@ -464,6 +465,19 @@ async def delete_profile(request: Request, session: SessionDep, id: int):
     ).first()
     if policy is not None:
         raise HTTPException(409, "Conflict", "distribution_policy_uses_profile")
+    schedule = (
+        await session.exec(
+            select(ModelPreheatSchedule.id).where(
+                ModelPreheatSchedule.s3_profile_id == profile.id
+            )
+        )
+    ).first()
+    if schedule is not None:
+        raise HTTPException(
+            409,
+            "model_preheat_schedule_uses_profile",
+            "model_preheat_schedule_uses_profile",
+        )
     try:
         await profile.delete(session)
     except Exception as exc:

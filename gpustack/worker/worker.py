@@ -253,6 +253,7 @@ class Worker:
             worker_uuid=self._worker_uuid,
             clientset=self._clientset,
             role_handlers=build_preheat_role_handlers(self._config.cache_dir),
+            idle_check=serve_manager.is_idle,
         )
         self._create_async_task(model_preheat_manager.watch_model_preheat_tasks())
 

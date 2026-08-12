@@ -4782,6 +4782,27 @@ server = ["fastapi", "sse-starlette", "uvicorn"]
 tests = ["expecttest", "flake8", "isort (>=4.3.21)", "pre-commit", "yapf (==0.30.0)"]
 
 [[package]]
+name = "modelscope-hub"
+version = "0.1.7"
+description = "The official Python client to connect with ModelScope Hub."
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "modelscope_hub-0.1.7-py3-none-any.whl", hash = "sha256:907e5da4d8b050277a3cbd79d1c2df4f723b549ba38f573f4ffb6d1cd1525349"},
+    {file = "modelscope_hub-0.1.7.tar.gz", hash = "sha256:b78730f3923cf13d5fbc56c6224a5ba617bf111a562fe3808c03e34c3c07840f"},
+]
+
+[package.dependencies]
+filelock = ">=3.9"
+requests = ">=2.28"
+tqdm = ">=4.64.0"
+urllib3 = ">=1.26"
+
+[package.extras]
+dev = ["mypy", "pytest (>=7.0)", "pytest-mock", "responses (>=0.20)", "ruff"]
+
+[[package]]
 name = "more-itertools"
 version = "11.1.0"
 description = "More routines for operating on iterables, beyond itertools"
@@ -11990,4 +12011,4 @@ vllm = ["bitsandbytes", "mistral_common", "timm", "vllm", "vllm-omni"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "80529b436d99c6f54e6fdc683556354c4e2fc7090db5d10b79c2b3e5c3d1e1ac"
+content-hash = "660a9d08d2ae0abd8a76e324e7757bcf757f23d9f4f95e6af3f1b212082f1098"

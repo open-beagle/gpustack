@@ -5,6 +5,7 @@ import os
 import shutil
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +23,10 @@ from gpustack.worker.model_preheat.local_cache import (
     write_trusted_manifest,
 )
 from gpustack.worker.model_preheat.manifest import build_model_preheat_manifest
-from gpustack.worker.model_preheat.s3_client import ModelPreheatS3Client
+from gpustack.worker.model_preheat.s3_client import (
+    ModelPreheatCanceled,
+    ModelPreheatS3Client,
+)
 from gpustack.worker import downloaders
 
 
@@ -551,6 +555,85 @@ def test_empty_include_passes_none_to_hub_downloaders(tmp_path, monkeypatch):
         )
 
     assert [kwargs["allow_patterns"] for _, kwargs in calls] == [None, None]
+
+
+def test_modelscope_download_stops_at_file_boundary_and_reports_cursor(
+    tmp_path, monkeypatch
+):
+    class FakeModelScopeHubApi:
+        def list_repo_files(self, model_id, repo_type, *, revision, recursive):
+            assert model_id == "org/model"
+            assert repo_type == "model"
+            assert revision == "resolved-commit"
+            assert recursive is True
+            return [
+                SimpleNamespace(path="config.json", size=2),
+                SimpleNamespace(path="weights/model.bin", size=3),
+            ]
+
+    downloaded = []
+    canceled = False
+
+    def download_file(*, model_id, file_path, revision, local_dir):
+        assert model_id == "org/model"
+        assert revision == "resolved-commit"
+        target = Path(local_dir) / file_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x")
+        downloaded.append(file_path)
+
+    def report_progress(completed, downloaded_size, total_size):
+        nonlocal canceled
+        assert list(completed) == ["config.json"]
+        assert (downloaded_size, total_size) == (2, 5)
+        canceled = True
+
+    monkeypatch.setattr(downloaders, "ModelScopeHubApi", FakeModelScopeHubApi)
+    monkeypatch.setattr(downloaders, "model_file_download", download_file)
+
+    with pytest.raises(ModelPreheatCanceled):
+        downloaders.download_resolved_revision_to_staging(
+            _identity(),
+            tmp_path / "staging",
+            cancel_check=lambda: canceled,
+            progress_callback=report_progress,
+        )
+    assert downloaded == ["config.json"]
+
+
+def test_modelscope_hub_runtime_dependency_is_declared_and_locked():
+    declared = set()
+    in_runtime_dependencies = False
+    for line in (
+        (Path.cwd() / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+    ):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_runtime_dependencies = stripped == "[tool.poetry.dependencies]"
+            continue
+        if (
+            in_runtime_dependencies
+            and stripped
+            and not stripped.startswith("#")
+            and "=" in stripped
+        ):
+            declared.add(stripped.split("=", 1)[0].strip())
+
+    locked = set()
+    in_package = False
+    for line in (Path.cwd() / "poetry.lock").read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped == "[[package]]":
+            in_package = True
+            continue
+        if stripped.startswith("["):
+            in_package = False
+            continue
+        if in_package and stripped.startswith("name = "):
+            locked.add(stripped.removeprefix("name = ").strip('"'))
+
+    assert "modelscope-hub" in declared
+    assert "modelscope-hub" in locked
 
 
 def test_handler_cancellation_waits_for_thread_and_never_publishes_ready(

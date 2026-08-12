@@ -11,6 +11,7 @@ from gpustack.routes import (
     model_cache,
     model_instances,
     model_preheats,
+    model_preheat_schedules,
     model_preheat_distribution_policies,
     model_preheat_worker_tasks,
     model_preheat_s3_profiles,
@@ -74,6 +75,11 @@ v1_admin_router.include_router(
 )
 v1_admin_router.include_router(
     model_preheats.router, prefix="/model-preheats", tags=["Model Preheats"]
+)
+v1_admin_router.include_router(
+    model_preheat_schedules.router,
+    prefix="/model-preheat-schedules",
+    tags=["Model Preheat Schedules"],
 )
 v1_admin_router.include_router(
     model_preheat_distribution_policies.router,

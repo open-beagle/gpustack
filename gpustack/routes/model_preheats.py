@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Header, Request
-from sqlalchemy import update
+from sqlalchemy import and_, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import delete, select
 
@@ -111,6 +111,7 @@ async def cancel_model_preheat(session: SessionDep, id: int):
 @router.post("/{id}/pause", response_model=ModelPreheatTaskPublic)
 async def pause_model_preheat(session: SessionDep, id: int):
     task = await _task_or_404(session, id)
+    _reject_schedule_managed_action(task)
     if (
         is_terminal_task(task)
         or task.desired_state == ModelPreheatDesiredStateEnum.PAUSED
@@ -132,6 +133,7 @@ async def pause_model_preheat(session: SessionDep, id: int):
 @router.post("/{id}/resume", response_model=ModelPreheatTaskPublic)
 async def resume_model_preheat(session: SessionDep, id: int):
     task = await _task_or_404(session, id)
+    _reject_schedule_managed_action(task)
     if task.desired_state != ModelPreheatDesiredStateEnum.PAUSED:
         return _to_public(task)
     restored_state = task.paused_from_state or ModelPreheatExecutionStateEnum.PENDING
@@ -142,6 +144,8 @@ async def resume_model_preheat(session: SessionDep, id: int):
         execution_state=restored_state,
         child_state=ModelPreheatWorkerTaskStateEnum.PENDING,
         from_child_states={ModelPreheatWorkerTaskStateEnum.PAUSED},
+        allow_pause_ack_pending=True,
+        include_pause_requested_running=True,
     )
     await session.commit()
     await session.refresh(task)
@@ -151,6 +155,7 @@ async def resume_model_preheat(session: SessionDep, id: int):
 @router.post("/{id}/retry", response_model=ModelPreheatTaskPublic)
 async def retry_model_preheat(session: SessionDep, id: int):
     task = await _task_or_404(session, id)
+    _reject_schedule_managed_action(task)
     if task.execution_state != ModelPreheatExecutionStateEnum.ERROR:
         return _to_public(task)
     expected_attempt = task.attempt
@@ -209,6 +214,7 @@ async def create_model_preheat(
     task_in: ModelPreheatCreate,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
+    _ensure_model_preheat_enabled(request)
     request_hash = canonical_request_hash(
         task_in.model_dump(mode="json", exclude_none=True)
     )
@@ -363,6 +369,12 @@ async def create_model_preheat(
             message=f"failed_to_create_model_preheat: {type(exc).__name__}"
         )
     return _to_public(task)
+
+
+def _ensure_model_preheat_enabled(request):
+    config = getattr(request.app.state, "server_config", None)
+    if config is not None and not getattr(config, "model_preheat_enabled", True):
+        raise HTTPException(503, "model_preheat_disabled", "model_preheat_disabled")
 
 
 async def release_task_lock_if_terminal(session, task: ModelPreheatTask) -> bool:
@@ -600,6 +612,15 @@ async def _task_or_404(session, task_id):
     return task
 
 
+def _reject_schedule_managed_action(task):
+    if task.schedule_id is not None:
+        raise HTTPException(
+            409,
+            "Conflict",
+            "model_preheat_schedule_managed_action",
+        )
+
+
 async def _transition_parent_and_children(
     session,
     task,
@@ -608,6 +629,8 @@ async def _transition_parent_and_children(
     execution_state,
     child_state,
     from_child_states=None,
+    allow_pause_ack_pending=False,
+    include_pause_requested_running=False,
 ):
     expected_desired_state = task.desired_state
     expected_execution_state = task.execution_state
@@ -619,16 +642,30 @@ async def _transition_parent_and_children(
         parent_values["paused_from_state"] = expected_execution_state
     elif desired_state == ModelPreheatDesiredStateEnum.RUNNING:
         parent_values["paused_from_state"] = None
-    result = await session.exec(
-        update(ModelPreheatTask)
-        .where(
-            ModelPreheatTask.id == task.id,
-            ModelPreheatTask.attempt == task.attempt,
-            ModelPreheatTask.desired_state == expected_desired_state,
-            ModelPreheatTask.execution_state == expected_execution_state,
+    parent_update = update(ModelPreheatTask).where(
+        ModelPreheatTask.id == task.id,
+        ModelPreheatTask.attempt == task.attempt,
+        ModelPreheatTask.desired_state == expected_desired_state,
+    )
+    if allow_pause_ack_pending:
+        parent_update = parent_update.where(
+            ModelPreheatTask.execution_state.not_in(
+                [
+                    ModelPreheatExecutionStateEnum.READY,
+                    ModelPreheatExecutionStateEnum.PARTIAL,
+                    ModelPreheatExecutionStateEnum.ERROR,
+                    ModelPreheatExecutionStateEnum.CANCELED,
+                ]
+            )
         )
-        .values(**parent_values)
-        .execution_options(synchronize_session=False)
+    else:
+        parent_update = parent_update.where(
+            ModelPreheatTask.execution_state == expected_execution_state
+        )
+    result = await session.exec(
+        parent_update.values(**parent_values).execution_options(
+            synchronize_session=False
+        )
     )
     if result.rowcount != 1:
         await session.rollback()
@@ -639,19 +676,31 @@ async def _transition_parent_and_children(
         ModelPreheatWorkerTaskStateEnum.RUNNING,
         ModelPreheatWorkerTaskStateEnum.PAUSED,
     }
+    child_condition = ModelPreheatWorkerTask.state.in_(active_states)
+    if include_pause_requested_running:
+        child_condition = or_(
+            child_condition,
+            and_(
+                ModelPreheatWorkerTask.state == ModelPreheatWorkerTaskStateEnum.RUNNING,
+                ModelPreheatWorkerTask.state_message == "pause_requested",
+            ),
+        )
+    child_values = {
+        "state": child_state,
+        "lease_owner": None,
+        "lease_token_hash": None,
+        "lease_expires_at": None,
+    }
+    if desired_state == ModelPreheatDesiredStateEnum.RUNNING:
+        child_values["state_message"] = None
     await session.exec(
         update(ModelPreheatWorkerTask)
         .where(
             ModelPreheatWorkerTask.task_id == task.id,
             ModelPreheatWorkerTask.parent_attempt == task.attempt,
-            ModelPreheatWorkerTask.state.in_(active_states),
+            child_condition,
         )
-        .values(
-            state=child_state,
-            lease_owner=None,
-            lease_token_hash=None,
-            lease_expires_at=None,
-        )
+        .values(**child_values)
         .execution_options(synchronize_session=False)
     )
     return True

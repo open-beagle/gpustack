@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel, select
@@ -19,21 +20,26 @@ from gpustack.model_preheat_credentials import (
     ModelPreheatCredentialCipher,
     generate_model_preheat_credential_key,
 )
-from gpustack.routes import model_preheat_worker_tasks
+from gpustack.routes import model_preheats, model_preheat_worker_tasks
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
     ModelPreheatCachedModel,
+    ModelPreheatDesiredStateEnum,
     ModelPreheatExecutionStateEnum,
     ModelPreheatPublicationMarker,
     ModelPreheatTargetScopeEnum,
     ModelPreheatTask,
     ModelPreheatWorkerTask,
+    ModelPreheatWorkerTaskLease,
+    ModelPreheatWorkerTaskProgress,
     ModelPreheatWorkerTaskRoleEnum,
+    ModelPreheatWorkerTaskStateEnum,
 )
 from gpustack.schemas.users import User
 from gpustack.schemas.workers import Worker, WorkerStateEnum
 from gpustack.server.db import get_session
 from gpustack.server.model_preheat_worker_identity import (
+    ModelPreheatWorkerPrincipal,
     get_model_preheat_worker_identity,
     issue_model_preheat_worker_credential,
 )
@@ -80,6 +86,7 @@ def _test_app(tmp_path, *, secure_identity=False):
         app.dependency_overrides[get_model_preheat_worker_identity] = identity_override
     router = APIRouter(dependencies=[Depends(get_admin_user)])
     router.include_router(model_preheat_worker_tasks.router, prefix=API_PREFIX)
+    router.include_router(model_preheats.router, prefix="/v1/model-preheats")
     app.include_router(router)
     exceptions.register_handlers(app)
     return app, engine, key
@@ -307,7 +314,7 @@ def test_seed_result_and_cursor_use_strict_safe_fields_only():
     assert model_preheat_worker_tasks._validated_cursor(
         ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
         {"completed_files": ["config.json"], "staging_exists": True},
-    ) == {"staging_exists": True}
+    ) == {"completed_files": ["config.json"], "staging_exists": True}
     with pytest.raises(HTTPException, match="invalid_preheat_result"):
         model_preheat_worker_tasks._validated_result(
             ModelPreheatWorkerTaskRoleEnum.SEED,
@@ -570,6 +577,18 @@ def test_execution_payload_is_claim_bound_no_store_and_public_data_is_sanitized(
 ):
     app, engine, key = _test_app(tmp_path)
     worker_id, task_id = asyncio.run(_seed(engine, key))
+
+    async def seed_cursor():
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatWorkerTask, task_id)
+            task.resumable_cursor = {
+                "completed_files": ["weights/model%207b.bin"],
+                "staging_exists": True,
+            }
+            session.add(task)
+            await session.commit()
+
+    asyncio.run(seed_cursor())
     with TestClient(app) as client:
         public = client.get(API_PREFIX, params={"worker_uuid": "worker-uuid"})
         claimed = _claim(client, task_id, worker_id).json()
@@ -595,6 +614,10 @@ def test_execution_payload_is_claim_bound_no_store_and_public_data_is_sanitized(
     assert payload.headers["cache-control"] == "no-store"
     assert payload.json()["profile"]["access_key"] == "access-plain"
     assert payload.json()["profile"]["secret_key"] == "secret-plain"
+    assert payload.json()["resumable_cursor"] == {
+        "completed_files": ["weights/model%207b.bin"],
+        "staging_exists": True,
+    }
     assert "s3_profile_snapshot_encrypted" not in payload.json()["task"]
     assert rejected.status_code == 409
     asyncio.run(engine.dispose())
@@ -753,7 +776,11 @@ def test_progress_persists_validated_cursor_and_safe_state_message(tmp_path):
                 "lease_token": claimed["lease_token"],
                 "progress": 50,
                 "resumable_cursor": {
-                    "completed_files": ["config.json"],
+                    "completed_files": [
+                        "config.json",
+                        "weights/model%207b.bin",
+                        "%E8%B5%84%E6%96%99/%E6%A8%A1%E5%9E%8B.bin",
+                    ],
                     "staging_exists": True,
                 },
                 "state_message": "downloading",
@@ -767,8 +794,591 @@ def test_progress_persists_validated_cursor_and_safe_state_message(tmp_path):
 
     assert response.status_code == 200
     assert asyncio.run(persisted()) == (
-        {"staging_exists": True},
+        {
+            "completed_files": [
+                "config.json",
+                "weights/model%207b.bin",
+                "%E8%B5%84%E6%96%99/%E6%A8%A1%E5%9E%8B.bin",
+            ],
+            "staging_exists": True,
+        },
         "downloading",
+    )
+    asyncio.run(engine.dispose())
+
+
+def test_paused_worker_uses_active_lease_to_persist_cursor_and_confirm_pause(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, worker_task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, worker_task_id, worker_id).json()
+
+        async def request_pause():
+            async with AsyncSession(engine) as session:
+                worker_task = await session.get(ModelPreheatWorkerTask, worker_task_id)
+                parent = await session.get(ModelPreheatTask, worker_task.task_id)
+                parent.desired_state = ModelPreheatDesiredStateEnum.PAUSED
+                worker_task.state_message = "pause_requested"
+                session.add(parent)
+                session.add(worker_task)
+                await session.commit()
+
+        asyncio.run(request_pause())
+        heartbeat = client.post(
+            f"{API_PREFIX}/{worker_task_id}/heartbeat",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": claimed["attempt"],
+                "lease_token": claimed["lease_token"],
+            },
+        )
+        payload = client.get(
+            f"{API_PREFIX}/{worker_task_id}/execution-payload",
+            headers={
+                "X-Worker-UUID": "worker-uuid",
+                "X-Worker-ID": str(worker_id),
+                "X-Task-Attempt": str(claimed["attempt"]),
+                "X-Lease-Token": claimed["lease_token"],
+            },
+        )
+        boundary = client.patch(
+            f"{API_PREFIX}/{worker_task_id}/progress",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": claimed["attempt"],
+                "lease_token": claimed["lease_token"],
+                "progress": 50,
+                "resumable_cursor": {
+                    "completed_files": ["weights/model%207b.bin"],
+                    "staging_exists": True,
+                },
+                "state_message": "downloading",
+            },
+        )
+        response = client.patch(
+            f"{API_PREFIX}/{worker_task_id}/progress",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": claimed["attempt"],
+                "lease_token": claimed["lease_token"],
+                "progress": 50,
+                "resumable_cursor": {
+                    "completed_files": ["weights/model%207b.bin"],
+                    "staging_exists": True,
+                },
+                "state_message": "paused",
+            },
+        )
+
+    async def persisted():
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatWorkerTask, worker_task_id)
+            parent = await session.get(ModelPreheatTask, task.task_id)
+            return (
+                task.state,
+                task.resumable_cursor,
+                task.lease_owner,
+                task.lease_token_hash,
+                parent.execution_state,
+            )
+
+    assert heartbeat.status_code == 409, heartbeat.text
+    assert heartbeat.json()["message"] == "parent_not_running"
+    assert payload.status_code == 409, payload.text
+    assert payload.json()["message"] == "parent_not_running"
+    assert boundary.status_code == 200, boundary.text
+    assert response.status_code == 200, response.text
+    assert asyncio.run(persisted()) == (
+        ModelPreheatWorkerTaskStateEnum.PAUSED,
+        {
+            "completed_files": ["weights/model%207b.bin"],
+            "staging_exists": True,
+        },
+        None,
+        None,
+        ModelPreheatExecutionStateEnum.PAUSED,
+    )
+    asyncio.run(engine.dispose())
+
+
+def test_pause_confirmation_updates_parent_before_child(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, worker_task_id = asyncio.run(_seed(engine, key))
+
+    async def request_pause():
+        async with AsyncSession(engine) as session:
+            child = await session.get(ModelPreheatWorkerTask, worker_task_id)
+            parent = await session.get(ModelPreheatTask, child.task_id)
+            parent.desired_state = ModelPreheatDesiredStateEnum.PAUSED
+            parent.paused_from_state = parent.execution_state
+            child.state_message = "pause_requested"
+            session.add(parent)
+            session.add(child)
+            await session.commit()
+
+    update_tables = []
+
+    def record_update_order(
+        connection, cursor, statement, parameters, context, executemany
+    ):
+        del connection, cursor, parameters, context, executemany
+        normalized = " ".join(statement.lower().split())
+        if normalized.startswith("update model_preheat_"):
+            update_tables.append(normalized.split()[1].strip('"`'))
+
+    with TestClient(app) as client:
+        claimed_response = _claim(client, worker_task_id, worker_id)
+        assert claimed_response.status_code == 200, claimed_response.text
+        claimed = claimed_response.json()
+        asyncio.run(request_pause())
+        event.listen(engine.sync_engine, "before_cursor_execute", record_update_order)
+        try:
+            confirmation = client.patch(
+                f"{API_PREFIX}/{worker_task_id}/progress",
+                json={
+                    "worker_uuid": "worker-uuid",
+                    "worker_id": worker_id,
+                    "attempt": claimed["attempt"],
+                    "lease_token": claimed["lease_token"],
+                    "progress": 50,
+                    "state_message": "paused",
+                },
+            )
+        finally:
+            event.remove(
+                engine.sync_engine, "before_cursor_execute", record_update_order
+            )
+
+    assert confirmation.status_code == 200, confirmation.text
+    assert update_tables == [
+        "model_preheat_tasks",
+        "model_preheat_worker_tasks",
+        "model_preheat_tasks",
+    ]
+    asyncio.run(engine.dispose())
+
+
+def test_resume_route_recovers_pause_pending_child_and_rejects_late_confirmation(
+    tmp_path,
+):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, worker_task_id = asyncio.run(_seed(engine, key))
+
+    async def request_schedule_pause():
+        async with AsyncSession(engine) as session:
+            child = await session.get(ModelPreheatWorkerTask, worker_task_id)
+            parent = await session.get(ModelPreheatTask, child.task_id)
+            parent.desired_state = ModelPreheatDesiredStateEnum.PAUSED
+            parent.paused_from_state = parent.execution_state
+            child.state_message = "pause_requested"
+            session.add(parent)
+            session.add(child)
+            parent_id = parent.id
+            await session.commit()
+            return parent_id
+
+    update_tables = []
+
+    def record_update_order(
+        connection, cursor, statement, parameters, context, executemany
+    ):
+        del connection, cursor, parameters, context, executemany
+        normalized = " ".join(statement.lower().split())
+        if normalized.startswith("update model_preheat_"):
+            update_tables.append(normalized.split()[1].strip('"`'))
+
+    with TestClient(app) as client:
+        claimed_response = _claim(client, worker_task_id, worker_id)
+        assert claimed_response.status_code == 200, claimed_response.text
+        claimed = claimed_response.json()
+        parent_id = asyncio.run(request_schedule_pause())
+
+        event.listen(engine.sync_engine, "before_cursor_execute", record_update_order)
+        try:
+            resumed = client.post(f"/v1/model-preheats/{parent_id}/resume")
+        finally:
+            event.remove(
+                engine.sync_engine, "before_cursor_execute", record_update_order
+            )
+
+        async def state_after_resume():
+            async with AsyncSession(engine) as session:
+                child = await session.get(ModelPreheatWorkerTask, worker_task_id)
+                return (
+                    child.state,
+                    child.state_message,
+                    child.lease_owner,
+                    child.lease_token_hash,
+                )
+
+        after_resume = asyncio.run(state_after_resume())
+        late_confirmation = client.patch(
+            f"{API_PREFIX}/{worker_task_id}/progress",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": claimed["attempt"],
+                "lease_token": claimed["lease_token"],
+                "progress": 50,
+                "state_message": "paused",
+            },
+        )
+        reclaimed_response = _claim(client, worker_task_id, worker_id)
+
+    async def final_state():
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, parent_id)
+            child = await session.get(ModelPreheatWorkerTask, worker_task_id)
+            return (
+                parent.desired_state,
+                parent.execution_state,
+                child.state,
+                child.state_message,
+            )
+
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["desired_state"] == "running"
+    assert update_tables[:2] == [
+        "model_preheat_tasks",
+        "model_preheat_worker_tasks",
+    ]
+    assert after_resume == (
+        ModelPreheatWorkerTaskStateEnum.PENDING,
+        None,
+        None,
+        None,
+    )
+    assert late_confirmation.status_code == 409, late_confirmation.text
+    assert reclaimed_response.status_code == 200, reclaimed_response.text
+    assert reclaimed_response.json()["lease_token"] != claimed["lease_token"]
+    assert asyncio.run(final_state()) == (
+        ModelPreheatDesiredStateEnum.RUNNING,
+        ModelPreheatExecutionStateEnum.PENDING,
+        ModelPreheatWorkerTaskStateEnum.RUNNING,
+        None,
+    )
+    asyncio.run(engine.dispose())
+
+
+def test_progress_database_update_preserves_concurrent_pause_request(
+    tmp_path, monkeypatch
+):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, worker_task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, worker_task_id, worker_id).json()
+
+    async def run():
+        validated = asyncio.Event()
+        release_progress = asyncio.Event()
+        original_validate = model_preheat_worker_tasks._validate_active_lease
+
+        async def validate_then_wait(*args, **kwargs):
+            worker_task = await original_validate(*args, **kwargs)
+            validated.set()
+            await release_progress.wait()
+            return worker_task
+
+        monkeypatch.setattr(
+            model_preheat_worker_tasks,
+            "_validate_active_lease",
+            validate_then_wait,
+        )
+        identity = ModelPreheatWorkerPrincipal(
+            worker_id=worker_id,
+            worker_uuid="worker-uuid",
+            credential_id=1,
+            token_version=1,
+        )
+        progress = ModelPreheatWorkerTaskProgress(
+            worker_uuid="worker-uuid",
+            worker_id=worker_id,
+            attempt=claimed["attempt"],
+            lease_token=claimed["lease_token"],
+            progress=45,
+            state_message="downloading",
+        )
+        async with AsyncSession(engine) as stale_session:
+            progress_update = asyncio.create_task(
+                model_preheat_worker_tasks.update_model_preheat_worker_task_progress(
+                    stale_session,
+                    worker_task_id,
+                    progress,
+                    identity,
+                )
+            )
+            await asyncio.wait_for(validated.wait(), timeout=1)
+            async with AsyncSession(engine) as controller_session:
+                worker_task = await controller_session.get(
+                    ModelPreheatWorkerTask, worker_task_id
+                )
+                parent = await controller_session.get(
+                    ModelPreheatTask, worker_task.task_id
+                )
+                parent.desired_state = ModelPreheatDesiredStateEnum.PAUSED
+                worker_task.state_message = "pause_requested"
+                controller_session.add(parent)
+                controller_session.add(worker_task)
+                await controller_session.commit()
+            release_progress.set()
+            await progress_update
+
+        async with AsyncSession(engine) as session:
+            persisted = await session.get(ModelPreheatWorkerTask, worker_task_id)
+            return persisted.progress, persisted.state_message
+
+    assert asyncio.run(run()) == (45, "pause_requested")
+    asyncio.run(engine.dispose())
+
+
+def test_heartbeat_database_cas_rejects_concurrent_pause_without_renewal(
+    tmp_path, monkeypatch
+):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, worker_task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, worker_task_id, worker_id).json()
+
+    async def run():
+        validated = asyncio.Event()
+        release_heartbeat = asyncio.Event()
+        original_validate = model_preheat_worker_tasks._validate_active_lease
+
+        async def validate_then_wait(*args, **kwargs):
+            worker_task = await original_validate(*args, **kwargs)
+            validated.set()
+            await release_heartbeat.wait()
+            return worker_task
+
+        monkeypatch.setattr(
+            model_preheat_worker_tasks,
+            "_validate_active_lease",
+            validate_then_wait,
+        )
+        identity = ModelPreheatWorkerPrincipal(
+            worker_id=worker_id,
+            worker_uuid="worker-uuid",
+            credential_id=1,
+            token_version=1,
+        )
+        lease = ModelPreheatWorkerTaskLease(
+            worker_uuid="worker-uuid",
+            worker_id=worker_id,
+            attempt=claimed["attempt"],
+            lease_token=claimed["lease_token"],
+        )
+        async with AsyncSession(engine) as stale_session:
+            heartbeat_update = asyncio.create_task(
+                model_preheat_worker_tasks.heartbeat_model_preheat_worker_task(
+                    stale_session,
+                    worker_task_id,
+                    lease,
+                    identity,
+                )
+            )
+            await asyncio.wait_for(validated.wait(), timeout=1)
+            async with AsyncSession(engine) as controller_session:
+                worker_task = await controller_session.get(
+                    ModelPreheatWorkerTask, worker_task_id
+                )
+                original_expiry = worker_task.lease_expires_at
+                parent = await controller_session.get(
+                    ModelPreheatTask, worker_task.task_id
+                )
+                parent.desired_state = ModelPreheatDesiredStateEnum.PAUSED
+                worker_task.state_message = "pause_requested"
+                controller_session.add(parent)
+                controller_session.add(worker_task)
+                await controller_session.commit()
+            release_heartbeat.set()
+            with pytest.raises(HTTPException) as conflict:
+                await heartbeat_update
+
+        async with AsyncSession(engine) as session:
+            persisted = await session.get(ModelPreheatWorkerTask, worker_task_id)
+            return (
+                conflict.value.status_code,
+                conflict.value.message,
+                persisted.lease_expires_at == original_expiry,
+                persisted.state_message,
+            )
+
+    assert asyncio.run(run()) == (409, "lease_lost", True, "pause_requested")
+    asyncio.run(engine.dispose())
+
+
+@pytest.mark.parametrize(
+    ("parent_execution_state", "state_message"),
+    [
+        (ModelPreheatExecutionStateEnum.PENDING, "pause_requested"),
+        (ModelPreheatExecutionStateEnum.PAUSED, "downloading"),
+    ],
+    ids=["pause-ack-pending", "parent-paused"],
+)
+def test_expired_child_of_pausing_parent_cannot_be_reclaimed_or_renewed(
+    tmp_path, parent_execution_state, state_message
+):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, worker_task_id = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claimed = _claim(client, worker_task_id, worker_id).json()
+
+        async def expire_during_pause():
+            async with AsyncSession(engine) as session:
+                worker_task = await session.get(ModelPreheatWorkerTask, worker_task_id)
+                parent = await session.get(ModelPreheatTask, worker_task.task_id)
+                parent.desired_state = ModelPreheatDesiredStateEnum.PAUSED
+                parent.execution_state = parent_execution_state
+                worker_task.state_message = state_message
+                worker_task.lease_expires_at = datetime.now(timezone.utc) - timedelta(
+                    seconds=1
+                )
+                session.add(parent)
+                session.add(worker_task)
+                await session.commit()
+
+        asyncio.run(expire_during_pause())
+        reclaimed = _claim(client, worker_task_id, worker_id)
+        candidate = reclaimed.json() if reclaimed.status_code == 200 else claimed
+        heartbeat = client.post(
+            f"{API_PREFIX}/{worker_task_id}/heartbeat",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": worker_id,
+                "attempt": candidate["attempt"],
+                "lease_token": candidate["lease_token"],
+            },
+        )
+
+    async def persisted():
+        async with AsyncSession(engine) as session:
+            worker_task = await session.get(ModelPreheatWorkerTask, worker_task_id)
+            return worker_task.attempt, worker_task.state_message
+
+    assert reclaimed.status_code == 409, reclaimed.text
+    assert reclaimed.json()["message"] == "task_not_claimable"
+    assert heartbeat.status_code == 409, heartbeat.text
+    assert asyncio.run(persisted()) == (claimed["attempt"], state_message)
+    asyncio.run(engine.dispose())
+
+
+def test_parent_pauses_only_after_every_child_acknowledges(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    del app
+    first_worker_id, first_worker_task_id = asyncio.run(_seed(engine, key))
+
+    async def run():
+        first_token = "first-lease"
+        second_token = "second-lease"
+        async with AsyncSession(engine) as session:
+            first_child = await session.get(
+                ModelPreheatWorkerTask, first_worker_task_id
+            )
+            parent = await session.get(ModelPreheatTask, first_child.task_id)
+            second_worker = Worker(
+                name="worker-b",
+                hostname="worker-b",
+                ip="127.0.0.2",
+                port=10150,
+                worker_uuid="worker-b-uuid",
+                state=WorkerStateEnum.READY,
+            )
+            session.add(second_worker)
+            await session.flush()
+            second_child = ModelPreheatWorkerTask(
+                task_id=parent.id,
+                parent_attempt=parent.attempt,
+                worker_uuid=second_worker.worker_uuid,
+                worker_id=second_worker.id,
+                role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                state=ModelPreheatWorkerTaskStateEnum.RUNNING,
+                attempt=1,
+                lease_owner=second_worker.worker_uuid,
+                lease_token_hash=model_preheat_worker_tasks._hash_token(second_token),
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+                state_message="pause_requested",
+            )
+            first_child.state = ModelPreheatWorkerTaskStateEnum.RUNNING
+            first_child.attempt = 1
+            first_child.lease_owner = first_child.worker_uuid
+            first_child.lease_token_hash = model_preheat_worker_tasks._hash_token(
+                first_token
+            )
+            first_child.lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=60
+            )
+            first_child.state_message = "pause_requested"
+            parent.desired_state = ModelPreheatDesiredStateEnum.PAUSED
+            session.add(first_child)
+            session.add(second_child)
+            session.add(parent)
+            await session.commit()
+            await session.refresh(second_worker)
+            await session.refresh(second_child)
+            second_worker_id = second_worker.id
+            second_worker_task_id = second_child.id
+
+        async def confirm(worker_task_id, worker_id, worker_uuid, token):
+            identity = ModelPreheatWorkerPrincipal(
+                worker_id=worker_id,
+                worker_uuid=worker_uuid,
+                credential_id=1,
+                token_version=1,
+            )
+            async with AsyncSession(engine) as session:
+                await model_preheat_worker_tasks.update_model_preheat_worker_task_progress(
+                    session,
+                    worker_task_id,
+                    ModelPreheatWorkerTaskProgress(
+                        worker_uuid=worker_uuid,
+                        worker_id=worker_id,
+                        attempt=1,
+                        lease_token=token,
+                        progress=50,
+                        state_message="paused",
+                    ),
+                    identity,
+                )
+
+        await confirm(
+            first_worker_task_id,
+            first_worker_id,
+            "worker-uuid",
+            first_token,
+        )
+        async with AsyncSession(engine) as session:
+            parent = (await session.exec(select(ModelPreheatTask))).one()
+            after_first = parent.execution_state
+
+        await confirm(
+            second_worker_task_id,
+            second_worker_id,
+            "worker-b-uuid",
+            second_token,
+        )
+        async with AsyncSession(engine) as session:
+            parent = (await session.exec(select(ModelPreheatTask))).one()
+            children = (
+                await session.exec(
+                    select(ModelPreheatWorkerTask).order_by(ModelPreheatWorkerTask.id)
+                )
+            ).all()
+            return (
+                after_first,
+                parent.execution_state,
+                [child.state for child in children],
+            )
+
+    assert asyncio.run(run()) == (
+        ModelPreheatExecutionStateEnum.PENDING,
+        ModelPreheatExecutionStateEnum.PAUSED,
+        [
+            ModelPreheatWorkerTaskStateEnum.PAUSED,
+            ModelPreheatWorkerTaskStateEnum.PAUSED,
+        ],
     )
     asyncio.run(engine.dispose())
 
@@ -843,7 +1453,7 @@ def test_generation_id_credential_disguise_is_not_persisted(tmp_path):
     asyncio.run(engine.dispose())
 
 
-def test_error_cursor_validates_but_does_not_persist_completed_file_paths(tmp_path):
+def test_error_cursor_persists_canonical_paths_without_exposing_them(tmp_path):
     app, engine, key = _test_app(tmp_path)
     worker_id, task_id = asyncio.run(_seed(engine, key))
     with TestClient(app) as client:
@@ -862,8 +1472,8 @@ def test_error_cursor_validates_but_does_not_persist_completed_file_paths(tmp_pa
                     "local_cache_state": "error",
                     "cursor": {
                         "completed_files": [
-                            "access/AKIAIOSFODNN7EXAMPLE",
-                            "secret/plain-secret",
+                            "weights/model%207b.bin",
+                            "%E8%B5%84%E6%96%99/%E6%A8%A1%E5%9E%8B.bin",
                         ],
                         "staging_exists": True,
                     },
@@ -877,9 +1487,14 @@ def test_error_cursor_validates_but_does_not_persist_completed_file_paths(tmp_pa
 
     cursor = asyncio.run(persisted_cursor())
     assert response.status_code == 200, response.text
-    assert cursor["cursor"] == {"staging_exists": True}
-    assert "AKIA" not in json.dumps(cursor)
-    assert "plain-secret" not in json.dumps(cursor)
+    assert cursor["cursor"] == {
+        "completed_files": [
+            "weights/model%207b.bin",
+            "%E8%B5%84%E6%96%99/%E6%A8%A1%E5%9E%8B.bin",
+        ],
+        "staging_exists": True,
+    }
+    assert "completed_files" not in response.text
     asyncio.run(engine.dispose())
 
 

@@ -146,7 +146,14 @@ class ModelPreheatTask(SQLModel, BaseModelMixin, table=True):
     s3_manifest_path: Optional[str] = None
     manifest_digest: Optional[str] = None
     keep_new_workers_in_sync: bool = False
-    schedule_id: Optional[int] = None
+    schedule_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            ForeignKey("model_preheat_schedules.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
+    bandwidth_limit_mbps: Optional[int] = None
     created_by_user_id: Optional[int] = Field(
         default=None,
         sa_column=Column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True),
@@ -336,6 +343,7 @@ class ModelPreheatWorkerTaskExecutionPayload(SQLModel):
     worker_task_id: int
     attempt: int
     role: ModelPreheatWorkerTaskRoleEnum
+    resumable_cursor: Optional[dict] = None
     task: dict
     profile: ModelPreheatExecutionProfile = Field(repr=False)
 
@@ -885,6 +893,11 @@ def is_terminal_task(task: ModelPreheatTask) -> bool:
         ModelPreheatExecutionStateEnum.ERROR,
         ModelPreheatExecutionStateEnum.CANCELED,
     }
+
+
+from gpustack.schemas import (
+    model_preheat_schedules as _model_preheat_schedules,
+)  # noqa: E402,F401
 
 
 # 注册 worker task 外键引用的 Task 9 表，兼容仅导入本模块后 create_all。

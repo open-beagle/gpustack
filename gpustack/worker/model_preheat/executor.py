@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from gpustack.worker.model_preheat.identity import ModelPreheatIdentity, decode_path
+from gpustack.worker.model_preheat.identity import (
+    ModelPreheatIdentity,
+    decode_path,
+    encode_path,
+)
 from gpustack.worker.model_preheat.local_cache import (
     LocalCacheError,
     LocalCacheState,
@@ -46,6 +50,8 @@ class SeedExecutionRequest:
     bucket: str
     prefix: str
     requested_revision: str | None = None
+    bandwidth_limit_mbps: int | None = None
+    resumable_cursor: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +68,8 @@ class TargetExecutionRequest:
     bucket: str
     prefix: str
     requested_revision: str | None = None
+    bandwidth_limit_mbps: int | None = None
+    resumable_cursor: dict | None = None
 
 
 def execute_seed_preheat(
@@ -70,6 +78,7 @@ def execute_seed_preheat(
     *,
     download_to_staging=None,
     cancel_check=None,
+    progress_callback=None,
 ) -> dict:
     staging = None
     try:
@@ -109,6 +118,7 @@ def execute_seed_preheat(
                 manifest,
                 request.target_dir,
                 cancel_check=cancel_check,
+                bandwidth_limit_mbps=request.bandwidth_limit_mbps,
             )
             if replaced_local_manifest is not None:
                 replace_trusted_manifest(
@@ -142,9 +152,12 @@ def execute_seed_preheat(
                     exclude_patterns=request.exclude_patterns,
                     bucket=request.bucket,
                     prefix=request.prefix,
+                    bandwidth_limit_mbps=request.bandwidth_limit_mbps,
+                    resumable_cursor=request.resumable_cursor,
                 ),
                 s3_client,
                 cancel_check=cancel_check,
+                progress_callback=progress_callback,
             )
 
         staging = create_staging_dir(
@@ -158,11 +171,13 @@ def execute_seed_preheat(
             )
 
             download_to_staging = download_resolved_revision_to_staging
-        download_to_staging(
-            request.identity,
-            staging,
-            exclude_patterns=request.exclude_patterns,
-        )
+        download_options = {"exclude_patterns": request.exclude_patterns}
+        if download_to_staging.__module__ == "gpustack.worker.downloaders":
+            download_options.update(
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
+        download_to_staging(request.identity, staging, **download_options)
         _raise_if_cancelled(cancel_check)
         _remove_excluded_files(staging, request.exclude_patterns)
         manifest = build_model_preheat_manifest(
@@ -182,6 +197,7 @@ def execute_seed_preheat(
             manifest,
             staging,
             cancel_check=cancel_check,
+            bandwidth_limit_mbps=request.bandwidth_limit_mbps,
         )
         local_result = publish_staging(
             request.cache_dir,
@@ -228,6 +244,7 @@ def execute_target_preheat(
     s3_client,
     *,
     cancel_check=None,
+    progress_callback=None,
 ) -> dict:
     staging = None
     completed_files = []
@@ -264,21 +281,46 @@ def execute_target_preheat(
         _reuse_previous_staging_files(request, staging, manifest)
         downloaded = 0
         skipped = 0
+        downloaded_size = 0
         for file in manifest.files:
             _raise_if_cancelled(cancel_check)
             target = _staging_manifest_path(staging, file.path)
             if _file_matches(target, file.size, file.sha256):
                 skipped += 1
                 completed_files.append(file.path)
+                downloaded_size += file.size
+                _report_progress(
+                    progress_callback,
+                    completed_files,
+                    downloaded_size,
+                    manifest.total_size,
+                )
                 continue
             for _ in range(3):
                 _raise_if_cancelled(cancel_check)
+                download_options = {}
+                if request.bandwidth_limit_mbps is not None:
+                    download_options["bandwidth_limit_mbps"] = (
+                        request.bandwidth_limit_mbps
+                    )
                 s3_client.download_generation_file(
-                    request.bucket, request.prefix, manifest, file, target
+                    request.bucket,
+                    request.prefix,
+                    manifest,
+                    file,
+                    target,
+                    **download_options,
                 )
                 if _file_matches(target, file.size, file.sha256):
                     downloaded += 1
                     completed_files.append(file.path)
+                    downloaded_size += file.size
+                    _report_progress(
+                        progress_callback,
+                        completed_files,
+                        downloaded_size,
+                        manifest.total_size,
+                    )
                     break
             else:
                 return _error_result(
@@ -325,6 +367,11 @@ def execute_target_preheat(
         return _error_result("validation_error", staging, completed_files)
     except Exception:
         return _error_result("worker_execution_failed", staging, completed_files)
+
+
+def _report_progress(callback, completed_files, downloaded_size, total_size):
+    if callback is not None:
+        callback(tuple(completed_files), downloaded_size, total_size)
 
 
 def _ready_result(
@@ -410,7 +457,10 @@ def _reuse_previous_staging_files(request, staging: Path, manifest) -> None:
         key=lambda path: int(path.name),
         reverse=True,
     )
+    cursor_files = _cursor_completed_files(request)
     for file in manifest.files:
+        if cursor_files is not None and file.path not in cursor_files:
+            continue
         target = _staging_manifest_path(staging, file.path)
         if _file_matches(target, file.size, file.sha256):
             continue
@@ -457,6 +507,7 @@ def _reuse_previous_seed_staging(request, staging: Path) -> None:
     if resolved_task_root not in source_root.parents:
         return
     target_root = staging.resolve()
+    cursor_files = _cursor_completed_files(request)
     for source in source_root.rglob("*"):
         try:
             source_stat = source.lstat()
@@ -468,6 +519,11 @@ def _reuse_previous_seed_staging(request, staging: Path) -> None:
         if source_root not in resolved_source.parents:
             continue
         relative = source.relative_to(source_root)
+        if (
+            cursor_files is not None
+            and encode_path(relative.as_posix()) not in cursor_files
+        ):
+            continue
         target = (target_root / relative).resolve(strict=False)
         if target_root not in target.parents or target.exists():
             continue
@@ -479,6 +535,13 @@ def _reuse_previous_seed_staging(request, staging: Path) -> None:
                 shutil.copy2(resolved_source, target)
             except OSError:
                 continue
+
+
+def _cursor_completed_files(request):
+    cursor = getattr(request, "resumable_cursor", None)
+    if cursor is None:
+        return None
+    return set(cursor.get("completed_files", []))
 
 
 def _remove_excluded_files(staging_dir: Path, exclude_patterns) -> None:
@@ -494,15 +557,17 @@ def _remove_excluded_files(staging_dir: Path, exclude_patterns) -> None:
 
 def build_preheat_role_handlers(cache_dir: str | Path) -> dict:
     async def seed_handler(payload, context):
-        return await _execute_payload(payload, cache_dir, seed=True)
+        return await _execute_payload(payload, context, cache_dir, seed=True)
 
     async def target_handler(payload, context):
-        return await _execute_payload(payload, cache_dir, seed=False)
+        return await _execute_payload(payload, context, cache_dir, seed=False)
 
     return {"seed": seed_handler, "distribute": target_handler}
 
 
-async def _execute_payload(payload, cache_dir: str | Path, *, seed: bool) -> dict:
+async def _execute_payload(
+    payload, context, cache_dir: str | Path, *, seed: bool
+) -> dict:
     from gpustack.worker.downloaders import preheat_model_target_dir
 
     task = payload.task
@@ -540,16 +605,43 @@ async def _execute_payload(payload, cache_dir: str | Path, *, seed: bool) -> dic
         "exclude_patterns": exclude_patterns,
         "bucket": profile.bucket,
         "prefix": profile.prefix,
+        "bandwidth_limit_mbps": task.get("bandwidth_limit_mbps"),
+        "resumable_cursor": getattr(payload, "resumable_cursor", None),
     }
     cancel_event = threading.Event()
     execution = execute_seed_preheat if seed else execute_target_preheat
     request_type = SeedExecutionRequest if seed else TargetExecutionRequest
+    loop = asyncio.get_running_loop()
+
+    def report_progress(completed_files, downloaded_size, total_size):
+        progress = min(
+            99,
+            (downloaded_size * 100 / total_size) if total_size else 0,
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            context.progress(
+                progress,
+                downloaded_size=downloaded_size,
+                total_size=total_size,
+                resumable_cursor={
+                    "completed_files": [
+                        encode_path(path) for path in list(completed_files)[-1024:]
+                    ],
+                    "staging_exists": True,
+                },
+                state_message="downloading" if not seed else "uploading",
+            ),
+            loop,
+        )
+        future.result()
+
     worker = asyncio.create_task(
         asyncio.to_thread(
             execution,
             request_type(**request_fields),
             client,
             cancel_check=cancel_event.is_set,
+            progress_callback=report_progress,
         )
     )
     try:

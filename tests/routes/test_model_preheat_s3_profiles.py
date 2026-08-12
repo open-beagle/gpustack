@@ -27,6 +27,11 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ConnectivityStateEnum,
     ModelPreheatS3Profile,
 )
+from gpustack.schemas.model_preheat_schedules import ModelPreheatSchedule
+from gpustack.schemas.model_preheats import (
+    ModelPreheatBackfillPolicyEnum,
+    ModelPreheatTargetScopeEnum,
+)
 from gpustack.schemas.users import User
 from gpustack.server.db import get_session
 
@@ -63,6 +68,7 @@ def app(tmp_path):
         model_preheat_credential_old_keys=None,
         force_auth_localhost=True,
     )
+    test_app.state.test_engine = engine
 
     async def session_override():
         async with AsyncSession(engine) as session:
@@ -116,6 +122,33 @@ def create_profile(client, **overrides):
     response = client.post(API_PREFIX, json=profile_payload(**overrides))
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def test_profile_delete_returns_conflict_when_schedule_references_it(app, client):
+    created = create_profile(client)
+
+    async def seed_schedule():
+        async with AsyncSession(app.state.test_engine) as session:
+            session.add(
+                ModelPreheatSchedule(
+                    name="profile-reference",
+                    cron_expression="0 1 * * *",
+                    timezone="UTC",
+                    window_duration_minutes=60,
+                    source="huggingface",
+                    model_id="org/model",
+                    target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
+                    target_worker_uuids=["worker-a"],
+                    s3_profile_id=created["id"],
+                    s3_backfill_policy=ModelPreheatBackfillPolicyEnum.WHEN_MISSING,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed_schedule())
+    response = client.delete(f"{API_PREFIX}/{created['id']}")
+    assert response.status_code == 409
+    assert response.json()["reason"] == "model_preheat_schedule_uses_profile"
 
 
 def test_profile_route_is_registered_on_v1_admin_router():

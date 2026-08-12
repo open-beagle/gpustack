@@ -8,7 +8,7 @@ from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, exists, func, or_, update
+from sqlalchemy import and_, case, exists, func, or_, update
 from sqlmodel import select
 
 from gpustack.api.exceptions import (
@@ -43,6 +43,7 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTaskRoleEnum,
     ModelPreheatWorkerTasksPublic,
     ModelPreheatWorkerTaskStateEnum,
+    is_terminal_task,
 )
 from gpustack.schemas.workers import Worker
 from gpustack.server.bus import EventType
@@ -158,6 +159,7 @@ STATE_MESSAGE_ALLOWLIST = {
     "publishing",
     "uploading",
     "verifying",
+    "paused",
 }
 
 
@@ -256,13 +258,17 @@ async def claim_model_preheat_worker_task(
             ModelPreheatWorkerTask.lease_expires_at <= now,
         ),
     )
+    claim_conditions = [
+        claimable,
+        *_execution_allowed_conditions(task.task_id is not None),
+    ]
     result = await session.exec(
         update(ModelPreheatWorkerTask)
         .where(
             ModelPreheatWorkerTask.id == worker_task_id,
             ModelPreheatWorkerTask.worker_uuid == identity.worker_uuid,
             _is_current_registration(identity.worker_uuid, identity.worker_id),
-            claimable,
+            *claim_conditions,
             *marker_conditions,
         )
         .values(
@@ -301,11 +307,22 @@ async def heartbeat_model_preheat_worker_task(
     lease: ModelPreheatWorkerTaskLease,
     identity: WorkerIdentityDep,
 ):
-    task = await _validate_active_lease(session, worker_task_id, lease, identity)
+    task = await _validate_active_lease(
+        session,
+        worker_task_id,
+        lease,
+        identity,
+    )
     now = _utcnow()
     expiry = now + LEASE_TTL
     result = await session.exec(
-        _active_lease_update(worker_task_id, lease, now).values(
+        _active_lease_update(
+            worker_task_id,
+            lease,
+            now,
+            require_execution_allowed=True,
+            has_parent=task.task_id is not None,
+        ).values(
             lease_expires_at=expiry,
             last_heartbeat_at=now,
         )
@@ -327,7 +344,14 @@ async def update_model_preheat_worker_task_progress(
     progress: ModelPreheatWorkerTaskProgress,
     identity: WorkerIdentityDep,
 ):
-    task = await _validate_active_lease(session, worker_task_id, progress, identity)
+    pause_confirmation = progress.state_message == "paused"
+    task = await _validate_active_lease(
+        session,
+        worker_task_id,
+        progress,
+        identity,
+        allow_pause_requested=True,
+    )
     cursor = _validated_cursor(task.role, progress.resumable_cursor)
     state_message = _validated_state_message(progress.state_message)
     values = {
@@ -343,10 +367,77 @@ async def update_model_preheat_worker_task_progress(
         value = getattr(progress, field)
         if value is not None:
             values[field] = value
+    if pause_confirmation:
+        values.update(
+            state=ModelPreheatWorkerTaskStateEnum.PAUSED,
+            lease_owner=None,
+            lease_token_hash=None,
+            lease_expires_at=None,
+        )
+        if task.task_id is not None:
+            parent_guard = await session.exec(
+                update(ModelPreheatTask)
+                .where(
+                    ModelPreheatTask.id == task.task_id,
+                    ModelPreheatTask.attempt == task.parent_attempt,
+                    ModelPreheatTask.desired_state
+                    == ModelPreheatDesiredStateEnum.PAUSED,
+                    ModelPreheatTask.execution_state.not_in(
+                        [
+                            ModelPreheatExecutionStateEnum.READY,
+                            ModelPreheatExecutionStateEnum.PARTIAL,
+                            ModelPreheatExecutionStateEnum.ERROR,
+                            ModelPreheatExecutionStateEnum.CANCELED,
+                        ]
+                    ),
+                )
+                .values(desired_state=ModelPreheatDesiredStateEnum.PAUSED)
+                .execution_options(synchronize_session=False)
+            )
+            if parent_guard.rowcount != 1:
+                await session.rollback()
+                _conflict("parent_not_running")
+    else:
+        values["state_message"] = case(
+            (
+                ModelPreheatWorkerTask.state_message == "pause_requested",
+                "pause_requested",
+            ),
+            else_=state_message,
+        )
     result = await session.exec(
-        _active_lease_update(worker_task_id, progress, _utcnow()).values(**values)
+        _active_lease_update(
+            worker_task_id,
+            progress,
+            _utcnow(),
+            require_pause_requested=pause_confirmation,
+        ).values(**values)
     )
-    await _commit_validated_update(session, task, result.rowcount)
+    if result.rowcount != 1:
+        await session.rollback()
+        _conflict("lease_lost")
+    if pause_confirmation and task.task_id is not None:
+        await session.exec(
+            update(ModelPreheatTask)
+            .where(
+                ModelPreheatTask.id == task.task_id,
+                ModelPreheatTask.attempt == task.parent_attempt,
+                ModelPreheatTask.desired_state == ModelPreheatDesiredStateEnum.PAUSED,
+                ~exists().where(
+                    ModelPreheatWorkerTask.task_id == ModelPreheatTask.id,
+                    ModelPreheatWorkerTask.parent_attempt == ModelPreheatTask.attempt,
+                    ModelPreheatWorkerTask.state.in_(
+                        [
+                            ModelPreheatWorkerTaskStateEnum.PENDING,
+                            ModelPreheatWorkerTaskStateEnum.RUNNING,
+                        ]
+                    ),
+                ),
+            )
+            .values(execution_state=ModelPreheatExecutionStateEnum.PAUSED)
+            .execution_options(synchronize_session=False)
+        )
+    await session.commit()
     task = await _refresh_task(session, worker_task_id)
     await _publish(task)
     return task
@@ -470,7 +561,12 @@ async def get_model_preheat_worker_task_execution_payload(
         attempt=attempt,
         lease_token=lease_token,
     )
-    worker_task = await _validate_active_lease(session, worker_task_id, lease, identity)
+    worker_task = await _validate_active_lease(
+        session,
+        worker_task_id,
+        lease,
+        identity,
+    )
     cipher = _cipher_from_request(request)
     try:
         task_payload, encrypted_profile = await _execution_source(session, worker_task)
@@ -482,6 +578,7 @@ async def get_model_preheat_worker_task_execution_payload(
         worker_task_id=worker_task.id,
         attempt=worker_task.attempt,
         role=worker_task.role,
+        resumable_cursor=worker_task.resumable_cursor,
         task=task_payload,
         profile=profile,
     )
@@ -555,6 +652,7 @@ async def _validate_active_lease(
     lease: ModelPreheatWorkerTaskLease,
     identity: ModelPreheatWorkerPrincipal,
     idempotent_state: Optional[ModelPreheatWorkerTaskStateEnum] = None,
+    allow_pause_requested: bool = False,
 ):
     task = await _task_or_404(session, worker_task_id)
     _validate_client_identity(lease, identity)
@@ -572,6 +670,8 @@ async def _validate_active_lease(
         _conflict("invalid_lease_token")
     if idempotent_state is not None and task.state == idempotent_state:
         return task
+    if task.state_message == "pause_requested" and not allow_pause_requested:
+        _conflict("parent_not_running")
     if task.distribution_policy_id is not None:
         await _active_distribution_source(session, task.distribution_policy_id)
     elif task.task_id is not None:
@@ -580,7 +680,14 @@ async def _validate_active_lease(
             _conflict("parent_not_running")
         if task.parent_attempt != parent.attempt:
             _conflict("stale_parent_attempt")
-        if (
+        pause_requested = (
+            allow_pause_requested
+            and task.state == ModelPreheatWorkerTaskStateEnum.RUNNING
+            and task.state_message == "pause_requested"
+            and parent.desired_state == ModelPreheatDesiredStateEnum.PAUSED
+            and not is_terminal_task(parent)
+        )
+        if not pause_requested and (
             parent.desired_state != ModelPreheatDesiredStateEnum.RUNNING
             or parent.execution_state
             in {
@@ -647,8 +754,16 @@ async def _validate_current_registration(session, worker_uuid: str, worker_id: i
     return current
 
 
-def _active_lease_update(worker_task_id, lease, now):
-    return (
+def _active_lease_update(
+    worker_task_id,
+    lease,
+    now,
+    *,
+    require_pause_requested=False,
+    require_execution_allowed=False,
+    has_parent=False,
+):
+    statement = (
         update(ModelPreheatWorkerTask)
         .where(
             ModelPreheatWorkerTask.id == worker_task_id,
@@ -663,6 +778,43 @@ def _active_lease_update(worker_task_id, lease, now):
         )
         .execution_options(synchronize_session=False)
     )
+    if require_pause_requested:
+        statement = statement.where(
+            ModelPreheatWorkerTask.state_message == "pause_requested"
+        )
+    if require_execution_allowed:
+        statement = statement.where(*_execution_allowed_conditions(has_parent))
+    return statement
+
+
+def _execution_allowed_conditions(has_parent):
+    conditions = [
+        or_(
+            ModelPreheatWorkerTask.state_message.is_(None),
+            ModelPreheatWorkerTask.state_message != "pause_requested",
+        )
+    ]
+    if has_parent:
+        conditions.append(
+            exists(
+                select(ModelPreheatTask.id).where(
+                    ModelPreheatTask.id == ModelPreheatWorkerTask.task_id,
+                    ModelPreheatTask.attempt == ModelPreheatWorkerTask.parent_attempt,
+                    ModelPreheatTask.desired_state
+                    == ModelPreheatDesiredStateEnum.RUNNING,
+                    ModelPreheatTask.execution_state.not_in(
+                        [
+                            ModelPreheatExecutionStateEnum.PAUSED,
+                            ModelPreheatExecutionStateEnum.READY,
+                            ModelPreheatExecutionStateEnum.PARTIAL,
+                            ModelPreheatExecutionStateEnum.ERROR,
+                            ModelPreheatExecutionStateEnum.CANCELED,
+                        ]
+                    ),
+                )
+            )
+        )
+    return conditions
 
 
 async def _commit_validated_update(session, task, rowcount):
@@ -851,9 +1003,12 @@ def _validated_cursor_value(value):
         raise HTTPException(422, "Invalid", "invalid_preheat_cursor")
     if "staging_exists" in value and not isinstance(value["staging_exists"], bool):
         raise HTTPException(422, "Invalid", "invalid_preheat_cursor")
+    validated = {}
+    if files:
+        validated["completed_files"] = files
     if "staging_exists" in value:
-        return {"staging_exists": value["staging_exists"]}
-    return {}
+        validated["staging_exists"] = value["staging_exists"]
+    return validated
 
 
 def _validated_state_message(value):

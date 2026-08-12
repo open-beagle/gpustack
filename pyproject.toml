@@ -80,6 +80,7 @@ aiolimiter = "^1.2.1"
 python3-saml="1.16.0"
 lxml="5.2.1"
 xmlsec="1.3.14"
+modelscope-hub = "0.1.7"
 [tool.poetry.group.dev.dependencies]
 coverage = {extras = ["toml"], version = "^7.5.1"}
 flake8 = "^7.0.0"

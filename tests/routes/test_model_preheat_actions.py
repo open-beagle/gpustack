@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import hashlib
 
+import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel, select
@@ -14,6 +15,13 @@ from gpustack.routes.model_preheats import (
     retry_model_preheat,
 )
 from gpustack.routes.model_preheat_worker_tasks import _validate_active_lease
+from gpustack.api.exceptions import HTTPException
+from gpustack.schemas.model_preheat_schedules import (
+    ModelPreheatSchedule,
+    ModelPreheatScheduleRun,
+    ModelPreheatScheduleRunStateEnum,
+    ModelPreheatScheduleRunTriggerEnum,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
     ModelPreheatDesiredStateEnum,
@@ -217,6 +225,106 @@ def test_retry_increments_parent_attempt_keeps_generation_and_history(tmp_path):
     assert parent.execution_state == ModelPreheatExecutionStateEnum.PENDING
     assert [child.parent_attempt for child in children] == [1]
     assert len(locks) == 1
+
+
+@pytest.mark.parametrize(
+    ("action", "task_desired", "task_execution", "run_state", "run_slot"),
+    [
+        (
+            pause_model_preheat,
+            ModelPreheatDesiredStateEnum.RUNNING,
+            ModelPreheatExecutionStateEnum.PUBLISHING,
+            ModelPreheatScheduleRunStateEnum.RUNNING,
+            0,
+        ),
+        (
+            resume_model_preheat,
+            ModelPreheatDesiredStateEnum.PAUSED,
+            ModelPreheatExecutionStateEnum.PAUSED,
+            ModelPreheatScheduleRunStateEnum.PAUSED,
+            None,
+        ),
+        (
+            retry_model_preheat,
+            ModelPreheatDesiredStateEnum.RUNNING,
+            ModelPreheatExecutionStateEnum.ERROR,
+            ModelPreheatScheduleRunStateEnum.ERROR,
+            None,
+        ),
+    ],
+)
+def test_common_actions_reject_schedule_managed_tasks_without_breaking_run_invariants(
+    tmp_path,
+    action,
+    task_desired,
+    task_execution,
+    run_state,
+    run_slot,
+):
+    async def run():
+        engine, task_id, child_id = await _seed(tmp_path)
+        async with AsyncSession(engine) as session:
+            schedule = ModelPreheatSchedule(
+                name="managed",
+                cron_expression="0 * * * *",
+                timezone="UTC",
+                window_duration_minutes=30,
+                source="huggingface",
+                model_id="org/model",
+                target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
+                target_worker_uuids=["worker-a"],
+                s3_profile_id=1,
+            )
+            session.add(schedule)
+            await session.flush()
+            task = await session.get(ModelPreheatTask, task_id)
+            child = await session.get(ModelPreheatWorkerTask, child_id)
+            task.schedule_id = schedule.id
+            task.desired_state = task_desired
+            task.execution_state = task_execution
+            task.paused_from_state = (
+                ModelPreheatExecutionStateEnum.PUBLISHING
+                if task_execution == ModelPreheatExecutionStateEnum.PAUSED
+                else None
+            )
+            if task_execution == ModelPreheatExecutionStateEnum.PAUSED:
+                child.state = ModelPreheatWorkerTaskStateEnum.PAUSED
+                child.lease_owner = None
+                child.lease_token_hash = None
+                child.lease_expires_at = None
+            schedule_run = ModelPreheatScheduleRun(
+                schedule_id=schedule.id,
+                window_start_utc=datetime(2026, 8, 12, 0, 0, tzinfo=timezone.utc),
+                window_end_utc=datetime(2026, 8, 12, 0, 30, tzinfo=timezone.utc),
+                trigger=ModelPreheatScheduleRunTriggerEnum.SCHEDULED,
+                state=run_state,
+                operation_key=f"scheduled-{action.__name__}",
+                slot=run_slot,
+                task_id=task.id,
+                started_at=datetime(2026, 8, 12, 0, 0, tzinfo=timezone.utc),
+            )
+            session.add_all([task, child, schedule_run])
+            await session.commit()
+
+        with pytest.raises(HTTPException) as caught:
+            await _invoke(engine, action, task_id)
+
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatTask, task_id)
+            schedule_run = (await session.exec(select(ModelPreheatScheduleRun))).one()
+            stored = (
+                task.desired_state,
+                task.execution_state,
+                schedule_run.state,
+                schedule_run.slot,
+            )
+        await engine.dispose()
+        return caught.value, stored
+
+    error, stored = asyncio.run(run())
+    assert error.status_code == 409
+    assert error.message == "model_preheat_schedule_managed_action"
+    assert stored == (task_desired, task_execution, run_state, run_slot)
 
 
 def test_late_result_is_rejected_when_parent_paused_or_retried(tmp_path):

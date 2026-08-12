@@ -70,6 +70,13 @@ class ServeManager:
                 logger.error(f"Failed watching model instances: {e}")
                 await asyncio.sleep(5)
 
+    def is_idle(self) -> bool:
+        if self._starting_model_instances:
+            return False
+        return not any(
+            process.is_alive() for process in self._serving_model_instances.values()
+        )
+
     async def monitor_error_instances(self):
         """Periodically checks cached ERROR state instances and attempts to restart them."""
         while True:
@@ -203,7 +210,7 @@ class ServeManager:
                     for i, sw in enumerate(subordinate_workers)
                     if sw.worker_id == self._worker_id
                 ),
-                None
+                None,
             )
             if sw_pos is not None:
                 sw = subordinate_workers[sw_pos]
@@ -448,7 +455,8 @@ class ServeManager:
                         else:
                             subordinate_workers = (
                                 mi.distributed_servers.subordinate_workers
-                                if mi.distributed_servers and mi.distributed_servers.subordinate_workers
+                                if mi.distributed_servers
+                                and mi.distributed_servers.subordinate_workers
                                 else []
                             )
                             sw_pos = next(
@@ -457,15 +465,13 @@ class ServeManager:
                                     for i, sw in enumerate(subordinate_workers)
                                     if sw.worker_id == self._worker_id
                                 ),
-                                None
+                                None,
                             )
                             patch_dict = {}
                             if sw_pos is not None:
                                 sw = subordinate_workers[sw_pos]
                                 sw.state = ModelInstanceStateEnum.ERROR
-                                sw.state_message = (
-                                    f"Inference server exited with code {process.exitcode}."
-                                )
+                                sw.state_message = f"Inference server exited with code {process.exitcode}."
                                 patch_dict = {
                                     f"distributed_servers.subordinate_workers.{sw_pos}": sw,
                                 }
@@ -523,7 +529,8 @@ class ServeManager:
                     # Otherwise, update subordinate worker state to RUNNING.
                     subordinate_workers = (
                         mi.distributed_servers.subordinate_workers
-                        if mi.distributed_servers and mi.distributed_servers.subordinate_workers
+                        if mi.distributed_servers
+                        and mi.distributed_servers.subordinate_workers
                         else []
                     )
                     sw_pos = next(
@@ -532,7 +539,7 @@ class ServeManager:
                             for i, sw in enumerate(subordinate_workers)
                             if sw.worker_id == self._worker_id
                         ),
-                        None
+                        None,
                     )
                     patch_dict = {}
                     if sw_pos is not None:

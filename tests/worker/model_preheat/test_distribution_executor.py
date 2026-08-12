@@ -1,3 +1,7 @@
+from dataclasses import replace
+
+import pytest
+
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
     TargetExecutionRequest,
@@ -80,6 +84,79 @@ def test_target_downloads_ready_generation_and_publishes_atomically(tmp_path):
     assert inspection.state == "valid"
 
 
+def test_target_reports_resumable_cursor_after_each_real_file_boundary(tmp_path):
+    minio = _published_client(tmp_path)
+    request = _target_request(tmp_path)
+    cursors = []
+
+    result = execute_target_preheat(
+        request,
+        ModelPreheatS3Client(minio),
+        progress_callback=lambda completed, downloaded_size, total_size: cursors.append(
+            (list(completed), downloaded_size, total_size)
+        ),
+    )
+
+    assert result["state"] == "ready"
+    assert [cursor[0] for cursor in cursors] == [
+        ["config.json"],
+        ["config.json", "weights/model.bin"],
+    ]
+    assert cursors[-1][1] == cursors[-1][2]
+
+
+def test_s3_download_honors_optional_bandwidth_limit(tmp_path, monkeypatch):
+    from gpustack.worker.model_preheat import s3_client as s3_client_module
+
+    minio = InMemoryMinio()
+    minio.objects[("models", "large.bin")] = StoredObject(b"x" * (2 * 1024 * 1024))
+    sleeps = []
+    monkeypatch.setattr(s3_client_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(s3_client_module.time, "sleep", sleeps.append)
+
+    chunks = list(
+        ModelPreheatS3Client(minio).stream_object(
+            "models",
+            "large.bin",
+            chunk_size=1024 * 1024,
+            bandwidth_limit_mbps=8,
+        )
+    )
+
+    assert sum(map(len, chunks)) == 2 * 1024 * 1024
+    assert len(chunks) == 32
+    assert max(map(len, chunks)) <= 64 * 1024
+    assert len(sleeps) == 32
+    assert sleeps[-1] == pytest.approx(2.097152)
+
+
+def test_seed_delegation_preserves_bandwidth_limit_and_resumable_cursor(
+    tmp_path, monkeypatch
+):
+    request = replace(
+        _seed_request(tmp_path),
+        bandwidth_limit_mbps=8,
+        resumable_cursor={"completed_files": ["config.json"]},
+    )
+    delegated = []
+
+    class ReadyClient:
+        def read_ready_manifest(self, *args, **kwargs):
+            return object()
+
+    def capture(target_request, *args, **kwargs):
+        delegated.append(target_request)
+        return {"state": "ready"}
+
+    monkeypatch.setattr(
+        "gpustack.worker.model_preheat.executor.execute_target_preheat", capture
+    )
+
+    assert execute_seed_preheat(request, ReadyClient())["state"] == "ready"
+    assert delegated[0].bandwidth_limit_mbps == 8
+    assert delegated[0].resumable_cursor == {"completed_files": ["config.json"]}
+
+
 def test_target_reuses_partial_file_and_retries_checksum_mismatch(tmp_path):
     minio = _published_client(tmp_path)
     request = _target_request(tmp_path)
@@ -92,6 +169,69 @@ def test_target_reuses_partial_file_and_retries_checksum_mismatch(tmp_path):
     assert result["state"] == "ready"
     assert result["downloaded"] == 1
     assert result["skipped"] == 1
+
+
+def test_target_resume_reuses_only_files_confirmed_by_persisted_cursor(tmp_path):
+    minio = _published_client(tmp_path)
+    request = replace(
+        _target_request(tmp_path),
+        attempt=2,
+        resumable_cursor={
+            "completed_files": ["config.json"],
+            "staging_exists": True,
+        },
+    )
+    previous = request.cache_dir / ".preheat" / str(request.task_id) / "1"
+    _write_model(previous)
+
+    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
+
+    assert result["state"] == "ready"
+    assert result["skipped"] == 1
+    assert result["downloaded"] == 1
+
+
+def test_target_resume_reuses_encoded_space_and_unicode_paths(tmp_path):
+    minio = _published_client(tmp_path)
+    manifest = ModelPreheatS3Client(minio).read_ready_manifest(
+        "models",
+        "preheat",
+        _identity(),
+        cache_key="cache-key",
+        selection_digest="selection-digest",
+    )
+    renamed_files = [
+        replace(manifest.files[0], path="weights/model%207b.bin"),
+        replace(
+            manifest.files[1],
+            path="%E8%B5%84%E6%96%99/%E6%A8%A1%E5%9E%8B.bin",
+        ),
+    ]
+    manifest = replace(manifest, files=renamed_files)
+    request = replace(
+        _target_request(tmp_path),
+        attempt=2,
+        resumable_cursor={
+            "completed_files": [file.path for file in manifest.files],
+            "staging_exists": True,
+        },
+    )
+    previous = request.cache_dir / ".preheat" / str(request.task_id) / "1"
+    (previous / "weights").mkdir(parents=True)
+    (previous / "weights" / "model 7b.bin").write_bytes(b"config")
+    (previous / "资料").mkdir(parents=True)
+    (previous / "资料" / "模型.bin").write_bytes(b"weights")
+    client = ModelPreheatS3Client(minio)
+    downloaded = []
+
+    client.read_ready_manifest = lambda *args, **kwargs: manifest
+    client.download_generation_file = lambda *args, **kwargs: downloaded.append(args)
+    result = execute_target_preheat(request, client)
+
+    assert result["state"] == "ready"
+    assert result["skipped"] == 2
+    assert result["downloaded"] == 0
+    assert downloaded == []
 
 
 def test_target_new_attempt_reuses_only_verified_previous_staging_files(

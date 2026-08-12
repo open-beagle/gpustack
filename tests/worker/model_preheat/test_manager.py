@@ -149,7 +149,7 @@ def test_sse_reconnect_and_duplicate_events_start_only_one_execution():
     assert worker_tasks.complete_count == 1
     assert calls == 1
     assert worker_tasks.list_params
-    assert worker_tasks.list_params[0]["state"] == ["pending", "running"]
+    assert worker_tasks.list_params[0]["state"] == ["pending", "running", "paused"]
 
 
 def test_periodic_reconciliation_claims_task_after_existing_lease_expires():

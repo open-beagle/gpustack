@@ -4,8 +4,10 @@ import hashlib
 import ssl
 import threading
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
+from minio import Minio
 
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 from gpustack.worker.model_preheat.manifest import (
@@ -74,7 +76,15 @@ class InMemoryMinio:
     ):
         del content_type
         self.puts.append(object_name)
-        payload = data.read(length)
+        chunks = []
+        remaining = length
+        while remaining:
+            chunk = data.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
         self.objects[(bucket_name, object_name)] = StoredObject(
             payload,
             metadata=metadata or {},
@@ -156,19 +166,15 @@ class ExecuteConditionalMinio(BasicMinio):
         super().__init__()
         self.execute_calls: list[dict] = []
         self.concurrent_ready_digest: str | None = None
+        self._http = self
 
-    def _execute(
-        self,
-        method,
-        bucket_name=None,
-        object_name=None,
-        body=None,
-        headers=None,
-        query_params=None,
-        preload_content=True,
-        no_body_trace=False,
-    ):
-        del query_params, preload_content, no_body_trace
+    def presigned_put_object(self, bucket_name, object_name, expires):
+        assert expires.total_seconds() == 300
+        return f"s3://{bucket_name}/{object_name}"
+
+    def urlopen(self, method, url, body=None, headers=None, **kwargs):
+        del kwargs
+        bucket_name, object_name = url.removeprefix("s3://").split("/", 1)
         headers = headers or {}
         self.execute_calls.append(
             {
@@ -189,8 +195,14 @@ class ExecuteConditionalMinio(BasicMinio):
             headers.get("If-None-Match") == "*"
             and (bucket_name, object_name) in self.objects
         ):
-            raise _S3CodeError("PreconditionFailed")
-        payload = body if isinstance(body, bytes) else body.read()
+            return SimpleNamespace(status=412, release_conn=lambda: None)
+        chunks = []
+        while True:
+            chunk = body.read(1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
         self.objects[(bucket_name, object_name)] = StoredObject(
             payload,
             metadata={
@@ -199,6 +211,7 @@ class ExecuteConditionalMinio(BasicMinio):
                 if key.startswith("x-amz-meta-")
             },
         )
+        return SimpleNamespace(status=200, release_conn=lambda: None)
 
 
 class NoConditionalMinio(BasicMinio):
@@ -208,14 +221,24 @@ class NoConditionalMinio(BasicMinio):
 class SdkLikeConditionalMinio:
     def __init__(self):
         self.calls = []
+        self._http = self
 
-    def _execute(
-        self, method, bucket_name, object_name, body=None, headers=None, **kwargs
-    ):
+    def presigned_put_object(self, bucket_name, object_name, expires):
+        assert expires.total_seconds() == 300
+        return f"https://s3.test/{bucket_name}/{object_name}?signed=true"
+
+    def urlopen(self, method, url, body=None, headers=None, **kwargs):
         del kwargs
-        len(body)
-        hashlib.sha256(body).hexdigest()
-        self.calls.append((method, bucket_name, object_name, body, headers))
+        chunks = []
+        while True:
+            chunk = body.read(2 * 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        hashlib.sha256(payload).hexdigest()
+        self.calls.append((method, url, payload, headers, chunks))
+        return SimpleNamespace(status=200, release_conn=lambda: None)
 
 
 class MultipartConditionalMinio:
@@ -261,6 +284,50 @@ class MultipartConditionalMinio:
         self.aborted.append((bucket_name, object_name, upload_id))
 
 
+class StreamingMultipartConditionalMinio(MultipartConditionalMinio):
+    def __init__(self, clock):
+        super().__init__()
+        self._http = self
+        self.clock = clock
+        self.sent_chunks = []
+
+    def _upload_part(self, *args, **kwargs):
+        raise AssertionError("限速 multipart 不应把完整 part 交给 _upload_part")
+
+    def get_presigned_url(
+        self,
+        method,
+        bucket_name,
+        object_name,
+        *,
+        expires,
+        extra_query_params,
+    ):
+        assert method == "PUT"
+        assert expires.total_seconds() == 300
+        return (
+            f"s3://{bucket_name}/{object_name}"
+            f"?uploadId={extra_query_params['uploadId']}"
+            f"&partNumber={extra_query_params['partNumber']}"
+        )
+
+    def urlopen(self, method, url, body, headers, **kwargs):
+        del kwargs
+        assert method == "PUT"
+        assert int(headers["Content-Length"]) > 0
+        while True:
+            chunk = body.read(2 * 1024 * 1024)
+            if not chunk:
+                break
+            self.sent_chunks.append((self.clock[0], len(chunk), url))
+        part_number = url.rsplit("partNumber=", 1)[1]
+        return SimpleNamespace(
+            status=200,
+            headers={"etag": f'"etag-{part_number}"'},
+            release_conn=lambda: None,
+        )
+
+
 def _manifest(tmp_path, content: bytes = b"weights"):
     (tmp_path / "model.bin").write_bytes(content)
     identity = ModelPreheatIdentity(
@@ -278,7 +345,7 @@ def _manifest(tmp_path, content: bytes = b"weights"):
     )
 
 
-def test_small_conditional_put_passes_bytes_compatible_with_real_sdk_headers():
+def test_small_conditional_put_streams_body_compatible_with_real_sdk_headers():
     minio = SdkLikeConditionalMinio()
     client = ModelPreheatS3Client(minio)
 
@@ -292,7 +359,55 @@ def test_small_conditional_put_passes_bytes_compatible_with_real_sdk_headers():
     )
 
     assert written is True
-    assert minio.calls[0][3] == b"payload"
+    assert minio.calls[0][2] == b"payload"
+    assert minio.calls[0][3]["If-None-Match"] == "*"
+
+
+def test_rate_limited_conditional_put_yields_small_chunks_to_transport(monkeypatch):
+    from gpustack.worker.model_preheat import s3_client as s3_client_module
+
+    sleeps = []
+    monkeypatch.setattr(s3_client_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(s3_client_module.time, "sleep", sleeps.append)
+    minio = SdkLikeConditionalMinio()
+    payload = b"x" * (2 * 1024 * 1024)
+
+    written = ModelPreheatS3Client(minio)._put_stream_if_absent(
+        "bucket",
+        "object",
+        io.BytesIO(payload),
+        len(payload),
+        "application/octet-stream",
+        {"sha256": "0" * 64},
+        bandwidth_limit_mbps=8,
+    )
+
+    assert written is True
+    assert b"".join(minio.calls[0][4]) == payload
+    assert max(map(len, minio.calls[0][4])) <= 64 * 1024
+    assert len(sleeps) == len(minio.calls[0][4])
+
+
+def test_publish_generation_honors_optional_upload_bandwidth_limit(
+    tmp_path, monkeypatch
+):
+    from gpustack.worker.model_preheat import s3_client as s3_client_module
+
+    sleeps = []
+    monkeypatch.setattr(s3_client_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(s3_client_module.time, "sleep", sleeps.append)
+    manifest = _manifest(tmp_path, b"x" * (2 * 1024 * 1024))
+
+    ModelPreheatS3Client(InMemoryMinio()).publish_generation(
+        "models",
+        "preheat",
+        manifest,
+        tmp_path,
+        bandwidth_limit_mbps=8,
+    )
+
+    assert len(sleeps) == 32
+    assert sleeps[-1] == pytest.approx(2.097152)
 
 
 def test_large_conditional_put_uses_multipart_and_conditions_complete(monkeypatch):
@@ -324,6 +439,128 @@ def test_large_conditional_put_uses_multipart_and_conditions_complete(monkeypatc
     assert complete[4]["If-None-Match"] == "*"
     assert complete[5] == {"uploadId": "upload-id"}
     assert minio.aborted == []
+
+
+def test_rate_limited_multipart_streams_small_chunks_through_http_transport(
+    monkeypatch,
+):
+    from gpustack.worker.model_preheat import s3_client as s3_client_module
+
+    monkeypatch.setattr(
+        "gpustack.worker.model_preheat.s3_client.CONDITIONAL_SINGLE_PUT_MAX_SIZE",
+        1024,
+    )
+    clock = [0.0]
+    monkeypatch.setattr(s3_client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        s3_client_module.time,
+        "sleep",
+        lambda delay: clock.__setitem__(0, clock[0] + delay),
+    )
+    payload = b"x" * (5 * 1024 * 1024 + 1)
+    minio = StreamingMultipartConditionalMinio(clock)
+
+    written = ModelPreheatS3Client(minio)._put_stream_if_absent(
+        "bucket",
+        "large-object",
+        io.BytesIO(payload),
+        len(payload),
+        "application/octet-stream",
+        {"sha256": "0" * 64},
+        bandwidth_limit_mbps=8,
+    )
+
+    assert written is True
+    assert sum(chunk[1] for chunk in minio.sent_chunks) == len(payload)
+    assert max(chunk[1] for chunk in minio.sent_chunks) <= 64 * 1024
+    assert minio.sent_chunks[0][0] == pytest.approx(0.065536)
+    assert minio.sent_chunks[-1][0] == pytest.approx(5.242881)
+    assert minio.parts == []
+    assert minio.completed[0][4]["If-None-Match"] == "*"
+    assert minio.aborted == []
+
+
+def test_rate_limited_multipart_uses_real_minio_presigned_url_shape(monkeypatch):
+    from gpustack.worker.model_preheat import s3_client as s3_client_module
+
+    monkeypatch.setattr(
+        "gpustack.worker.model_preheat.s3_client.CONDITIONAL_SINGLE_PUT_MAX_SIZE",
+        1024,
+    )
+    clock = [0.0]
+    monkeypatch.setattr(s3_client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        s3_client_module.time,
+        "sleep",
+        lambda delay: clock.__setitem__(0, clock[0] + delay),
+    )
+    transport = StreamingMultipartConditionalMinio(clock)
+    sdk = Minio(
+        "localhost:9000",
+        access_key="access-key",
+        secret_key="secret-key",
+        secure=False,
+        region="us-east-1",
+    )
+    monkeypatch.setattr(sdk, "_http", transport)
+    monkeypatch.setattr(sdk, "_create_multipart_upload", lambda *args: "upload-id")
+    monkeypatch.setattr(
+        sdk, "_abort_multipart_upload", transport._abort_multipart_upload
+    )
+    monkeypatch.setattr(sdk, "_execute", transport._execute)
+    payload = b"x" * (5 * 1024 * 1024 + 1)
+
+    written = ModelPreheatS3Client(sdk)._put_stream_if_absent(
+        "bucket",
+        "large-object",
+        io.BytesIO(payload),
+        len(payload),
+        "application/octet-stream",
+        {"sha256": "0" * 64},
+        bandwidth_limit_mbps=8,
+    )
+
+    assert written is True
+    assert sum(chunk[1] for chunk in transport.sent_chunks) == len(payload)
+    assert all("uploadId=upload-id" in chunk[2] for chunk in transport.sent_chunks)
+    assert all("X-Amz-Signature=" in chunk[2] for chunk in transport.sent_chunks)
+    assert transport.completed[0][4]["If-None-Match"] == "*"
+
+
+def test_rate_limited_multipart_cancel_during_http_stream_aborts(monkeypatch):
+    monkeypatch.setattr(
+        "gpustack.worker.model_preheat.s3_client.CONDITIONAL_SINGLE_PUT_MAX_SIZE",
+        1024,
+    )
+    canceled = threading.Event()
+    clock = [0.0]
+
+    class CancelingTransport(StreamingMultipartConditionalMinio):
+        def urlopen(self, method, url, body, headers, **kwargs):
+            del kwargs
+            chunk = body.read(2 * 1024 * 1024)
+            self.sent_chunks.append((self.clock[0], len(chunk), url))
+            canceled.set()
+            body.read(2 * 1024 * 1024)
+            raise AssertionError("取消后不应继续读取")
+
+    minio = CancelingTransport(clock)
+
+    with pytest.raises(ModelPreheatCanceled, match="canceled"):
+        ModelPreheatS3Client(minio)._put_stream_if_absent(
+            "bucket",
+            "large-object",
+            io.BytesIO(b"x" * (5 * 1024 * 1024 + 1)),
+            5 * 1024 * 1024 + 1,
+            "application/octet-stream",
+            {"sha256": "0" * 64},
+            cancel_check=canceled.is_set,
+            bandwidth_limit_mbps=8,
+        )
+
+    assert len(minio.sent_chunks) == 1
+    assert minio.sent_chunks[0][1] <= 64 * 1024
+    assert minio.aborted == [("bucket", "large-object", "upload-id")]
 
 
 def test_multipart_cancel_aborts_upload(monkeypatch):
@@ -822,7 +1059,7 @@ def test_ready_final_write_does_not_overwrite_concurrent_digest(tmp_path):
     assert ready["digest"] == "other-generation"
 
 
-def test_ready_write_uses_minio_execute_condition_and_keeps_concurrent_digest(tmp_path):
+def test_ready_write_uses_streaming_condition_and_keeps_concurrent_digest(tmp_path):
     manifest = _manifest(tmp_path)
     minio = ExecuteConditionalMinio()
     minio.concurrent_ready_digest = "other-generation"
