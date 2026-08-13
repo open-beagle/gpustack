@@ -8,7 +8,8 @@ RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
     pip3 install --no-cache-dir --no-deps --force-reinstall "${WHEEL_PACKAGE}" && \
     rm -rf /tmp/*.whl
 
-ENV GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin
+ENV GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin \
+    HF_ENDPOINT=https://hf-mirror.com
 
 COPY ./.beagle/tools-downloads.sh /tmp/gpustack-tools-downloads.sh
 RUN TOOLS_DOWNLOAD_BASE_URL=https://cache.ali.wodcloud.com/vscode \

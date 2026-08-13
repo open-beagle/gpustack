@@ -5,6 +5,7 @@ import pytest
 
 from gpustack.server.model_cache_service import (
     ModelCacheService,
+    _client_from_config,
     model_object_prefix,
     validate_model_id,
 )
@@ -81,3 +82,34 @@ def test_delete_model_is_limited_to_computed_model_prefix():
 
     assert result.deleted_file_count == 1
     assert service._client.deleted == ["datamodel/model_Qwen/Qwen3/config.json"]
+
+
+def test_local_s3_client_disables_certificate_check_by_default(monkeypatch):
+    captured = {}
+
+    class CapturingMinio:
+        def __init__(self, host, **kwargs):
+            captured["host"] = host
+            captured.update(kwargs)
+
+        def disable_virtual_style_endpoint(self):
+            pass
+
+    monkeypatch.setattr(
+        "gpustack.server.model_cache_service.Minio", CapturingMinio
+    )
+    config = SimpleNamespace(
+        worker_local_s3_host="https://minio.example.com",
+        worker_local_s3_access_key="access",
+        worker_local_s3_secret_key="secret",
+        worker_local_s3_ssl=False,
+        worker_local_s3_use_virtual_hosted_style=False,
+        worker_local_s3_region="",
+        worker_local_s3_modelscope_prefix="s3://models/datamodel",
+    )
+
+    _client_from_config(config)
+
+    assert captured["host"] == "minio.example.com"
+    assert captured["secure"] is True
+    assert captured["cert_check"] is False

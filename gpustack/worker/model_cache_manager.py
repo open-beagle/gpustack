@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
+import urllib3
 from minio import Minio
 
 from gpustack.schemas.model_cache import (
@@ -177,12 +178,14 @@ class ModelCacheManager:
             not parsed.scheme and self._config.worker_local_s3_ssl
         )
         prefix = urlparse(self._config.worker_local_s3_modelscope_prefix)
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         client = Minio(
             host,
             access_key=self._config.worker_local_s3_access_key,
             secret_key=self._config.worker_local_s3_secret_key,
             secure=secure,
             region=self._config.worker_local_s3_region or None,
+            cert_check=False,
         )
         if self._config.worker_local_s3_use_virtual_hosted_style:
             client.enable_virtual_style_endpoint()
