@@ -35,7 +35,6 @@ def test_local_s3_host_enables_default_modelscope_prefix(tmp_path):
     )
 
     assert cfg.worker_local_s3_modelscope_prefix == "s3://bd-wind/datamodel"
-    assert cfg.worker_local_s3_modelscope_fallback is True
 
 
 def test_center_s3_legacy_uri_maps_to_beagle_cache_path():
@@ -71,14 +70,13 @@ def test_s3_download_object_reuses_local_file_when_size_matches(tmp_path):
     assert local_file.read_bytes() == b"1234"
 
 
-def test_modelscope_local_s3_cache_miss_raises_without_fallback(tmp_path):
+def test_modelscope_local_s3_cache_miss_raises(tmp_path):
     cfg = Config(
         data_dir=str(tmp_path),
         worker_local_s3_host="local-minio.example.com",
         worker_local_s3_access_key="access",
         worker_local_s3_secret_key="secret",
         worker_local_s3_modelscope_prefix="s3://model-cache/modelscope",
-        worker_local_s3_modelscope_fallback=False,
     )
 
     with (
@@ -97,42 +95,13 @@ def test_modelscope_local_s3_cache_miss_raises_without_fallback(tmp_path):
     snapshot.assert_not_called()
 
 
-def test_modelscope_file_info_local_s3_cache_miss_falls_back_by_default(tmp_path):
+def test_modelscope_file_info_local_s3_cache_miss_raises(tmp_path):
     cfg = Config(
         data_dir=str(tmp_path),
         worker_local_s3_host="local-minio.example.com",
         worker_local_s3_access_key="access",
         worker_local_s3_secret_key="secret",
         worker_local_s3_modelscope_prefix="s3://model-cache/modelscope",
-    )
-    downloader = Mock()
-    downloader.list_file_entries.return_value = []
-    api = Mock()
-    api.get_model_files.return_value = [{"Path": "config.json", "Size": 123}]
-    model = Mock(model_scope_model_id="Qwen/Qwen-7B-Chat-Int8")
-
-    with (
-        patch("gpustack.worker.downloaders.get_s3_downloader", return_value=downloader),
-        patch("gpustack.worker.downloaders.HubApi", return_value=api),
-    ):
-        file_list = ModelScopeDownloader.get_model_file_info(model, cfg=cfg)
-
-    assert len(file_list) == 1
-    assert file_list[0].rfilename == "config.json"
-    assert file_list[0].size == 123
-    api.get_model_files.assert_called_once_with(
-        "Qwen/Qwen-7B-Chat-Int8", recursive=True
-    )
-
-
-def test_modelscope_file_info_local_s3_cache_miss_raises_without_fallback(tmp_path):
-    cfg = Config(
-        data_dir=str(tmp_path),
-        worker_local_s3_host="local-minio.example.com",
-        worker_local_s3_access_key="access",
-        worker_local_s3_secret_key="secret",
-        worker_local_s3_modelscope_prefix="s3://model-cache/modelscope",
-        worker_local_s3_modelscope_fallback=False,
     )
     downloader = Mock()
     downloader.list_file_entries.return_value = []

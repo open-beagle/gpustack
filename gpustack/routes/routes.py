@@ -8,6 +8,7 @@ from gpustack.routes import (
     gpu_devices,
     model_evaluations,
     model_files,
+    model_cache,
     model_instances,
     model_preheats,
     model_preheat_distribution_policies,
@@ -58,6 +59,12 @@ v1_admin_router.include_router(
 )
 v1_admin_router.include_router(
     model_files.router, prefix="/model-files", tags=["Model Files"]
+)
+v1_admin_router.include_router(
+    model_cache.router, prefix="/model-cache", tags=["Model Cache"]
+)
+v1_admin_router.include_router(
+    model_cache.task_router, prefix="/model-cache-tasks", tags=["Model Cache Tasks"]
 )
 v1_admin_router.include_router(
     model_evaluations.router, prefix="/model-evaluations", tags=["Model Evaluations"]

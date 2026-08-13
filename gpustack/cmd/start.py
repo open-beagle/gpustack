@@ -497,17 +497,6 @@ def setup_start_cmd(subparsers: argparse._SubParsersAction):
         help="Local S3 prefix for ModelScope mirror cache.",
         default=get_gpustack_env("STACK_WORKER_LOCAL_S3_MODELSCOPE_PREFIX"),
     )
-    group.add_argument(
-        "--worker-local-s3-modelscope-fallback",
-        action=OptionalBoolAction,
-        help="Fallback to public ModelScope when local S3 cache misses.",
-        default=(
-            get_gpustack_env_bool("STACK_WORKER_LOCAL_S3_MODELSCOPE_FALLBACK")
-            if get_gpustack_env_bool("STACK_WORKER_LOCAL_S3_MODELSCOPE_FALLBACK")
-            is not None
-            else True
-        ),
-    )
     # External authentication settings
     group.add_argument(
         "--external-auth-name",
@@ -723,7 +712,6 @@ def set_common_options(args, config_data: dict):
         "worker_local_s3_use_virtual_hosted_style",
         "worker_local_s3_region",
         "worker_local_s3_modelscope_prefix",
-        "worker_local_s3_modelscope_fallback",
     ]
 
     for option in options:

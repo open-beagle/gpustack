@@ -9,6 +9,7 @@ from .generated_model_instance_client import ModelInstanceClient
 from .generated_model_file_client import ModelFileClient
 from .generated_user_client import UserClient
 from .generated_model_preheat_worker_task_client import ModelPreheatWorkerTaskClient
+from .generated_model_cache_task_client import ModelCacheTaskClient
 
 
 class ClientSet:
@@ -50,6 +51,7 @@ class ClientSet:
         self.model_files = ModelFileClient(http_client)
         self.users = UserClient(http_client)
         self.model_preheat_worker_tasks = ModelPreheatWorkerTaskClient(http_client)
+        self.model_cache_tasks = ModelCacheTaskClient(http_client)
 
     def set_model_preheat_worker_credential(self, credential: str):
         self.http_client = self.http_client.with_headers(

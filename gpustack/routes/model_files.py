@@ -1,5 +1,5 @@
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import String, cast, func, or_
 
@@ -18,8 +18,22 @@ from gpustack.schemas.model_files import (
     ModelFileUpdate,
     ModelFilesPublic,
 )
+from gpustack.schemas.model_cache import ModelCacheTaskCreate, ModelCacheTaskPublic
+from gpustack.server.deps import CurrentAdminUserDep
+from gpustack.routes.model_cache import create_model_cache_task
 
 router = APIRouter()
+
+
+@router.post("/{id}/cache", response_model=ModelCacheTaskPublic)
+async def cache_model_file(
+    request: Request,
+    session: SessionDep,
+    current_user: CurrentAdminUserDep,
+    id: int,
+    create: ModelCacheTaskCreate,
+):
+    return await create_model_cache_task(request, session, current_user, id, create)
 
 
 @router.get("", response_model=ModelFilesPublic)

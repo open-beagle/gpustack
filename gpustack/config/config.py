@@ -185,7 +185,6 @@ class Config(BaseSettings):
     worker_local_s3_use_virtual_hosted_style: bool = True
     worker_local_s3_region: Optional[str] = ""
     worker_local_s3_modelscope_prefix: Optional[str] = ""
-    worker_local_s3_modelscope_fallback: bool = True
     model_preheat_credential_key: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices(

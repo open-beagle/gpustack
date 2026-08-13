@@ -695,11 +695,9 @@ class ModelScopeDownloader:
             )
             if file_list:
                 return file_list
-            if not cfg.worker_local_s3_modelscope_fallback:
-                raise ValueError(
-                    f"ModelScope local S3 cache not found for {model.model_scope_model_id}"
-                )
-            logger.info("Fallback to public ModelScope file list is enabled")
+            raise ValueError(
+                f"ModelScope local S3 cache not found for {model.model_scope_model_id}"
+            )
 
         api = HubApi()
         repo_files = api.get_model_files(model.model_scope_model_id, recursive=True)
@@ -714,7 +712,11 @@ class ModelScopeDownloader:
 
     @classmethod
     def _local_modelscope_s3_path(cls, model_id: str, cfg: Config) -> str:
-        return f"{cfg.worker_local_s3_modelscope_prefix.rstrip('/')}/{model_id}"
+        organization, model_name = model_id.split("/", 1)
+        return (
+            f"{cfg.worker_local_s3_modelscope_prefix.rstrip('/')}/"
+            f"model_{organization}/{model_name}"
+        )
 
     @classmethod
     def _local_modelscope_model_strip_prefix(cls, s3_path: str) -> str:
@@ -799,64 +801,57 @@ class ModelScopeDownloader:
             logger.info("ModelScope local S3 cache is enabled")
 
             if not cls.check_s3_model_exists(model_id, cfg):
-                if not cfg.worker_local_s3_modelscope_fallback:
-                    raise ValueError(f"ModelScope local S3 cache miss for {model_id}")
-                logger.info("Fallback to public ModelScope download is enabled")
-            else:
-                try:
-                    s3_path = cls._local_modelscope_s3_path(model_id, cfg)
-                    logger.info(f"下载源: {s3_path}")
+                raise ValueError(f"ModelScope local S3 cache miss for {model_id}")
+            try:
+                s3_path = cls._local_modelscope_s3_path(model_id, cfg)
+                logger.info(f"下载源: {s3_path}")
 
-                    local_downloader = get_s3_downloader(cfg, S3_PROFILE_LOCAL)
+                local_downloader = get_s3_downloader(cfg, S3_PROFILE_LOCAL)
 
-                    # 下载到 ModelScope 的 local_dir，保持路径一致
-                    group_or_owner, name = model_id_to_group_owner_name(model_id)
-                    if local_dir is None:
-                        local_dir = os.path.join(cache_dir, group_or_owner, name)
+                # 下载到 ModelScope 的 local_dir，保持路径一致
+                group_or_owner, name = model_id_to_group_owner_name(model_id)
+                if local_dir is None:
+                    local_dir = os.path.join(cache_dir, group_or_owner, name)
 
-                    downloaded_path = local_downloader.download(
-                        s3_path,
-                        cache_dir=cache_dir,
-                        strip_prefix=cls._local_modelscope_cache_strip_prefix(cfg),
-                    )
-                    logger.info(f"从本地 S3 下载成功: {downloaded_path}")
+                downloaded_path = local_downloader.download(
+                    s3_path,
+                    cache_dir=cache_dir,
+                    strip_prefix=cls._local_modelscope_cache_strip_prefix(cfg),
+                )
+                logger.info(f"从本地 S3 下载成功: {downloaded_path}")
 
-                    if file_path:
-                        all_files = []
-                        for root, _, files in os.walk(downloaded_path):
-                            for f in files:
-                                rel_path = os.path.relpath(
-                                    os.path.join(root, f), downloaded_path
-                                )
-                                all_files.append(rel_path)
-
-                        matching_files = [
-                            f for f in all_files if fnmatch.fnmatch(f, file_path)
-                        ]
-                        if len(matching_files) == 0:
-                            raise ValueError(
-                                f"No file found in local S3 path that match {file_path}"
+                if file_path:
+                    all_files = []
+                    for root, _, files in os.walk(downloaded_path):
+                        for f in files:
+                            rel_path = os.path.relpath(
+                                os.path.join(root, f), downloaded_path
                             )
+                            all_files.append(rel_path)
 
-                        if extra_file_path:
-                            matching_files.extend(
-                                f
-                                for f in all_files
-                                if fnmatch.fnmatch(f, extra_file_path)
-                                and f not in matching_files
-                            )
+                    matching_files = [
+                        f for f in all_files if fnmatch.fnmatch(f, file_path)
+                    ]
+                    if len(matching_files) == 0:
+                        raise ValueError(
+                            f"No file found in local S3 path that match {file_path}"
+                        )
 
-                        return [
-                            os.path.join(downloaded_path, f) for f in matching_files
-                        ]
+                    if extra_file_path:
+                        matching_files.extend(
+                            f
+                            for f in all_files
+                            if fnmatch.fnmatch(f, extra_file_path)
+                            and f not in matching_files
+                        )
 
-                    return [downloaded_path]
+                    return [os.path.join(downloaded_path, f) for f in matching_files]
 
-                except Exception as e:
-                    logger.warning(f"从本地 S3 下载失败: {e}")
-                    if not cfg.worker_local_s3_modelscope_fallback:
-                        raise
-                    logger.info("Fallback to public ModelScope download is enabled")
+                return [downloaded_path]
+
+            except Exception as e:
+                logger.warning(f"从本地 S3 下载失败: {e}")
+                raise
 
         # 从 ModelScope 下载（原有逻辑）
         logger.info(f"从 ModelScope 下载模型: {model_id}")
