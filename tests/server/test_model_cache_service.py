@@ -41,21 +41,22 @@ def test_validate_model_id_rejects_unsafe_paths(model_id):
         validate_model_id(model_id)
 
 
-def test_model_object_prefix_adds_model_organization_prefix():
+def test_model_object_prefix_preserves_modelscope_namespace():
     assert (
-        model_object_prefix("datamodel", "Qwen/Qwen3") == "datamodel/model_Qwen/Qwen3/"
+        model_object_prefix("cache/modelscope", "Qwen/Qwen3")
+        == "cache/modelscope/Qwen/Qwen3/"
     )
 
 
 def test_list_models_groups_plain_s3_directories():
     service = ModelCacheService.__new__(ModelCacheService)
     service._bucket = "bd-wind"
-    service._prefix = "datamodel"
+    service._prefix = "cache/modelscope"
     service._client = FakeMinio(
         [
-            object_info("datamodel/model_Qwen/Qwen3/config.json", 10),
-            object_info("datamodel/model_Qwen/Qwen3/model.bin", 20),
-            object_info("datamodel/unrelated/file", 30),
+            object_info("cache/modelscope/Qwen/Qwen3/config.json", 10),
+            object_info("cache/modelscope/Qwen/Qwen3/model.bin", 20),
+            object_info("cache/modelscope/unrelated/file", 30),
         ]
     )
 
@@ -70,18 +71,18 @@ def test_list_models_groups_plain_s3_directories():
 def test_delete_model_is_limited_to_computed_model_prefix():
     service = ModelCacheService.__new__(ModelCacheService)
     service._bucket = "bd-wind"
-    service._prefix = "datamodel"
+    service._prefix = "cache/modelscope"
     service._client = FakeMinio(
         [
-            object_info("datamodel/model_Qwen/Qwen3/config.json", 10),
-            object_info("datamodel/model_Qwen/Other/config.json", 20),
+            object_info("cache/modelscope/Qwen/Qwen3/config.json", 10),
+            object_info("cache/modelscope/Qwen/Other/config.json", 20),
         ]
     )
 
     result = service.delete_model("Qwen/Qwen3")
 
     assert result.deleted_file_count == 1
-    assert service._client.deleted == ["datamodel/model_Qwen/Qwen3/config.json"]
+    assert service._client.deleted == ["cache/modelscope/Qwen/Qwen3/config.json"]
 
 
 def test_local_s3_client_disables_certificate_check_by_default(monkeypatch):
@@ -95,9 +96,7 @@ def test_local_s3_client_disables_certificate_check_by_default(monkeypatch):
         def disable_virtual_style_endpoint(self):
             pass
 
-    monkeypatch.setattr(
-        "gpustack.server.model_cache_service.Minio", CapturingMinio
-    )
+    monkeypatch.setattr("gpustack.server.model_cache_service.Minio", CapturingMinio)
     config = SimpleNamespace(
         worker_local_s3_host="https://minio.example.com",
         worker_local_s3_access_key="access",

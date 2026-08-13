@@ -17,13 +17,14 @@ from gpustack.schemas.model_cache import (
     ModelCacheFilesPublic,
     ModelCacheModelsPublic,
     ModelCacheTask,
-    ModelCacheTaskCreate,
+    ModelCachePreview,
     ModelCacheTaskPublic,
     ModelCacheTaskStateEnum,
     ModelCacheTasksPublic,
     ModelCacheTaskUpdate,
 )
 from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
+from gpustack.schemas.models import SourceEnum
 from gpustack.schemas.workers import Worker, WorkerStateEnum
 from gpustack.server.deps import (
     CurrentAdminUserDep,
@@ -34,9 +35,8 @@ from gpustack.server.deps import (
 from gpustack.server.model_cache_service import (
     ModelCacheConfigurationError,
     ModelCacheService,
-    model_object_prefix,
-    validate_model_id,
 )
+from gpustack.utils.model_cache import model_object_prefix, validate_model_id
 
 
 router = APIRouter()
@@ -152,15 +152,20 @@ async def create_model_cache_task(
     session: SessionDep,
     current_user: CurrentAdminUserDep,
     model_file_id: int,
-    create: ModelCacheTaskCreate,
 ):
-    try:
-        validate_model_id(create.model_id)
-    except ValueError as exc:
-        raise ConflictException(message="invalid_model_id") from exc
     model_file = await ModelFile.one_by_id(session, model_file_id)
     if model_file is None:
         raise NotFoundException(message="model_file_not_found")
+    if (
+        model_file.source != SourceEnum.MODEL_SCOPE
+        or not model_file.model_scope_model_id
+    ):
+        raise ConflictException(message="model_cache_requires_modelscope_source")
+    model_id = model_file.model_scope_model_id
+    try:
+        validate_model_id(model_id)
+    except ValueError as exc:
+        raise ConflictException(message="invalid_model_id") from exc
     if (
         model_file.state != ModelFileStateEnum.READY
         or model_file.worker_id is None
@@ -172,13 +177,13 @@ async def create_model_cache_task(
         raise ConflictException(message="model_file_worker_not_ready")
 
     service = _service(request)
-    if service.exists(create.model_id):
+    if service.exists(model_id):
         raise AlreadyExistsException(message="model_cache_already_exists")
     active = (
         await session.exec(
             select(ModelCacheTask).where(
                 and_(
-                    ModelCacheTask.model_id == create.model_id,
+                    ModelCacheTask.model_id == model_id,
                     ModelCacheTask.state.in_(
                         [
                             ModelCacheTaskStateEnum.PENDING,
@@ -195,15 +200,41 @@ async def create_model_cache_task(
     config = request.app.state.server_config
     target_path = model_object_prefix(
         urlparse(config.worker_local_s3_modelscope_prefix).path.strip("/"),
-        create.model_id,
+        model_id,
     )
     task = ModelCacheTask(
         model_file_id=model_file.id,
         worker_id=model_file.worker_id,
-        model_id=create.model_id,
+        model_id=model_id,
         target_path=target_path,
         source_paths=list(model_file.resolved_paths),
         total_size=model_file.size or 0,
         created_by_user_id=current_user.id,
     )
     return await ModelCacheTask.create(session, task)
+
+
+async def get_model_cache_preview(
+    request: Request,
+    session: SessionDep,
+    model_file_id: int,
+):
+    model_file = await ModelFile.one_by_id(session, model_file_id)
+    if model_file is None:
+        raise NotFoundException(message="model_file_not_found")
+    if (
+        model_file.source != SourceEnum.MODEL_SCOPE
+        or not model_file.model_scope_model_id
+    ):
+        raise ConflictException(message="model_cache_requires_modelscope_source")
+    try:
+        validate_model_id(model_file.model_scope_model_id)
+    except ValueError as exc:
+        raise ConflictException(message="invalid_model_id") from exc
+    service = _service(request)
+    return ModelCachePreview(
+        model_id=model_file.model_scope_model_id,
+        s3_path=service.s3_path(model_file.model_scope_model_id),
+        file_count=len(model_file.resolved_paths),
+        total_size=model_file.size or 0,
+    )

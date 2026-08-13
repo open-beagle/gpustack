@@ -33,6 +33,7 @@ from gpustack.utils.hub import (
     match_model_scope_file_paths,
     FileEntry,
 )
+from gpustack.utils.model_cache import model_object_prefix
 from gpustack.worker.downloader_s3 import S3Downloader
 from gpustack.config.config import Config
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity, decode_path
@@ -712,11 +713,9 @@ class ModelScopeDownloader:
 
     @classmethod
     def _local_modelscope_s3_path(cls, model_id: str, cfg: Config) -> str:
-        organization, model_name = model_id.split("/", 1)
-        return (
-            f"{cfg.worker_local_s3_modelscope_prefix.rstrip('/')}/"
-            f"model_{organization}/{model_name}"
-        )
+        return model_object_prefix(
+            cfg.worker_local_s3_modelscope_prefix, model_id
+        ).rstrip("/")
 
     @classmethod
     def _local_modelscope_model_strip_prefix(cls, s3_path: str) -> str:

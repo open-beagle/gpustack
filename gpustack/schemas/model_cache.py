@@ -41,8 +41,11 @@ class ModelCacheTask(SQLModel, BaseModelMixin, table=True):
     finished_at: Optional[datetime] = None
 
 
-class ModelCacheTaskCreate(SQLModel):
+class ModelCachePreview(SQLModel):
     model_id: str
+    s3_path: str
+    file_count: int
+    total_size: int
 
 
 class ModelCacheTaskUpdate(SQLModel):

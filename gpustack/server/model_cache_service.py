@@ -12,30 +12,24 @@ from gpustack.schemas.model_cache import (
     ModelCacheModelPublic,
     ModelCacheModelsPublic,
 )
+from gpustack.utils.model_cache import (
+    model_object_prefix,
+    safe_path_part,
+    validate_model_id,
+)
 
 
 class ModelCacheConfigurationError(ValueError):
     pass
 
 
-def validate_model_id(model_id: str) -> tuple[str, str]:
-    parts = model_id.split("/")
-    if len(parts) != 2 or any(not _safe_path_part(part) for part in parts):
-        raise ValueError("invalid_model_id")
-    return parts[0], parts[1]
-
-
-def model_object_prefix(root_prefix: str, model_id: str) -> str:
-    organization, model_name = validate_model_id(model_id)
-    root = root_prefix.strip("/")
-    path = f"model_{organization}/{model_name}/"
-    return f"{root}/{path}" if root else path
-
-
 class ModelCacheService:
     def __init__(self, config):
         self._config = config
         self._client, self._bucket, self._prefix = _client_from_config(config)
+
+    def s3_path(self, model_id: str) -> str:
+        return f"s3://{self._bucket}/{model_object_prefix(self._prefix, model_id)}"
 
     def list_models(self, search: str | None = None, organization: str | None = None):
         grouped = defaultdict(lambda: {"count": 0, "size": 0, "updated_at": None})
@@ -45,11 +39,11 @@ class ModelCacheService:
         ):
             relative = item.object_name[len(prefix) :]
             parts = relative.split("/", 2)
-            if len(parts) < 3 or not parts[0].startswith("model_"):
+            if len(parts) < 3:
                 continue
-            org = parts[0][len("model_") :]
+            org = parts[0]
             name = parts[1]
-            if not _safe_path_part(org) or not _safe_path_part(name) or not parts[2]:
+            if not safe_path_part(org) or not safe_path_part(name) or not parts[2]:
                 continue
             model_id = f"{org}/{name}"
             if organization and org != organization:
@@ -75,7 +69,7 @@ class ModelCacheService:
             items.append(
                 ModelCacheModelPublic(
                     model_id=model_id,
-                    s3_path=f"s3://{self._bucket}/{model_object_prefix(self._prefix, model_id)}",
+                    s3_path=self.s3_path(model_id),
                     file_count=value["count"],
                     total_size=value["size"],
                     updated_at=updated_at,
@@ -167,13 +161,3 @@ def _client_from_config(config):
     else:
         client.disable_virtual_style_endpoint()
     return client, bucket, prefix
-
-
-def _safe_path_part(value: str) -> bool:
-    return (
-        bool(value)
-        and value not in {".", ".."}
-        and "/" not in value
-        and "\\" not in value
-        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
-    )

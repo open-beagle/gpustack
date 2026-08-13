@@ -25,7 +25,7 @@ from gpustack.utils import platform
 from gpustack.utils.platform import DeviceTypeEnum, device_type_from_vendor
 
 _config = None
-DEFAULT_LOCAL_S3_MODELSCOPE_PREFIX = "s3://bd-wind/datamodel"
+DEFAULT_LOCAL_S3_MODELSCOPE_PREFIX = "s3://bd-wind/cache/modelscope"
 
 
 class Config(BaseSettings):

@@ -18,9 +18,9 @@ from gpustack.schemas.model_files import (
     ModelFileUpdate,
     ModelFilesPublic,
 )
-from gpustack.schemas.model_cache import ModelCacheTaskCreate, ModelCacheTaskPublic
+from gpustack.schemas.model_cache import ModelCachePreview, ModelCacheTaskPublic
 from gpustack.server.deps import CurrentAdminUserDep
-from gpustack.routes.model_cache import create_model_cache_task
+from gpustack.routes.model_cache import create_model_cache_task, get_model_cache_preview
 
 router = APIRouter()
 
@@ -31,9 +31,17 @@ async def cache_model_file(
     session: SessionDep,
     current_user: CurrentAdminUserDep,
     id: int,
-    create: ModelCacheTaskCreate,
 ):
-    return await create_model_cache_task(request, session, current_user, id, create)
+    return await create_model_cache_task(request, session, current_user, id)
+
+
+@router.get("/{id}/cache", response_model=ModelCachePreview)
+async def preview_model_file_cache(
+    request: Request,
+    session: SessionDep,
+    id: int,
+):
+    return await get_model_cache_preview(request, session, id)
 
 
 @router.get("", response_model=ModelFilesPublic)

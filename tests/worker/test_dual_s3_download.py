@@ -34,7 +34,20 @@ def test_local_s3_host_enables_default_modelscope_prefix(tmp_path):
         worker_local_s3_secret_key="secret",
     )
 
-    assert cfg.worker_local_s3_modelscope_prefix == "s3://bd-wind/datamodel"
+    assert cfg.worker_local_s3_modelscope_prefix == "s3://bd-wind/cache/modelscope"
+
+
+def test_modelscope_local_s3_path_includes_source_namespace(tmp_path):
+    cfg = Config(
+        data_dir=str(tmp_path),
+        worker_local_s3_host="local-minio.example.com",
+        worker_local_s3_access_key="access",
+        worker_local_s3_secret_key="secret",
+    )
+
+    assert ModelScopeDownloader._local_modelscope_s3_path(
+        "unsloth/Qwen3.6-27B-MTP-GGUF", cfg
+    ) == ("s3://bd-wind/cache/modelscope/" "unsloth/Qwen3.6-27B-MTP-GGUF")
 
 
 def test_center_s3_legacy_uri_maps_to_beagle_cache_path():
