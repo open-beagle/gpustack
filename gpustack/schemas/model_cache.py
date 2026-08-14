@@ -21,7 +21,9 @@ class ModelCacheTask(SQLModel, BaseModelMixin, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     model_file_id: int = Field(
-        sa_column=Column(ForeignKey("model_files.id", ondelete="RESTRICT"), nullable=False)
+        sa_column=Column(
+            ForeignKey("model_files.id", ondelete="CASCADE"), nullable=False
+        )
     )
     worker_id: int = Field(
         sa_column=Column(ForeignKey("workers.id", ondelete="RESTRICT"), nullable=False)
@@ -33,7 +35,9 @@ class ModelCacheTask(SQLModel, BaseModelMixin, table=True):
     progress: float = 0
     uploaded_size: int = Field(default=0, sa_column=Column(BigInteger, nullable=False))
     total_size: int = Field(default=0, sa_column=Column(BigInteger, nullable=False))
-    error_message: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    error_message: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
     created_by_user_id: Optional[int] = Field(
         default=None,
         sa_column=Column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True),
