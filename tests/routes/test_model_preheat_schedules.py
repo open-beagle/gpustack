@@ -41,11 +41,11 @@ def _load_schedule_migrations(prefix):
     return (
         load(
             f"{prefix}_initial",
-            "2026_08_12_1000-e1f2a3b4c5d6_add_model_preheat_schedules.py",
+            "2026_08_12_1000-11caac4ba6d4_add_model_preheat_schedules.py",
         ),
         load(
             f"{prefix}_successor",
-            "2026_08_12_1800-f2a3b4c5d6e7_fix_model_preheat_schedule_ddl.py",
+            "2026_08_12_1800-b0307846729c_fix_model_preheat_schedule_ddl.py",
         ),
     )
 
@@ -301,10 +301,10 @@ def test_schedule_schema_and_migration_are_portable():
 
     migration = Path(
         "gpustack/migrations/versions/"
-        "2026_08_12_1000-e1f2a3b4c5d6_add_model_preheat_schedules.py"
+        "2026_08_12_1000-11caac4ba6d4_add_model_preheat_schedules.py"
     )
     source = migration.read_text(encoding="utf-8")
-    assert 'down_revision: Union[str, None] = "d0e1f2a3b4c5"' in source
+    assert 'down_revision: Union[str, None] = "f2a3b4c5d6e7"' in source
     assert "postgresql_where" not in source
     assert "advisory" not in source.lower()
     assert "CREATE UNIQUE INDEX" not in source
@@ -349,11 +349,11 @@ def test_schedule_migration_executes_on_sqlite_and_compiles_for_server_dialects(
 ):
     old_migration_path = Path(
         "gpustack/migrations/versions/"
-        "2026_08_12_1000-e1f2a3b4c5d6_add_model_preheat_schedules.py"
+        "2026_08_12_1000-11caac4ba6d4_add_model_preheat_schedules.py"
     )
     successor_path = Path(
         "gpustack/migrations/versions/"
-        "2026_08_12_1800-f2a3b4c5d6e7_fix_model_preheat_schedule_ddl.py"
+        "2026_08_12_1800-b0307846729c_fix_model_preheat_schedule_ddl.py"
     )
 
     def load(name, path):
@@ -364,7 +364,7 @@ def test_schedule_migration_executes_on_sqlite_and_compiles_for_server_dialects(
 
     old_migration = load("task13_old_migration", old_migration_path)
     successor = load("task13_successor_migration", successor_path)
-    assert successor.down_revision == "e1f2a3b4c5d6"
+    assert successor.down_revision == "11caac4ba6d4"
 
     engine = create_engine(f"sqlite:///{tmp_path / 'migration.db'}")
     with engine.connect() as connection:
@@ -453,11 +453,11 @@ def test_schedule_migration_preserves_sqlite_task_foreign_key_dependents(tmp_pat
 
     initial = load(
         "task13_fk_initial",
-        "2026_08_12_1000-e1f2a3b4c5d6_add_model_preheat_schedules.py",
+        "2026_08_12_1000-11caac4ba6d4_add_model_preheat_schedules.py",
     )
     successor = load(
         "task13_fk_successor",
-        "2026_08_12_1800-f2a3b4c5d6e7_fix_model_preheat_schedule_ddl.py",
+        "2026_08_12_1800-b0307846729c_fix_model_preheat_schedule_ddl.py",
     )
     engine = create_engine(f"sqlite:///{tmp_path / 'migration-fk-data.db'}")
 
@@ -566,7 +566,7 @@ def test_schedule_migration_restores_sqlite_foreign_keys_when_batch_fails(
 ):
     path = Path(
         "gpustack/migrations/versions/"
-        "2026_08_12_1800-f2a3b4c5d6e7_fix_model_preheat_schedule_ddl.py"
+        "2026_08_12_1800-b0307846729c_fix_model_preheat_schedule_ddl.py"
     )
     spec = importlib.util.spec_from_file_location("task13_fk_failure", path)
     successor = importlib.util.module_from_spec(spec)
@@ -823,7 +823,7 @@ def test_schedule_migration_joins_existing_sqlite_transaction_with_foreign_keys_
 def test_sqlite_offline_migration_preserves_existing_task_defaults(tmp_path):
     successor_path = Path(
         "gpustack/migrations/versions/"
-        "2026_08_12_1800-f2a3b4c5d6e7_fix_model_preheat_schedule_ddl.py"
+        "2026_08_12_1800-b0307846729c_fix_model_preheat_schedule_ddl.py"
     )
     spec = importlib.util.spec_from_file_location(
         "task13_offline_defaults", successor_path

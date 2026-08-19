@@ -1,7 +1,7 @@
 """修复模型预热调度增量 DDL
 
-Revision ID: f2a3b4c5d6e7
-Revises: e1f2a3b4c5d6
+Revision ID: b0307846729c
+Revises: 11caac4ba6d4
 Create Date: 2026-08-12 18:00:00.000000
 """
 
@@ -14,8 +14,8 @@ import sqlalchemy as sa
 from gpustack.schemas.common import UTCDateTime
 
 
-revision: str = "f2a3b4c5d6e7"
-down_revision: Union[str, None] = "e1f2a3b4c5d6"
+revision: str = "b0307846729c"
+down_revision: Union[str, None] = "11caac4ba6d4"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

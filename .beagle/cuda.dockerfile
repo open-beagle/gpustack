@@ -11,6 +11,7 @@ RUN python3 -m pip install --no-cache-dir --default-timeout=12000 \
     pip3 install --no-cache-dir --no-deps --force-reinstall "${WHEEL_PACKAGE}" && \
     python3 -m pip check && \
     python3 -c "import modelscope_hub" && \
+    python3 -m gpustack.migrations.validate && \
     rm -f /tmp/*.whl /tmp/requirements-vllm.txt
 
 ENV GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin \

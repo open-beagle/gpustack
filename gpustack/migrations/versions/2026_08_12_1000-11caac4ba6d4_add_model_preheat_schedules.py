@@ -1,7 +1,7 @@
 """add model preheat schedules
 
-Revision ID: e1f2a3b4c5d6
-Revises: d0e1f2a3b4c5
+Revision ID: 11caac4ba6d4
+Revises: f2a3b4c5d6e7
 Create Date: 2026-08-12 10:00:00.000000
 """
 
@@ -13,8 +13,8 @@ import sqlalchemy as sa
 from gpustack.schemas.common import UTCDateTime
 
 
-revision: str = "e1f2a3b4c5d6"
-down_revision: Union[str, None] = "d0e1f2a3b4c5"
+revision: str = "11caac4ba6d4"
+down_revision: Union[str, None] = "f2a3b4c5d6e7"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
