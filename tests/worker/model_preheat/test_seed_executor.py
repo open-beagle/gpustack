@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gpustack.worker.model_preheat import local_cache
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
     TargetExecutionRequest,
@@ -296,6 +297,125 @@ def test_seed_falls_back_when_trusted_candidate_misses_an_include_pattern(tmp_pa
     assert downloads == ["org/model"]
 
 
+@pytest.mark.parametrize("patterns", [[], ["*.json"]])
+def test_seed_falls_back_for_partial_candidate_with_empty_or_glob_selection(
+    tmp_path, patterns
+):
+    trusted_root = tmp_path / "single-file"
+    trusted_root.mkdir()
+    selected = trusted_root / "config.json"
+    selected.write_bytes(b"config")
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="org/model",
+        revision="resolved-commit",
+        file_patterns=patterns,
+    )
+    request = SeedExecutionRequest(
+        **{
+            **_request(tmp_path).__dict__,
+            "identity": identity,
+            "trusted_local_candidate": TrustedLocalCandidate(
+                source="model_file",
+                root=trusted_root,
+                paths=(selected,),
+                repository_complete=False,
+            ),
+        }
+    )
+    downloads = []
+
+    def download(identity, staging, **kwargs):
+        downloads.append(identity.model_id)
+        if patterns:
+            staging.mkdir(parents=True, exist_ok=True)
+            (staging / "config.json").write_bytes(b"config")
+        else:
+            _write_model(staging)
+
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(InMemoryMinio()),
+        download_to_staging=download,
+    )
+
+    assert result["state"] == "ready"
+    assert downloads == ["org/model"]
+
+
+def test_seed_reuses_partial_candidate_for_existing_exact_paths(tmp_path):
+    trusted_root = tmp_path / "single-file"
+    selected = trusted_root / "weights" / "model.bin"
+    selected.parent.mkdir(parents=True)
+    selected.write_bytes(b"weights")
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="org/model",
+        revision="resolved-commit",
+        file_patterns=["weights/model.bin"],
+    )
+    request = SeedExecutionRequest(
+        **{
+            **_request(tmp_path).__dict__,
+            "identity": identity,
+            "trusted_local_candidate": TrustedLocalCandidate(
+                source="model_file",
+                root=trusted_root,
+                paths=(selected,),
+                repository_complete=False,
+            ),
+        }
+    )
+
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(InMemoryMinio()),
+        download_to_staging=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("精确文件候选不应回退到 Hub")
+        ),
+    )
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 0
+    assert (request.target_dir / "weights" / "model.bin").read_bytes() == b"weights"
+
+
+def test_seed_reuses_complete_repository_with_glob_selection(tmp_path):
+    trusted_root = tmp_path / "complete-repository"
+    _write_model(trusted_root)
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="org/model",
+        revision="resolved-commit",
+        file_patterns=["weights/*.bin"],
+    )
+    request = SeedExecutionRequest(
+        **{
+            **_request(tmp_path).__dict__,
+            "identity": identity,
+            "trusted_local_candidate": TrustedLocalCandidate(
+                source="model_file",
+                root=trusted_root,
+                paths=(trusted_root,),
+                repository_complete=True,
+            ),
+        }
+    )
+
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(InMemoryMinio()),
+        download_to_staging=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("完整仓库应按 glob 选择复用")
+        ),
+    )
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 0
+    assert (request.target_dir / "weights" / "model.bin").exists()
+    assert not (request.target_dir / "config.json").exists()
+
+
 def test_seed_falls_back_to_hub_when_trusted_candidate_has_no_selected_files(tmp_path):
     trusted_root = tmp_path / "unrelated-archive"
     trusted_root.mkdir()
@@ -533,6 +653,129 @@ def test_s3_download_stream_interruption_keeps_staging_for_next_attempt(tmp_path
         ).state.value
         == "valid"
     )
+
+
+def test_target_cancellation_during_final_hash_does_not_publish(tmp_path, monkeypatch):
+    source_request = _request(tmp_path / "source")
+    client = ModelPreheatS3Client(InMemoryMinio())
+
+    def download_large_model(identity, staging, **kwargs):
+        _write_model(staging)
+        (staging / "weights" / "model.bin").write_bytes(b"x" * (3 * 1024 * 1024))
+
+    assert (
+        execute_seed_preheat(
+            source_request,
+            client,
+            download_to_staging=download_large_model,
+        )["state"]
+        == "ready"
+    )
+
+    target_request = TargetExecutionRequest(
+        **{
+            **source_request.__dict__,
+            "cache_dir": tmp_path / "target-cache",
+            "target_dir": tmp_path / "target-cache" / "model",
+            "task_id": 9,
+        }
+    )
+    _write_model(target_request.target_dir)
+    (target_request.target_dir / "weights" / "model.bin").write_bytes(b"stale")
+    (target_request.target_dir / "tokenizer.json").write_bytes(b"tokenizer")
+    original_merge = local_cache._merge_unselected_files
+    merge_finished = False
+    final_checks = 0
+
+    def track_merge(*args, **kwargs):
+        nonlocal merge_finished
+        result = original_merge(*args, **kwargs)
+        merge_finished = True
+        return result
+
+    def cancel_during_final_hash():
+        nonlocal final_checks
+        if merge_finished:
+            final_checks += 1
+        return final_checks >= 8
+
+    monkeypatch.setattr(local_cache, "_merge_unselected_files", track_merge)
+
+    result = execute_target_preheat(
+        target_request,
+        client,
+        cancel_check=cancel_during_final_hash,
+    )
+
+    assert result["state"] == "error"
+    assert result["error_code"] == "canceled"
+    assert final_checks >= 8
+    assert (
+        target_request.target_dir / "weights" / "model.bin"
+    ).read_bytes() == b"stale"
+    assert (target_request.target_dir / "tokenizer.json").read_bytes() == b"tokenizer"
+    assert not list(target_request.target_dir.parent.glob(".model.preheat-backup-*"))
+
+
+def test_target_cancellation_after_extra_verification_does_not_replace(
+    tmp_path, monkeypatch
+):
+    source_request = _request(tmp_path / "source")
+    client = ModelPreheatS3Client(InMemoryMinio())
+    assert (
+        execute_seed_preheat(
+            source_request,
+            client,
+            download_to_staging=lambda identity, staging, **kwargs: _write_model(
+                staging
+            ),
+        )["state"]
+        == "ready"
+    )
+
+    target_request = TargetExecutionRequest(
+        **{
+            **source_request.__dict__,
+            "cache_dir": tmp_path / "target-cache",
+            "target_dir": tmp_path / "target-cache" / "model",
+            "task_id": 9,
+        }
+    )
+    _write_model(target_request.target_dir)
+    (target_request.target_dir / "weights" / "model.bin").write_bytes(b"stale")
+    (target_request.target_dir / "tokenizer.json").write_bytes(b"tokenizer")
+    original_verify = local_cache._verify_directory
+    canceled = False
+
+    def cancel_after_merged_verification(root, manifest, **kwargs):
+        nonlocal canceled
+        result = original_verify(root, manifest, **kwargs)
+        if Path(
+            root
+        ) == target_request.cache_dir / ".preheat" / "9" / "1" and kwargs.get(
+            "allow_extra"
+        ):
+            canceled = True
+        return result
+
+    monkeypatch.setattr(
+        local_cache, "_verify_directory", cancel_after_merged_verification
+    )
+
+    result = execute_target_preheat(
+        target_request, client, cancel_check=lambda: canceled
+    )
+
+    assert canceled is True
+    assert result["state"] == "error"
+    assert result["error_code"] == "canceled"
+    assert (
+        target_request.target_dir / "weights" / "model.bin"
+    ).read_bytes() == b"stale"
+    assert (target_request.target_dir / "tokenizer.json").read_bytes() == b"tokenizer"
+    staging = target_request.cache_dir / ".preheat" / "9" / "1"
+    assert not (staging / "tokenizer.json").exists()
+    assert not list(target_request.target_dir.parent.glob(".model.preheat-backup-*"))
 
 
 def test_seed_reports_s3_conflict_when_cancel_cleanup_never_succeeds(tmp_path):

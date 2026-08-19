@@ -638,8 +638,9 @@ def test_execution_payload_only_contains_claimed_workers_trusted_paths(tmp_path)
             own = ModelFile(
                 source=SourceEnum.MODEL_SCOPE,
                 model_scope_model_id="Qwen/Test",
+                model_scope_file_path="weights/model.bin",
                 worker_id=worker_id,
-                resolved_paths=["/worker-a/models/Qwen/Test"],
+                resolved_paths=["/worker-a/models/Qwen/Test/weights/model.bin"],
                 state=ModelFileStateEnum.READY,
             )
             other_worker = Worker(
@@ -681,7 +682,8 @@ def test_execution_payload_only_contains_claimed_workers_trusted_paths(tmp_path)
     assert payload.json()["trusted_local_candidate"] == {
         "source": "model_file",
         "root": "/worker-a/models/Qwen/Test",
-        "paths": ["/worker-a/models/Qwen/Test"],
+        "paths": ["/worker-a/models/Qwen/Test/weights/model.bin"],
+        "repository_complete": False,
     }
     assert "/worker-b/secret" not in payload.text
     asyncio.run(engine.dispose())
@@ -756,6 +758,7 @@ def test_distribution_execution_payload_uses_source_task_and_claimed_worker_cand
         "source": "model_file",
         "root": "/worker-a/models/Qwen/Test",
         "paths": ["/worker-a/models/Qwen/Test"],
+        "repository_complete": True,
     }
     asyncio.run(engine.dispose())
 

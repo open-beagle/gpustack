@@ -593,6 +593,7 @@ async def get_model_preheat_worker_task_execution_payload(
                 source=candidate.source,
                 root=candidate.root,
                 paths=list(candidate.paths),
+                repository_complete=candidate.repository_complete,
             )
     return ModelPreheatWorkerTaskExecutionPayload(
         worker_task_id=worker_task.id,

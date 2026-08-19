@@ -91,6 +91,7 @@ def test_probe_finds_ready_model_file_on_any_of_ten_workers(tmp_path):
     assert results["worker-7"].state == "candidate"
     assert results["worker-7"].source == "model_file"
     assert results["worker-7"].paths == ("/models/Qwen/Test",)
+    assert results["worker-7"].repository_complete is True
     assert sum(result.state == "candidate" for result in results.values()) == 1
 
 
@@ -135,7 +136,39 @@ def test_archive_candidate_is_worker_scoped_and_preserves_source_paths(tmp_path)
     own, other = asyncio.run(run())
     assert own.source == "model_archive"
     assert own.paths == ("/archive-source/Qwen/Test",)
+    assert own.repository_complete is True
     assert other is None
+
+
+def test_single_file_candidate_is_not_repository_complete(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        async with AsyncSession(engine) as session:
+            task, workers = await _seed(session)
+            session.add(
+                ModelFile(
+                    source=SourceEnum.MODEL_SCOPE,
+                    model_scope_model_id="Qwen/Test",
+                    model_scope_file_path="weights/model.bin",
+                    worker_id=workers[0].id,
+                    resolved_paths=["/models/Qwen/Test/weights/model.bin"],
+                    state=ModelFileStateEnum.READY,
+                )
+            )
+            task_id = task.id
+            worker_id = workers[0].id
+            await session.commit()
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatTask, task_id)
+            candidate = await trusted_local_candidate_for_worker(
+                session, task, "worker-0", worker_id
+            )
+        await engine.dispose()
+        return candidate
+
+    candidate = asyncio.run(run())
+    assert candidate.repository_complete is False
+    assert candidate.root == "/models/Qwen/Test"
 
 
 def test_probe_ignores_unsupported_ready_model_sources(tmp_path):

@@ -10,10 +10,9 @@ import time
 import asyncio
 import threading
 from dataclasses import dataclass
+from glob import has_magic
 from pathlib import Path
 from urllib.parse import urlparse
-
-from huggingface_hub.utils import filter_repo_objects
 
 from gpustack.worker.model_preheat.identity import (
     ModelPreheatIdentity,
@@ -43,6 +42,7 @@ class TrustedLocalCandidate:
     source: str
     root: Path
     paths: tuple[Path, ...]
+    repository_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -327,6 +327,7 @@ def execute_target_preheat(
                     trusted_staging,
                     manifest,
                     replace_conflicting=True,
+                    cancel_callback=lambda: _raise_if_cancelled(cancel_check),
                 )
                 if local_result.state == LocalCacheState.VALID:
                     return _ready_result(
@@ -420,6 +421,7 @@ def execute_target_preheat(
             staging,
             manifest,
             replace_conflicting=True,
+            cancel_callback=lambda: _raise_if_cancelled(cancel_check),
         )
         if local_result.state != LocalCacheState.VALID:
             return _error_result(
@@ -600,20 +602,25 @@ def _build_trusted_candidate_manifest(
             cancel_callback=lambda: _raise_if_cancelled(cancel_check),
             progress_callback=progress_callback,
         )
-        if not _trusted_selection_complete(manifest, request.identity):
+        if not _trusted_selection_complete(
+            manifest, request.identity, request.trusted_local_candidate
+        ):
             return None
         return manifest
     except (OSError, ValueError):
         return None
 
 
-def _trusted_selection_complete(manifest, identity) -> bool:
+def _trusted_selection_complete(manifest, identity, candidate) -> bool:
     selected_paths = [decode_path(file.path) for file in manifest.files]
-    for encoded_pattern in identity.file_patterns:
-        pattern = decode_path(encoded_pattern)
-        if not list(filter_repo_objects(selected_paths, allow_patterns=[pattern])):
-            return False
-    return bool(selected_paths)
+    if not selected_paths:
+        return False
+    if candidate is not None and candidate.repository_complete:
+        return True
+    patterns = [decode_path(pattern) for pattern in identity.file_patterns]
+    if not patterns or any(has_magic(pattern) for pattern in patterns):
+        return False
+    return all(pattern in selected_paths for pattern in patterns)
 
 
 def _retain_manifest_files(staging: Path, manifest, *, cancel_check=None) -> None:
@@ -881,6 +888,7 @@ async def _execute_payload(
                 paths=tuple(
                     Path(path) for path in payload.trusted_local_candidate.paths
                 ),
+                repository_complete=payload.trusted_local_candidate.repository_complete,
             )
             if getattr(payload, "trusted_local_candidate", None) is not None
             else None

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -69,8 +70,8 @@ def create_staging_dir(
     task_component = _safe_component(task_id)
     attempt_component = _safe_component(attempt)
     staging = cache_root / ".preheat" / task_component / attempt_component
-    if staging.exists():
-        if not staging.is_dir():
+    if os.path.lexists(staging):
+        if not _is_real_directory(staging):
             raise LocalCacheError("local_cache_staging_conflict")
         _require_descendant(cache_root / ".preheat", staging.resolve())
         _require_same_device(cache_root, staging)
@@ -153,15 +154,21 @@ def inspect_local_cache(
     target_dir: str | Path,
     cache_key: str,
     reference_manifest: ModelPreheatManifest | None = None,
+    *,
+    cancel_callback=None,
 ) -> LocalCacheInspection:
     target = Path(target_dir)
     try:
         _require_descendant(Path(cache_dir).resolve(), target.resolve(strict=False))
     except LocalCacheError as exc:
         return LocalCacheInspection(LocalCacheState.ERROR, error_code=str(exc))
-    if not target.exists():
+    if not os.path.lexists(target):
         return LocalCacheInspection(LocalCacheState.MISSING)
-    if not target.is_dir():
+    if not _is_real_directory(target):
+        if target.is_symlink() or not target.is_file():
+            return LocalCacheInspection(
+                LocalCacheState.ERROR, error_code="local_cache_scan_failed"
+            )
         return LocalCacheInspection(
             LocalCacheState.CONFLICT, error_code="local_cache_conflict"
         )
@@ -186,7 +193,12 @@ def inspect_local_cache(
         )
 
     try:
-        verification = _verify_directory(target, trusted_manifest)
+        verification = _verify_directory(
+            target,
+            trusted_manifest,
+            allow_extra=True,
+            cancel_callback=cancel_callback,
+        )
     except (LocalCacheError, OSError):
         return LocalCacheInspection(
             LocalCacheState.ERROR, error_code="local_cache_scan_failed"
@@ -213,6 +225,7 @@ def publish_staging(
     manifest: ModelPreheatManifest,
     *,
     replace_conflicting: bool = False,
+    cancel_callback=None,
 ) -> LocalCachePublishResult:
     target = Path(target_dir)
     staging = Path(staging_dir)
@@ -238,21 +251,26 @@ def publish_staging(
 
     try:
         with SoftFileLock(str(model_lock_path(cache_root, target)), timeout=0):
-            if target.exists():
+            if os.path.lexists(target):
                 inspection = inspect_local_cache(
-                    cache_root, target, cache_key, manifest
+                    cache_root,
+                    target,
+                    cache_key,
+                    manifest,
+                    cancel_callback=cancel_callback,
                 )
                 if inspection.state != LocalCacheState.VALID:
-                    if (
-                        replace_conflicting
-                        and inspection.state == LocalCacheState.CONFLICT
-                    ):
+                    if replace_conflicting and inspection.state in {
+                        LocalCacheState.CONFLICT,
+                        LocalCacheState.MISSING,
+                    }:
                         return _replace_conflicting_target(
                             cache_root,
                             target,
                             cache_key,
                             staging,
                             manifest,
+                            cancel_callback,
                         )
                     if inspection.state == LocalCacheState.ERROR:
                         return LocalCachePublishResult(
@@ -268,6 +286,7 @@ def publish_staging(
                         "local_cache_conflict",
                     )
                 if staging.exists():
+                    _run_cancel_callback(cancel_callback)
                     try:
                         shutil.rmtree(staging)
                     except OSError:
@@ -277,13 +296,14 @@ def publish_staging(
                             target,
                             "local_cache_staging_cleanup_failed",
                         )
+                _run_cancel_callback(cancel_callback)
                 try:
                     write_trusted_manifest(cache_root, cache_key, manifest)
                 except LocalCacheError as exc:
                     return _manifest_publish_error(target, str(exc))
                 return LocalCachePublishResult(LocalCacheState.VALID, False, target)
 
-            if not staging.is_dir():
+            if not _is_real_directory(staging):
                 return LocalCachePublishResult(
                     LocalCacheState.ERROR,
                     False,
@@ -291,7 +311,9 @@ def publish_staging(
                     "local_cache_staging_missing",
                 )
             try:
-                staging_verification = _verify_directory(staging, manifest)
+                staging_verification = _verify_directory(
+                    staging, manifest, cancel_callback=cancel_callback
+                )
             except (LocalCacheError, OSError):
                 staging_verification = LocalCacheInspection(
                     LocalCacheState.ERROR, error_code="local_cache_scan_failed"
@@ -308,6 +330,7 @@ def publish_staging(
             except LocalCacheError as exc:
                 return _manifest_publish_error(target, str(exc))
             try:
+                _run_cancel_callback(cancel_callback)
                 os.replace(staging, target)
             except OSError:
                 return LocalCachePublishResult(
@@ -316,6 +339,19 @@ def publish_staging(
                     target,
                     "local_cache_publish_failed",
                 )
+            try:
+                _run_cancel_callback(cancel_callback)
+            except Exception:
+                try:
+                    os.replace(target, staging)
+                except OSError:
+                    return LocalCachePublishResult(
+                        LocalCacheState.ERROR,
+                        False,
+                        target,
+                        "local_cache_publish_rollback_failed",
+                    )
+                raise
             try:
                 write_trusted_manifest(cache_root, cache_key, manifest)
             except LocalCacheError as exc:
@@ -343,8 +379,9 @@ def _replace_conflicting_target(
     cache_key: str,
     staging: Path,
     manifest: ModelPreheatManifest,
+    cancel_callback,
 ) -> LocalCachePublishResult:
-    if not staging.is_dir():
+    if not _is_real_directory(staging):
         return LocalCachePublishResult(
             LocalCacheState.ERROR,
             False,
@@ -352,7 +389,12 @@ def _replace_conflicting_target(
             "local_cache_staging_missing",
         )
     try:
-        verification = _verify_directory(staging, manifest)
+        verification = _verify_directory(
+            staging,
+            manifest,
+            allow_extra=False,
+            cancel_callback=cancel_callback,
+        )
     except (LocalCacheError, OSError):
         verification = LocalCacheInspection(
             LocalCacheState.ERROR, error_code="local_cache_scan_failed"
@@ -365,6 +407,65 @@ def _replace_conflicting_target(
             "local_cache_staging_invalid",
         )
 
+    try:
+        source_snapshot = _scan_real_directory(
+            Path(os.path.abspath(target)), cancel_callback=cancel_callback
+        )
+        merged = _merge_unselected_files(
+            target,
+            staging,
+            manifest,
+            cancel_callback=cancel_callback,
+        )
+    except LocalCacheError as exc:
+        return LocalCachePublishResult(
+            LocalCacheState.ERROR,
+            False,
+            target,
+            str(exc),
+        )
+    try:
+        merged_verification = _verify_directory(
+            staging,
+            manifest,
+            allow_extra=True,
+            cancel_callback=cancel_callback,
+        )
+    except (LocalCacheError, OSError):
+        merged_verification = LocalCacheInspection(
+            LocalCacheState.ERROR, error_code="local_cache_scan_failed"
+        )
+    except Exception:
+        _cleanup_merged_files(staging, *merged)
+        raise
+    if merged_verification.state != LocalCacheState.VALID:
+        _cleanup_merged_files(staging, *merged)
+        return LocalCachePublishResult(
+            LocalCacheState.ERROR,
+            False,
+            target,
+            "local_cache_staging_invalid",
+        )
+
+    try:
+        _run_cancel_callback(cancel_callback)
+        current_snapshot = _scan_real_directory(
+            Path(os.path.abspath(target)), cancel_callback=cancel_callback
+        )
+        if not _tree_snapshots_match(source_snapshot, current_snapshot):
+            raise LocalCacheError("local_cache_extra_source_changed")
+    except LocalCacheError as exc:
+        _cleanup_merged_files(staging, *merged)
+        return LocalCachePublishResult(
+            LocalCacheState.ERROR,
+            False,
+            target,
+            str(exc),
+        )
+    except Exception:
+        _cleanup_merged_files(staging, *merged)
+        raise
+
     backup = target.with_name(f".{target.name}.preheat-backup-{uuid4().hex}")
     target_replaced = False
     try:
@@ -374,6 +475,7 @@ def _replace_conflicting_target(
             target_replaced = True
         except OSError:
             os.replace(backup, target)
+            _cleanup_merged_files(staging, *merged)
             raise
         try:
             _overwrite_trusted_manifest(cache_root, cache_key, manifest)
@@ -382,6 +484,7 @@ def _replace_conflicting_target(
                 os.replace(target, staging)
                 target_replaced = False
                 os.replace(backup, target)
+                _cleanup_merged_files(staging, *merged)
             except OSError:
                 return LocalCachePublishResult(
                     LocalCacheState.ERROR,
@@ -396,6 +499,7 @@ def _replace_conflicting_target(
         if not target_replaced and backup.exists() and not target.exists():
             try:
                 os.replace(backup, target)
+                _cleanup_merged_files(staging, *merged)
             except OSError:
                 return LocalCachePublishResult(
                     LocalCacheState.ERROR,
@@ -403,12 +507,156 @@ def _replace_conflicting_target(
                     target,
                     "local_cache_publish_rollback_failed",
                 )
+        if staging.exists():
+            _cleanup_merged_files(staging, *merged)
         return LocalCachePublishResult(
             LocalCacheState.ERROR,
             False,
             target,
             "local_cache_publish_failed",
         )
+
+
+def _merge_unselected_files(
+    source_dir: Path,
+    staging_dir: Path,
+    manifest: ModelPreheatManifest,
+    *,
+    cancel_callback=None,
+):
+    source_root = Path(os.path.abspath(source_dir))
+    staging_root = Path(os.path.abspath(staging_dir))
+    if not _is_real_directory(source_root) or not _is_real_directory(staging_root):
+        raise LocalCacheError("local_cache_unsafe_extra_file")
+    expected_paths = {decode_path(file.path) for file in manifest.files}
+    directory_stats = {source_root: source_root.lstat()}
+    extra_files = []
+
+    for path in source_root.rglob("*"):
+        _run_cancel_callback(cancel_callback)
+        source_stat = path.lstat()
+        if stat.S_ISLNK(source_stat.st_mode):
+            raise LocalCacheError("local_cache_unsafe_extra_file")
+        resolved = path.resolve(strict=True)
+        _require_descendant(source_root, resolved)
+        if stat.S_ISDIR(source_stat.st_mode):
+            directory_stats[resolved] = source_stat
+            continue
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise LocalCacheError("local_cache_unsafe_extra_file")
+        relative = resolved.relative_to(source_root).as_posix()
+        if relative not in expected_paths:
+            extra_files.append((relative, resolved, source_stat))
+
+    copied_files = []
+    created_directories = []
+    try:
+        for relative, source, source_stat in sorted(extra_files):
+            _run_cancel_callback(cancel_callback)
+            destination = staging_root / relative
+            _require_descendant(staging_root, destination)
+            _ensure_safe_parent_directories(
+                staging_root, destination.parent, created_directories
+            )
+            if os.path.lexists(destination):
+                raise LocalCacheError("local_cache_extra_path_conflict")
+            try:
+                _copy_stable_file(
+                    source,
+                    source_stat,
+                    destination,
+                    cancel_callback=cancel_callback,
+                )
+            except Exception:
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+                raise
+            copied_files.append(destination)
+        for directory, expected_stat in directory_stats.items():
+            _run_cancel_callback(cancel_callback)
+            if not _same_file_identity(directory.lstat(), expected_stat):
+                raise LocalCacheError("local_cache_extra_source_changed")
+    except Exception:
+        _cleanup_merged_files(staging_root, copied_files, created_directories)
+        raise
+    return copied_files, created_directories
+
+
+def _ensure_safe_parent_directories(root, parent, created_directories):
+    relative = parent.relative_to(root)
+    current = root
+    for component in relative.parts:
+        current = current / component
+        if os.path.lexists(current):
+            current_stat = current.lstat()
+            if not stat.S_ISDIR(current_stat.st_mode):
+                raise LocalCacheError("local_cache_extra_path_conflict")
+            continue
+        current.mkdir()
+        created_directories.append(current)
+
+
+def _copy_stable_file(source, expected_stat, destination, *, cancel_callback=None):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(source, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not _same_file_identity(before, expected_stat):
+            raise LocalCacheError("local_cache_extra_source_changed")
+        with (
+            os.fdopen(descriptor, "rb", closefd=False) as input_file,
+            destination.open("xb") as output_file,
+        ):
+            while True:
+                _run_cancel_callback(cancel_callback)
+                chunk = input_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                output_file.write(chunk)
+            output_file.flush()
+        after = os.fstat(descriptor)
+        if not _same_file_identity(after, before) or not _same_file_identity(
+            source.lstat(), before
+        ):
+            raise LocalCacheError("local_cache_extra_source_changed")
+    finally:
+        os.close(descriptor)
+
+
+def _same_file_identity(first, second):
+    return all(
+        getattr(first, field) == getattr(second, field)
+        for field in (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+    )
+
+
+def _run_cancel_callback(cancel_callback):
+    if cancel_callback is not None:
+        cancel_callback()
+
+
+def _cleanup_merged_files(staging_root, copied_files, created_directories):
+    del staging_root
+    for path in reversed(copied_files):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    for path in reversed(created_directories):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
 
 
 def _overwrite_trusted_manifest(
@@ -530,31 +778,59 @@ def _manifest_from_payload(payload: dict) -> ModelPreheatManifest:
 
 
 def _verify_directory(
-    root_dir: Path, manifest: ModelPreheatManifest
+    root_dir: Path,
+    manifest: ModelPreheatManifest,
+    *,
+    allow_extra: bool = False,
+    cancel_callback=None,
 ) -> LocalCacheInspection:
-    root = root_dir.resolve()
+    try:
+        root = Path(os.path.abspath(root_dir))
+        actual_paths, directory_stats, file_stats = _scan_real_directory(
+            root, cancel_callback=cancel_callback
+        )
+    except (LocalCacheError, OSError):
+        return LocalCacheInspection(
+            LocalCacheState.ERROR, error_code="local_cache_scan_failed"
+        )
     expected_paths = set()
     for file in manifest.files:
         path = _manifest_file_path(root, file)
-        expected_paths.add(path.relative_to(root).as_posix())
-        if not path.exists() or not path.is_file():
+        relative_path = path.relative_to(root).as_posix()
+        expected_paths.add(relative_path)
+        expected_stat = file_stats.get(relative_path)
+        if expected_stat is None:
             return LocalCacheInspection(LocalCacheState.MISSING)
-        if path.stat().st_size != file.size or _sha256_file(path) != file.sha256:
+        if (
+            expected_stat.st_size != file.size
+            or _sha256_file(path, expected_stat, cancel_callback=cancel_callback)
+            != file.sha256
+        ):
             return LocalCacheInspection(
                 LocalCacheState.CONFLICT, error_code="local_cache_conflict"
             )
 
     try:
-        actual_paths = {
-            path.relative_to(root).as_posix()
-            for path in root.rglob("*")
-            if path.is_file()
-        }
-    except OSError:
+        final_paths, final_directories, final_files = _scan_real_directory(
+            root, cancel_callback=cancel_callback
+        )
+        if (
+            final_paths != actual_paths
+            or not _identities_match(directory_stats, final_directories)
+            or not _identities_match(file_stats, final_files)
+        ):
+            raise LocalCacheError("local_cache_source_changed")
+    except (LocalCacheError, OSError):
         return LocalCacheInspection(
             LocalCacheState.ERROR, error_code="local_cache_scan_failed"
         )
-    if actual_paths != expected_paths:
+
+    paths_match = (
+        expected_paths.issubset(actual_paths)
+        if allow_extra
+        else actual_paths == expected_paths
+    )
+    if not paths_match:
         return LocalCacheInspection(
             LocalCacheState.CONFLICT, error_code="local_cache_conflict"
         )
@@ -562,16 +838,83 @@ def _verify_directory(
 
 
 def _manifest_file_path(root: Path, file: ManifestFile) -> Path:
-    path = (root / decode_path(file.path)).resolve()
+    path = Path(os.path.abspath(root / decode_path(file.path)))
     _require_descendant(root, path)
     return path
 
 
-def _sha256_file(path: Path) -> str:
+def _scan_real_directory(root: Path, *, cancel_callback=None):
+    root_stat = root.lstat()
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise LocalCacheError("local_cache_unsafe_root")
+
+    actual_paths = set()
+    directory_stats = {"": root_stat}
+    file_stats = {}
+    for path in root.rglob("*"):
+        _run_cancel_callback(cancel_callback)
+        path_stat = path.lstat()
+        relative_path = path.relative_to(root).as_posix()
+        if stat.S_ISDIR(path_stat.st_mode):
+            directory_stats[relative_path] = path_stat
+            continue
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise LocalCacheError("local_cache_unsafe_file")
+        actual_paths.add(relative_path)
+        file_stats[relative_path] = path_stat
+    return actual_paths, directory_stats, file_stats
+
+
+def _is_real_directory(path: Path) -> bool:
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _identities_match(before, after) -> bool:
+    return before.keys() == after.keys() and all(
+        _same_file_identity(expected, after[path]) for path, expected in before.items()
+    )
+
+
+def _tree_snapshots_match(before, after) -> bool:
+    before_paths, before_directories, before_files = before
+    after_paths, after_directories, after_files = after
+    return (
+        before_paths == after_paths
+        and _identities_match(before_directories, after_directories)
+        and _identities_match(before_files, after_files)
+    )
+
+
+def _sha256_file(path: Path, expected_stat, *, cancel_callback=None) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or not _same_file_identity(
+            before, expected_stat
+        ):
+            raise LocalCacheError("local_cache_source_changed")
+        with os.fdopen(descriptor, "rb", closefd=False) as file:
+            while True:
+                _run_cancel_callback(cancel_callback)
+                chunk = file.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+        if not _same_file_identity(before, after) or not _same_file_identity(
+            current, before
+        ):
+            raise LocalCacheError("local_cache_source_changed")
+    finally:
+        os.close(descriptor)
     return digest.hexdigest()
 
 

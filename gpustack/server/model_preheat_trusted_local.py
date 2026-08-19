@@ -1,6 +1,7 @@
 import ntpath
 import posixpath
 from dataclasses import dataclass
+from glob import has_magic
 
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -22,6 +23,7 @@ class TrustedLocalCandidateRecord:
     source: str
     root: str
     paths: tuple[str, ...]
+    repository_complete: bool
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,7 @@ class ProductionLocalInventoryProbeResult:
     source: str | None = None
     root: str | None = None
     paths: tuple[str, ...] = ()
+    repository_complete: bool = False
 
 
 class ProductionLocalInventoryProbe:
@@ -62,6 +65,11 @@ class ProductionLocalInventoryProbe:
                     source=candidate.source if candidate is not None else None,
                     root=candidate.root if candidate is not None else None,
                     paths=candidate.paths if candidate is not None else (),
+                    repository_complete=(
+                        candidate.repository_complete
+                        if candidate is not None
+                        else False
+                    ),
                 )
             return results
 
@@ -162,7 +170,18 @@ def _record(worker_uuid, worker_id, source, model_file, raw_paths):
     root = _candidate_root(model_file, paths)
     if not root:
         return None
-    return TrustedLocalCandidateRecord(worker_uuid, worker_id, source, root, paths)
+    repository_complete = (
+        model_file.huggingface_filename is None
+        and model_file.model_scope_file_path is None
+    )
+    return TrustedLocalCandidateRecord(
+        worker_uuid,
+        worker_id,
+        source,
+        root,
+        paths,
+        repository_complete,
+    )
 
 
 def _candidate_root(model_file, paths):
@@ -170,10 +189,33 @@ def _candidate_root(model_file, paths):
     if model_file.local_dir:
         return path_module.normpath(model_file.local_dir)
     if len(paths) == 1:
-        if model_file.huggingface_filename or model_file.model_scope_file_path:
+        selected_path = (
+            model_file.huggingface_filename or model_file.model_scope_file_path
+        )
+        if selected_path:
+            if not has_magic(selected_path):
+                return _repository_root_for_exact_path(
+                    path_module, paths[0], selected_path
+                )
             return path_module.dirname(path_module.normpath(paths[0]))
         return path_module.normpath(paths[0])
     try:
         return path_module.commonpath(paths)
     except ValueError:
         return None
+
+
+def _repository_root_for_exact_path(path_module, resolved_path, selected_path):
+    normalized_selected = path_module.normpath(selected_path)
+    if (
+        path_module.isabs(normalized_selected)
+        or normalized_selected in {"", ".", ".."}
+        or normalized_selected.startswith(f"..{path_module.sep}")
+    ):
+        return None
+    remaining = path_module.normpath(resolved_path)
+    for component in reversed(normalized_selected.split(path_module.sep)):
+        if path_module.basename(remaining) != component:
+            return None
+        remaining = path_module.dirname(remaining)
+    return remaining or None

@@ -343,6 +343,7 @@ class ModelPreheatTrustedLocalCandidate(SQLModel):
     source: str
     root: str
     paths: list[str]
+    repository_complete: bool
 
 
 class ModelPreheatWorkerTaskExecutionPayload(SQLModel):
