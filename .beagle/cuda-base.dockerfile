@@ -101,11 +101,16 @@ RUN python3 -m pip install -i ${PYPI_MIRROR} --upgrade pip && \
 RUN mkdir -p /var/lib/gpustack && \
     chmod -R 0755 /var/lib/gpustack
 
-# 设置环境变量
-ENV LD_LIBRARY_PATH=/opt/gpustack/venv/lib/python3.12/site-packages/nvidia/nccl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/cuda/compat \
+# 禁止将 CUDA compat 放入运行时搜索路径，避免覆盖宿主机注入的 libcuda。
+ENV LD_LIBRARY_PATH=/opt/gpustack/venv/lib/python3.12/site-packages/nvidia/nccl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64 \
     PIPX_HOME=/var/lib/gpustack/pipx \
     PIPX_LOCAL_VENVS=/var/lib/gpustack/pipx/venvs \
     PIPX_BIN_DIR=/var/lib/gpustack/bin
+
+RUN case ":${LD_LIBRARY_PATH}:" in \
+      *:/usr/local/cuda/compat:*) echo "CUDA compat 不得进入运行时 LD_LIBRARY_PATH" >&2; exit 1 ;; \
+      *) exit 0 ;; \
+    esac
 
 ARG VERSION=dev
 LABEL version=$VERSION
