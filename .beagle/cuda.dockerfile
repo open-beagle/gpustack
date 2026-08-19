@@ -4,9 +4,14 @@ FROM $BASE
 
 # 安装 GPUStack 应用层。底层运行时依赖已内置在 CUDA runtime 镜像中。
 COPY ./dist/*.whl /tmp/
-RUN WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
+COPY ./dist/requirements-vllm.txt /tmp/requirements-vllm.txt
+RUN python3 -m pip install --no-cache-dir --default-timeout=12000 \
+        -r /tmp/requirements-vllm.txt && \
+    WHEEL_PACKAGE="$(ls /tmp/*.whl)" && \
     pip3 install --no-cache-dir --no-deps --force-reinstall "${WHEEL_PACKAGE}" && \
-    rm -rf /tmp/*.whl
+    python3 -m pip check && \
+    python3 -c "import modelscope_hub" && \
+    rm -f /tmp/*.whl /tmp/requirements-vllm.txt
 
 ENV GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin \
     HF_ENDPOINT=https://hf-mirror.com
