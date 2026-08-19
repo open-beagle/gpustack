@@ -1000,7 +1000,11 @@ def test_expired_pause_request_lease_is_reaped_before_resume(tmp_path):
             await session.commit()
         await controller.tick(datetime(2026, 8, 12, 0, 31, tzinfo=UTC))
         async with AsyncSession(engine) as session:
-            resumed = await controller._resume_paused_task(session, schedule_id)
+            resumed = await controller._resume_paused_task(
+                session,
+                schedule_id,
+                datetime(2026, 8, 12, 0, 31, tzinfo=UTC),
+            )
             await session.commit()
         async with AsyncSession(engine) as session:
             parent = (await session.exec(select(ModelPreheatTask))).one()
@@ -1020,6 +1024,39 @@ def test_expired_pause_request_lease_is_reaped_before_resume(tmp_path):
         ModelPreheatWorkerTaskStateEnum.PENDING,
         None,
     )
+
+
+def test_resume_paused_task_uses_window_time_for_pause_ack(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        schedule_id = await _seed_schedule(engine)
+        controller = ModelPreheatScheduleController(
+            engine, task_creator=RecordingTaskCreator()
+        )
+        await controller.tick(datetime(2026, 8, 12, 0, 0, tzinfo=UTC))
+        async with AsyncSession(engine) as session:
+            parent = (await session.exec(select(ModelPreheatTask))).one()
+            child = (await session.exec(select(ModelPreheatWorkerTask))).one()
+            parent.desired_state = ModelPreheatDesiredStateEnum.PAUSED
+            parent.paused_from_state = parent.execution_state
+            child.state = ModelPreheatWorkerTaskStateEnum.RUNNING
+            child.state_message = "pause_requested"
+            child.lease_owner = child.worker_uuid
+            child.lease_token_hash = "still-valid-at-window-time"
+            child.lease_expires_at = datetime(2026, 8, 15, tzinfo=UTC)
+            session.add(parent)
+            session.add(child)
+            await session.commit()
+        async with AsyncSession(engine) as session:
+            resumed = await controller._resume_paused_task(
+                session,
+                schedule_id,
+                datetime(2026, 8, 12, 0, 31, tzinfo=UTC),
+            )
+        await engine.dispose()
+        return resumed
+
+    assert asyncio.run(run()) is None
 
 
 def test_expired_pause_child_is_reaped_when_legacy_marker_was_lost(tmp_path):

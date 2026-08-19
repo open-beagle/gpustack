@@ -164,6 +164,8 @@ def build_model_preheat_manifest(
     generation_id: str,
     exclude_patterns: tuple[str, ...] | list[str] = (),
     requested_revision: str | None = None,
+    cancel_callback=None,
+    progress_callback=None,
 ) -> ModelPreheatManifest:
     root = Path(root_dir).resolve()
     if not root.is_dir():
@@ -188,6 +190,7 @@ def build_model_preheat_manifest(
 
     candidates = {}
     for path in root.rglob("*"):
+        _run_cancel_callback(cancel_callback)
         resolved = path.resolve()
         if root not in resolved.parents and resolved != root:
             raise ModelPreheatManifestError("path_traversal")
@@ -204,9 +207,13 @@ def build_model_preheat_manifest(
         raise ModelPreheatManifestError("no_manifest_files")
 
     files = []
+    completed_paths = []
+    completed_size = 0
+    total_size = sum(path.stat().st_size for path in matched_paths)
     for path in sorted(
         matched_paths, key=lambda item: item.relative_to(root).as_posix()
     ):
+        _run_cancel_callback(cancel_callback)
         relative_path = path.relative_to(root).as_posix()
         try:
             encoded_path = encode_path(relative_path)
@@ -216,9 +223,13 @@ def build_model_preheat_manifest(
             ManifestFile(
                 path=encoded_path,
                 size=path.stat().st_size,
-                sha256=_sha256_file(path),
+                sha256=_sha256_file(path, cancel_callback),
             )
         )
+        completed_paths.append(relative_path)
+        completed_size += path.stat().st_size
+        if progress_callback is not None:
+            progress_callback(tuple(completed_paths), completed_size, total_size)
 
     return ModelPreheatManifest(
         identity=identity,
@@ -272,9 +283,15 @@ def _reject_decoded_manifest_path(path: str):
         raise ModelPreheatManifestError("path_traversal")
 
 
-def _sha256_file(path: Path) -> str:
+def _run_cancel_callback(cancel_callback):
+    if cancel_callback is not None:
+        cancel_callback()
+
+
+def _sha256_file(path: Path, cancel_callback=None) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            _run_cancel_callback(cancel_callback)
             digest.update(chunk)
     return digest.hexdigest()

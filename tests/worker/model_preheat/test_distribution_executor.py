@@ -5,6 +5,7 @@ import pytest
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
     TargetExecutionRequest,
+    TrustedLocalCandidate,
     execute_seed_preheat,
     execute_target_preheat,
 )
@@ -82,6 +83,94 @@ def test_target_downloads_ready_generation_and_publishes_atomically(tmp_path):
     assert result["state"] == "ready"
     assert result["downloaded"] == 2
     assert inspection.state == "valid"
+
+
+def test_target_reuses_matching_trusted_archive_without_s3_download(tmp_path):
+    minio = _published_client(tmp_path)
+    trusted_root = tmp_path / "archive-source"
+    _write_model(trusted_root)
+    request = replace(
+        _target_request(tmp_path),
+        trusted_local_candidate=TrustedLocalCandidate(
+            source="model_archive",
+            root=trusted_root,
+            paths=(trusted_root,),
+        ),
+    )
+    client = ModelPreheatS3Client(minio)
+    client.download_generation_file = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("清单匹配时不应从 S3 下载")
+    )
+
+    result = execute_target_preheat(request, client)
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 0
+
+
+def test_target_falls_back_to_s3_when_trusted_candidate_manifest_mismatches(tmp_path):
+    minio = _published_client(tmp_path)
+    trusted_root = tmp_path / "stale-model-file"
+    _write_model(trusted_root)
+    (trusted_root / "weights" / "model.bin").write_bytes(b"stale")
+    request = replace(
+        _target_request(tmp_path),
+        trusted_local_candidate=TrustedLocalCandidate(
+            source="model_file",
+            root=trusted_root,
+            paths=(trusted_root,),
+        ),
+    )
+
+    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 2
+
+
+def test_target_replaces_mismatched_trusted_candidate_in_canonical_directory(
+    tmp_path,
+):
+    minio = _published_client(tmp_path)
+    request = _target_request(tmp_path)
+    _write_model(request.target_dir)
+    stale = request.target_dir / "weights" / "model.bin"
+    stale.write_bytes(b"stale")
+    request = replace(
+        request,
+        trusted_local_candidate=TrustedLocalCandidate(
+            source="model_file",
+            root=request.target_dir,
+            paths=(request.target_dir,),
+        ),
+    )
+
+    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 2
+    assert stale.read_bytes() == b"weights"
+    assert not list(request.target_dir.parent.glob(".model.preheat-backup-*"))
+
+
+def test_target_falls_back_when_trusted_candidate_has_no_selected_files(tmp_path):
+    minio = _published_client(tmp_path)
+    trusted_root = tmp_path / "unrelated-model-file"
+    trusted_root.mkdir()
+    (trusted_root / "notes.txt").write_text("not part of selected model")
+    request = replace(
+        _target_request(tmp_path),
+        trusted_local_candidate=TrustedLocalCandidate(
+            source="model_file",
+            root=trusted_root,
+            paths=(trusted_root,),
+        ),
+    )
+
+    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 2
 
 
 def test_target_reports_resumable_cursor_after_each_real_file_boundary(tmp_path):
@@ -253,11 +342,6 @@ def test_target_new_attempt_reuses_only_verified_previous_staging_files(
         return original(bucket, prefix, manifest, file, target)
 
     monkeypatch.setattr(client, "download_generation_file", track_download)
-    monkeypatch.setattr(
-        "gpustack.worker.model_preheat.executor.os.link",
-        lambda *args: (_ for _ in ()).throw(OSError()),
-    )
-
     result = execute_target_preheat(request, client)
 
     assert result["state"] == "ready"

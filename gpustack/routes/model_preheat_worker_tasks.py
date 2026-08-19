@@ -31,6 +31,7 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatPublicationMarker,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatTask,
+    ModelPreheatTrustedLocalCandidate,
     ModelPreheatWorkerTask,
     ModelPreheatWorkerTaskClaim,
     ModelPreheatWorkerTaskClaimed,
@@ -52,6 +53,9 @@ from gpustack.server.model_preheat_connectivity import aggregate_connectivity_ch
 from gpustack.server.model_preheat_worker_identity import (
     ModelPreheatWorkerPrincipal,
     get_model_preheat_worker_identity,
+)
+from gpustack.server.model_preheat_trusted_local import (
+    trusted_local_candidate_for_worker,
 )
 from gpustack.worker.model_preheat.identity import (
     ModelPreheatIdentityError,
@@ -569,11 +573,27 @@ async def get_model_preheat_worker_task_execution_payload(
     )
     cipher = _cipher_from_request(request)
     try:
-        task_payload, encrypted_profile = await _execution_source(session, worker_task)
+        task_payload, encrypted_profile, source_task = await _execution_source(
+            session, worker_task
+        )
         profile = _decrypt_profile(cipher, encrypted_profile)
     except (ModelPreheatCredentialError, KeyError, TypeError, ValueError):
         raise ServiceUnavailableException(message="execution_credentials_unavailable")
     response.headers["Cache-Control"] = "no-store"
+    trusted_local_candidate = None
+    if source_task is not None and worker_task.worker_id is not None:
+        candidate = await trusted_local_candidate_for_worker(
+            session,
+            source_task,
+            worker_task.worker_uuid,
+            worker_task.worker_id,
+        )
+        if candidate is not None:
+            trusted_local_candidate = ModelPreheatTrustedLocalCandidate(
+                source=candidate.source,
+                root=candidate.root,
+                paths=list(candidate.paths),
+            )
     return ModelPreheatWorkerTaskExecutionPayload(
         worker_task_id=worker_task.id,
         attempt=worker_task.attempt,
@@ -581,6 +601,7 @@ async def get_model_preheat_worker_task_execution_payload(
         resumable_cursor=worker_task.resumable_cursor,
         task=task_payload,
         profile=profile,
+        trusted_local_candidate=trusted_local_candidate,
     )
 
 
@@ -592,7 +613,7 @@ async def _execution_source(session, worker_task: ModelPreheatWorkerTask):
         payload = task.model_dump(
             exclude={"s3_profile_snapshot_encrypted", "encryption_key_version"}
         )
-        return payload, task.s3_profile_snapshot_encrypted
+        return payload, task.s3_profile_snapshot_encrypted, task
 
     if worker_task.distribution_policy_id is not None:
         _, task = await _active_distribution_source(
@@ -601,7 +622,7 @@ async def _execution_source(session, worker_task: ModelPreheatWorkerTask):
         payload = task.model_dump(
             exclude={"s3_profile_snapshot_encrypted", "encryption_key_version"}
         )
-        return payload, task.s3_profile_snapshot_encrypted
+        return payload, task.s3_profile_snapshot_encrypted, task
 
     check = await session.get(
         ModelPreheatS3ConnectivityCheck, worker_task.connectivity_check_id
@@ -622,7 +643,7 @@ async def _execution_source(session, worker_task: ModelPreheatWorkerTask):
         "access_key_encrypted": profile.access_key_encrypted,
         "secret_key_encrypted": profile.secret_key_encrypted,
     }
-    return {"connectivity_check_id": check.id}, encrypted_profile
+    return {"connectivity_check_id": check.id}, encrypted_profile, None
 
 
 def _decrypt_profile(cipher, encrypted_profile):

@@ -339,6 +339,12 @@ class ModelPreheatExecutionProfile(SQLModel):
     secret_key: str = Field(repr=False)
 
 
+class ModelPreheatTrustedLocalCandidate(SQLModel):
+    source: str
+    root: str
+    paths: list[str]
+
+
 class ModelPreheatWorkerTaskExecutionPayload(SQLModel):
     worker_task_id: int
     attempt: int
@@ -346,6 +352,7 @@ class ModelPreheatWorkerTaskExecutionPayload(SQLModel):
     resumable_cursor: Optional[dict] = None
     task: dict
     profile: ModelPreheatExecutionProfile = Field(repr=False)
+    trusted_local_candidate: Optional[ModelPreheatTrustedLocalCandidate] = None
 
 
 class ModelPreheatS3ConnectivityCheck(SQLModel, BaseModelMixin, table=True):

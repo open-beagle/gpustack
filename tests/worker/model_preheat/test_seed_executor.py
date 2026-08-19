@@ -13,6 +13,7 @@ import pytest
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
     TargetExecutionRequest,
+    TrustedLocalCandidate,
     build_preheat_role_handlers,
     execute_seed_preheat,
     execute_target_preheat,
@@ -196,6 +197,134 @@ def test_seed_reuses_trusted_local_cache_and_publishes_ready(tmp_path):
     assert result["generation_id"] == "parent-generation-id"
     assert result["ready_path"].endswith("ready.json")
     assert "access" not in json.dumps(result)
+
+
+def test_seed_publishes_ready_from_trusted_model_file_without_hub_download(tmp_path):
+    trusted_root = tmp_path / "model-files" / "org" / "model"
+    _write_model(trusted_root)
+    request = SeedExecutionRequest(
+        **{
+            **_request(tmp_path).__dict__,
+            "trusted_local_candidate": TrustedLocalCandidate(
+                source="model_file",
+                root=trusted_root,
+                paths=(trusted_root,),
+            ),
+        }
+    )
+
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(InMemoryMinio()),
+        download_to_staging=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("可信本地模型不应重新从 Hub 下载")
+        ),
+    )
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 0
+    assert (request.target_dir / "config.json").stat().st_ino != (
+        trusted_root / "config.json"
+    ).stat().st_ino
+
+
+def test_seed_cancels_while_copying_trusted_local_snapshot(tmp_path):
+    trusted_root = tmp_path / "large-model-file"
+    trusted_root.mkdir()
+    (trusted_root / "config.json").write_bytes(b"{}")
+    (trusted_root / "weights").mkdir()
+    (trusted_root / "weights" / "model.bin").write_bytes(b"x" * (3 * 1024 * 1024))
+    request = SeedExecutionRequest(
+        **{
+            **_request(tmp_path).__dict__,
+            "trusted_local_candidate": TrustedLocalCandidate(
+                source="model_file",
+                root=trusted_root,
+                paths=(trusted_root,),
+            ),
+        }
+    )
+    checks = 0
+
+    def cancel_during_copy():
+        nonlocal checks
+        checks += 1
+        return checks >= 10
+
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(InMemoryMinio()),
+        cancel_check=cancel_during_copy,
+        download_to_staging=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("取消后不应回退到 Hub")
+        ),
+    )
+
+    assert result["state"] == "error"
+    assert result["error_code"] == "canceled"
+    assert checks >= 10
+
+
+def test_seed_falls_back_when_trusted_candidate_misses_an_include_pattern(tmp_path):
+    trusted_root = tmp_path / "incomplete-model-file"
+    trusted_root.mkdir()
+    (trusted_root / "config.json").write_bytes(b"{}")
+    request = SeedExecutionRequest(
+        **{
+            **_request(tmp_path).__dict__,
+            "trusted_local_candidate": TrustedLocalCandidate(
+                source="model_file",
+                root=trusted_root,
+                paths=(trusted_root,),
+            ),
+        }
+    )
+    downloads = []
+
+    def download(identity, staging, **kwargs):
+        downloads.append(identity.model_id)
+        _write_model(staging)
+
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(InMemoryMinio()),
+        download_to_staging=download,
+    )
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 2
+    assert downloads == ["org/model"]
+
+
+def test_seed_falls_back_to_hub_when_trusted_candidate_has_no_selected_files(tmp_path):
+    trusted_root = tmp_path / "unrelated-archive"
+    trusted_root.mkdir()
+    (trusted_root / "notes.txt").write_text("unrelated")
+    request = SeedExecutionRequest(
+        **{
+            **_request(tmp_path).__dict__,
+            "trusted_local_candidate": TrustedLocalCandidate(
+                source="model_archive",
+                root=trusted_root,
+                paths=(trusted_root,),
+            ),
+        }
+    )
+    downloads = []
+
+    def download(identity, staging, **kwargs):
+        downloads.append(identity.model_id)
+        _write_model(staging)
+
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(InMemoryMinio()),
+        download_to_staging=download,
+    )
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 2
+    assert downloads == ["org/model"]
 
 
 def test_seed_rebuilds_current_generation_from_valid_old_local_sidecar(

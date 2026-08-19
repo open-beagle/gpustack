@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from huggingface_hub.utils import filter_repo_objects
+
 from gpustack.worker.model_preheat.identity import (
     ModelPreheatIdentity,
     decode_path,
@@ -37,6 +39,13 @@ from gpustack.worker.model_preheat.s3_client import (
 
 
 @dataclass(frozen=True)
+class TrustedLocalCandidate:
+    source: str
+    root: Path
+    paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
 class SeedExecutionRequest:
     cache_dir: Path
     target_dir: Path
@@ -52,6 +61,7 @@ class SeedExecutionRequest:
     requested_revision: str | None = None
     bandwidth_limit_mbps: int | None = None
     resumable_cursor: dict | None = None
+    trusted_local_candidate: TrustedLocalCandidate | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +80,7 @@ class TargetExecutionRequest:
     requested_revision: str | None = None
     bandwidth_limit_mbps: int | None = None
     resumable_cursor: dict | None = None
+    trusted_local_candidate: TrustedLocalCandidate | None = None
 
 
 def execute_seed_preheat(
@@ -154,6 +165,7 @@ def execute_seed_preheat(
                     prefix=request.prefix,
                     bandwidth_limit_mbps=request.bandwidth_limit_mbps,
                     resumable_cursor=request.resumable_cursor,
+                    trusted_local_candidate=request.trusted_local_candidate,
                 ),
                 s3_client,
                 cancel_check=cancel_check,
@@ -163,24 +175,51 @@ def execute_seed_preheat(
         staging = create_staging_dir(
             request.cache_dir, request.task_id, request.attempt
         )
-        _reuse_previous_seed_staging(request, staging)
-        _raise_if_cancelled(cancel_check)
-        if download_to_staging is None:
-            from gpustack.worker.downloaders import (
-                download_resolved_revision_to_staging,
-            )
-
-            download_to_staging = download_resolved_revision_to_staging
-        download_options = {"exclude_patterns": request.exclude_patterns}
-        if download_to_staging.__module__ == "gpustack.worker.downloaders":
-            download_options.update(
+        trusted_candidate_staged = _stage_trusted_local_candidate(
+            request.trusted_local_candidate,
+            staging,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        trusted_candidate_manifest = None
+        if trusted_candidate_staged:
+            trusted_candidate_manifest = _build_trusted_candidate_manifest(
+                request,
+                staging,
+                request.generation_id,
                 cancel_check=cancel_check,
                 progress_callback=progress_callback,
             )
-        download_to_staging(request.identity, staging, **download_options)
+            if trusted_candidate_manifest is None:
+                _discard_staging(staging)
+                staging.mkdir(parents=True, exist_ok=True)
+                trusted_candidate_staged = False
+            else:
+                _retain_manifest_files(
+                    staging, trusted_candidate_manifest, cancel_check=cancel_check
+                )
+        if not trusted_candidate_staged:
+            _reuse_previous_seed_staging(request, staging, cancel_check=cancel_check)
         _raise_if_cancelled(cancel_check)
-        _remove_excluded_files(staging, request.exclude_patterns)
-        manifest = build_model_preheat_manifest(
+        if not trusted_candidate_staged:
+            if download_to_staging is None:
+                from gpustack.worker.downloaders import (
+                    download_resolved_revision_to_staging,
+                )
+
+                download_to_staging = download_resolved_revision_to_staging
+            download_options = {"exclude_patterns": request.exclude_patterns}
+            if download_to_staging.__module__ == "gpustack.worker.downloaders":
+                download_options.update(
+                    cancel_check=cancel_check,
+                    progress_callback=progress_callback,
+                )
+            download_to_staging(request.identity, staging, **download_options)
+        _raise_if_cancelled(cancel_check)
+        _remove_excluded_files(
+            staging, request.exclude_patterns, cancel_check=cancel_check
+        )
+        manifest = trusted_candidate_manifest or build_model_preheat_manifest(
             staging,
             request.identity,
             cache_key=request.cache_key,
@@ -188,6 +227,8 @@ def execute_seed_preheat(
             generation_id=request.generation_id,
             exclude_patterns=request.exclude_patterns,
             requested_revision=request.requested_revision,
+            cancel_callback=lambda: _raise_if_cancelled(cancel_check),
+            progress_callback=progress_callback,
         )
         if reference_manifest is not None and manifest != reference_manifest:
             return _error_result("checksum_mismatch", staging)
@@ -219,7 +260,7 @@ def execute_seed_preheat(
             local_result.state,
             publish_result.uploaded,
             publish_result.skipped,
-            len(manifest.files),
+            0 if trusted_candidate_staged else len(manifest.files),
         )
     except ModelPreheatCanceled:
         return _error_result("canceled", staging)
@@ -258,6 +299,46 @@ def execute_target_preheat(
         )
         if manifest is None:
             return _error_result("s3_ready_not_found")
+        trusted_staging = create_staging_dir(
+            request.cache_dir, request.task_id, request.attempt
+        )
+        if _stage_trusted_local_candidate(
+            request.trusted_local_candidate,
+            trusted_staging,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        ):
+            candidate_manifest = _build_trusted_candidate_manifest(
+                request,
+                trusted_staging,
+                manifest.generation_id,
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
+            if candidate_manifest is not None:
+                _retain_manifest_files(
+                    trusted_staging, candidate_manifest, cancel_check=cancel_check
+                )
+            if candidate_manifest == manifest:
+                local_result = publish_staging(
+                    request.cache_dir,
+                    request.target_dir,
+                    request.cache_key,
+                    trusted_staging,
+                    manifest,
+                    replace_conflicting=True,
+                )
+                if local_result.state == LocalCacheState.VALID:
+                    return _ready_result(
+                        request,
+                        s3_client,
+                        manifest,
+                        local_result.state,
+                        0,
+                        len(manifest.files),
+                        0,
+                    )
+            _discard_staging(trusted_staging)
         inspection = inspect_local_cache(
             request.cache_dir,
             request.target_dir,
@@ -278,14 +359,16 @@ def execute_target_preheat(
         staging = create_staging_dir(
             request.cache_dir, request.task_id, request.attempt
         )
-        _reuse_previous_staging_files(request, staging, manifest)
+        _reuse_previous_staging_files(
+            request, staging, manifest, cancel_check=cancel_check
+        )
         downloaded = 0
         skipped = 0
         downloaded_size = 0
         for file in manifest.files:
             _raise_if_cancelled(cancel_check)
             target = _staging_manifest_path(staging, file.path)
-            if _file_matches(target, file.size, file.sha256):
+            if _file_matches(target, file.size, file.sha256, cancel_check):
                 skipped += 1
                 completed_files.append(file.path)
                 downloaded_size += file.size
@@ -311,7 +394,7 @@ def execute_target_preheat(
                     target,
                     **download_options,
                 )
-                if _file_matches(target, file.size, file.sha256):
+                if _file_matches(target, file.size, file.sha256, cancel_check):
                     downloaded += 1
                     completed_files.append(file.path)
                     downloaded_size += file.size
@@ -336,6 +419,7 @@ def execute_target_preheat(
             request.cache_key,
             staging,
             manifest,
+            replace_conflicting=True,
         )
         if local_result.state != LocalCacheState.VALID:
             return _error_result(
@@ -372,6 +456,180 @@ def execute_target_preheat(
 def _report_progress(callback, completed_files, downloaded_size, total_size):
     if callback is not None:
         callback(tuple(completed_files), downloaded_size, total_size)
+
+
+def _stage_trusted_local_candidate(
+    candidate,
+    staging: Path,
+    *,
+    cancel_check=None,
+    progress_callback=None,
+) -> bool:
+    if candidate is None:
+        return False
+    try:
+        root_input = Path(candidate.root)
+        if not root_input.is_absolute() or root_input.is_symlink():
+            return False
+        root = root_input.resolve(strict=True)
+        if not root.is_dir():
+            return False
+        root_stat = root.stat()
+        files = {}
+        for raw_path in candidate.paths:
+            _raise_if_cancelled(cancel_check)
+            path_input = Path(raw_path)
+            if not path_input.is_absolute() or path_input.is_symlink():
+                return False
+            path = path_input.resolve(strict=True)
+            if path != root and root not in path.parents:
+                return False
+            candidates = path.rglob("*") if path.is_dir() else (path,)
+            for source in candidates:
+                _raise_if_cancelled(cancel_check)
+                source_stat = source.lstat()
+                if stat.S_ISLNK(source_stat.st_mode):
+                    return False
+                if stat.S_ISDIR(source_stat.st_mode):
+                    continue
+                if not stat.S_ISREG(source_stat.st_mode):
+                    return False
+                resolved = source.resolve(strict=True)
+                if root not in resolved.parents:
+                    return False
+                files[resolved.relative_to(root)] = (resolved, source_stat)
+        if not files:
+            return False
+        _discard_staging(staging)
+        staging.mkdir(parents=True, exist_ok=False)
+        staging_root = staging.resolve()
+        completed_files = []
+        copied_size = 0
+        total_size = sum(source_stat.st_size for _, source_stat in files.values())
+        for relative, (source, source_stat) in sorted(
+            files.items(), key=lambda item: str(item[0])
+        ):
+            _raise_if_cancelled(cancel_check)
+            target = (staging_root / relative).resolve(strict=False)
+            if staging_root not in target.parents:
+                raise LocalCacheError("local_cache_path_escape")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _copy_stable_snapshot(source, source_stat, target, cancel_check)
+            completed_files.append(relative.as_posix())
+            copied_size += source_stat.st_size
+            _report_progress(
+                progress_callback, completed_files, copied_size, total_size
+            )
+        if not _same_file_identity(root.stat(), root_stat):
+            raise LocalCacheError("trusted_local_candidate_changed")
+        return True
+    except (LocalCacheError, OSError, ValueError):
+        _discard_staging(staging)
+        staging.mkdir(parents=True, exist_ok=True)
+        return False
+
+
+def _discard_staging(staging: Path) -> None:
+    if staging.exists():
+        if staging.is_dir() and not staging.is_symlink():
+            shutil.rmtree(staging)
+        else:
+            staging.unlink()
+
+
+def _copy_stable_snapshot(source, expected_stat, target, cancel_check):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(source, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not _same_file_identity(before, expected_stat):
+            raise LocalCacheError("trusted_local_candidate_changed")
+        with (
+            os.fdopen(descriptor, "rb", closefd=False) as input_file,
+            target.open("xb") as output_file,
+        ):
+            while True:
+                _raise_if_cancelled(cancel_check)
+                chunk = input_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                output_file.write(chunk)
+            output_file.flush()
+        after = os.fstat(descriptor)
+        path_after = source.lstat()
+        if not _same_file_identity(after, before) or not _same_file_identity(
+            path_after, before
+        ):
+            raise LocalCacheError("trusted_local_candidate_changed")
+    finally:
+        os.close(descriptor)
+
+
+def _same_file_identity(first, second):
+    return all(
+        getattr(first, field) == getattr(second, field)
+        for field in (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+    )
+
+
+def _build_trusted_candidate_manifest(
+    request,
+    staging,
+    generation_id,
+    *,
+    cancel_check=None,
+    progress_callback=None,
+):
+    try:
+        manifest = build_model_preheat_manifest(
+            staging,
+            request.identity,
+            cache_key=request.cache_key,
+            selection_digest=request.selection_digest,
+            generation_id=generation_id,
+            exclude_patterns=request.exclude_patterns,
+            requested_revision=request.requested_revision,
+            cancel_callback=lambda: _raise_if_cancelled(cancel_check),
+            progress_callback=progress_callback,
+        )
+        if not _trusted_selection_complete(manifest, request.identity):
+            return None
+        return manifest
+    except (OSError, ValueError):
+        return None
+
+
+def _trusted_selection_complete(manifest, identity) -> bool:
+    selected_paths = [decode_path(file.path) for file in manifest.files]
+    for encoded_pattern in identity.file_patterns:
+        pattern = decode_path(encoded_pattern)
+        if not list(filter_repo_objects(selected_paths, allow_patterns=[pattern])):
+            return False
+    return bool(selected_paths)
+
+
+def _retain_manifest_files(staging: Path, manifest, *, cancel_check=None) -> None:
+    expected = {decode_path(file.path) for file in manifest.files}
+    root = staging.resolve()
+    for path in sorted(root.rglob("*"), reverse=True):
+        _raise_if_cancelled(cancel_check)
+        if path.is_symlink():
+            raise LocalCacheError("local_cache_path_escape")
+        if path.is_file() and path.relative_to(root).as_posix() not in expected:
+            path.unlink()
+        elif path.is_dir():
+            try:
+                path.rmdir()
+            except OSError:
+                pass
 
 
 def _ready_result(
@@ -427,17 +685,22 @@ def _staging_manifest_path(staging_dir: Path, encoded_path: str) -> Path:
     return path
 
 
-def _file_matches(path: Path, size: int, expected_sha256: str) -> bool:
+def _file_matches(
+    path: Path, size: int, expected_sha256: str, cancel_check=None
+) -> bool:
     if not path.is_file() or path.stat().st_size != size:
         return False
     digest = hashlib.sha256()
     with path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            _raise_if_cancelled(cancel_check)
             digest.update(chunk)
     return digest.hexdigest() == expected_sha256
 
 
-def _reuse_previous_staging_files(request, staging: Path, manifest) -> None:
+def _reuse_previous_staging_files(
+    request, staging: Path, manifest, *, cancel_check=None
+) -> None:
     task_root = Path(request.cache_dir) / ".preheat" / str(request.task_id)
     if not task_root.is_dir():
         return
@@ -459,28 +722,30 @@ def _reuse_previous_staging_files(request, staging: Path, manifest) -> None:
     )
     cursor_files = _cursor_completed_files(request)
     for file in manifest.files:
+        _raise_if_cancelled(cancel_check)
         if cursor_files is not None and file.path not in cursor_files:
             continue
         target = _staging_manifest_path(staging, file.path)
-        if _file_matches(target, file.size, file.sha256):
+        if _file_matches(target, file.size, file.sha256, cancel_check):
             continue
         for old_staging in previous:
             try:
                 source = _staging_manifest_path(old_staging, file.path)
-                matches = _file_matches(source, file.size, file.sha256)
+                matches = _file_matches(source, file.size, file.sha256, cancel_check)
             except (LocalCacheError, OSError):
                 continue
             if not matches:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             try:
-                os.link(source, target)
-            except OSError:
-                shutil.copy2(source, target)
+                _copy_stable_snapshot(source, source.lstat(), target, cancel_check)
+            except (LocalCacheError, OSError):
+                target.unlink(missing_ok=True)
+                continue
             break
 
 
-def _reuse_previous_seed_staging(request, staging: Path) -> None:
+def _reuse_previous_seed_staging(request, staging: Path, *, cancel_check=None) -> None:
     task_root = Path(request.cache_dir) / ".preheat" / str(request.task_id)
     try:
         current_attempt = int(request.attempt)
@@ -509,6 +774,7 @@ def _reuse_previous_seed_staging(request, staging: Path) -> None:
     target_root = staging.resolve()
     cursor_files = _cursor_completed_files(request)
     for source in source_root.rglob("*"):
+        _raise_if_cancelled(cancel_check)
         try:
             source_stat = source.lstat()
         except OSError:
@@ -529,12 +795,10 @@ def _reuse_previous_seed_staging(request, staging: Path) -> None:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.link(resolved_source, target)
-        except OSError:
-            try:
-                shutil.copy2(resolved_source, target)
-            except OSError:
-                continue
+            _copy_stable_snapshot(resolved_source, source_stat, target, cancel_check)
+        except (LocalCacheError, OSError):
+            target.unlink(missing_ok=True)
+            continue
 
 
 def _cursor_completed_files(request):
@@ -544,10 +808,13 @@ def _cursor_completed_files(request):
     return set(cursor.get("completed_files", []))
 
 
-def _remove_excluded_files(staging_dir: Path, exclude_patterns) -> None:
+def _remove_excluded_files(
+    staging_dir: Path, exclude_patterns, *, cancel_check=None
+) -> None:
     root = staging_dir.resolve()
     decoded_patterns = tuple(decode_path(pattern) for pattern in exclude_patterns)
     for path in root.rglob("*"):
+        _raise_if_cancelled(cancel_check)
         if not path.is_file():
             continue
         relative_path = path.relative_to(root).as_posix()
@@ -607,6 +874,17 @@ async def _execute_payload(
         "prefix": profile.prefix,
         "bandwidth_limit_mbps": task.get("bandwidth_limit_mbps"),
         "resumable_cursor": getattr(payload, "resumable_cursor", None),
+        "trusted_local_candidate": (
+            TrustedLocalCandidate(
+                source=payload.trusted_local_candidate.source,
+                root=Path(payload.trusted_local_candidate.root),
+                paths=tuple(
+                    Path(path) for path in payload.trusted_local_candidate.paths
+                ),
+            )
+            if getattr(payload, "trusted_local_candidate", None) is not None
+            else None
+        ),
     }
     cancel_event = threading.Event()
     execution = execute_seed_preheat if seed else execute_target_preheat

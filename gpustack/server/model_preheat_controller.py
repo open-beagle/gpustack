@@ -350,6 +350,11 @@ class ModelPreheatController:
                 for worker_uuid, result in inventory.items()
                 if worker_uuid in current_workers and result.state == "valid"
             )
+            candidates = sorted(
+                worker_uuid
+                for worker_uuid, result in inventory.items()
+                if worker_uuid in current_workers and result.state == "candidate"
+            )
             if ready is not None:
                 missing = set(current_workers) - set(valid)
                 new_state = (
@@ -409,9 +414,10 @@ class ModelPreheatController:
                     session, task.target_worker_uuids
                 )
                 valid = sorted(set(valid) & set(current_workers))
+                candidates = sorted(set(candidates) & set(current_workers))
                 if not current_workers:
                     return
-            seed_uuid = _select_seed(task, current_workers, valid)
+            seed_uuid = _select_seed(task, current_workers, valid, candidates)
             worker = current_workers[seed_uuid]
             if not await _cas_parent_update(
                 session,
@@ -420,6 +426,7 @@ class ModelPreheatController:
                 local_cache_hit_worker_uuids=valid,
                 seed_worker_uuid=seed_uuid,
                 seed_worker_id=worker.id,
+                seed_source=getattr(inventory.get(seed_uuid), "source", None),
                 started_at=task.started_at or datetime.now(timezone.utc),
             ):
                 return
@@ -658,9 +665,11 @@ async def _create_distribution_tasks(session, task, workers, local_hits):
         )
 
 
-def _select_seed(task, workers, valid):
+def _select_seed(task, workers, valid, candidates=()):
     if valid:
         return valid[0]
+    if candidates:
+        return candidates[0]
     if task.seed_worker_uuid in workers:
         return task.seed_worker_uuid
     return sorted(workers)[0]

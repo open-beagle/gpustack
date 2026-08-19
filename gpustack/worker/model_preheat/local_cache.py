@@ -211,6 +211,8 @@ def publish_staging(
     cache_key: str,
     staging_dir: str | Path,
     manifest: ModelPreheatManifest,
+    *,
+    replace_conflicting: bool = False,
 ) -> LocalCachePublishResult:
     target = Path(target_dir)
     staging = Path(staging_dir)
@@ -241,6 +243,17 @@ def publish_staging(
                     cache_root, target, cache_key, manifest
                 )
                 if inspection.state != LocalCacheState.VALID:
+                    if (
+                        replace_conflicting
+                        and inspection.state == LocalCacheState.CONFLICT
+                    ):
+                        return _replace_conflicting_target(
+                            cache_root,
+                            target,
+                            cache_key,
+                            staging,
+                            manifest,
+                        )
                     if inspection.state == LocalCacheState.ERROR:
                         return LocalCachePublishResult(
                             LocalCacheState.ERROR,
@@ -322,6 +335,116 @@ def publish_staging(
             target,
             "local_cache_publish_failed",
         )
+
+
+def _replace_conflicting_target(
+    cache_root: Path,
+    target: Path,
+    cache_key: str,
+    staging: Path,
+    manifest: ModelPreheatManifest,
+) -> LocalCachePublishResult:
+    if not staging.is_dir():
+        return LocalCachePublishResult(
+            LocalCacheState.ERROR,
+            False,
+            target,
+            "local_cache_staging_missing",
+        )
+    try:
+        verification = _verify_directory(staging, manifest)
+    except (LocalCacheError, OSError):
+        verification = LocalCacheInspection(
+            LocalCacheState.ERROR, error_code="local_cache_scan_failed"
+        )
+    if verification.state != LocalCacheState.VALID:
+        return LocalCachePublishResult(
+            LocalCacheState.ERROR,
+            False,
+            target,
+            "local_cache_staging_invalid",
+        )
+
+    backup = target.with_name(f".{target.name}.preheat-backup-{uuid4().hex}")
+    target_replaced = False
+    try:
+        os.replace(target, backup)
+        try:
+            os.replace(staging, target)
+            target_replaced = True
+        except OSError:
+            os.replace(backup, target)
+            raise
+        try:
+            _overwrite_trusted_manifest(cache_root, cache_key, manifest)
+        except LocalCacheError as exc:
+            try:
+                os.replace(target, staging)
+                target_replaced = False
+                os.replace(backup, target)
+            except OSError:
+                return LocalCachePublishResult(
+                    LocalCacheState.ERROR,
+                    False,
+                    target,
+                    "local_cache_publish_rollback_failed",
+                )
+            return _manifest_publish_error(target, str(exc))
+        _remove_replaced_path(backup)
+        return LocalCachePublishResult(LocalCacheState.VALID, True, target)
+    except OSError:
+        if not target_replaced and backup.exists() and not target.exists():
+            try:
+                os.replace(backup, target)
+            except OSError:
+                return LocalCachePublishResult(
+                    LocalCacheState.ERROR,
+                    False,
+                    target,
+                    "local_cache_publish_rollback_failed",
+                )
+        return LocalCachePublishResult(
+            LocalCacheState.ERROR,
+            False,
+            target,
+            "local_cache_publish_failed",
+        )
+
+
+def _overwrite_trusted_manifest(
+    cache_dir: str | Path, cache_key: str, manifest: ModelPreheatManifest
+) -> Path:
+    path = trusted_manifest_path(cache_dir, cache_key)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with SoftFileLock(f"{path}.lock", timeout=0):
+            with temporary.open("xb") as file:
+                file.write(manifest.to_json_bytes())
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, path)
+    except Timeout as exc:
+        raise LocalCacheError("local_manifest_lock_unavailable") from exc
+    except OSError as exc:
+        raise LocalCacheError("local_manifest_write_failed") from exc
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+    return path
+
+
+def _remove_replaced_path(path: Path) -> None:
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError:
+        pass
 
 
 def _ensure_trusted_manifest_compatible(

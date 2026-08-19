@@ -35,6 +35,12 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTaskRoleEnum,
     ModelPreheatWorkerTaskStateEnum,
 )
+from gpustack.schemas.model_preheat_distribution_policies import (
+    ModelPreheatDistributionPolicy,
+)
+from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
+from gpustack.schemas.models import SourceEnum
 from gpustack.schemas.users import User
 from gpustack.schemas.workers import Worker, WorkerStateEnum
 from gpustack.server.db import get_session
@@ -620,6 +626,137 @@ def test_execution_payload_is_claim_bound_no_store_and_public_data_is_sanitized(
     }
     assert "s3_profile_snapshot_encrypted" not in payload.json()["task"]
     assert rejected.status_code == 409
+    asyncio.run(engine.dispose())
+
+
+def test_execution_payload_only_contains_claimed_workers_trusted_paths(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, task_id = asyncio.run(_seed(engine, key))
+
+    async def seed_candidates():
+        async with AsyncSession(engine) as session:
+            own = ModelFile(
+                source=SourceEnum.MODEL_SCOPE,
+                model_scope_model_id="Qwen/Test",
+                worker_id=worker_id,
+                resolved_paths=["/worker-a/models/Qwen/Test"],
+                state=ModelFileStateEnum.READY,
+            )
+            other_worker = Worker(
+                name="worker-b",
+                hostname="worker-b",
+                ip="127.0.0.2",
+                port=10150,
+                worker_uuid="worker-b",
+                state=WorkerStateEnum.READY,
+            )
+            session.add(own)
+            session.add(other_worker)
+            await session.flush()
+            session.add(
+                ModelFile(
+                    source=SourceEnum.MODEL_SCOPE,
+                    model_scope_model_id="Qwen/Test",
+                    worker_id=other_worker.id,
+                    resolved_paths=["/worker-b/secret/Qwen/Test"],
+                    state=ModelFileStateEnum.READY,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed_candidates())
+    with TestClient(app) as client:
+        claimed = _claim(client, task_id, worker_id).json()
+        payload = client.get(
+            f"{API_PREFIX}/{task_id}/execution-payload",
+            headers={
+                "X-Worker-UUID": "worker-uuid",
+                "X-Worker-ID": str(worker_id),
+                "X-Task-Attempt": str(claimed["attempt"]),
+                "X-Lease-Token": claimed["lease_token"],
+            },
+        )
+
+    assert payload.status_code == 200, payload.text
+    assert payload.json()["trusted_local_candidate"] == {
+        "source": "model_file",
+        "root": "/worker-a/models/Qwen/Test",
+        "paths": ["/worker-a/models/Qwen/Test"],
+    }
+    assert "/worker-b/secret" not in payload.text
+    asyncio.run(engine.dispose())
+
+
+def test_distribution_execution_payload_uses_source_task_and_claimed_worker_candidate(
+    tmp_path,
+):
+    app, engine, key = _test_app(tmp_path)
+    worker_id, worker_task_id = asyncio.run(_seed(engine, key))
+
+    async def seed_distribution():
+        async with AsyncSession(engine) as session:
+            worker_task = await session.get(ModelPreheatWorkerTask, worker_task_id)
+            source_task = await session.get(ModelPreheatTask, worker_task.task_id)
+            profile = ModelPreheatS3Profile(
+                name="distribution-profile",
+                endpoint="https://s3.example.com",
+                bucket="models",
+                access_key_encrypted={"ciphertext": "unused"},
+                secret_key_encrypted={"ciphertext": "unused"},
+                encryption_key_version="v1",
+            )
+            session.add(profile)
+            await session.flush()
+            source_task.s3_profile_id = profile.id
+            source_task.execution_state = ModelPreheatExecutionStateEnum.READY
+            policy = ModelPreheatDistributionPolicy(
+                name="持续同步",
+                profile_id=profile.id,
+                profile_config_version=profile.config_version,
+                cache_key=source_task.cache_key,
+                target_scope=source_task.target_scope,
+                worker_selector={"worker_uuids": [worker_task.worker_uuid]},
+                gpu_selector={},
+                selector_digest="selector",
+                created_by_task_id=source_task.id,
+            )
+            session.add(policy)
+            await session.flush()
+            worker_task.task_id = None
+            worker_task.distribution_policy_id = policy.id
+            worker_task.role = ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE
+            session.add(worker_task)
+            session.add(source_task)
+            session.add(
+                ModelFile(
+                    source=SourceEnum.MODEL_SCOPE,
+                    model_scope_model_id="Qwen/Test",
+                    worker_id=worker_id,
+                    resolved_paths=["/worker-a/models/Qwen/Test"],
+                    state=ModelFileStateEnum.READY,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed_distribution())
+    with TestClient(app) as client:
+        claimed = _claim(client, worker_task_id, worker_id).json()
+        payload = client.get(
+            f"{API_PREFIX}/{worker_task_id}/execution-payload",
+            headers={
+                "X-Worker-UUID": "worker-uuid",
+                "X-Worker-ID": str(worker_id),
+                "X-Task-Attempt": str(claimed["attempt"]),
+                "X-Lease-Token": claimed["lease_token"],
+            },
+        )
+
+    assert payload.status_code == 200, payload.text
+    assert payload.json()["trusted_local_candidate"] == {
+        "source": "model_file",
+        "root": "/worker-a/models/Qwen/Test",
+        "paths": ["/worker-a/models/Qwen/Test"],
+    }
     asyncio.run(engine.dispose())
 
 

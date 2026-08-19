@@ -62,6 +62,30 @@ class FakeInventoryProbe:
         }
 
 
+def test_candidate_on_any_target_is_preferred_as_seed(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        worker_uuids = tuple(f"worker-{index}" for index in range(10))
+        task_id, _ = await _seed(engine, worker_uuids)
+        controller = ModelPreheatController(
+            engine,
+            ready_probe=FakeReadyProbe(),
+            inventory_probe=FakeInventoryProbe({"worker-7": "candidate"}),
+        )
+        await controller.reconcile_task(task_id)
+        children = await _tasks(engine, task_id)
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+        await engine.dispose()
+        return parent, children
+
+    parent, children = asyncio.run(run())
+    assert [(child.role, child.worker_uuid) for child in children] == [
+        (ModelPreheatWorkerTaskRoleEnum.SEED, "worker-7")
+    ]
+    assert parent.local_cache_hit_worker_uuids == []
+
+
 class BlockingReadyProbe:
     def __init__(self, result=None):
         self.started = asyncio.Event()

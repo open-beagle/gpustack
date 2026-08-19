@@ -35,6 +35,7 @@ from gpustack.server.model_preheat_worker_reconciler import (
     ModelPreheatWorkerReconciler,
 )
 from gpustack.server.model_preheat_s3_inventory import ModelPreheatS3Inventory
+from gpustack.server.model_preheat_trusted_local import ProductionLocalInventoryProbe
 from gpustack.server.usage_buffer import flush_usage_to_db
 from gpustack.server.worker_syncer import WorkerSyncer
 from gpustack.utils.process import add_signal_handlers_in_loop
@@ -224,6 +225,7 @@ class Server:
         model_preheat_controller = ModelPreheatController(
             get_engine(),
             ready_probe=StrictS3ReadyProbe(self._config),
+            inventory_probe=ProductionLocalInventoryProbe(get_engine()),
             s3_inventory=self._model_preheat_s3_inventory,
         )
         self._create_restartable_async_task(

@@ -153,7 +153,7 @@ class ModelPreheatScheduleController:
                     continue
                 return existing
             try:
-                task = await self._resume_paused_task(session, schedule_id)
+                task = await self._resume_paused_task(session, schedule_id, now)
                 pause_ack_pending_id = None
                 creator_savepoint = None
                 if task is None:
@@ -458,7 +458,7 @@ class ModelPreheatScheduleController:
             await session.commit()
             return run
         try:
-            task = await self._resume_paused_task(session, schedule.id)
+            task = await self._resume_paused_task(session, schedule.id, now)
             pause_ack_pending_id = None
             creator_savepoint = None
             if task is None:
@@ -760,7 +760,8 @@ class ModelPreheatScheduleController:
             )
         ).first()
 
-    async def _resume_paused_task(self, session, schedule_id):
+    async def _resume_paused_task(self, session, schedule_id, now=None):
+        now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         paused_runs = (
             await session.exec(
                 select(ModelPreheatScheduleRun)
@@ -781,9 +782,7 @@ class ModelPreheatScheduleController:
                 or is_terminal_task(task)
             ):
                 continue
-            await self._reap_expired_pause_requests(
-                session, task, datetime.now(timezone.utc)
-            )
+            await self._reap_expired_pause_requests(session, task, now)
             task = await session.get(ModelPreheatTask, task.id, populate_existing=True)
             if task.execution_state != ModelPreheatExecutionStateEnum.PAUSED:
                 continue
