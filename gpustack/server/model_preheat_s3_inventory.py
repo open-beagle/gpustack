@@ -36,11 +36,16 @@ from gpustack.schemas.model_preheats import (
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 from gpustack.worker.model_preheat.manifest import MAX_MANIFEST_BYTES
 from gpustack.worker.model_preheat.s3_client import (
-    MAX_READY_BYTES,
     ModelPreheatS3Client,
     ModelPreheatS3ManifestError,
 )
 
+
+# ready.json 读取上限（任务 1→任务 2 import seam）。
+# 任务 1 收敛 s3_client 后不再从该模块导出此常量；这里在库存模块本地保留
+# 相同的旧协议读取上限，不恢复 s3_client 旧发布协议。任务 5 将本模块改写为
+# 统一 Artifact 库存后，此本地常量随旧 generation 流程一并移除。
+MAX_READY_BYTES = 64 * 1024
 
 MAX_INVENTORY_OBJECT_PATH = 4096
 MAX_INVENTORY_OBJECTS = 100_000

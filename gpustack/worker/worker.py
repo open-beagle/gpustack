@@ -30,7 +30,7 @@ from gpustack.utils.task import run_periodically_in_thread
 from gpustack.worker.model_file_manager import ModelFileManager
 from gpustack.worker.model_preheat.executor import build_preheat_role_handlers
 from gpustack.worker.model_preheat.manager import ModelPreheatManager
-from gpustack.worker.model_cache_manager import ModelCacheManager
+from gpustack.worker.model_storage_sync_manager import ModelStorageSyncManager
 from gpustack.worker.serve_manager import ServeManager
 from gpustack.worker.startup_cleanup import cleanup_stale_model_instances
 from gpustack.worker.exporter import MetricExporter
@@ -243,10 +243,10 @@ class Worker:
         )
         self._create_async_task(model_file_manager.watch_model_files())
 
-        model_cache_manager = ModelCacheManager(
+        model_storage_sync_manager = ModelStorageSyncManager(
             worker_id=self._worker_id, clientset=self._clientset, cfg=self._config
         )
-        self._create_async_task(model_cache_manager.watch_model_cache_tasks())
+        self._create_async_task(model_storage_sync_manager.watch_model_storage_sync_tasks())
 
         model_preheat_manager = ModelPreheatManager(
             worker_id=self._worker_id,

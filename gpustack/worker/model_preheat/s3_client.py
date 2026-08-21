@@ -6,7 +6,6 @@ import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import timedelta
-from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -20,20 +19,18 @@ from minio.helpers import (
 )
 import urllib3
 
-from gpustack.worker.model_preheat.identity import (
-    ModelPreheatIdentity,
-    decode_path,
-    encode_path,
-)
+from gpustack.worker.model_preheat.identity import decode_path
+
 from gpustack.worker.model_preheat.manifest import (
     MAX_MANIFEST_BYTES,
     ManifestFile,
     ModelPreheatManifest,
+    ModelPreheatManifestError,
+    parse_artifact_manifest,
 )
 
 
-GENERATION_MANIFEST_OBJECT_NAME = ".gpustack-manifest.json"
-MAX_READY_BYTES = 64 * 1024
+ARTIFACT_MANIFEST_OBJECT_NAME = "manifest.json"
 CONDITIONAL_SINGLE_PUT_MAX_SIZE = 64 * 1024 * 1024
 CONDITIONAL_MULTIPART_PART_SIZE = 5 * 1024 * 1024
 RATE_LIMIT_CHUNK_SIZE = 64 * 1024
@@ -52,6 +49,12 @@ class ModelPreheatS3ManifestError(RuntimeError):
 
 
 class ModelPreheatCanceled(RuntimeError):
+    pass
+
+
+class ModelPreheatS3ManifestConflict(RuntimeError):
+    """统一 Artifact 的 Manifest 已存在且内容不一致。"""
+
     pass
 
 
@@ -142,12 +145,6 @@ def _read_exact(source, size, cancel_check=None):
     return b"".join(chunks)
 
 
-class CancelCleanupResult(str, Enum):
-    REMOVED = "removed"
-    ABSENT = "absent"
-    NOT_OWNED = "not_owned"
-
-
 @dataclass(frozen=True)
 class PublishResult:
     uploaded: int
@@ -210,382 +207,203 @@ class ModelPreheatS3Client:
             minio_client.disable_virtual_style_endpoint()
         return cls(minio_client)
 
-    def ready_object(self, prefix: str, manifest: ModelPreheatManifest) -> str:
-        return self._ready_object(prefix, manifest.identity, manifest.selection_digest)
+    def artifact_manifest_object(
+        self,
+        profile_prefix: str,
+        manifest: ModelPreheatManifest,
+    ) -> str:
+        """统一 Artifact 的 Manifest 对象 Key。
 
-    def generation_prefix(self, prefix: str, manifest: ModelPreheatManifest) -> str:
+        固定为 `<profile_prefix>/<source>/<organization>/<model>/<artifact_id>/manifest.json`。
+        profile_prefix 必须显式传入并安全透传到 Artifact 前缀。
+        """
         return self._join_object_name(
-            self._selection_prefix(
-                prefix, manifest.identity, manifest.selection_digest
-            ),
-            "generations",
-            manifest.generation_id,
+            manifest.artifact_prefix(profile_prefix),
+            ARTIFACT_MANIFEST_OBJECT_NAME,
         )
 
-    def generation_file_object(
+    def artifact_file_object(
         self,
-        prefix: str,
+        profile_prefix: str,
         manifest: ModelPreheatManifest,
         file: ManifestFile,
     ) -> str:
+        """统一 Artifact 的文件对象 Key：`.../<artifact_id>/files/<relative_path>`。"""
         return self._join_object_name(
-            self.generation_prefix(prefix, manifest),
+            manifest.artifact_prefix(profile_prefix),
             "files",
             file.path,
         )
 
-    def manifest_object(self, prefix: str, manifest: ModelPreheatManifest) -> str:
-        return self._join_object_name(
-            self.generation_prefix(prefix, manifest),
-            GENERATION_MANIFEST_OBJECT_NAME,
-        )
-
-    def publish_generation(
+    def read_artifact_manifest(
         self,
         bucket_name: str,
-        prefix: str,
+        profile_prefix: str,
+        manifest: ModelPreheatManifest,
+    ) -> ModelPreheatManifest | None:
+        """读取并严格校验统一 Artifact Manifest；不存在时返回 None。
+
+        旧协议的 Manifest 字段集合与统一 Artifact 不同，
+        会被 `parse_artifact_manifest` 拒绝，不视为有效 Artifact。
+        """
+        object_name = self.artifact_manifest_object(profile_prefix, manifest)
+        try:
+            manifest_bytes = self._read_object_bytes(bucket_name, object_name)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ModelPreheatS3ManifestError("s3_manifest_invalid") from exc
+        if manifest_bytes is None:
+            return None
+        try:
+            payload = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ModelPreheatS3ManifestError("s3_manifest_invalid") from exc
+        stored = parse_artifact_manifest(payload)
+        if stored.artifact_id != manifest.artifact_id:
+            # 对象 Key 由调用方 artifact_id 推导，存储内容却指向
+            # 不同身份，视为内容冲突而不是格式非法。
+            raise ModelPreheatS3ManifestConflict("artifact_manifest_conflict")
+        return stored
+
+    def publish_artifact(
+        self,
+        bucket_name: str,
+        profile_prefix: str,
         manifest: ModelPreheatManifest,
         root_dir: str | Path,
         *,
         cancel_check=None,
         bandwidth_limit_mbps: int | None = None,
     ) -> PublishResult:
+        """按统一 Artifact 协议发布：校验已有文件、补传缺失文件、
+        全量校验、最后条件写 Manifest。
+
+        Manifest 已存在且内容一致时幂等成功；内容冲突或路径上存在
+        非法 Manifest 时失败闭合；
+        不创建 `ready.json`。并发发布者依靠对象级幂等校验与
+        Manifest 条件写入收敛到同一有效 Artifact。
+
+        内容完整性不信任 metadata：远端文件通过流式重算 SHA-256 校验，
+        本地文件在发布时流式重算 SHA-256 后再上传。
+        profile_prefix 必须显式传入并安全透传到所有对象 Key。
+        """
         root = Path(root_dir).resolve()
         uploaded = 0
         skipped = 0
         publish_attempt = uuid.uuid4().hex
-        written_manifest = None
-        written_ready = None
         self._raise_if_cancelled(cancel_check)
-        try:
-            existing_ready = self.read_ready_manifest(
-                bucket_name,
-                prefix,
-                manifest.identity,
-                cache_key=manifest.cache_key,
-                selection_digest=manifest.selection_digest,
-            )
-            if existing_ready is not None and existing_ready != manifest:
-                raise ReadyGenerationConflict("ready_generation_conflict")
 
-            for file in manifest.files:
-                self._raise_if_cancelled(cancel_check)
-                local_path = self._local_manifest_path(root, file)
-                object_name = self.generation_file_object(prefix, manifest, file)
-                if self._object_matches(
+        for file in manifest.files:
+            self._raise_if_cancelled(cancel_check)
+            local_path = self._local_manifest_path(root, file)
+            # 本地完整性：流式重算 SHA-256，不能只信 Manifest 声明值。
+            local_sha256 = self._sha256_file_bytes(
+                local_path,
+                cancel_check=cancel_check,
+                bandwidth_limit_mbps=bandwidth_limit_mbps,
+            )
+            if local_sha256 != file.sha256:
+                raise ModelPreheatS3Conflict("local_file_content_mismatch")
+            object_name = self.artifact_file_object(profile_prefix, manifest, file)
+            if self._remote_object_matches(
+                bucket_name, object_name, file.size, file.sha256
+            ):
+                skipped += 1
+                continue
+            written = self._put_file_if_absent(
+                bucket_name,
+                object_name,
+                local_path,
+                metadata={
+                    "sha256": file.sha256,
+                    "model-artifact-id": manifest.artifact_id,
+                    "model-artifact-publish-attempt": publish_attempt,
+                },
+                cancel_check=cancel_check,
+                bandwidth_limit_mbps=bandwidth_limit_mbps,
+            )
+            self._raise_if_cancelled(cancel_check)
+            if not written:
+                if self._remote_object_matches(
                     bucket_name, object_name, file.size, file.sha256
                 ):
                     skipped += 1
                     continue
-                written = self._put_file_if_absent(
-                    bucket_name,
-                    object_name,
-                    local_path,
-                    metadata={
-                        "sha256": file.sha256,
-                        "model-preheat-digest": manifest.digest,
-                        "model-preheat-publish-attempt": publish_attempt,
-                    },
-                    cancel_check=cancel_check,
-                    bandwidth_limit_mbps=bandwidth_limit_mbps,
-                )
-                self._raise_if_cancelled(cancel_check)
-                if not written:
-                    if self._object_matches(
-                        bucket_name, object_name, file.size, file.sha256
-                    ):
-                        skipped += 1
-                        continue
-                    raise ModelPreheatS3Conflict("object_content_conflict")
-                uploaded += 1
+                raise ModelPreheatS3Conflict("object_content_conflict")
+            uploaded += 1
 
-            for file in manifest.files:
-                object_name = self.generation_file_object(prefix, manifest, file)
-                if not self._object_matches(
-                    bucket_name, object_name, file.size, file.sha256
-                ):
-                    raise ModelPreheatS3Conflict("object_content_conflict")
-
-            self._raise_if_cancelled(cancel_check)
-            manifest_bytes = manifest.to_json_bytes()
-            manifest_sha256 = self._sha256_bytes(manifest_bytes)
-            manifest_object = self.manifest_object(prefix, manifest)
-            if self._object_matches(
-                bucket_name, manifest_object, len(manifest_bytes), manifest_sha256
-            ):
-                skipped += 1
-            else:
-                written_manifest = self._put_bytes_if_absent(
-                    bucket_name,
-                    manifest_object,
-                    manifest_bytes,
-                    content_type="application/json",
-                    metadata={
-                        "sha256": manifest_sha256,
-                        "model-preheat-digest": manifest.digest,
-                        "model-preheat-publish-attempt": publish_attempt,
-                    },
-                )
-                self._raise_if_cancelled(cancel_check)
-                if not written_manifest:
-                    if not self._object_matches(
-                        bucket_name,
-                        manifest_object,
-                        len(manifest_bytes),
-                        manifest_sha256,
-                    ):
-                        raise ModelPreheatS3Conflict("object_content_conflict")
-                    skipped += 1
-                else:
-                    uploaded += 1
-
-            if not self._object_matches(
-                bucket_name, manifest_object, len(manifest_bytes), manifest_sha256
+        for file in manifest.files:
+            object_name = self.artifact_file_object(profile_prefix, manifest, file)
+            if not self._remote_object_matches(
+                bucket_name, object_name, file.size, file.sha256
             ):
                 raise ModelPreheatS3Conflict("object_content_conflict")
-            self._raise_if_cancelled(cancel_check)
-            ready_object = self.ready_object(prefix, manifest)
-            existing_ready = self.read_ready_manifest(
-                bucket_name,
-                prefix,
-                manifest.identity,
-                cache_key=manifest.cache_key,
-                selection_digest=manifest.selection_digest,
-            )
-            ready_payload = self._ready_payload(prefix, manifest, manifest_sha256)
-            if existing_ready is not None:
-                if existing_ready != manifest:
-                    raise ReadyGenerationConflict("ready_generation_conflict")
-                ready_written = False
-            else:
-                ready_written = self._put_ready_if_absent(
-                    bucket_name,
-                    ready_object,
-                    ready_payload,
-                    metadata={
-                        "model-preheat-digest": manifest.digest,
-                        "model-preheat-publish-attempt": publish_attempt,
-                        "sha256": self._sha256_bytes(ready_payload),
-                    },
-                    ready_payload=ready_payload,
-                )
-                written_ready = ready_written
-                self._raise_if_cancelled(cancel_check)
 
+        self._raise_if_cancelled(cancel_check)
+        try:
+            existing = self.read_artifact_manifest(
+                bucket_name, profile_prefix, manifest
+            )
+        except (ModelPreheatS3ManifestError, ModelPreheatManifestError):
+            # 路径上已存在无法解析的 Manifest：绝不覆盖，按冲突失败闭合。
+            raise ModelPreheatS3ManifestConflict("artifact_manifest_conflict") from None
+        if existing is not None:
+            # artifact_id 是身份核心字段的内容摘要，相同即语义一致，幂等成功；
+            # 本运行已补传的文件计入 uploaded。
             return PublishResult(
                 uploaded=uploaded,
-                skipped=skipped,
-                ready_written=ready_written,
-                ready_digest=manifest.digest,
-                generation_prefix=self.generation_prefix(prefix, manifest),
+                skipped=skipped + 1,
+                ready_written=False,
+                ready_digest=manifest.artifact_id,
+                generation_prefix=manifest.artifact_prefix(profile_prefix),
             )
-        except ModelPreheatCanceled:
-            cleanup_objects = []
-            if written_ready:
-                cleanup_objects.append((ready_object, ready_payload))
-            if written_manifest:
-                cleanup_objects.append((manifest_object, manifest_bytes))
-            cleanup_succeeded = True
-            for object_name, payload in cleanup_objects:
-                if not self._retry_remove_if_owned(
-                    bucket_name, object_name, payload, publish_attempt
-                ):
-                    cleanup_succeeded = False
-            if not cleanup_succeeded:
-                raise ModelPreheatS3Conflict("cancel_cleanup_failed") from None
-            raise
 
-    def head_object(self, bucket_name: str, object_name: str) -> dict | None:
-        try:
-            stat = self._client.stat_object(bucket_name, object_name)
-        except Exception as exc:
-            if self._is_not_found(exc):
-                return None
-            raise
-        metadata = self._normalized_metadata(getattr(stat, "metadata", {}) or {})
-        return {
-            "size": getattr(stat, "size", None),
-            "sha256": metadata.get("sha256"),
-        }
-
-    def list_objects(self, bucket_name: str, prefix: str) -> list[str]:
-        return sorted(self.iter_objects(bucket_name, prefix))
-
-    def iter_objects(self, bucket_name: str, prefix: str, *, max_objects=None):
-        objects = self._client.list_objects(bucket_name, prefix=prefix, recursive=True)
-        count = 0
-        for item in objects:
-            object_name = getattr(item, "object_name", None)
-            if object_name is None:
-                continue
-            count += 1
-            if max_objects is not None and count > max_objects:
-                raise ModelPreheatS3ManifestError("s3_inventory_object_limit")
-            yield object_name
-
-    def remove_object(self, bucket_name: str, object_name: str):
-        try:
-            self._client.remove_object(bucket_name, object_name)
-        except Exception as exc:
-            if not self._is_not_found(exc):
-                raise
-
-    def stream_object(
-        self,
-        bucket_name: str,
-        object_name: str,
-        chunk_size: int = 1024 * 1024,
-        bandwidth_limit_mbps: int | None = None,
-    ):
-        response = self._client.get_object(bucket_name, object_name)
-        limiter = _BandwidthLimiter(bandwidth_limit_mbps)
-        if limiter.enabled:
-            chunk_size = min(chunk_size, RATE_LIMIT_CHUNK_SIZE)
-        try:
-            while True:
-                chunk = response.read(chunk_size)
-                if not chunk:
-                    return
-                limiter.consume(len(chunk))
-                yield chunk
-        finally:
-            self._close_response(response)
-
-    def download_generation_file(
-        self,
-        bucket_name: str,
-        prefix: str,
-        manifest: ModelPreheatManifest,
-        file: ManifestFile,
-        target_path: str | Path,
-        *,
-        bandwidth_limit_mbps: int | None = None,
-    ):
-        target = Path(target_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        object_name = self.generation_file_object(prefix, manifest, file)
-        with target.open("wb") as output:
-            for chunk in self.stream_object(
-                bucket_name,
-                object_name,
-                bandwidth_limit_mbps=bandwidth_limit_mbps,
-            ):
-                output.write(chunk)
-
-    def read_ready(
-        self,
-        bucket_name: str,
-        prefix: str,
-        identity,
-        selection_digest: str,
-    ) -> dict | None:
-        return self._read_ready(
+        manifest_bytes = manifest.to_artifact_json_bytes()
+        manifest_sha256 = self._sha256_bytes(manifest_bytes)
+        manifest_object = self.artifact_manifest_object(profile_prefix, manifest)
+        written_manifest = self._put_bytes_if_absent(
             bucket_name,
-            self._ready_object(prefix, identity, selection_digest),
+            manifest_object,
+            manifest_bytes,
+            content_type="application/json",
+            metadata={
+                "sha256": manifest_sha256,
+                "model-artifact-id": manifest.artifact_id,
+                "model-artifact-publish-attempt": publish_attempt,
+            },
         )
+        self._raise_if_cancelled(cancel_check)
+        if not written_manifest:
+            try:
+                existing = self.read_artifact_manifest(
+                    bucket_name, profile_prefix, manifest
+                )
+            except (ModelPreheatS3ManifestError, ModelPreheatManifestError):
+                # 条件写失败后重读到非法 Manifest：按冲突失败闭合。
+                raise ModelPreheatS3ManifestConflict(
+                    "artifact_manifest_conflict"
+                ) from None
+            if existing is not None:
+                # 条件写失败但内容一致：并发发布者已写入同一 Manifest。
+                return PublishResult(
+                    uploaded=uploaded,
+                    skipped=skipped,
+                    ready_written=False,
+                    ready_digest=manifest.artifact_id,
+                    generation_prefix=manifest.artifact_prefix(profile_prefix),
+                )
+            raise ModelPreheatS3Conflict("object_content_conflict")
 
-    def read_ready_manifest(
-        self,
-        bucket_name: str,
-        prefix: str,
-        identity,
-        *,
-        cache_key: str,
-        selection_digest: str,
-    ) -> ModelPreheatManifest | None:
-        try:
-            ready = self.read_ready(bucket_name, prefix, identity, selection_digest)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid") from exc
-        if ready is None:
-            return None
-        if (
-            not isinstance(ready, dict)
-            or ready.get("identity_digest") != identity.digest
+        if not self._remote_object_matches(
+            bucket_name, manifest_object, len(manifest_bytes), manifest_sha256
         ):
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid")
-        manifest_name = ready.get("manifest_object")
-        ready_generation_id = ready.get("generation_id")
-        if (
-            not isinstance(manifest_name, str)
-            or not self._is_sha256(ready.get("manifest_sha256"))
-            or not self._is_safe_identifier(ready_generation_id)
-            or not self._is_safe_identifier(ready.get("cache_key"))
-            or not self._is_safe_identifier(ready.get("selection_digest"))
-        ):
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid")
-        expected_generation_prefix = self._join_object_name(
-            self._selection_prefix(prefix, identity, selection_digest),
-            "generations",
-            ready_generation_id,
-        )
-        expected_manifest_name = self._join_object_name(
-            expected_generation_prefix, GENERATION_MANIFEST_OBJECT_NAME
-        )
-        if (
-            ready.get("generation_prefix") != expected_generation_prefix
-            or manifest_name != expected_manifest_name
-        ):
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid")
-        try:
-            manifest_bytes = self._read_object_bytes(bucket_name, manifest_name)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid") from exc
-        if manifest_bytes is None or self._sha256_bytes(manifest_bytes) != ready.get(
-            "manifest_sha256"
-        ):
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid")
-        try:
-            manifest = self._manifest_from_payload(
-                json.loads(manifest_bytes.decode("utf-8"))
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid") from exc
-        if (
-            manifest.identity != identity
-            or ready.get("digest") != manifest.digest
-            or ready.get("cache_key") != manifest.cache_key
-            or ready.get("selection_digest") != manifest.selection_digest
-            or ready_generation_id != manifest.generation_id
-            or ready.get("generation_prefix")
-            != self.generation_prefix(prefix, manifest)
-            or manifest_name != self.manifest_object(prefix, manifest)
-            or ready.get("files") != len(manifest.files)
-            or ready.get("total_size") != manifest.total_size
-            or ready.get("schema_version") != 1
-        ):
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid")
-        if (
-            manifest.cache_key != cache_key
-            or manifest.selection_digest != selection_digest
-        ):
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid")
-        return manifest
+            raise ModelPreheatS3Conflict("object_content_conflict")
 
-    @staticmethod
-    def _encoded_prefix(prefix: str) -> str:
-        stripped = prefix.strip("/")
-        if stripped == "":
-            return ""
-        return encode_path(stripped)
-
-    def _selection_prefix(self, prefix: str, identity, selection_digest: str) -> str:
-        if not self._is_safe_identifier(selection_digest):
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid")
-        return self._join_object_name(
-            self._encoded_prefix(prefix),
-            "model-cache",
-            "v1",
-            identity.source,
-            identity.model_path,
-            identity.revision_path,
-            selection_digest,
-        )
-
-    def _ready_object(self, prefix: str, identity, selection_digest: str) -> str:
-        return self._join_object_name(
-            self._selection_prefix(prefix, identity, selection_digest),
-            "ready.json",
+        return PublishResult(
+            uploaded=uploaded + 1,
+            skipped=skipped,
+            ready_written=True,
+            ready_digest=manifest.artifact_id,
+            generation_prefix=manifest.artifact_prefix(profile_prefix),
         )
 
     @staticmethod
@@ -618,16 +436,28 @@ class ModelPreheatS3Client:
             raise ValueError("manifest_path_escape")
         return local_path
 
-    def _read_ready(self, bucket_name: str, object_name: str) -> dict | None:
-        return self._read_json_object(bucket_name, object_name)
+    def _sha256_file_bytes(
+        self,
+        path: Path,
+        *,
+        cancel_check=None,
+        bandwidth_limit_mbps: int | None = None,
+    ) -> str:
+        """流式读取本地文件并计算内容 SHA-256（不信任 Manifest 声明值）。"""
+        import hashlib
 
-    def _read_json_object(self, bucket_name: str, object_name: str) -> dict | None:
-        payload = self._read_object_bytes(
-            bucket_name, object_name, max_bytes=MAX_READY_BYTES
-        )
-        if payload is None:
-            return None
-        return json.loads(payload.decode("utf-8"))
+        digest = hashlib.sha256()
+        limiter = _BandwidthLimiter(bandwidth_limit_mbps)
+        chunk_size = RATE_LIMIT_CHUNK_SIZE if limiter.enabled else 1024 * 1024
+        with path.open("rb") as source:
+            while True:
+                if cancel_check is not None and cancel_check():
+                    raise ModelPreheatCanceled("canceled")
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    return digest.hexdigest()
+                limiter.consume(len(chunk))
+                digest.update(chunk)
 
     def _read_object_bytes(
         self, bucket_name: str, object_name: str, *, max_bytes=MAX_MANIFEST_BYTES
@@ -652,86 +482,66 @@ class ModelPreheatS3Client:
         finally:
             self._close_response(response)
 
-    def _object_matches(
+    def _remote_object_matches(
         self,
         bucket_name: str,
         object_name: str,
         size: int,
         sha256: str,
+        *,
+        cancel_check=None,
+        bandwidth_limit_mbps: int | None = None,
     ) -> bool:
+        """校验远端对象与声明的大小、SHA-256 一致。
+
+        不能只信 metadata：先比对对象大小，再通过 `get_object` 流式
+        读取完整内容并重新计算 SHA-256。内容读取或摘要不一致都判定
+        不匹配，由调用方按冲突失败闭合。
+        """
         try:
             stat = self._client.stat_object(bucket_name, object_name)
         except Exception as exc:
             if self._is_not_found(exc):
                 return False
             raise
-        metadata = self._normalized_metadata(getattr(stat, "metadata", {}) or {})
-        return getattr(stat, "size", None) == size and metadata.get("sha256") == sha256
-
-    def _manifest_from_payload(self, payload: dict) -> ModelPreheatManifest:
-        try:
-            identity_payload = payload["identity"]
-            identity = ModelPreheatIdentity(
-                source=identity_payload["source"],
-                model_id=decode_path(identity_payload["model_id"]),
-                revision=decode_path(identity_payload["revision"]),
-                file_patterns=tuple(
-                    decode_path(pattern)
-                    for pattern in identity_payload["file_patterns"]
-                ),
+        if getattr(stat, "size", None) != size:
+            return False
+        return (
+            self._stream_sha256(
+                bucket_name,
+                object_name,
+                cancel_check=cancel_check,
+                bandwidth_limit_mbps=bandwidth_limit_mbps,
             )
-            manifest = ModelPreheatManifest(
-                identity=identity,
-                files=tuple(
-                    ManifestFile(
-                        path=file["path"],
-                        size=file["size"],
-                        sha256=file["sha256"],
-                    )
-                    for file in payload["files"]
-                ),
-                cache_key=payload["cache_key"],
-                selection_digest=payload["selection_digest"],
-                generation_id=payload["generation_id"],
-                exclude_patterns=tuple(
-                    decode_path(pattern)
-                    for pattern in payload.get("exclude_patterns", [])
-                ),
-                requested_revision=decode_path(
-                    payload.get("requested_revision", identity.revision_path)
-                ),
-                schema_version=payload.get("schema_version", 1),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid") from exc
-        if payload != manifest.to_dict():
-            raise ModelPreheatS3ManifestError("s3_manifest_invalid")
-        return manifest
+            == sha256
+        )
 
-    def _ensure_no_conflicting_object(self, bucket_name: str, object_name: str):
-        try:
-            self._client.stat_object(bucket_name, object_name)
-        except Exception as exc:
-            if self._is_not_found(exc):
-                return
-            raise
-        raise ModelPreheatS3Conflict(f"object_content_conflict:{object_name}")
-
-    def _put_json_bytes(
+    def _stream_sha256(
         self,
         bucket_name: str,
         object_name: str,
-        payload: bytes,
-        metadata: dict[str, str] | None = None,
-    ):
-        self._client.put_object(
-            bucket_name,
-            object_name,
-            io.BytesIO(payload),
-            len(payload),
-            content_type="application/json",
-            metadata=metadata or {},
-        )
+        *,
+        cancel_check=None,
+        bandwidth_limit_mbps: int | None = None,
+    ) -> str:
+        """流式读取对象并计算内容 SHA-256（不信任任何 metadata）。"""
+        import hashlib
+
+        digest = hashlib.sha256()
+        limiter = _BandwidthLimiter(bandwidth_limit_mbps)
+        try:
+            response = self._client.get_object(bucket_name, object_name)
+            chunk_size = RATE_LIMIT_CHUNK_SIZE if limiter.enabled else 1024 * 1024
+            while True:
+                if cancel_check is not None and cancel_check():
+                    raise ModelPreheatCanceled("canceled")
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    return digest.hexdigest()
+                limiter.consume(len(chunk))
+                digest.update(chunk)
+        finally:
+            self._close_response(response)
 
     def _put_file_if_absent(
         self,
@@ -1004,99 +814,6 @@ class ModelPreheatS3Client:
             ET.SubElement(element, "ETag").text = f'"{part.etag}"'
         return ET.tostring(root, encoding="utf-8")
 
-    def _remove_if_owned(
-        self, bucket_name: str, object_name: str, payload: bytes, attempt: str
-    ) -> CancelCleanupResult:
-        try:
-            stat = self._client.stat_object(bucket_name, object_name)
-        except Exception as exc:
-            if self._is_not_found(exc):
-                return CancelCleanupResult.ABSENT
-            raise
-        metadata = self._normalized_metadata(getattr(stat, "metadata", {}) or {})
-        if (
-            getattr(stat, "size", None) != len(payload)
-            or metadata.get("sha256") != self._sha256_bytes(payload)
-            or metadata.get("model-preheat-publish-attempt") != attempt
-            or self._read_object_bytes(bucket_name, object_name) != payload
-        ):
-            return CancelCleanupResult.NOT_OWNED
-        self._client.remove_object(bucket_name, object_name)
-        if not self._cleanup_object_absent(bucket_name, object_name):
-            raise ModelPreheatS3Conflict("cancel_cleanup_not_confirmed")
-        return CancelCleanupResult.REMOVED
-
-    def _retry_remove_if_owned(
-        self, bucket_name: str, object_name: str, payload: bytes, attempt: str
-    ) -> bool:
-        for retry in range(self._cancel_cleanup_attempts):
-            try:
-                self._remove_if_owned(bucket_name, object_name, payload, attempt)
-                return True
-            except Exception:
-                if retry + 1 == self._cancel_cleanup_attempts:
-                    return False
-                self._cancel_cleanup_sleep(self._cancel_cleanup_backoff * (2**retry))
-        return False
-
-    def _cleanup_object_absent(self, bucket_name: str, object_name: str) -> bool:
-        try:
-            self._client.stat_object(bucket_name, object_name)
-            return False
-        except Exception as exc:
-            if not self._is_not_found(exc):
-                raise
-        return self._read_object_bytes(bucket_name, object_name) is None
-
-    def _put_ready_if_absent(
-        self,
-        bucket_name: str,
-        object_name: str,
-        payload: bytes,
-        metadata: dict[str, str],
-        ready_payload: bytes,
-    ) -> bool:
-        written = self._put_stream_if_absent(
-            bucket_name,
-            object_name,
-            io.BytesIO(payload),
-            len(payload),
-            "application/json",
-            metadata,
-        )
-        if written:
-            return True
-        existing_ready = self._read_ready(bucket_name, object_name)
-        if existing_ready == json.loads(ready_payload.decode("utf-8")):
-            return False
-        raise ReadyGenerationConflict("ready_generation_conflict")
-
-    def _ready_payload(
-        self,
-        prefix: str,
-        manifest: ModelPreheatManifest,
-        manifest_sha256: str,
-    ) -> bytes:
-        payload = {
-            "digest": manifest.digest,
-            "cache_key": manifest.cache_key,
-            "files": len(manifest.files),
-            "generation_prefix": self.generation_prefix(prefix, manifest),
-            "generation_id": manifest.generation_id,
-            "identity_digest": manifest.identity.digest,
-            "manifest_object": self.manifest_object(prefix, manifest),
-            "manifest_sha256": manifest_sha256,
-            "selection_digest": manifest.selection_digest,
-            "schema_version": 1,
-            "total_size": manifest.total_size,
-        }
-        return json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-
     @staticmethod
     def _close_response(response):
         close = getattr(response, "close", None)
@@ -1146,21 +863,3 @@ class ModelPreheatS3Client:
         import hashlib
 
         return hashlib.sha256(payload).hexdigest()
-
-    @staticmethod
-    def _is_sha256(value) -> bool:
-        return (
-            isinstance(value, str)
-            and len(value) == 64
-            and all(char in "0123456789abcdef" for char in value)
-        )
-
-    @staticmethod
-    def _is_safe_identifier(value) -> bool:
-        return (
-            isinstance(value, str)
-            and 0 < len(value) <= 256
-            and "/" not in value
-            and "\\" not in value
-            and all(ord(char) >= 32 and ord(char) != 127 for char in value)
-        )

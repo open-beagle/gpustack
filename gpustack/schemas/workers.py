@@ -9,6 +9,12 @@ from gpustack.schemas.common import PaginatedList, UTCDateTime, pydantic_column_
 from typing import List
 from sqlalchemy.orm import declarative_base
 
+# 统一模型存储协议版本。
+# 新 Worker 注册/心跳固定上报 ``MODEL_STORAGE_PROTOCOL_VERSION``（=1）；
+# 数据库列缺省为 0，表示该 Worker 尚不支持统一存储协议（旧版本）。
+# Server 不向版本 0 或不匹配的 Worker 创建新的 ModelFile/同步/预热任务。
+MODEL_STORAGE_PROTOCOL_VERSION = 1
+
 Base = declarative_base()
 
 
@@ -172,6 +178,9 @@ class WorkerBase(SQLModel):
         sa_column=Column(UTCDateTime), default=None
     )
     worker_uuid: str
+    # 统一模型存储协议版本；新 Worker 上报 1，缺省 0 表示不支持统一存储协议。
+    # Server 不向版本 0 或不匹配的 Worker 创建新 ModelFile/同步/预热任务。
+    model_storage_protocol_version: int = 0
 
     def clear_allocated_resources(self):
         if self.status is None:

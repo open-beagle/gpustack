@@ -8,7 +8,7 @@ from gpustack.routes import (
     gpu_devices,
     model_evaluations,
     model_files,
-    model_cache,
+    model_storage,
     model_instances,
     model_preheats,
     model_preheat_schedules,
@@ -61,11 +61,10 @@ v1_admin_router.include_router(
 v1_admin_router.include_router(
     model_files.router, prefix="/model-files", tags=["Model Files"]
 )
+# 模型存储：路由内已带完整 /model-storage* 前缀（capabilities/connection-tests
+# /sync-tasks/artifacts），挂载在 /v1 管理员作用域下，不再叠加额外前缀。
 v1_admin_router.include_router(
-    model_cache.router, prefix="/model-cache", tags=["Model Cache"]
-)
-v1_admin_router.include_router(
-    model_cache.task_router, prefix="/model-cache-tasks", tags=["Model Cache Tasks"]
+    model_storage.router, tags=["Model Storage"]
 )
 v1_admin_router.include_router(
     model_evaluations.router, prefix="/model-evaluations", tags=["Model Evaluations"]
@@ -110,6 +109,11 @@ api_router.include_router(
     model_preheat_worker_tasks.router,
     prefix="/v1/model-preheat-worker-tasks",
     tags=["Model Preheat Worker Tasks"],
+)
+api_router.include_router(
+    model_storage.worker_router,
+    prefix="/v1/model-storage-worker-tasks",
+    tags=["Model Storage Worker Tasks"],
 )
 api_router.include_router(
     admin_container_exec.ws_router,

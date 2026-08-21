@@ -17,7 +17,7 @@ class ModelPreheatDistributionPolicy(SQLModel, BaseModelMixin, table=True):
     __table_args__ = (
         UniqueConstraint(
             "profile_id",
-            "cache_key",
+            "request_digest",
             "target_scope",
             "selector_digest",
             name="uix_preheat_distribution_policy_selector",
@@ -35,7 +35,10 @@ class ModelPreheatDistributionPolicy(SQLModel, BaseModelMixin, table=True):
         )
     )
     profile_config_version: int
-    cache_key: str
+    # 用请求身份与其摘要替代旧 cache_key；每次实例化任务时再解析不可变 revision
+    # 选择或生成 Artifact，不再依赖旧 cache_key。
+    request_identity: dict = Field(sa_column=Column(JSON, nullable=False))
+    request_digest: str
     target_scope: ModelPreheatTargetScopeEnum
     worker_selector: dict = Field(sa_column=Column(JSON, nullable=False))
     gpu_selector: dict = Field(sa_column=Column(JSON, nullable=False))
@@ -66,7 +69,8 @@ class ModelPreheatDistributionPolicyPublic(SQLModel):
     enabled: bool
     profile_id: int
     profile_config_version: int
-    cache_key: str
+    request_identity: dict
+    request_digest: str
     target_scope: ModelPreheatTargetScopeEnum
     worker_selector: dict
     gpu_selector: dict
@@ -105,8 +109,12 @@ def distribution_selector_digest(worker_selector: dict, gpu_selector: dict) -> s
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def distribution_operation_key(policy_id: int, worker_uuid: str, cache_key: str) -> str:
+def distribution_operation_key(
+    policy_id: int, worker_uuid: str, request_digest: str
+) -> str:
     payload = json.dumps(
-        [policy_id, worker_uuid, cache_key], separators=(",", ":"), ensure_ascii=False
+        [policy_id, worker_uuid, request_digest],
+        separators=(",", ":"),
+        ensure_ascii=False,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

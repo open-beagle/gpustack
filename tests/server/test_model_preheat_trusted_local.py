@@ -4,7 +4,6 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from gpustack.schemas.model_cache import ModelCacheTask, ModelCacheTaskStateEnum
 from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
@@ -47,7 +46,10 @@ async def _seed(session):
         include_patterns=[],
         exclude_patterns=[],
         selection_digest="selection",
-        cache_key="cache-key",
+        # 请求身份为 NOT NULL（任务 1 契约）：本文件只验证本地候选探测，
+        # 不依赖其内容，直接给出占位值。
+        request_identity={"source": "modelscope", "model_id": "Qwen/Test"},
+        request_digest="digest",
         generation_id="preheat-00000000-0000-4000-8000-000000000001",
         target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
         target_worker_uuids=[worker.worker_uuid for worker in workers],
@@ -93,51 +95,6 @@ def test_probe_finds_ready_model_file_on_any_of_ten_workers(tmp_path):
     assert results["worker-7"].paths == ("/models/Qwen/Test",)
     assert results["worker-7"].repository_complete is True
     assert sum(result.state == "candidate" for result in results.values()) == 1
-
-
-def test_archive_candidate_is_worker_scoped_and_preserves_source_paths(tmp_path):
-    async def run():
-        engine = await _database(tmp_path)
-        async with AsyncSession(engine) as session:
-            task, workers = await _seed(session)
-            model_file = ModelFile(
-                source=SourceEnum.MODEL_SCOPE,
-                model_scope_model_id="Qwen/Test",
-                worker_id=workers[3].id,
-                resolved_paths=["/models/Qwen/Test"],
-                state=ModelFileStateEnum.READY,
-            )
-            session.add(model_file)
-            await session.flush()
-            session.add(
-                ModelCacheTask(
-                    model_file_id=model_file.id,
-                    worker_id=workers[3].id,
-                    model_id="Qwen/Test",
-                    target_path="archive/Qwen/Test",
-                    source_paths=["/archive-source/Qwen/Test"],
-                    state=ModelCacheTaskStateEnum.READY,
-                )
-            )
-            task_id = task.id
-            worker_ids = [worker.id for worker in workers]
-            await session.commit()
-        async with AsyncSession(engine) as session:
-            task = await session.get(ModelPreheatTask, task_id)
-            own = await trusted_local_candidate_for_worker(
-                session, task, "worker-3", worker_ids[3]
-            )
-            other = await trusted_local_candidate_for_worker(
-                session, task, "worker-4", worker_ids[4]
-            )
-        await engine.dispose()
-        return own, other
-
-    own, other = asyncio.run(run())
-    assert own.source == "model_archive"
-    assert own.paths == ("/archive-source/Qwen/Test",)
-    assert own.repository_complete is True
-    assert other is None
 
 
 def test_single_file_candidate_is_not_repository_complete(tmp_path):

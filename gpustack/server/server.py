@@ -39,6 +39,20 @@ from gpustack.server.model_preheat_trusted_local import ProductionLocalInventory
 from gpustack.server.usage_buffer import flush_usage_to_db
 from gpustack.server.worker_syncer import WorkerSyncer
 from gpustack.utils.process import add_signal_handlers_in_loop
+from gpustack.model_preheat_credentials import ModelPreheatCredentialCipher
+from gpustack.server.model_storage_credential_key import (
+    ModelStorageCredentialKeyError,
+    ensure_model_preheat_credential_key,
+)
+from gpustack.server.model_storage_bootstrap import (
+    bootstrap_worker_local_s3_profile,
+)
+from gpustack.server.model_preheat_connectivity import (
+    create_or_reuse_connectivity_check,
+)
+from gpustack.server.model_preheat_worker_identity import (
+    issue_embedded_worker_credential_file,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -97,6 +111,8 @@ class Server:
         await self._prepare_data()
 
         init_model_catalog(self._config.model_catalog_file)
+
+        await self._prepare_model_storage()
 
         self._start_sub_processes()
         self._start_scheduler()
@@ -194,6 +210,88 @@ class Server:
 
         logger.debug("Data initialization completed.")
 
+    @property
+    def _is_embedded(self) -> bool:
+        # Server 仅在存在内嵌 Worker 子进程时运行 embedded Worker；
+        # 独立 Server 的远程 Worker 不经过本地凭据文件修复路径。
+        return bool(self._sub_processes)
+
+    async def _prepare_model_storage(self):
+        """收敛模型存储启动引导（任务 2 步骤 4/5）。
+
+        顺序固定为：
+        1. 确保凭据加密主密钥可用（环境变量优先，缺失则原子生成 0600 文件，
+           目录不可持久/不安全则启动失败）；
+        2. 幂等引导/更新 ``worker-local-s3-*`` 系统 Profile；
+        3. embedded Worker 一次性凭据修复（migration/db 初始化后、启动内置
+           Worker 子进程前）。
+
+        该步骤在 :meth:`_run_migrations` 与 :meth:`_prepare_data` 之后、
+        :meth:`_start_sub_processes` 之前调用，因此内置 Worker 启动时本地
+        已存在可复用的凭据文件。
+        """
+        try:
+            key_result = ensure_model_preheat_credential_key(self._config)
+        except ModelStorageCredentialKeyError as exc:
+            # 稳定错误码不含凭据；启动失败，不降级为明文保存。
+            raise RuntimeError(
+                f"model storage credential key unavailable: {exc.reason}"
+            ) from exc
+        if key_result.from_environment:
+            logger.info(
+                "model storage credential key provided via environment "
+                "(multi-server must share the same secret)"
+            )
+
+        engine = get_engine()
+        cipher = ModelPreheatCredentialCipher(
+            current_key=self._config.model_preheat_credential_key,
+            current_key_version=self._config.model_preheat_credential_key_version,
+            old_keys=self._config.model_preheat_credential_old_keys,
+        )
+        async with AsyncSession(engine) as session:
+            await bootstrap_worker_local_s3_profile(
+                self._config,
+                session,
+                cipher,
+                create_connectivity_check=create_or_reuse_connectivity_check,
+            )
+
+        if self._is_embedded:
+            await self._repair_embedded_worker_credential()
+
+        logger.debug("Model storage startup bootstrap completed.")
+
+    async def _repair_embedded_worker_credential(self):
+        """升级后的 embedded Worker 一次性凭据修复（任务 2 步骤 4）。
+
+        仅在 embedded 模式、匹配当前 ``worker_uuid``、身份仍为
+        ``bootstrap_required`` 且本地没有凭据文件时签发一次性引导凭据并原子写入
+        ``<data_dir>/model_preheat_worker_credential``（POSIX 0600）。
+        远程 Worker 身份隔离不放宽：不为其写入本地凭据文件，共享 token 不能接管
+        既有 UUID。Worker 注册成功后继续按现有轮换逻辑覆盖该凭据。
+        """
+        worker_uuid_path = os.path.join(self._config.data_dir, "worker_uuid")
+        try:
+            with open(worker_uuid_path, "r", encoding="utf-8") as file:
+                worker_uuid = file.read().strip()
+        except OSError:
+            return
+        if not worker_uuid:
+            return
+        credential_path = os.path.join(
+            self._config.data_dir, "model_preheat_worker_credential"
+        )
+        engine = get_engine()
+        async with AsyncSession(engine) as session:
+            written = await issue_embedded_worker_credential_file(
+                session, worker_uuid, credential_path
+            )
+        if written:
+            logger.info(
+                "Issued one-time bootstrap credential for embedded worker "
+                "(upgraded database, no local credential file)"
+            )
     def _start_scheduler(self):
         scheduler = Scheduler(self._config)
         self._create_async_task(scheduler.start())

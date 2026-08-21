@@ -27,6 +27,10 @@ class ModelFileBase(SQLModel, ModelSource):
     state_message: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
+    # 节点模型下载成功时保存 requested/resolved revision；Hugging Face、ModelScope
+    # 新下载必填，其他来源可为空。resolved revision 与 Artifact/Manifest 保持一致。
+    requested_revision: Optional[str] = None
+    resolved_revision: Optional[str] = None
 
 
 class ModelFile(ModelFileBase, BaseModelMixin, table=True):

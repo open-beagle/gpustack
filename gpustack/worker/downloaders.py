@@ -35,7 +35,6 @@ from gpustack.utils.hub import (
     match_model_scope_file_paths,
     FileEntry,
 )
-from gpustack.utils.model_cache import model_object_prefix
 from gpustack.worker.downloader_s3 import S3Downloader
 from gpustack.config.config import Config
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity, decode_path
@@ -52,6 +51,30 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     except ValueError:
         logger.warning("Invalid integer value for %s, using default %s", name, default)
         return default
+
+
+def _safe_path_part(value: str) -> bool:
+    return (
+        bool(value)
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+
+def _validate_model_id(model_id: str) -> tuple[str, str]:
+    parts = model_id.split("/")
+    if len(parts) != 2 or any(not _safe_path_part(part) for part in parts):
+        raise ValueError("invalid_model_id")
+    return parts[0], parts[1]
+
+
+def _model_object_prefix(root_prefix: str, model_id: str) -> str:
+    organization, model_name = _validate_model_id(model_id)
+    root = root_prefix.strip("/")
+    path = f"{organization}/{model_name}/"
+    return f"{root}/{path}" if root else path
 
 
 def init_s3_client(cfg: Config):
@@ -794,7 +817,7 @@ class ModelScopeDownloader:
 
     @classmethod
     def _local_modelscope_s3_path(cls, model_id: str, cfg: Config) -> str:
-        return model_object_prefix(
+        return _model_object_prefix(
             cfg.worker_local_s3_modelscope_prefix, model_id
         ).rstrip("/")
 

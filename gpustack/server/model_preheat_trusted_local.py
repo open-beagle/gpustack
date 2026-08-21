@@ -6,7 +6,6 @@ from glob import has_magic
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from gpustack.schemas.model_cache import ModelCacheTask, ModelCacheTaskStateEnum
 from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.models import SourceEnum
 from gpustack.schemas.workers import Worker
@@ -96,32 +95,6 @@ async def trusted_local_candidate_for_worker(
     ]
     if not matching_files:
         return None
-
-    model_file_ids = [model_file.id for model_file in matching_files]
-    archives = (
-        await session.exec(
-            select(ModelCacheTask)
-            .where(
-                ModelCacheTask.worker_id == worker_id,
-                ModelCacheTask.model_file_id.in_(model_file_ids),
-                ModelCacheTask.state == ModelCacheTaskStateEnum.READY,
-            )
-            .order_by(ModelCacheTask.id.desc())
-        )
-    ).all()
-    for archive in archives:
-        model_file = next(
-            item for item in matching_files if item.id == archive.model_file_id
-        )
-        candidate = _record(
-            worker_uuid,
-            worker_id,
-            "model_archive",
-            model_file,
-            archive.source_paths,
-        )
-        if candidate is not None:
-            return candidate
 
     for model_file in matching_files:
         candidate = _record(

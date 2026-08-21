@@ -108,7 +108,11 @@ class ModelPreheatTask(SQLModel, BaseModelMixin, table=True):
     include_patterns: list[str] = Field(sa_column=Column(JSON, nullable=False))
     exclude_patterns: list[str] = Field(sa_column=Column(JSON, nullable=False))
     selection_digest: str
-    cache_key: str
+    # 请求身份（规范化的 source/model_id/requested_revision/Patterns）与其摘要，
+    # 取代旧的 cache_key。Schedule 与分发策略同样保存请求身份，
+    # 每次实例化任务时再解析不可变 revision 并绑定 Artifact。
+    request_identity: dict = Field(sa_column=Column(JSON, nullable=False))
+    request_digest: str
     generation_id: str
     desired_state: ModelPreheatDesiredStateEnum = ModelPreheatDesiredStateEnum.RUNNING
     execution_state: ModelPreheatExecutionStateEnum = (
@@ -119,6 +123,10 @@ class ModelPreheatTask(SQLModel, BaseModelMixin, table=True):
         default=None, sa_column=Column(Text, nullable=True)
     )
     progress: float = 0
+    # Artifact 两阶段绑定：创建任务时库存精确命中则直接绑定，否则保持 NULL，
+    # 由 Worker 解析并扫描后用任务 ID + request digest + Worker UUID + lease token
+    # 通过 CAS（WHERE artifact_id IS NULL）原子绑定，不能覆盖已有值。
+    artifact_id: Optional[str] = None
     seed_worker_uuid: Optional[str] = None
     seed_worker_id: Optional[int] = None
     seed_source: Optional[str] = None
@@ -146,6 +154,11 @@ class ModelPreheatTask(SQLModel, BaseModelMixin, table=True):
     s3_manifest_path: Optional[str] = None
     manifest_digest: Optional[str] = None
     keep_new_workers_in_sync: bool = False
+    # 任务执行结果来源字段：模型身份（source/model_id/revision）保持不变，
+    # 这些字段仅记录本次传输路径，不参与 Artifact ID 计算。
+    transfer_source: Optional[str] = None
+    transfer_profile_id: Optional[int] = None
+    source_worker_id: Optional[int] = None
     schedule_id: Optional[int] = Field(
         default=None,
         sa_column=Column(
@@ -452,17 +465,29 @@ class ModelPreheatTaskLock(SQLModel, BaseModelMixin, table=True):
     lease_expires_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
 
 
-class ModelPreheatCachedModel(SQLModel, BaseModelMixin, table=True):
-    __tablename__ = "model_preheat_cached_models"
+class ModelPreheatArtifact(SQLModel, BaseModelMixin, table=True):
+    """统一 Artifact 库存。
+
+    库存不是第二份事实来源：只认合法 ``<artifact_id>/manifest.json``，
+    手工刷新按 Profile 扫描合法 Manifest 重建本表，数据库记录丢失时可恢复。
+    查询必须同时精确匹配 ``profile_id + profile_config_version``；
+    Profile 配置变化递增 config_version 并把旧版本库存标记 stale。
+    现有库存数据直接清空，不做字段转换。
+    """
+
+    __tablename__ = "model_preheat_artifacts"
     __table_args__ = (
         UniqueConstraint(
-            "profile_id", "cache_key", name="uix_preheat_cached_model_profile_key"
+            "profile_id",
+            "profile_config_version",
+            "artifact_id",
+            name="uix_preheat_artifact_profile_version_artifact",
         ),
         Index(
-            "ix_preheat_cached_model_profile_state_key",
+            "ix_preheat_artifact_profile_state_version",
             "profile_id",
+            "profile_config_version",
             "manifest_state",
-            "cache_key",
         ),
     )
 
@@ -473,16 +498,15 @@ class ModelPreheatCachedModel(SQLModel, BaseModelMixin, table=True):
             nullable=False,
         )
     )
+    # 新任务查询必须精确匹配配置版本；旧版本记录仅供已创建任务读取，
+    # 待无活动任务引用后删除数据库缓存，不删除旧 S3 对象。
     profile_config_version: int
-    revision: int = 1
-    cache_key: str
+    artifact_id: str
     source: str
     model_id: str
     resolved_revision: str
     include_patterns: list[str] = Field(sa_column=Column(JSON, nullable=False))
     exclude_patterns: list[str] = Field(sa_column=Column(JSON, nullable=False))
-    generation_id: str
-    ready_path: str = Field(sa_column=Column(Text, nullable=False))
     manifest_path: str = Field(sa_column=Column(Text, nullable=False))
     manifest_digest: str
     file_count: int
@@ -495,29 +519,79 @@ class ModelPreheatCachedModel(SQLModel, BaseModelMixin, table=True):
             ForeignKey("model_preheat_tasks.id", ondelete="SET NULL"), nullable=True
         ),
     )
+
+
+class ModelPreheatArtifactPublic(SQLModel):
+    artifact_id: str
+    source: str
+    model_id: str
+    resolved_revision: str
+    include_patterns: list[str]
+    exclude_patterns: list[str]
+    manifest_path: str
+    manifest_digest: str
+    file_count: int
+    total_size: int
+    manifest_state: ModelPreheatInventoryManifestStateEnum
+    last_verified_at: datetime
+    created_by_task_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ModelPreheatArtifactsPage(SQLModel):
+    items: list[ModelPreheatArtifactPublic]
+    next_cursor: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# 任务 1→任务 2 过渡兼容（import seam）：
+# 统一 Artifact 库存已由 :class:`ModelPreheatArtifact` 取代，且收敛 migration 已删除
+# 下列旧 generation / cached-model / inventory job / selection lock / publication
+# marker / publish lock 数据表。为让 ``routes/model_preheat_s3_profiles.py`` 与
+# ``server/model_preheat_s3_inventory.py``（任务 5 才重写为统一库存）在任务 2 阶段仍可被
+# 收集与导入，这里以 ``table=False`` 保留这些 Python 类定义：它们不再登记到
+# ``SQLModel.metadata``，因此不会被 create_all 重建、migration 删除的旧表保持不变，
+# 也不伪造旧协议可运行性。任务 5 重写统一库存后应删除这些兼容类与相应路由。
+# ---------------------------------------------------------------------------
+class ModelPreheatCachedModel(SQLModel, table=False):
+    """旧裸目录缓存库存兼容类（表已由 migration 删除，不再持久化）。"""
+
+    id: Optional[int] = None
+    profile_id: int
+    profile_config_version: int
+    revision: int = 1
+    cache_key: str
+    source: str
+    model_id: str
+    resolved_revision: str
+    include_patterns: list[str] = []
+    exclude_patterns: list[str] = []
+    generation_id: str
+    ready_path: str
+    manifest_path: str
+    manifest_digest: str
+    file_count: int
+    total_size: int
+    manifest_state: ModelPreheatInventoryManifestStateEnum
+    last_verified_at: datetime
+    created_by_task_id: Optional[int] = None
     source_parent_attempt: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
 
 
-class ModelPreheatInventoryJob(SQLModel, BaseModelMixin, table=True):
-    __tablename__ = "model_preheat_inventory_jobs"
-    __table_args__ = (
-        UniqueConstraint("active_key", name="uix_preheat_inventory_job_active"),
-        Index("ix_preheat_inventory_job_profile_created", "profile_id", "created_at"),
-    )
+class ModelPreheatInventoryJob(SQLModel, table=False):
+    """旧库存任务兼容类（表已由 migration 删除，不再持久化）。"""
 
-    id: Optional[int] = Field(default=None, primary_key=True)
-    profile_id: int = Field(
-        sa_column=Column(
-            ForeignKey("model_preheat_s3_profiles.id", ondelete="CASCADE"),
-            nullable=False,
-        )
-    )
+    id: Optional[int] = None
+    profile_id: int
     profile_config_version: int
     kind: str = "refresh"
     state: ModelPreheatInventoryJobStateEnum = ModelPreheatInventoryJobStateEnum.PENDING
     active_key: Optional[str] = None
     claim_token: Optional[str] = None
-    cursor: Optional[dict] = Field(default=None, sa_column=Column(JSON))
+    cursor: Optional[dict] = None
     scanned_count: int = 0
     valid_count: int = 0
     invalid_count: int = 0
@@ -526,153 +600,76 @@ class ModelPreheatInventoryJob(SQLModel, BaseModelMixin, table=True):
     skipped_count: int = 0
     failed_count: int = 0
     error_code: Optional[str] = None
-    error_message: Optional[str] = Field(
-        default=None, sa_column=Column(Text, nullable=True)
-    )
-    started_at: Optional[datetime] = Field(
-        default=None, sa_column=Column(UTCDateTime, nullable=True)
-    )
-    scan_started_at: Optional[datetime] = Field(
-        default=None, sa_column=Column(UTCDateTime, nullable=True)
-    )
-    lease_expires_at: Optional[datetime] = Field(
-        default=None, sa_column=Column(UTCDateTime, nullable=True)
-    )
-    finished_at: Optional[datetime] = Field(
-        default=None, sa_column=Column(UTCDateTime, nullable=True)
-    )
+    error_message: Optional[str] = None
+    started_at: Optional[datetime] = None
+    scan_started_at: Optional[datetime] = None
+    lease_expires_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
 
 
-class ModelPreheatInventoryScanSnapshot(SQLModel, BaseModelMixin, table=True):
-    __tablename__ = "model_preheat_inventory_scan_snapshots"
-    __table_args__ = (
-        UniqueConstraint(
-            "job_id",
-            "cached_model_id",
-            name="uix_preheat_inventory_scan_snapshot_row",
-        ),
-        Index("ix_preheat_inventory_scan_snapshot_job", "job_id"),
-    )
+class ModelPreheatInventoryScanSnapshot(SQLModel, table=False):
+    """旧库存扫描快照兼容类（表已由 migration 删除，不再持久化）。"""
 
-    id: Optional[int] = Field(default=None, primary_key=True)
-    job_id: int = Field(
-        sa_column=Column(
-            ForeignKey("model_preheat_inventory_jobs.id", ondelete="CASCADE"),
-            nullable=False,
-        )
-    )
-    cached_model_id: int = Field(
-        sa_column=Column(
-            ForeignKey("model_preheat_cached_models.id", ondelete="CASCADE"),
-            nullable=False,
-        )
-    )
+    id: Optional[int] = None
+    job_id: int
+    cached_model_id: int
     revision: int
 
 
-class ModelPreheatInventoryGeneration(SQLModel, BaseModelMixin, table=True):
-    __tablename__ = "model_preheat_inventory_generations"
-    __table_args__ = (
-        UniqueConstraint(
-            "profile_id",
-            "generation_key",
-            name="uix_preheat_inventory_generation_path",
-        ),
-        Index(
-            "ix_preheat_inventory_generation_gc",
-            "profile_id",
-            "state",
-            "orphaned_at",
-        ),
-    )
+class ModelPreheatInventoryGeneration(SQLModel, table=False):
+    """旧库存 generation 兼容类（表已由 migration 删除，不再持久化）。"""
 
-    id: Optional[int] = Field(default=None, primary_key=True)
-    profile_id: int = Field(
-        sa_column=Column(
-            ForeignKey("model_preheat_s3_profiles.id", ondelete="CASCADE"),
-            nullable=False,
-        )
-    )
+    id: Optional[int] = None
+    profile_id: int
     generation_key: str
     selection_key: str
     cache_key: Optional[str] = None
-    generation_path: str = Field(sa_column=Column(Text, nullable=False))
-    ready_path: str = Field(sa_column=Column(Text, nullable=False))
+    generation_path: str
+    ready_path: str
     ready_fingerprint: Optional[str] = None
-    ready_generation_path: Optional[str] = Field(
-        default=None, sa_column=Column(Text, nullable=True)
-    )
+    ready_generation_path: Optional[str] = None
     state: ModelPreheatInventoryGenerationStateEnum
-    first_seen_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
-    last_seen_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
-    orphaned_at: Optional[datetime] = Field(
-        default=None, sa_column=Column(UTCDateTime, nullable=True)
-    )
-    deleted_at_s3: Optional[datetime] = Field(
-        default=None, sa_column=Column(UTCDateTime, nullable=True)
-    )
+    first_seen_at: datetime
+    last_seen_at: datetime
+    orphaned_at: Optional[datetime] = None
+    deleted_at_s3: Optional[datetime] = None
     error_code: Optional[str] = None
 
 
-class ModelPreheatInventorySelectionLock(SQLModel, BaseModelMixin, table=True):
-    __tablename__ = "model_preheat_inventory_selection_locks"
-    __table_args__ = (
-        UniqueConstraint(
-            "profile_id",
-            "selection_key",
-            name="uix_preheat_inventory_selection_lock",
-        ),
-    )
+class ModelPreheatInventorySelectionLock(SQLModel, table=False):
+    """旧库存选择锁兼容类（表已由 migration 删除，不再持久化）。"""
 
-    id: Optional[int] = Field(default=None, primary_key=True)
-    profile_id: int = Field(
-        sa_column=Column(
-            ForeignKey("model_preheat_s3_profiles.id", ondelete="CASCADE"),
-            nullable=False,
-        )
-    )
+    id: Optional[int] = None
+    profile_id: int
     selection_key: str
     owner_token: str
     operation: str
-    lease_expires_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
+    lease_expires_at: datetime
 
 
-class ModelPreheatPublicationMarker(SQLModel, BaseModelMixin, table=True):
-    __tablename__ = "model_preheat_publication_markers"
-    __table_args__ = (
-        UniqueConstraint(
-            "profile_id",
-            "selection_key",
-            "generation_id",
-            name="uix_preheat_publication_marker_generation",
-        ),
-        Index(
-            "ix_preheat_publication_marker_task_attempt",
-            "task_id",
-            "parent_attempt",
-        ),
-    )
+class ModelPreheatPublicationMarker(SQLModel, table=False):
+    """旧 publication marker 兼容类（表已由 migration 删除，不再持久化）。"""
 
-    id: Optional[int] = Field(default=None, primary_key=True)
-    profile_id: int = Field(
-        sa_column=Column(
-            ForeignKey("model_preheat_s3_profiles.id", ondelete="CASCADE"),
-            nullable=False,
-        )
-    )
+    id: Optional[int] = None
+    profile_id: int
     selection_key: str
     generation_id: str
-    task_id: Optional[int] = Field(
-        default=None,
-        sa_column=Column(
-            ForeignKey("model_preheat_tasks.id", ondelete="SET NULL"), nullable=True
-        ),
-    )
+    task_id: Optional[int] = None
     parent_attempt: int
     profile_config_version: int
-    terminated_at: Optional[datetime] = Field(
-        default=None, sa_column=Column(UTCDateTime, nullable=True)
-    )
+    terminated_at: Optional[datetime] = None
+
+
+class ModelPreheatPublishLock(SQLModel, table=False):
+    """旧 publish lock 兼容类（表已由 migration 删除，不再持久化）。"""
+
+    id: Optional[int] = None
+    s3_profile_id: int
+    cache_key: str
+    task_id: int
+    lease_expires_at: datetime
 
 
 class ModelPreheatCachedModelPublic(SQLModel):
@@ -718,28 +715,6 @@ class ModelPreheatInventoryJobPublic(SQLModel):
     finished_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
-
-
-class ModelPreheatPublishLock(SQLModel, BaseModelMixin, table=True):
-    __tablename__ = "model_preheat_publish_locks"
-    __table_args__ = (
-        UniqueConstraint("s3_profile_id", "cache_key", name="uix_preheat_publish"),
-    )
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    s3_profile_id: int = Field(
-        sa_column=Column(
-            ForeignKey("model_preheat_s3_profiles.id", ondelete="RESTRICT"),
-            nullable=False,
-        )
-    )
-    cache_key: str
-    task_id: int = Field(
-        sa_column=Column(
-            ForeignKey("model_preheat_tasks.id", ondelete="CASCADE"), nullable=False
-        )
-    )
-    lease_expires_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
 
 
 class ModelPreheatCreate(SQLModel):
@@ -835,7 +810,9 @@ class ModelPreheatTaskPublic(SQLModel):
     include_patterns: list[str]
     exclude_patterns: list[str]
     selection_digest: str
-    cache_key: str
+    request_identity: dict
+    request_digest: str
+    artifact_id: Optional[str] = None
     generation_id: str
     desired_state: ModelPreheatDesiredStateEnum
     execution_state: ModelPreheatExecutionStateEnum
@@ -847,6 +824,9 @@ class ModelPreheatTaskPublic(SQLModel):
     s3_profile_config_version: int
     s3_backfill_policy: ModelPreheatBackfillPolicyEnum
     keep_new_workers_in_sync: bool
+    transfer_source: Optional[str] = None
+    transfer_profile_id: Optional[int] = None
+    source_worker_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     deduplicated: bool = False

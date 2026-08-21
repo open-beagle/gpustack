@@ -19,7 +19,6 @@ from gpustack.schemas.model_usage import (
     ModelUsageLog,
 )
 from gpustack.schemas.models import Model, ModelInstance
-from gpustack.schemas.model_cache import ModelCacheTask
 from gpustack.schemas.system_load import SystemLoad
 from gpustack.schemas.users import User
 from gpustack.schemas.workers import Worker
@@ -87,7 +86,6 @@ async def create_db_and_tables(engine: AsyncEngine):
                 ModelUsageDailyStat.__table__,
                 Model.__table__,
                 ModelInstance.__table__,
-                ModelCacheTask.__table__,
                 SystemLoad.__table__,
                 User.__table__,
                 Worker.__table__,

@@ -24,6 +24,7 @@ from gpustack.model_preheat_credentials import (
 )
 from gpustack.schemas.common import PaginatedList, Pagination
 from gpustack.schemas.model_preheat_s3_profiles import (
+    DEFAULT_SLOT_GLOBAL,
     ModelPreheatS3ConnectivityStateEnum,
     ModelPreheatS3Profile,
     ModelPreheatS3ProfileCreate,
@@ -242,7 +243,8 @@ async def create_profile(
             secret_key_encrypted=cipher.encrypt(profile_in.secret_key),
             encryption_key_version=cipher.current_key_version,
         )
-        if profile.is_default:
+        # 显式使用 default_slot 占用默认槽位；Public API 的 is_default 由槽位派生。
+        if profile.default_slot == DEFAULT_SLOT_GLOBAL:
             await _unset_other_defaults(session)
         profile = await ModelPreheatS3Profile.create(session, profile)
     except CredentialEncryptionUnavailable as exc:
@@ -270,8 +272,17 @@ async def update_profile(
     profile_in: ModelPreheatS3ProfileUpdate,
 ):
     profile = await _get_profile(session, id)
+    # 系统引导 Profile（worker-local-s3）由 Server 管理，UI 可查看/检测/选择，
+    # 仅允许重新选择默认槽位（default_slot），连接/凭据及其他字段一律禁止
+    # 直接编辑：连接/凭据变化只能通过启动参数在重启时更新。
     cipher = _cipher_from_request(request)
     update_data = profile_in.model_dump(exclude_unset=True)
+    if profile.system_managed and set(update_data) != {"default_slot"}:
+        raise HTTPException(
+            403,
+            "system_profile_read_only",
+            "system_profile_read_only",
+        )
 
     if "name" in update_data:
         existing = await ModelPreheatS3Profile.one_by_field(
@@ -320,8 +331,14 @@ async def update_profile(
             )
             update_data["last_connectivity_check_id"] = None
             update_data["last_connectivity_checked_at"] = None
-        if update_data.get("is_default") is True:
+        # 显式使用 default_slot：请求 default_slot="global" 时在同一事务转移槽位，
+        # 先清除其他默认 Profile 的槽位并 flush（否则 SQLite 唯一约束检查时
+        # 仍读到未落库的 'global' 旧值而误报冲突），再为本 Profile 占位；
+        # 仍依赖唯一约束保证跨数据库最多一个默认，且整段处于同一事务，
+        # 后续 CAS 失败可整体回滚（包括已清除的其他默认槽位）。
+        if update_data.get("default_slot") == DEFAULT_SLOT_GLOBAL:
             await _unset_other_defaults(session, profile.id)
+            await session.flush()
         if connection_config_changed:
             await _update_connection_config_with_cas(session, profile, update_data)
         else:
@@ -335,7 +352,13 @@ async def update_profile(
             message=f"credential_encryption_unavailable: {exc}"
         )
     except IntegrityError:
-        raise AlreadyExistsException(message="Model preheat S3 profile already exists")
+        # 唯一约束冲突：可能是重名，也可能是并发默认槽位抢占（default_slot 唯一）。
+        # 后者返回稳定错误允许用户重试。
+        raise HTTPException(
+            409,
+            "default_slot_conflict",
+            "default_slot_conflict",
+        )
     except ProfileConfigConflict:
         raise HTTPException(409, "profile_config_conflict", "profile_config_conflict")
     except Exception as exc:
@@ -465,6 +488,21 @@ async def delete_profile(request: Request, session: SessionDep, id: int):
     ).first()
     if policy is not None:
         raise HTTPException(409, "Conflict", "distribution_policy_uses_profile")
+    # 系统引导 Profile 不允许删除（避免破坏启动引导与任务/策略外键）。
+    if profile.system_managed:
+        raise HTTPException(
+            409,
+            "system_profile_not_deletable",
+            "system_profile_not_deletable",
+        )
+    # 当前默认 Profile 不允许直接删除：必须先把另一条 Profile 设为默认，
+    # 避免删除瞬间改变普通下载行为。
+    if profile.default_slot == DEFAULT_SLOT_GLOBAL:
+        raise HTTPException(
+            409,
+            "default_profile_not_deletable",
+            "default_profile_not_deletable",
+        )
     schedule = (
         await session.exec(
             select(ModelPreheatSchedule.id).where(
@@ -495,13 +533,13 @@ async def _get_profile(session, id: int) -> ModelPreheatS3Profile:
 
 async def _unset_other_defaults(session, profile_id: int | None = None):
     statement = select(ModelPreheatS3Profile).where(
-        ModelPreheatS3Profile.is_default == True  # noqa: E712
+        ModelPreheatS3Profile.default_slot == DEFAULT_SLOT_GLOBAL
     )
     if profile_id is not None:
         statement = statement.where(ModelPreheatS3Profile.id != profile_id)
     profiles = (await session.exec(statement)).all()
     for profile in profiles:
-        profile.is_default = False
+        profile.default_slot = None
         session.add(profile)
 
 
@@ -576,7 +614,11 @@ def _to_public(profile: ModelPreheatS3Profile) -> ModelPreheatS3ProfilePublic:
         tls_verify=profile.tls_verify,
         region=profile.region,
         use_virtual_hosted_style=profile.use_virtual_hosted_style,
-        is_default=profile.is_default,
+        default_slot=profile.default_slot,
+        provisioning_source=profile.provisioning_source,
+        provisioning_key=profile.provisioning_key,
+        system_managed=profile.system_managed,
+        source_fallback_enabled=profile.source_fallback_enabled,
         config_version=profile.config_version,
         connectivity_state=profile.connectivity_state,
         last_connectivity_check_id=profile.last_connectivity_check_id,
@@ -687,6 +729,3 @@ async def _connectivity_check_public(session, check, config):
         started_at=check.started_at,
         finished_at=check.finished_at,
     )
-    ModelPreheatInventoryJob,
-    ModelPreheatInventoryJobPublic,
-    ModelPreheatInventoryManifestStateEnum,

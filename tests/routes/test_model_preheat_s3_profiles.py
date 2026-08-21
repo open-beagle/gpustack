@@ -24,6 +24,7 @@ from gpustack.model_preheat_credentials import (
 )
 from gpustack.routes import model_preheat_s3_profiles
 from gpustack.schemas.model_preheat_s3_profiles import (
+    DEFAULT_SLOT_GLOBAL,
     ModelPreheatS3ConnectivityStateEnum,
     ModelPreheatS3Profile,
 )
@@ -112,7 +113,7 @@ def profile_payload(**overrides):
         "tls_enabled": True,
         "region": "us-east-1",
         "use_virtual_hosted_style": True,
-        "is_default": False,
+        "default_slot": None,
     }
     payload.update(overrides)
     return payload
@@ -344,7 +345,7 @@ def test_validation_error_scrubs_sensitive_field_input(
 
 
 def test_create_returns_public_profile_and_never_exposes_plain_credentials(client):
-    created = create_profile(client, is_default=True)
+    created = create_profile(client, default_slot="global")
 
     assert created["name"] == "center-cache"
     assert created["prefix"] == "datamodel/team-a"
@@ -435,8 +436,8 @@ def test_endpoint_allows_only_http_or_https(client, endpoint):
 
 
 def test_setting_default_profile_unsets_other_defaults(client):
-    first = create_profile(client, name="first", is_default=True)
-    second = create_profile(client, name="second", is_default=True)
+    first = create_profile(client, name="first", default_slot="global")
+    second = create_profile(client, name="second", default_slot="global")
 
     first_response = client.get(f"{API_PREFIX}/{first['id']}")
     second_response = client.get(f"{API_PREFIX}/{second['id']}")
@@ -448,7 +449,7 @@ def test_setting_default_profile_unsets_other_defaults(client):
 def test_failed_default_create_does_not_clear_existing_default(
     client, app, monkeypatch
 ):
-    first = create_profile(client, name="first", is_default=True)
+    first = create_profile(client, name="first", default_slot="global")
 
     async def fail_create(*args, **kwargs):
         raise RuntimeError("forced create failure")
@@ -457,12 +458,12 @@ def test_failed_default_create_does_not_clear_existing_default(
 
     response = client.post(
         API_PREFIX,
-        json=profile_payload(name="second", is_default=True),
+        json=profile_payload(name="second", default_slot="global"),
     )
 
     assert response.status_code == 500
     stored = asyncio.run(_stored_profile(app, first["id"]))
-    assert stored.is_default is True
+    assert stored.default_slot == "global"
 
 
 def test_update_without_credentials_preserves_encrypted_values_and_config_version(
@@ -604,11 +605,11 @@ def test_default_profile_changes_roll_back_when_config_cas_loses(app, monkeypatc
         ) as async_client:
             default_response = await async_client.post(
                 API_PREFIX,
-                json=profile_payload(name="default", is_default=True),
+                json=profile_payload(name="default", default_slot="global"),
             )
             target_response = await async_client.post(
                 API_PREFIX,
-                json=profile_payload(name="target", is_default=False),
+                json=profile_payload(name="target", default_slot=None),
             )
             default_id = default_response.json()["id"]
             target_id = target_response.json()["id"]
@@ -631,7 +632,7 @@ def test_default_profile_changes_roll_back_when_config_cas_loses(app, monkeypatc
                     f"{API_PREFIX}/{target_id}",
                     json={
                         "endpoint": "https://loser.example.com",
-                        "is_default": True,
+                        "default_slot": "global",
                     },
                 )
             )
@@ -648,8 +649,8 @@ def test_default_profile_changes_roll_back_when_config_cas_loses(app, monkeypatc
         assert loser_response.json()["message"] == "profile_config_conflict"
         stored_default = await _stored_profile(app, default_id)
         stored_target = await _stored_profile(app, target_id)
-        assert stored_default.is_default is True
-        assert stored_target.is_default is False
+        assert stored_default.default_slot == "global"
+        assert stored_target.default_slot is None
         assert stored_target.endpoint == "https://winner.example.com"
         assert stored_target.config_version == 2
 
@@ -739,6 +740,116 @@ def test_delete_requires_configured_credential_key(app):
 
     assert response.status_code == 503
     assert "credential_encryption_unavailable" in response.json()["message"]
+
+
+def test_update_system_managed_profile_is_forbidden(client, app):
+    created = create_profile(client)
+    asyncio.run(
+        _update_stored_profile(
+            app, created["id"], {"system_managed": True}
+        )
+    )
+    response = client.patch(
+        f"{API_PREFIX}/{created['id']}", json={"description": "blocked"}
+    )
+    assert response.status_code == 403
+    assert response.json()["reason"] == "system_profile_read_only"
+    # 未改动：description 仍为创建时的值。
+    stored = asyncio.run(_stored_profile(app, created["id"]))
+    assert stored.description == "central cache"
+
+
+def test_delete_system_managed_profile_is_forbidden(client, app):
+    created = create_profile(client)
+    asyncio.run(_update_stored_profile(app, created["id"], {"system_managed": True}))
+    response = client.delete(f"{API_PREFIX}/{created['id']}")
+    assert response.status_code == 409
+    assert response.json()["reason"] == "system_profile_not_deletable"
+
+
+def test_delete_current_default_profile_is_forbidden(client, app):
+    created = create_profile(client, default_slot=DEFAULT_SLOT_GLOBAL)
+    response = client.delete(f"{API_PREFIX}/{created['id']}")
+    assert response.status_code == 409
+    assert response.json()["reason"] == "default_profile_not_deletable"
+
+
+def test_update_system_managed_profile_allows_only_default_slot_reselect(client, app):
+    """system_managed Profile 允许仅 PATCH default_slot 重新选择默认，
+    但禁止连接/凭据及其他任何字段变化。"""
+    system = create_profile(client, name="system")
+    asyncio.run(
+        _update_stored_profile(
+            app, system["id"], {"system_managed": True, "default_slot": None}
+        )
+    )
+    other = create_profile(client, name="other")
+
+    response = client.patch(
+        f"{API_PREFIX}/{other['id']}", json={"default_slot": "global"}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["default_slot"] == "global"
+
+    # 仅重新选择默认：允许。
+    response = client.patch(
+        f"{API_PREFIX}/{system['id']}", json={"default_slot": "global"}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["default_slot"] == "global"
+    assert response.json()["is_default"] is True
+    stored_other = asyncio.run(_stored_profile(app, other["id"]))
+    assert stored_other.default_slot is None
+    stored_system = asyncio.run(_stored_profile(app, system["id"]))
+    # 连接/凭据/其他字段必须保持不变。
+    assert stored_system.endpoint == "https://s3.example.com"
+    assert stored_system.config_version == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"description": "blocked"},
+        {"endpoint": "https://s3-new.example.com"},
+        {"access_key": "new-access"},
+        {"secret_key": "new-secret"},
+        {"prefix": "datamodel/other"},
+        {"tls_enabled": False},
+        {"source_fallback_enabled": False},
+        {"name": "renamed"},
+    ],
+    ids=[
+        "description",
+        "endpoint",
+        "access_key",
+        "secret_key",
+        "prefix",
+        "tls_enabled",
+        "source_fallback_enabled",
+        "name",
+    ],
+)
+def test_update_system_managed_profile_rejects_non_default_slot_fields(
+    client, app, payload
+):
+    created = create_profile(client)
+    asyncio.run(_update_stored_profile(app, created["id"], {"system_managed": True}))
+    before = asyncio.run(_stored_profile(app, created["id"]))
+
+    response = client.patch(f"{API_PREFIX}/{created['id']}", json=payload)
+
+    assert response.status_code == 403
+    assert response.json()["reason"] == "system_profile_read_only"
+    after = asyncio.run(_stored_profile(app, created["id"]))
+    assert after.model_dump(exclude={"updated_at"}) == before.model_dump(
+        exclude={"updated_at"}
+    )
+
+
+def test_delete_non_default_non_system_profile_allowed(client, app):
+    created = create_profile(client)
+    response = client.delete(f"{API_PREFIX}/{created['id']}")
+    assert response.status_code == 200
 
 
 async def _stored_profile(app, profile_id):

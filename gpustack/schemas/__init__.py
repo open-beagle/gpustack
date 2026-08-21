@@ -20,12 +20,6 @@ from gpustack.schemas.model_files import (
     ModelFilePublic,
     ModelFilesPublic,
 )
-from gpustack.schemas.model_cache import (
-    ModelCacheTask,
-    ModelCacheTaskPublic,
-    ModelCacheTasksPublic,
-    ModelCacheTaskUpdate,
-)
 from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTask,
     ModelPreheatWorkerTaskClaim,
@@ -115,10 +109,6 @@ __all__ = [
     "ModelFileUpdate",
     "ModelFilePublic",
     "ModelFilesPublic",
-    "ModelCacheTask",
-    "ModelCacheTaskPublic",
-    "ModelCacheTasksPublic",
-    "ModelCacheTaskUpdate",
     "ModelPreheatWorkerTask",
     "ModelPreheatWorkerTaskClaim",
     "ModelPreheatWorkerTaskClaimed",

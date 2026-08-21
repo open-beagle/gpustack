@@ -13,7 +13,12 @@ from gpustack.routes.model_files import (
     update_model_file,
 )
 from gpustack.schemas.links import ModelInstanceModelFileLink
-from gpustack.schemas.model_cache import ModelCacheTask, ModelCacheTaskStateEnum
+from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_storage_sync import (
+    ModelFileTransferSourceEnum,
+    ModelStorageSyncTask,
+    ModelStorageSyncTaskStateEnum,
+)
 from gpustack.schemas.model_files import (
     ModelFile,
     ModelFileCreate,
@@ -25,10 +30,10 @@ from gpustack.schemas.users import User
 from gpustack.schemas.workers import Worker
 
 
-def test_model_cache_task_is_owned_by_model_file():
+def test_model_storage_sync_task_is_owned_by_model_file():
     foreign_key = next(
         foreign_key
-        for foreign_key in ModelCacheTask.__table__.foreign_keys
+        for foreign_key in ModelStorageSyncTask.__table__.foreign_keys
         if foreign_key.parent.name == "model_file_id"
     )
 
@@ -36,7 +41,7 @@ def test_model_cache_task_is_owned_by_model_file():
     assert foreign_key.ondelete == "CASCADE"
 
 
-def test_model_file_crud_cascades_cache_tasks(tmp_path):
+def test_model_file_crud_cascades_sync_tasks(tmp_path):
     asyncio.run(_run_model_file_crud(tmp_path))
 
 
@@ -58,7 +63,8 @@ async def _run_model_file_crud(tmp_path):
         ModelInstance.__table__,
         ModelFile.__table__,
         ModelInstanceModelFileLink.__table__,
-        ModelCacheTask.__table__,
+        ModelPreheatS3Profile.__table__,
+        ModelStorageSyncTask.__table__,
     ]
     async with engine.begin() as connection:
         await connection.run_sync(SQLModel.metadata.create_all, tables=tables)
@@ -92,23 +98,39 @@ async def _run_model_file_crud(tmp_path):
         assert updated.state == ModelFileStateEnum.READY
         assert updated.resolved_paths == ["/models/original.gguf"]
 
-        cache_task = ModelCacheTask(
+        profile = ModelPreheatS3Profile(
+            name="center-cache",
+            endpoint="https://s3.example.com",
+            bucket="models",
+            access_key_encrypted={},
+            secret_key_encrypted={},
+            encryption_key_version="v1",
+        )
+        profile = await ModelPreheatS3Profile.create(session, profile)
+        sync_task = ModelStorageSyncTask(
             model_file_id=created.id,
             worker_id=worker.id,
+            worker_uuid=worker.worker_uuid,
+            profile_id=profile.id,
+            profile_config_version=1,
+            request_identity={},
+            request_digest="d" * 64,
+            source="modelscope",
             model_id="example/model",
-            target_path="cache/modelscope/example/model/",
-            source_paths=["/models/original.gguf"],
-            state=ModelCacheTaskStateEnum.READY,
-            progress=100,
-            uploaded_size=10,
-            total_size=10,
+            resolved_revision="sha",
+            credential_snapshot_encrypted={},
+            encryption_key_version="v1",
+            state=ModelStorageSyncTaskStateEnum.READY,
+            transfer_source=ModelFileTransferSourceEnum.S3,
+            transfer_profile_id=profile.id,
+            source_worker_id=worker.id,
         )
-        cache_task = await ModelCacheTask.create(session, cache_task)
+        sync_task = await ModelStorageSyncTask.create(session, sync_task)
 
         await delete_model_file(session, created.id)
 
     async with AsyncSession(engine) as session:
         assert await ModelFile.one_by_id(session, created.id) is None
-        assert await ModelCacheTask.one_by_id(session, cache_task.id) is None
+        assert await ModelStorageSyncTask.one_by_id(session, sync_task.id) is None
 
     await engine.dispose()

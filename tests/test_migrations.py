@@ -6,7 +6,7 @@ from gpustack.migrations.validate import validate_revision_graph
 
 
 def test_alembic_revision_graph_has_one_resolvable_head():
-    assert validate_revision_graph() == "b0307846729c"
+    assert validate_revision_graph() == "c1d2e3f4a5b6"
 
 
 def test_alembic_upgrades_existing_model_cache_head_to_schedule_head(tmp_path):
@@ -33,7 +33,9 @@ def test_alembic_upgrades_existing_model_cache_head_to_schedule_head(tmp_path):
     config = Config()
     config.set_main_option("script_location", "gpustack/migrations")
     config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
-    command.upgrade(config, "head")
+    # 只验证到 schedule head；收敛 migration c1d2e3f4a5b6 的完整前置
+    # 与 DDL 由 tests/migrations/test_model_storage_migration.py 单独覆盖。
+    command.upgrade(config, "b0307846729c")
 
     with engine.connect() as connection:
         assert (

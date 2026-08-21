@@ -109,6 +109,10 @@ class ModelPreheatIdentity:
     model_id: str
     revision: str
     file_patterns: tuple[str, ...] | list[str]
+    # 请求身份字段：仅参与 request_digest，不参与 Artifact 身份。
+    # main/master 等移动 revision 只允许出现在这里。
+    requested_revision: str | None = None
+    exclude_patterns: tuple[str, ...] | list[str] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "source", normalize_source(self.source))
@@ -119,12 +123,75 @@ class ModelPreheatIdentity:
             "file_patterns",
             _normalize_unique_patterns(self.file_patterns),
         )
-        object.__setattr__(self, "digest", self._digest())
         object.__setattr__(
             self,
-            "storage_prefix",
-            (f"{self.source}/{self.model_path}/" f"{self.revision_path}/{self.digest}"),
+            "exclude_patterns",
+            _normalize_unique_patterns(self.exclude_patterns),
         )
+        requested_revision = (
+            None
+            if self.requested_revision is None
+            else encode_path(self.requested_revision)
+        )
+        object.__setattr__(self, "requested_revision_path", requested_revision)
+        # request_digest 使用编码后的规范值做摘要，
+        # 与 manifest.compute_request_digest 保持同一语义。
+        object.__setattr__(
+            self,
+            "request_digest",
+            _canonical_sha256(
+                {
+                    "source": self.source,
+                    "model_id": self.model_path,
+                    "requested_revision": requested_revision,
+                    "include_patterns": sorted(self.file_patterns),
+                    "exclude_patterns": sorted(self.exclude_patterns),
+                }
+            ),
+        )
+
+    def artifact_prefix(self, profile_prefix: str) -> str:
+        """统一 Artifact 的模型级前缀（不含 artifact_id 末段）。
+
+        结构为 `<prefix>/<source>/<organization>/<model>`（设计文档第 6 节），
+        不包含 resolved revision 路径段（revision 已编码进 artifact_id）、
+        协议版本目录、requested_revision 或 generation。
+
+        profile_prefix 必须显式传入：空串表示“无前缀”，非空时必须是
+        安全的对象段（多段以 `/` 分隔，禁止 `.`/`..`/控制字符）。
+        """
+        return self._join_object_name(
+            profile_prefix,
+            self.source,
+            self.model_path,
+        )
+
+    @staticmethod
+    def _join_object_name(*segments: str) -> str:
+        clean_segments = []
+        for segment in segments:
+            if not isinstance(segment, str):
+                raise ModelPreheatIdentityError("invalid_path")
+            if segment == "":
+                continue
+            clean_segment = segment.strip("/")
+            if clean_segment == "":
+                continue
+            ModelPreheatIdentity._validate_segment(clean_segment)
+            clean_segments.append(clean_segment)
+        if not clean_segments:
+            raise ModelPreheatIdentityError("empty_path")
+        return "/".join(clean_segments)
+
+    @staticmethod
+    def _validate_segment(segment: str):
+        if segment.startswith("/") or "\\" in segment:
+            raise ModelPreheatIdentityError("invalid_path")
+        if any(ord(char) < 32 or ord(char) == 127 for char in segment):
+            raise ModelPreheatIdentityError("control_char")
+        for part in segment.split("/"):
+            if part in ("", ".", ".."):
+                raise ModelPreheatIdentityError("invalid_path_segment")
 
     def to_dict(self) -> dict:
         return {
@@ -142,5 +209,13 @@ class ModelPreheatIdentity:
             sort_keys=True,
         ).encode("utf-8")
 
-    def _digest(self) -> str:
-        return hashlib.sha256(self.to_json_bytes()).hexdigest()
+
+def _canonical_sha256(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()

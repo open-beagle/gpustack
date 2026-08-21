@@ -7,6 +7,7 @@ from gpustack.detectors.detector_factory import DetectorFactory
 from gpustack.policies.base import Allocated
 from gpustack.schemas.models import ComputedResourceClaim
 from gpustack.schemas.workers import (
+    MODEL_STORAGE_PROTOCOL_VERSION,
     RPCServer,
     MountPoint,
     WorkerStateEnum,
@@ -110,6 +111,9 @@ class WorkerStatusCollector:
             status=status,
             state_message=state_message,
             worker_uuid=self._worker_uuid if self._worker_manager else None,
+            # 上报统一模型存储协议版本（任务 2 步骤 3）。新 Worker 固定 1；
+            # Server 依此判断是否为该 Worker 创建 ModelFile/同步/预热任务。
+            model_storage_protocol_version=MODEL_STORAGE_PROTOCOL_VERSION,
         )
 
     def _inject_unified_memory(self, status: WorkerStatus):

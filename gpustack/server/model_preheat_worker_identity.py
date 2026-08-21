@@ -1,6 +1,8 @@
 import hashlib
 import hmac
 import secrets
+import os
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -8,6 +10,7 @@ from typing import Annotated, Optional
 from fastapi import Depends, Header, Request
 from sqlalchemy import update
 from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import UnauthorizedException
 from gpustack.schemas.model_preheats import ModelPreheatWorkerIdentity
@@ -167,6 +170,131 @@ async def worker_uuid_has_credential(session, worker_uuid):
         )
     ).first()
     return worker_exists is not None
+
+
+async def issue_embedded_worker_credential_file(
+    session: AsyncSession,
+    worker_uuid: str,
+    credential_path: str,
+) -> bool:
+    """为升级后的 embedded Worker 签发一次性引导凭据文件（任务 2 步骤 4）。
+
+    仅在以下全部条件成立时写入，保证幂等且不放宽远程 Worker 身份隔离：
+
+    - 数据库中确实存在匹配 ``worker_uuid`` 的既有 Worker（重复 UUID 时取最大
+      ``worker.id``，即最新注册记录）；
+    - 其预热身份仍为 ``bootstrap_required=True``（从未拿到可用凭据）；
+    - 本地没有凭据文件（避免覆盖已轮换的新凭据）。
+
+    写盘可恢复：先在会话内准备身份并 flush（尚未提交），原子写入
+    ``credential_path``（POSIX ``0600``）成功后再提交；若写盘失败则回滚身份变更，
+    使下次启动可重试，而不是留下“DB 已有凭据但无文件”的不可恢复状态。
+    写盘成功但数据库 commit 失败时，必须删除**仅本次创建**的凭据文件并回滚
+    身份变更，使重启可重新签发；调用前已存在的凭据文件绝不被删除
+    （入口已按存在性短路，清理仅在文件确实由本次写盘产生时执行）。
+    独立远程 Worker 不经过该路径：Server 不会为其写入本地凭据文件，
+    且共享 token 不能接管既有 UUID（见 :func:`_authorize_worker_registration`）。
+    返回是否实际写入了凭据。
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    preexisting = bool(credential_path) and os.path.exists(credential_path)
+    if preexisting:
+        return False
+    # 重复 UUID 时取最新（最大 id）的 Worker，避免绑定到被替换的旧记录。
+    worker = (
+        await session.exec(
+            select(Worker)
+            .where(Worker.worker_uuid == worker_uuid)
+            .order_by(Worker.id.desc())
+        )
+    ).first()
+    if worker is None:
+        return False
+    identity = (
+        await session.exec(
+            select(ModelPreheatWorkerIdentity).where(
+                ModelPreheatWorkerIdentity.worker_id == worker.id
+            )
+        )
+    ).first()
+    if identity is None or not identity.bootstrap_required:
+        return False
+    now = _utcnow()
+    secret = secrets.token_urlsafe(32)
+    if identity is None:
+        identity = ModelPreheatWorkerIdentity(
+            worker_id=worker.id,
+            worker_uuid=worker_uuid,
+            bootstrap_required=False,
+            expires_at=now + WORKER_CREDENTIAL_TTL,
+        )
+        session.add(identity)
+        await session.flush()
+    else:
+        identity.token_version += 1
+        identity.worker_uuid = worker_uuid
+        identity.expires_at = now + WORKER_CREDENTIAL_TTL
+        identity.revoked_at = None
+        identity.bootstrap_required = False
+        session.add(identity)
+        await session.flush()
+    token = f"{WORKER_CREDENTIAL_PREFIX}_{identity.id}_{secret}"
+    identity.token_hash = _hash_token(token)
+    session.add(identity)
+    # 先写盘再提交：写盘失败时回滚身份变更，保证下次可重试（可恢复）。
+    try:
+        _write_credential_file(credential_path, token)
+    except OSError:
+        await session.rollback()
+        logger.error(
+            "Failed to write embedded worker credential file; rolling back "
+            "identity change so the next startup can retry"
+        )
+        return False
+    try:
+        await session.commit()
+    except Exception:
+        # 写盘成功但数据库 commit 失败：凭据未持久化，必须删除仅本次创建的
+        # 无效凭据文件（preexisting 为 True 时入口已短路，这里必为本次新建），
+        # 并回滚身份变更，使重启可重签；绝不删除调用前既有文件。
+        try:
+            if os.path.exists(credential_path):
+                os.unlink(credential_path)
+        except OSError:
+            logger.error(
+                "Failed to remove invalid embedded worker credential file "
+                "after commit failure"
+            )
+        await session.rollback()
+        logger.error(
+            "Failed to commit embedded worker credential; rolled back identity "
+            "and removed the invalid credential file so the next startup can retry"
+        )
+        return False
+    return True
+
+
+def _write_credential_file(credential_path: str, credential: str) -> None:
+    os.makedirs(os.path.dirname(credential_path) or ".", exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix="." + os.path.basename(credential_path) + ".",
+        dir=os.path.dirname(credential_path) or ".",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(credential)
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, credential_path)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _credential_id(token):
