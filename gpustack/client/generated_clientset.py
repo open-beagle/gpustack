@@ -58,5 +58,6 @@ class ClientSet:
             {"X-GPUStack-Worker-Credential": credential}
         )
         self.workers._client = self.http_client
+        self.model_files._client = self.http_client
         self.model_preheat_worker_tasks._client = self.http_client
         self.model_storage_sync_tasks._client = self.http_client

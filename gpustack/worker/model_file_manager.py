@@ -22,6 +22,10 @@ from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
 from gpustack.logginglocal import setup_logging
 from gpustack.schemas.model_files import ModelFile, ModelFileUpdate, ModelFileStateEnum
+from gpustack.schemas.model_file_download_executions import (
+    ModelFileDownloadExecutionComplete,
+    ModelFileTransferSourceEnum,
+)
 from gpustack.client import ClientSet
 from gpustack.schemas.models import SourceEnum
 from gpustack.server.bus import Event, EventType
@@ -35,6 +39,21 @@ logger = logging.getLogger(__name__)
 max_concurrent_downloads = 5
 
 
+def _download_error_code(exc: Exception) -> str:
+    message = str(exc)
+    stable_codes = {
+        "model_artifact_not_found",
+        "s3_manifest_invalid",
+        "s3_manifest_missing",
+        "network_timeout",
+    }
+    if message in stable_codes:
+        return message
+    if type(exc).__name__ == "ModelPreheatS3ManifestError":
+        return "s3_manifest_invalid"
+    return "worker_execution_failed"
+
+
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
     try:
         return max(int(os.getenv(name, str(default))), minimum)
@@ -43,9 +62,7 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
-download_no_progress_timeout = _env_int(
-    "GPUSTACK_DOWNLOAD_NO_PROGRESS_TIMEOUT", 7200
-)
+download_no_progress_timeout = _env_int("GPUSTACK_DOWNLOAD_NO_PROGRESS_TIMEOUT", 7200)
 download_watchdog_interval = _env_int("GPUSTACK_DOWNLOAD_WATCHDOG_INTERVAL", 300)
 
 
@@ -169,7 +186,9 @@ class ModelFileManager:
         if not stalled_model_files:
             return
 
-        stalled_ids = ", ".join(str(model_file.id) for model_file in stalled_model_files)
+        stalled_ids = ", ".join(
+            str(model_file.id) for model_file in stalled_model_files
+        )
         logger.warning(
             "Model file downloads have no progress for %s seconds, restarting "
             "download process pool. model_file_ids=%s",
@@ -368,9 +387,28 @@ class ModelFileManager:
         if model_file.id in self._active_downloads:
             return
 
+        try:
+            execution = self._clientset.model_files.claim_download_execution(
+                model_file.id
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to claim model file download execution for id %s: %s",
+                model_file.id,
+                type(exc).__name__,
+            )
+            self._update_model_file(
+                model_file.id,
+                state=ModelFileStateEnum.ERROR,
+                state_message="download_execution_claim_failed",
+            )
+            return
+
         cancel_flag = self._mp_manager.Event()
 
-        download_task = ModelFileDownloadTask(model_file, self._config, cancel_flag)
+        download_task = ModelFileDownloadTask(
+            model_file, self._config, cancel_flag, execution
+        )
         try:
             future = self._download_pool.submit(download_task.run)
         except BrokenProcessPool:
@@ -390,7 +428,20 @@ class ModelFileManager:
         async def _check_completion():
             retry_download = False
             try:
-                await asyncio.wrap_future(future)
+                result = await asyncio.wrap_future(future)
+                if result.get("error_code"):
+                    self._clientset.model_files.fail_download_execution(
+                        model_file.id, result["error_code"]
+                    )
+                else:
+                    self._clientset.model_files.complete_download_execution(
+                        model_file.id,
+                        ModelFileDownloadExecutionComplete(
+                            transfer_source=result["transfer_source"],
+                            transfer_profile_id=result.get("transfer_profile_id"),
+                            source_worker_id=result.get("source_worker_id"),
+                        ),
+                    )
             except NotFoundException:
                 logger.info(
                     f"Model file {model_file.readable_source} not found. Maybe it was cancelled."
@@ -437,10 +488,11 @@ class ModelFileManager:
 
 class ModelFileDownloadTask:
 
-    def __init__(self, model_file: ModelFile, cfg: Config, cancel_flag):
+    def __init__(self, model_file: ModelFile, cfg: Config, cancel_flag, execution=None):
         self._model_file = model_file
         self._config = cfg
         self._cancel_flag = cancel_flag
+        self._execution = execution
         # Store download log file paths for related model instances
         self._instance_download_log_file = None
         self._download_completed = False
@@ -631,26 +683,33 @@ class ModelFileDownloadTask:
                 self._write_to_instance_download_logs(
                     f"Model file already exists locally: {self._model_file.readable_source}"
                 )
-                return
+                return {
+                    "transfer_source": ModelFileTransferSourceEnum.CURRENT_NODE,
+                    "source_worker_id": self._model_file.worker_id,
+                }
 
             self._download_model_file()
             self._write_to_instance_download_logs(
                 f"Model file download task completed successfully: {self._model_file.readable_source}"
             )
+            return self._transfer_result()
         except asyncio.CancelledError:
             self._write_to_instance_download_logs(
                 f"Download task cancelled: {self._model_file.readable_source}"
             )
+            return {"error_code": "worker_execution_failed"}
         except Exception as e:
+            error_code = _download_error_code(e)
             self._write_to_instance_download_logs(
-                f"Download task failed: {self._model_file.readable_source} - {str(e)}",
+                f"Download task failed: {self._model_file.readable_source} - {error_code}",
                 is_error=True,
             )
             self._update_model_file(
                 self._model_file.id,
                 state=ModelFileStateEnum.ERROR,
-                state_message=str(e),
+                state_message=error_code,
             )
+            return {"error_code": error_code}
 
     def _download_model_file(self):
         self._write_to_instance_download_logs(
@@ -664,6 +723,7 @@ class ModelFileDownloadTask:
             ollama_library_base_url=self._config.ollama_library_base_url,
             huggingface_token=self._config.huggingface_token,
             cfg=self._config,
+            execution=self._execution,
         )
         self._download_completed = True
         self._update_model_file(
@@ -671,10 +731,41 @@ class ModelFileDownloadTask:
             state=ModelFileStateEnum.READY,
             download_progress=100,
             resolved_paths=model_paths,
+            requested_revision=(
+                self._execution.requested_revision if self._execution else None
+            ),
+            resolved_revision=(
+                self._execution.resolved_revision if self._execution else None
+            ),
+            size=(
+                self._execution.artifact_total_size
+                if self._execution and self._execution.artifact_total_size is not None
+                else self._model_file.size
+            ),
         )
         self._write_to_instance_download_logs(
             f"Successfully downloaded {self._model_file.readable_source}"
         )
+
+    def _transfer_result(self):
+        if self._execution and self._execution.artifact_id:
+            return {
+                "transfer_source": ModelFileTransferSourceEnum.S3,
+                "transfer_profile_id": self._execution.profile.id,
+            }
+        source = self._model_file.source
+        if source not in {SourceEnum.HUGGING_FACE, SourceEnum.MODEL_SCOPE}:
+            return {
+                "transfer_source": ModelFileTransferSourceEnum.CURRENT_NODE,
+                "source_worker_id": self._model_file.worker_id,
+            }
+        return {
+            "transfer_source": (
+                ModelFileTransferSourceEnum.HUGGINGFACE
+                if source == SourceEnum.HUGGING_FACE
+                else ModelFileTransferSourceEnum.MODELSCOPE
+            )
+        }
 
     def _reconcile_completed_model_file(self) -> bool:
         if not self._local_model_file_complete():
@@ -902,13 +993,18 @@ class ModelFileDownloadTask:
     def _ensure_model_file_size_and_paths(self):
         if self._model_file.size is not None and self._model_file.resolved_paths:
             return
+        if self._execution and (
+            self._execution.artifact_id or not self._execution.source_fallback_enabled
+        ):
+            return
 
         repo_file_list = downloaders.get_model_file_info(
             self._model_file,
             huggingface_token=self._config.huggingface_token,
             cache_dir=self._config.cache_dir,
             ollama_library_base_url=self._config.ollama_library_base_url,
-            cfg=self._config,
+            cfg=None if self._execution else self._config,
+            revision=(self._execution.resolved_revision if self._execution else None),
         )
 
         (size, file_paths) = hub.match_file_and_calculate_size(

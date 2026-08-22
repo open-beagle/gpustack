@@ -37,7 +37,15 @@ from gpustack.utils.hub import (
 )
 from gpustack.worker.downloader_s3 import S3Downloader
 from gpustack.config.config import Config
-from gpustack.worker.model_preheat.identity import ModelPreheatIdentity, decode_path
+from gpustack.worker.model_preheat.identity import (
+    ModelPreheatIdentity,
+    decode_path,
+    encode_path,
+)
+from gpustack.worker.model_preheat.s3_client import (
+    ModelPreheatS3Client,
+    ModelPreheatS3ManifestError,
+)
 
 logger = logging.getLogger(__name__)
 S3_PROFILE_CENTER = "center"
@@ -135,7 +143,20 @@ def download_model(
     ollama_library_base_url: Optional[str] = None,
     huggingface_token: Optional[str] = None,
     cfg: Config = None,
+    execution=None,
 ) -> List[str]:
+    if execution is not None and execution.source in {
+        "huggingface",
+        "modelscope",
+    }:
+        return download_model_with_execution(
+            model,
+            execution,
+            local_dir=local_dir,
+            cache_dir=cache_dir,
+            huggingface_token=huggingface_token,
+            cfg=cfg,
+        )
     if model.source == SourceEnum.HUGGING_FACE:
         return HfDownloader.download(
             repo_id=model.huggingface_repo_id,
@@ -171,6 +192,98 @@ def download_model(
             )
         else:
             return file.get_sharded_file_paths(model.local_path)
+
+
+def download_model_with_execution(
+    model: ModelSource,
+    execution,
+    *,
+    local_dir: Optional[str],
+    cache_dir: str,
+    huggingface_token: Optional[str],
+    cfg: Config,
+) -> List[str]:
+    """严格执行领取时固定的 S3 命中或公共源回源决策。"""
+    if execution.artifact_id:
+        if execution.profile is None or not execution.manifest_path:
+            raise ValueError("s3_execution_profile_missing")
+        return _download_execution_artifact(execution, local_dir, cache_dir)
+    if not execution.source_fallback_enabled:
+        raise ValueError("model_artifact_not_found")
+
+    if execution.source == "huggingface":
+        return HfDownloader.download(
+            repo_id=model.huggingface_repo_id,
+            filename=model.huggingface_filename,
+            extra_filename=get_mmproj_filename(model),
+            token=huggingface_token,
+            local_dir=local_dir,
+            cache_dir=os.path.join(cache_dir, "huggingface"),
+            revision=execution.resolved_revision,
+        )
+    return ModelScopeDownloader.download(
+        model_id=model.model_scope_model_id,
+        file_path=model.model_scope_file_path,
+        extra_file_path=get_mmproj_filename(model),
+        local_dir=local_dir,
+        cache_dir=os.path.join(cache_dir, "model_scope"),
+        cfg=None,
+        revision=execution.resolved_revision,
+    )
+
+
+def _download_execution_artifact(execution, local_dir, cache_dir) -> List[str]:
+    profile = execution.profile
+    client = ModelPreheatS3Client.from_minio(
+        endpoint=profile.endpoint,
+        access_key=profile.access_key,
+        secret_key=profile.secret_key,
+        secure=bool(profile.tls_enabled),
+        tls_verify=bool(profile.tls_verify),
+        region=profile.region or None,
+        use_virtual_hosted_style=profile.use_virtual_hosted_style,
+    )
+    manifest = client.read_artifact_manifest_path(
+        profile.bucket, execution.manifest_path
+    )
+    if manifest is None:
+        raise ModelPreheatS3ManifestError("s3_manifest_missing")
+    if (
+        manifest.artifact_id != execution.artifact_id
+        or manifest.identity.source != execution.source
+        or decode_path(manifest.identity.model_path) != execution.model_id
+        or decode_path(manifest.identity.revision_path) != execution.resolved_revision
+        or list(manifest.identity.file_patterns)
+        != sorted(encode_path(item) for item in execution.include_patterns)
+        or list(manifest.exclude_patterns)
+        != sorted(encode_path(item) for item in execution.exclude_patterns)
+        or client.artifact_manifest_object(profile.prefix, manifest)
+        != execution.manifest_path
+    ):
+        raise ModelPreheatS3ManifestError("s3_manifest_invalid")
+
+    group, name = model_id_to_group_owner_name(execution.model_id)
+    source_cache = "huggingface" if execution.source == "huggingface" else "model_scope"
+    target_root = Path(local_dir or Path(cache_dir) / source_cache / group / name)
+    lock_path = Path(cache_dir) / source_cache / group / f"{name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with SoftFileLock(str(lock_path)):
+        downloaded_paths = []
+        for manifest_file in manifest.files:
+            target = target_root / decode_path(manifest_file.path)
+            resolved_target = target.resolve(strict=False)
+            resolved_root = target_root.resolve(strict=False)
+            if resolved_root not in resolved_target.parents:
+                raise ModelPreheatS3ManifestError("s3_manifest_invalid")
+            client.download_artifact_file(
+                profile.bucket,
+                profile.prefix,
+                manifest,
+                manifest_file,
+                target,
+            )
+            downloaded_paths.append(str(target))
+    return [str(target_root)] if not execution.include_patterns else downloaded_paths
 
 
 def download_resolved_revision_to_staging(
@@ -311,16 +424,19 @@ def get_model_file_info(
     cache_dir: Optional[str] = None,
     ollama_library_base_url: Optional[str] = None,
     cfg: Config = None,
+    revision: Optional[str] = None,
 ) -> List[FileEntry]:
     if model.source == SourceEnum.HUGGING_FACE:
         return HfDownloader.get_model_file_info(
             model=model,
             token=huggingface_token,
+            revision=revision,
         )
     elif model.source == SourceEnum.MODEL_SCOPE:
         return ModelScopeDownloader.get_model_file_info(
             model=model,
             cfg=cfg,
+            revision=revision,
         )
     elif model.source == SourceEnum.OLLAMA_LIBRARY:
         ollama_downloader = OllamaLibraryDownloader(
@@ -350,10 +466,16 @@ class HfDownloader:
     _registry_url = "https://hf-mirror.com"
 
     @classmethod
-    def get_model_file_info(cls, model: Model, token: Optional[str]) -> List[FileEntry]:
+    def get_model_file_info(
+        cls, model: Model, token: Optional[str], revision: Optional[str] = None
+    ) -> List[FileEntry]:
 
         api = HfApi(token=token)
-        repo_info = api.repo_info(model.huggingface_repo_id, files_metadata=True)
+        repo_info = api.repo_info(
+            model.huggingface_repo_id,
+            revision=revision,
+            files_metadata=True,
+        )
         file_list = [FileEntry(f.rfilename, f.size) for f in repo_info.siblings]
         return file_list
 
@@ -367,6 +489,7 @@ class HfDownloader:
         local_dir: Optional[Union[str, os.PathLike[str]]] = None,
         cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
         max_workers: int = 8,
+        revision: Optional[str] = None,
     ) -> List[str]:
         """Download a model from the Hugging Face Hub.
 
@@ -404,12 +527,14 @@ class HfDownloader:
                     token=token,
                     local_dir=local_dir,
                     extra_filename=extra_filename,
+                    revision=revision,
                 )
 
             snapshot_download(
                 repo_id=repo_id,
                 token=token,
                 local_dir=local_dir,
+                revision=revision,
             )
             return [local_dir]
 
@@ -422,6 +547,7 @@ class HfDownloader:
         local_dir: Optional[Union[str, os.PathLike[str]]] = None,
         max_workers: int = 8,
         extra_filename: Optional[str] = None,
+        revision: Optional[str] = None,
     ) -> List[str]:
         """Download a model from the Hugging Face Hub.
         Args:
@@ -434,9 +560,20 @@ class HfDownloader:
             The path to the downloaded model.
         """
 
-        matching_files = match_hugging_face_files(
-            repo_id, filename, extra_filename, token
-        )
+        if revision:
+            repo_files = HfApi(token=token).list_repo_files(
+                repo_id=repo_id, revision=revision
+            )
+            matching_files = [
+                path
+                for path in repo_files
+                if fnmatch.fnmatch(path, filename)
+                or (extra_filename and fnmatch.fnmatch(path, extra_filename))
+            ]
+        else:
+            matching_files = match_hugging_face_files(
+                repo_id, filename, extra_filename, token
+            )
 
         if len(matching_files) == 0:
             raise ValueError(f"No file found in {repo_id} that match {filename}")
@@ -459,6 +596,7 @@ class HfDownloader:
                 token=token,
                 subfolder=subfolder,
                 local_dir=local_dir,
+                revision=revision,
             )
             downloaded_files.append(downloaded_file)
 
@@ -789,7 +927,12 @@ class ModelScopeDownloader:
     )
 
     @classmethod
-    def get_model_file_info(cls, model: Model, cfg: Config = None) -> List[FileEntry]:
+    def get_model_file_info(
+        cls,
+        model: Model,
+        cfg: Config = None,
+        revision: Optional[str] = None,
+    ) -> List[FileEntry]:
         if cls._use_local_s3_cache(cfg):
             s3_path = cls._local_modelscope_s3_path(model.model_scope_model_id, cfg)
             strip_prefix = cls._local_modelscope_model_strip_prefix(s3_path)
@@ -805,7 +948,9 @@ class ModelScopeDownloader:
             )
 
         api = HubApi()
-        repo_files = api.get_model_files(model.model_scope_model_id, recursive=True)
+        repo_files = api.get_model_files(
+            model.model_scope_model_id, revision=revision, recursive=True
+        )
         file_list = [FileEntry(f.get("Path"), f.get("Size")) for f in repo_files]
         return file_list
 
@@ -883,6 +1028,7 @@ class ModelScopeDownloader:
         local_dir: Optional[Union[str, os.PathLike[str]]] = None,
         cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
         cfg: Config = None,
+        revision: Optional[str] = None,
     ) -> List[str]:
         """Download a model from Model Scope.
 
@@ -968,9 +1114,24 @@ class ModelScopeDownloader:
         logger.info(f"Retrieving file lock: {lock_filename}")
         with SoftFileLock(lock_filename):
             if file_path:
-                matching_files = match_model_scope_file_paths(
-                    model_id, file_path, extra_file_path
-                )
+                if revision:
+                    remote_files = ModelScopeHubApi().list_repo_files(
+                        model_id, "model", revision=revision, recursive=True
+                    )
+                    remote_paths = [
+                        item.path if hasattr(item, "path") else str(item)
+                        for item in remote_files
+                    ]
+                    matching_files = [
+                        path
+                        for path in remote_paths
+                        if fnmatch.fnmatch(path, file_path)
+                        or (extra_file_path and fnmatch.fnmatch(path, extra_file_path))
+                    ]
+                else:
+                    matching_files = match_model_scope_file_paths(
+                        model_id, file_path, extra_file_path
+                    )
                 if len(matching_files) == 0:
                     raise ValueError(
                         f"No file found in {model_id} that match {file_path}"
@@ -981,6 +1142,7 @@ class ModelScopeDownloader:
                     local_dir=local_dir,
                     allow_patterns=matching_files,
                     max_workers=cls._max_workers,
+                    revision=revision,
                 )
                 return [os.path.join(model_dir, file) for file in matching_files]
 
@@ -988,6 +1150,7 @@ class ModelScopeDownloader:
                 model_id=model_id,
                 local_dir=local_dir,
                 max_workers=cls._max_workers,
+                revision=revision,
             )
             return [local_dir]
 

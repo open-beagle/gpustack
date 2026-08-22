@@ -1,5 +1,5 @@
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import String, cast, func, or_
 
@@ -7,6 +7,7 @@ from gpustack.api.exceptions import (
     AlreadyExistsException,
     ConflictException,
     InternalServerErrorException,
+    HTTPException,
     NotFoundException,
 )
 from gpustack.server.deps import ListParamsDep, SessionDep, EngineDep
@@ -17,6 +18,9 @@ from gpustack.schemas.model_files import (
     ModelFileStateEnum,
     ModelFileUpdate,
     ModelFilesPublic,
+)
+from gpustack.server.model_file_download_execution_service import (
+    create_model_file_with_download_execution,
 )
 
 router = APIRouter()
@@ -125,7 +129,11 @@ async def get_model_file(session: SessionDep, id: int):
 
 
 @router.post("", response_model=ModelFilePublic)
-async def create_model_file(session: SessionDep, model_file_in: ModelFileCreate):
+async def create_model_file(
+    session: SessionDep,
+    model_file_in: ModelFileCreate,
+    request: Request = None,
+):
     fields = {
         "worker_id": model_file_in.worker_id,
         "source_index": model_file_in.model_source_index,
@@ -141,9 +149,16 @@ async def create_model_file(session: SessionDep, model_file_in: ModelFileCreate)
         model_file = ModelFile(
             **model_file_in.model_dump(), source_index=model_file_in.model_source_index
         )
-        model_file = await ModelFile.create(session, model_file)
+        model_file = await create_model_file_with_download_execution(
+            session,
+            model_file,
+            request.app.state.server_config if request is not None else None,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise InternalServerErrorException(message=f"Failed to create model file: {e}")
+        await session.rollback()
+        raise InternalServerErrorException(message="Failed to create model file") from e
 
     return model_file
 

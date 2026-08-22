@@ -34,6 +34,9 @@ from gpustack.server.services import (
     ModelInstanceService,
     ModelService,
 )
+from gpustack.server.model_file_download_execution_service import (
+    create_model_file_with_download_execution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +131,9 @@ class ModelInstanceController:
                     return
 
                 if model_instance.state == ModelInstanceStateEnum.INITIALIZING:
-                    await ensure_instance_model_file(session, model_instance)
+                    await ensure_instance_model_file(
+                        session, model_instance, self._config
+                    )
 
                 await model.refresh(session)
 
@@ -257,9 +262,7 @@ async def _sync_replicas_locked(
         # placement_override is request-scoped and applies only to instances
         # created in this sync. Existing replicas keep their current placement.
         replica_groups = (
-            placement_override.groups_for_new_replicas()
-            if placement_override
-            else []
+            placement_override.groups_for_new_replicas() if placement_override else []
         )
         for index in range(model.replicas - len(instances)):
             name_prefix = ''.join(
@@ -347,7 +350,9 @@ def specified_scale_down_instances(
     return deleting_instances
 
 
-async def ensure_instance_model_file(session: AsyncSession, instance: ModelInstance):
+async def ensure_instance_model_file(
+    session: AsyncSession, instance: ModelInstance, config: Config = None
+):
     """
     Synchronize the model file of the model instance.
     """
@@ -362,7 +367,9 @@ async def ensure_instance_model_file(session: AsyncSession, instance: ModelInsta
         await sync_instance_files_state(session, instance, existing_model_files)
         return
 
-    model_files = await get_or_create_model_files_for_instance(session, instance)
+    model_files = await get_or_create_model_files_for_instance(
+        session, instance, config
+    )
     for model_file in model_files:
         if model_file.state == ModelFileStateEnum.ERROR:
             # Retry the download
@@ -415,7 +422,7 @@ async def ensure_model_instance_file_links(
 
 
 async def get_or_create_model_files_for_instance(
-    session: AsyncSession, instance: ModelInstance
+    session: AsyncSession, instance: ModelInstance, config: Config = None
 ) -> List[ModelFile]:
     """
     Get or create model files for the given model instance.
@@ -449,7 +456,7 @@ async def get_or_create_model_files_for_instance(
             worker_id=worker_id,
             source_index=instance.model_source_index,
         )
-        await ModelFile.create(session, model_file)
+        await create_model_file_with_download_execution(session, model_file, config)
         logger.info(
             f"Created model file for model instance {instance.name} and worker {worker_id}"
         )

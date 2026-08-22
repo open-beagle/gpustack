@@ -19,6 +19,9 @@ from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncTask,
     ModelStorageSyncTaskStateEnum,
 )
+from gpustack.schemas.model_file_download_executions import (
+    ModelFileDownloadExecution,
+)
 from gpustack.schemas.model_files import (
     ModelFile,
     ModelFileCreate,
@@ -64,6 +67,7 @@ async def _run_model_file_crud(tmp_path):
         ModelFile.__table__,
         ModelInstanceModelFileLink.__table__,
         ModelPreheatS3Profile.__table__,
+        ModelFileDownloadExecution.__table__,
         ModelStorageSyncTask.__table__,
     ]
     async with engine.begin() as connection:
@@ -76,6 +80,7 @@ async def _run_model_file_crud(tmp_path):
             ip="127.0.0.1",
             port=10150,
             worker_uuid="worker-a-uuid",
+            model_storage_protocol_version=1,
         )
         worker = await Worker.create(session, worker)
 
@@ -131,6 +136,12 @@ async def _run_model_file_crud(tmp_path):
 
     async with AsyncSession(engine) as session:
         assert await ModelFile.one_by_id(session, created.id) is None
+        assert (
+            await ModelFileDownloadExecution.one_by_field(
+                session, "model_file_id", created.id
+            )
+            is None
+        )
         assert await ModelStorageSyncTask.one_by_id(session, sync_task.id) is None
 
     await engine.dispose()

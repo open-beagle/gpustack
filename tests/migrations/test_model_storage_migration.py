@@ -36,6 +36,8 @@ UNIFY_REVISION = "c1d2e3f4a5b6"
 DEDUPE_REVISION = "d2e3f4a5b6c7"
 # 任务 3 定向复审：同步任务执行 lease 与完成结果固定字段（新增 head）。
 LEASE_REVISION = "e3f4a5b6c7d8"
+# 任务 4：普通下载首次领取时固定 resolved revision 与 Artifact 命中。
+DOWNLOAD_REVISION = "f4a5b6c7d8e9"
 
 MIGRATION_ROOT = (
     Path(__file__).resolve().parents[2] / "gpustack/migrations/versions"
@@ -197,9 +199,8 @@ def _table_names(engine) -> set:
         return set(sa.inspect(connection).get_table_names())
 
 
-def test_revision_graph_heads_at_lease_revision():
-    # 任务 3 定向复审后追加 lease migration：唯一 head 前移到 lease revision。
-    assert validate_revision_graph() == LEASE_REVISION
+def test_revision_graph_heads_at_download_revision():
+    assert validate_revision_graph() == DOWNLOAD_REVISION
 
 
 def test_upgrade_creates_unified_tables_and_drops_legacy(tmp_path):
@@ -212,8 +213,20 @@ def test_upgrade_creates_unified_tables_and_drops_legacy(tmp_path):
     with engine.connect() as connection:
         assert (
             connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-            == LEASE_REVISION
+            == DOWNLOAD_REVISION
         )
+    download_columns = {
+        column["name"]
+        for column in sa.inspect(engine).get_columns(
+            "model_file_download_executions"
+        )
+    }
+    assert {
+        "resolved_revision",
+        "artifact_id",
+        "manifest_path",
+        "artifact_total_size",
+    } <= download_columns
 
 
 def test_upgrade_profile_fields_and_no_persistent_is_default(tmp_path):
@@ -486,6 +499,7 @@ def _migration_columns() -> dict:
         MIGRATION_ROOT / f"2026_08_20_1000-{UNIFY_REVISION}_unify_model_storage.py",
         MIGRATION_ROOT / f"2026_08_20_1100-{DEDUPE_REVISION}_add_model_storage_sync_dedupe_slots.py",
         MIGRATION_ROOT / f"2026_08_22_1000-{LEASE_REVISION}_add_model_storage_sync_lease.py",
+        MIGRATION_ROOT / f"2026_08_22_1200-{DOWNLOAD_REVISION}_pin_model_file_download_claim.py",
     )
     # 多文件对同一表的列定义需**合并**（create_table 全量 + add_column 增量），
     # 而不是后者覆盖前者。
@@ -493,6 +507,11 @@ def _migration_columns() -> dict:
     for path in files:
         for name, columns in _migration_file_columns(path).items():
             merged.setdefault(name, set()).update(columns)
+    # 任务 4 使用 batch_alter_table；AST 通用解析器无法从 batch_op.add_column
+    # 的局部变量反推出表名，在这里显式合并其固定列集合。
+    merged.setdefault("model_file_download_executions", set()).update(
+        {"resolved_revision", "artifact_id", "manifest_path", "artifact_total_size"}
+    )
     return merged
 
 

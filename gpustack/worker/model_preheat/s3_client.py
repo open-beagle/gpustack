@@ -264,6 +264,60 @@ class ModelPreheatS3Client:
             raise ModelPreheatS3ManifestConflict("artifact_manifest_conflict")
         return stored
 
+    def read_artifact_manifest_path(
+        self, bucket_name: str, manifest_path: str
+    ) -> ModelPreheatManifest | None:
+        """按 Server 库存固定的对象 Key 读取并严格解析 Manifest。"""
+        self._validate_object_name(manifest_path)
+        try:
+            manifest_bytes = self._read_object_bytes(bucket_name, manifest_path)
+            if manifest_bytes is None:
+                return None
+            return parse_artifact_manifest(json.loads(manifest_bytes.decode("utf-8")))
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ModelPreheatManifestError,
+        ) as exc:
+            raise ModelPreheatS3ManifestError("s3_manifest_invalid") from exc
+
+    def download_artifact_file(
+        self,
+        bucket_name: str,
+        profile_prefix: str,
+        manifest: ModelPreheatManifest,
+        file: ManifestFile,
+        target: str | Path,
+    ) -> None:
+        """下载单个 Artifact 文件，并以大小和 SHA-256 校验后原子替换。"""
+        import hashlib
+        import os
+
+        destination = Path(target)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.part")
+        object_name = self.artifact_file_object(profile_prefix, manifest, file)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            response = self._client.get_object(bucket_name, object_name)
+            try:
+                with temporary.open("wb") as output:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+            finally:
+                self._close_response(response)
+            if size != file.size or digest.hexdigest() != file.sha256:
+                raise ModelPreheatS3Conflict("checksum_mismatch")
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def publish_artifact(
         self,
         bucket_name: str,
@@ -435,6 +489,18 @@ class ModelPreheatS3Client:
         if root not in local_path.parents and local_path != root:
             raise ValueError("manifest_path_escape")
         return local_path
+
+    @staticmethod
+    def _validate_object_name(object_name: str) -> None:
+        if (
+            not isinstance(object_name, str)
+            or not object_name
+            or object_name.startswith("/")
+            or "\\" in object_name
+            or any(part in {"", ".", ".."} for part in object_name.split("/"))
+            or any(ord(char) < 32 or ord(char) == 127 for char in object_name)
+        ):
+            raise ValueError("invalid_s3_object_name")
 
     def _sha256_file_bytes(
         self,

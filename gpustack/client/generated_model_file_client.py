@@ -107,3 +107,30 @@ class ModelFileClient:
     def delete(self, id: int):
         response = self._client.get_httpx_client().delete(f"{self._url}/{id}")
         raise_if_response_error(response)
+
+    def claim_download_execution(self, id: int) -> ModelFileDownloadExecutionClaimed:
+        response = self._client.get_httpx_client().post(
+            f"{self._url}/{id}/download-executions/claim"
+        )
+        raise_if_response_error(response)
+        return ModelFileDownloadExecutionClaimed.model_validate(response.json())
+
+    def complete_download_execution(
+        self, id: int, result: ModelFileDownloadExecutionComplete
+    ):
+        response = self._client.get_httpx_client().post(
+            f"{self._url}/{id}/download-executions/complete",
+            content=result.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+        raise_if_response_error(response)
+
+    def fail_download_execution(self, id: int, error_code: str):
+        response = self._client.get_httpx_client().post(
+            f"{self._url}/{id}/download-executions/fail",
+            content=ModelFileDownloadExecutionFail(
+                error_code=error_code
+            ).model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+        raise_if_response_error(response)

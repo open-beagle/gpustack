@@ -1,0 +1,366 @@
+"""Worker 私有的普通模型下载执行配置领取端点。"""
+
+import asyncio
+import json
+import re
+from datetime import datetime, timezone
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Request, Response
+from sqlalchemy import and_
+from sqlmodel import select
+
+from gpustack.api.exceptions import (
+    HTTPException,
+    NotFoundException,
+    ServiceUnavailableException,
+)
+from gpustack.model_preheat_credentials import (
+    ModelPreheatCredentialCipher,
+    ModelPreheatCredentialError,
+)
+from gpustack.schemas.model_file_download_executions import (
+    ModelFileDownloadExecution,
+    ModelFileDownloadExecutionClaimed,
+    ModelFileDownloadExecutionComplete,
+    ModelFileDownloadExecutionFail,
+    ModelFileDownloadExecutionProfile,
+    ModelFileDownloadExecutionStateEnum,
+)
+from gpustack.schemas.model_files import ModelFile
+from gpustack.schemas.model_preheats import (
+    ModelPreheatArtifact,
+    ModelPreheatInventoryManifestStateEnum,
+)
+from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
+from gpustack.server.deps import SessionDep
+from gpustack.server.model_preheat_revision import resolve_model_preheat_revision
+from gpustack.server.model_preheat_worker_identity import (
+    ModelPreheatWorkerPrincipal,
+    get_model_preheat_worker_identity,
+)
+from gpustack.worker.model_preheat.identity import encode_path
+
+
+router = APIRouter()
+WorkerIdentityDep = Annotated[
+    ModelPreheatWorkerPrincipal, Depends(get_model_preheat_worker_identity)
+]
+_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+
+
+@router.post(
+    "/{model_file_id}/download-executions/claim",
+    response_model=ModelFileDownloadExecutionClaimed,
+)
+async def claim_model_file_download_execution(
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    model_file_id: int,
+    identity: WorkerIdentityDep,
+):
+    execution = (
+        await session.exec(
+            select(ModelFileDownloadExecution).where(
+                ModelFileDownloadExecution.model_file_id == model_file_id
+            )
+        )
+    ).first()
+    if execution is None:
+        raise NotFoundException(message="model_file_download_execution_not_found")
+    model_file = await session.get(ModelFile, model_file_id)
+    if model_file is None:
+        raise NotFoundException(message="model_file_not_found")
+    await _authorize_execution(session, execution, model_file, identity)
+
+    resolved_revision = execution.resolved_revision
+    artifact_id = execution.artifact_id
+    manifest_path = execution.manifest_path
+    artifact_total_size = execution.artifact_total_size
+    request_identity = execution.request_identity or {}
+    source = request_identity.get("source")
+    model_id = request_identity.get("model_id")
+    requested_revision = request_identity.get("requested_revision")
+    if source in {"huggingface", "modelscope"} and not resolved_revision:
+        resolved_revision = await _resolve_revision(
+            request, source, model_id, requested_revision
+        )
+        artifact = await _exact_artifact(
+            session,
+            execution,
+            source,
+            model_id,
+            resolved_revision,
+            request_identity.get("include_patterns") or [],
+            request_identity.get("exclude_patterns") or [],
+        )
+        artifact_id = artifact.artifact_id if artifact is not None else None
+        manifest_path = artifact.manifest_path if artifact is not None else None
+        artifact_total_size = artifact.total_size if artifact is not None else None
+        execution.resolved_revision = resolved_revision
+        execution.artifact_id = artifact_id
+        execution.manifest_path = manifest_path
+        execution.artifact_total_size = artifact_total_size
+        model_file.requested_revision = requested_revision
+        model_file.resolved_revision = resolved_revision
+    elif not resolved_revision:
+        resolved_revision = requested_revision or "not_applicable"
+        execution.resolved_revision = resolved_revision
+
+    if execution.claimed_by_worker_uuid not in {None, identity.worker_uuid}:
+        raise HTTPException(403, "worker_not_authorized", "worker_not_authorized")
+    execution.claimed_by_worker_uuid = identity.worker_uuid
+    execution.claimed_at = execution.claimed_at or datetime.now(timezone.utc)
+    execution.state = ModelFileDownloadExecutionStateEnum.RUNNING
+    session.add(execution)
+    session.add(model_file)
+    await session.commit()
+
+    profile, fallback_enabled = _execution_profile(request, execution)
+    response.headers["Cache-Control"] = "no-store"
+    return ModelFileDownloadExecutionClaimed(
+        execution_id=execution.id,
+        model_file_id=model_file.id,
+        request_identity=request_identity,
+        request_digest=execution.request_digest,
+        source=source,
+        model_id=model_id or "",
+        requested_revision=requested_revision,
+        resolved_revision=resolved_revision,
+        include_patterns=list(request_identity.get("include_patterns") or []),
+        exclude_patterns=list(request_identity.get("exclude_patterns") or []),
+        artifact_id=artifact_id,
+        manifest_path=manifest_path,
+        artifact_total_size=artifact_total_size,
+        source_fallback_enabled=fallback_enabled,
+        profile=profile,
+    )
+
+
+async def _authorize_execution(session, execution, model_file, identity) -> Worker:
+    if (
+        execution.target_worker_id != identity.worker_id
+        or execution.target_worker_uuid != identity.worker_uuid
+        or model_file.worker_id != identity.worker_id
+    ):
+        raise HTTPException(403, "worker_not_authorized", "worker_not_authorized")
+    worker = await session.get(Worker, identity.worker_id)
+    if worker is None or worker.worker_uuid != identity.worker_uuid:
+        raise HTTPException(403, "worker_not_current", "worker_not_current")
+    latest = (
+        await session.exec(
+            select(Worker)
+            .where(Worker.worker_uuid == identity.worker_uuid)
+            .order_by(Worker.id.desc())
+        )
+    ).first()
+    if latest is None or latest.id != worker.id:
+        raise HTTPException(403, "worker_not_current", "worker_not_current")
+    if worker.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
+        raise HTTPException(
+            409, "model_storage_protocol_mismatch", "model_storage_protocol_mismatch"
+        )
+    return worker
+
+
+async def _resolve_revision(request, source, model_id, requested_revision) -> str:
+    if not isinstance(model_id, str) or not model_id:
+        raise HTTPException(409, "invalid_model_identity", "invalid_model_identity")
+    if isinstance(requested_revision, str):
+        if _COMMIT_SHA.fullmatch(requested_revision):
+            return requested_revision.lower()
+    resolver = getattr(
+        request.app.state,
+        "model_file_download_revision_resolver",
+        resolve_model_preheat_revision,
+    )
+    try:
+        return await asyncio.to_thread(
+            resolver,
+            source,
+            model_id,
+            requested_revision,
+            token=getattr(request.app.state.server_config, "huggingface_token", None),
+        )
+    except Exception:
+        raise ServiceUnavailableException(
+            message="revision_resolution_unavailable"
+        ) from None
+
+
+async def _exact_artifact(
+    session,
+    execution,
+    source,
+    model_id,
+    resolved_revision,
+    include_patterns,
+    exclude_patterns,
+):
+    if execution.default_profile_id is None:
+        return None
+    rows = (
+        await session.exec(
+            select(ModelPreheatArtifact).where(
+                and_(
+                    ModelPreheatArtifact.profile_id == execution.default_profile_id,
+                    ModelPreheatArtifact.profile_config_version
+                    == execution.default_profile_config_version,
+                    ModelPreheatArtifact.source == source,
+                    ModelPreheatArtifact.model_id == encode_path(model_id),
+                    ModelPreheatArtifact.resolved_revision == resolved_revision,
+                    ModelPreheatArtifact.manifest_state
+                    == ModelPreheatInventoryManifestStateEnum.VALID,
+                )
+            )
+        )
+    ).all()
+    expected_include = sorted(encode_path(item) for item in include_patterns)
+    expected_exclude = sorted(encode_path(item) for item in exclude_patterns)
+    matched = [
+        row
+        for row in rows
+        if list(row.include_patterns) == expected_include
+        and list(row.exclude_patterns) == expected_exclude
+    ]
+    return matched[0] if len(matched) == 1 else None
+
+
+def _execution_profile(request, execution):
+    if execution.default_profile_id is None:
+        return None, True
+    cipher = _cipher(request)
+    try:
+        outer = execution.credential_snapshot_encrypted
+        plaintext = cipher.decrypt(outer)
+        snapshot = json.loads(plaintext)
+        profile = ModelFileDownloadExecutionProfile(
+            id=snapshot["id"],
+            config_version=snapshot["config_version"],
+            endpoint=snapshot["endpoint"],
+            bucket=snapshot["bucket"],
+            prefix=snapshot.get("prefix") or "",
+            tls_enabled=snapshot.get("tls_enabled", True),
+            tls_verify=snapshot.get("tls_verify", True),
+            region=snapshot.get("region") or "",
+            use_virtual_hosted_style=snapshot.get("use_virtual_hosted_style", True),
+            access_key=cipher.decrypt(snapshot["access_key_encrypted"]),
+            secret_key=cipher.decrypt(snapshot["secret_key_encrypted"]),
+        )
+        return profile, bool(snapshot.get("source_fallback_enabled", True))
+    except (ModelPreheatCredentialError, KeyError, TypeError, ValueError):
+        raise ServiceUnavailableException(
+            message="execution_credentials_unavailable"
+        ) from None
+
+
+def _cipher(request):
+    config = request.app.state.server_config
+    return ModelPreheatCredentialCipher(
+        current_key=getattr(config, "model_preheat_credential_key", None),
+        current_key_version=getattr(
+            config, "model_preheat_credential_key_version", None
+        ),
+        old_keys=getattr(config, "model_preheat_credential_old_keys", None),
+    )
+
+
+@router.post("/{model_file_id}/download-executions/complete")
+async def complete_model_file_download_execution(
+    session: SessionDep,
+    model_file_id: int,
+    complete: ModelFileDownloadExecutionComplete,
+    identity: WorkerIdentityDep,
+):
+    execution, model_file = await _execution_and_model_file(session, model_file_id)
+    await _authorize_execution(session, execution, model_file, identity)
+    if execution.state == ModelFileDownloadExecutionStateEnum.READY:
+        if (
+            execution.transfer_source == complete.transfer_source
+            and execution.transfer_profile_id == complete.transfer_profile_id
+            and execution.source_worker_id == complete.source_worker_id
+        ):
+            return {"state": execution.state}
+        raise HTTPException(
+            409, "execution_already_completed", "execution_already_completed"
+        )
+    if execution.state != ModelFileDownloadExecutionStateEnum.RUNNING:
+        raise HTTPException(409, "execution_not_running", "execution_not_running")
+    if complete.transfer_profile_id not in {None, execution.default_profile_id}:
+        raise HTTPException(422, "invalid_transfer_profile", "invalid_transfer_profile")
+    if complete.source_worker_id not in {None, identity.worker_id}:
+        raise HTTPException(422, "invalid_source_worker", "invalid_source_worker")
+    if complete.transfer_source.value == "s3":
+        if (
+            execution.artifact_id is None
+            or complete.transfer_profile_id != execution.default_profile_id
+        ):
+            raise HTTPException(
+                422, "invalid_transfer_source", "invalid_transfer_source"
+            )
+    elif complete.transfer_profile_id is not None:
+        raise HTTPException(422, "invalid_transfer_source", "invalid_transfer_source")
+    execution.state = ModelFileDownloadExecutionStateEnum.READY
+    execution.transfer_source = complete.transfer_source
+    execution.transfer_profile_id = complete.transfer_profile_id
+    execution.source_worker_id = complete.source_worker_id
+    execution.error_code = None
+    execution.state_message = None
+    execution.finished_at = datetime.now(timezone.utc)
+    session.add(execution)
+    await session.commit()
+    return {"state": execution.state}
+
+
+@router.post("/{model_file_id}/download-executions/fail")
+async def fail_model_file_download_execution(
+    session: SessionDep,
+    model_file_id: int,
+    failure: ModelFileDownloadExecutionFail,
+    identity: WorkerIdentityDep,
+):
+    execution, model_file = await _execution_and_model_file(session, model_file_id)
+    await _authorize_execution(session, execution, model_file, identity)
+    if execution.state == ModelFileDownloadExecutionStateEnum.READY:
+        raise HTTPException(
+            409, "execution_already_completed", "execution_already_completed"
+        )
+    if execution.state == ModelFileDownloadExecutionStateEnum.ERROR:
+        return {"state": execution.state}
+    if execution.state != ModelFileDownloadExecutionStateEnum.RUNNING:
+        raise HTTPException(409, "execution_not_running", "execution_not_running")
+    allowed = {
+        "model_artifact_not_found",
+        "revision_resolution_unavailable",
+        "s3_manifest_invalid",
+        "s3_manifest_missing",
+        "s3_authentication_failed",
+        "network_timeout",
+        "worker_execution_failed",
+    }
+    execution.state = ModelFileDownloadExecutionStateEnum.ERROR
+    execution.error_code = (
+        failure.error_code
+        if failure.error_code in allowed
+        else "worker_execution_failed"
+    )
+    execution.state_message = execution.error_code
+    execution.finished_at = datetime.now(timezone.utc)
+    session.add(execution)
+    await session.commit()
+    return {"state": execution.state}
+
+
+async def _execution_and_model_file(session, model_file_id):
+    execution = (
+        await session.exec(
+            select(ModelFileDownloadExecution).where(
+                ModelFileDownloadExecution.model_file_id == model_file_id
+            )
+        )
+    ).first()
+    model_file = await session.get(ModelFile, model_file_id)
+    if execution is None or model_file is None:
+        raise NotFoundException(message="model_file_download_execution_not_found")
+    return execution, model_file

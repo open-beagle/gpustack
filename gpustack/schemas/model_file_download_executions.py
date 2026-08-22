@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import Column, ForeignKey, JSON, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Column, ForeignKey, JSON, Text, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 from gpustack.mixins import BaseModelMixin
@@ -56,9 +56,7 @@ class ModelFileDownloadExecution(SQLModel, BaseModelMixin, table=True):
     request_digest: str
     # 目标 Worker 身份；只允许版本匹配且属于该 ModelFile 的 Worker 领取。
     target_worker_id: int = Field(
-        sa_column=Column(
-            ForeignKey("workers.id", ondelete="CASCADE"), nullable=False
-        )
+        sa_column=Column(ForeignKey("workers.id", ondelete="CASCADE"), nullable=False)
     )
     target_worker_uuid: str
     # 默认 Profile 与其配置版本；无默认 Profile 时为 NULL（明确的无 S3 执行）。
@@ -70,6 +68,13 @@ class ModelFileDownloadExecution(SQLModel, BaseModelMixin, table=True):
         ),
     )
     default_profile_config_version: Optional[int] = None
+    # 首次领取时固定解析结果与库存命中，保证同一 Worker 重试得到同一配置。
+    resolved_revision: Optional[str] = None
+    artifact_id: Optional[str] = None
+    manifest_path: Optional[str] = None
+    artifact_total_size: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
     # 任务私有加密凭据快照（AES-GCM），仅进入受 Worker 身份约束的领取 payload。
     credential_snapshot_encrypted: Optional[dict] = Field(
         default=None, sa_column=Column(JSON, nullable=True)
@@ -104,6 +109,8 @@ class ModelFileDownloadExecutionPublic(SQLModel):
     target_worker_id: int
     default_profile_id: Optional[int] = None
     default_profile_config_version: Optional[int] = None
+    resolved_revision: Optional[str] = None
+    artifact_id: Optional[str] = None
     state: ModelFileDownloadExecutionStateEnum
     transfer_source: Optional[ModelFileTransferSourceEnum] = None
     transfer_profile_id: Optional[int] = None
@@ -116,3 +123,51 @@ class ModelFileDownloadExecutionPublic(SQLModel):
 
 
 ModelFileDownloadExecutionsPublic = PaginatedList[ModelFileDownloadExecutionPublic]
+
+
+class ModelFileDownloadExecutionProfile(SQLModel):
+    """只在 Worker 私有领取响应中出现的 Profile 固定快照。"""
+
+    id: int
+    config_version: int
+    endpoint: str
+    bucket: str
+    prefix: str = ""
+    tls_enabled: bool = True
+    tls_verify: bool = True
+    region: str = ""
+    use_virtual_hosted_style: bool = True
+    access_key: str = Field(repr=False)
+    secret_key: str = Field(repr=False)
+
+
+class ModelFileDownloadExecutionClaimed(SQLModel):
+    """普通下载执行配置；不得由管理员列表或 SSE 返回。"""
+
+    execution_id: int
+    model_file_id: int
+    request_identity: dict
+    request_digest: str
+    source: str
+    model_id: str
+    requested_revision: Optional[str] = None
+    resolved_revision: str
+    include_patterns: list[str] = Field(default_factory=list)
+    exclude_patterns: list[str] = Field(default_factory=list)
+    artifact_id: Optional[str] = None
+    manifest_path: Optional[str] = None
+    artifact_total_size: Optional[int] = None
+    source_fallback_enabled: bool
+    profile: Optional[ModelFileDownloadExecutionProfile] = Field(
+        default=None, repr=False
+    )
+
+
+class ModelFileDownloadExecutionComplete(SQLModel):
+    transfer_source: ModelFileTransferSourceEnum
+    transfer_profile_id: Optional[int] = None
+    source_worker_id: Optional[int] = None
+
+
+class ModelFileDownloadExecutionFail(SQLModel):
+    error_code: str
