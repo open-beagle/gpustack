@@ -38,6 +38,24 @@ def test_modelscope_revision_uses_commit_when_sdk_proves_it():
     assert resolved == "c" * 40
 
 
+def test_explicit_commit_revision_does_not_access_hub():
+    class ForbiddenApi:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("不应访问 Hub")
+
+    commit = "c" * 40
+    assert (
+        resolve_model_preheat_revision(
+            "modelscope",
+            "org/model",
+            commit,
+            modelscope_api_factory=ForbiddenApi,
+            modelscope_file_api_factory=ForbiddenApi,
+        )
+        == commit
+    )
+
+
 def test_modelscope_moving_revision_uses_remote_file_fingerprint():
     class FakeHubApi:
         def get_valid_revision(self, model_id, revision=None):
@@ -109,6 +127,34 @@ def test_modelscope_aliases_with_same_files_share_fingerprint():
     }
 
     assert len(resolved) == 1
+
+
+def test_modelscope_file_fingerprint_rejects_missing_content_digest():
+    class FakeHubApi:
+        def get_valid_revision(self, model_id, revision=None):
+            return revision
+
+    class MissingDigestFileApi:
+        def list_repo_files(self, model_id, repo_type, *, revision, recursive):
+            return [
+                type(
+                    "File",
+                    (),
+                    {"path": "model.bin", "size": 10, "blob_id": None, "lfs": None},
+                )()
+            ]
+
+    with pytest.raises(
+        ModelPreheatRevisionResolutionError,
+        match="remote_revision_resolution_failed",
+    ):
+        resolve_model_preheat_revision(
+            "modelscope",
+            "org/model",
+            "release",
+            modelscope_api_factory=FakeHubApi,
+            modelscope_file_api_factory=MissingDigestFileApi,
+        )
 
 
 def test_revision_resolution_wraps_upstream_error_without_message():

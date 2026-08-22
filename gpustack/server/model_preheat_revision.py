@@ -29,6 +29,10 @@ def resolve_model_preheat_revision(
 ) -> str:
     try:
         normalized_source = normalize_source(source)
+        if isinstance(requested_revision, str) and _COMMIT_SHA.fullmatch(
+            requested_revision
+        ):
+            return requested_revision.lower()
         if normalized_source == "huggingface":
             resolved = (
                 hf_api_factory(token=token)
@@ -157,11 +161,11 @@ def _modelscope_filelist_fingerprint(rows) -> str:
             raise ValueError("invalid_modelscope_file_size")
         if blob_id is None and isinstance(lfs, dict):
             blob_id = lfs.get("sha256") or lfs.get("oid")
-        if blob_id is not None and not isinstance(blob_id, str):
+        if not isinstance(blob_id, str) or not blob_id:
             raise ValueError("invalid_modelscope_blob_id")
         files.append(
             {
-                "blob_id": blob_id.lower() if blob_id else None,
+                "blob_id": blob_id.lower(),
                 "path": encode_path(path),
                 "size": size,
             }

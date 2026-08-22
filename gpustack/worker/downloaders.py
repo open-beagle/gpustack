@@ -299,7 +299,7 @@ def download_resolved_revision_to_staging(
     model_id = decode_path(identity.model_path)
     revision = decode_path(identity.revision_path)
     patterns = [decode_path(pattern) for pattern in identity.file_patterns]
-    ignored_patterns = [decode_path(pattern) for pattern in exclude_patterns or []]
+    ignored_patterns = list(exclude_patterns or [])
 
     if identity.source == "huggingface":
         if cancel_check is None and progress_callback is None:

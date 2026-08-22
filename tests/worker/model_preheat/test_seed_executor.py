@@ -248,6 +248,26 @@ def test_modelscope_filelist_revision_downloads_requested_upstream_revision(tmp_
     assert snapshot_download.call_args.kwargs["revision"] == "release"
 
 
+def test_download_preserves_raw_special_character_exclude_patterns(tmp_path):
+    identity = ModelPreheatIdentity(
+        source="huggingface",
+        model_id="org/model",
+        revision="a" * 40,
+        file_patterns=("**",),
+    )
+    exclude_patterns = ("private/%20/*.bin", "中文/模型 文件.bin")
+    with patch("gpustack.worker.downloaders.snapshot_download") as snapshot_download:
+        download_resolved_revision_to_staging(
+            identity,
+            tmp_path / "staging",
+            exclude_patterns=exclude_patterns,
+        )
+
+    assert snapshot_download.call_args.kwargs["ignore_patterns"] == list(
+        exclude_patterns
+    )
+
+
 def test_seed_disabled_fallback_never_calls_hub(tmp_path):
     request = _seed_request(tmp_path, source_fallback_enabled=False)
     calls = []
