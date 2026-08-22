@@ -53,7 +53,7 @@ class ModelPreheatWorkerReconciler:
         self,
         engine,
         *,
-        ready_probe,
+        ready_probe=None,
         connectivity_creator=create_or_reuse_connectivity_check,
         interval=15,
     ):
@@ -240,13 +240,14 @@ class ModelPreheatWorkerReconciler:
                     or result[0].state != ModelPreheatWorkerTaskStateEnum.READY
                 ):
                     continue
-                ready = await self._ready_probe.probe(source_task)
                 await session.refresh(source_task)
                 await session.refresh(policy)
                 await session.refresh(profile)
                 current_worker = await _latest_worker(session, worker.worker_uuid)
                 if (
-                    ready is None
+                    not source_task.artifact_id
+                    or not source_task.s3_manifest_path
+                    or not source_task.manifest_digest
                     or not policy.enabled
                     or policy.profile_config_version != profile.config_version
                     or source_task.s3_profile_config_version
@@ -255,8 +256,6 @@ class ModelPreheatWorkerReconciler:
                     or current_worker.id != worker.id
                     or source_task.execution_state
                     != ModelPreheatExecutionStateEnum.READY
-                    or ready.manifest_digest != source_task.manifest_digest
-                    or ready.generation_id != source_task.generation_id
                 ):
                     continue
                 await _create_or_rebind_distribution_task(
@@ -330,7 +329,7 @@ async def _ensure_policy(session, task):
         await session.exec(
             select(ModelPreheatDistributionPolicy).where(
                 ModelPreheatDistributionPolicy.profile_id == task.s3_profile_id,
-                ModelPreheatDistributionPolicy.cache_key == task.cache_key,
+                ModelPreheatDistributionPolicy.request_digest == task.request_digest,
                 ModelPreheatDistributionPolicy.target_scope == task.target_scope,
                 ModelPreheatDistributionPolicy.selector_digest == selector_digest,
             )
@@ -377,7 +376,8 @@ async def _ensure_policy(session, task):
         name=f"{task.model_id} 自动同步"[:255],
         profile_id=task.s3_profile_id,
         profile_config_version=task.s3_profile_config_version,
-        cache_key=task.cache_key,
+        request_identity=task.request_identity,
+        request_digest=task.request_digest,
         target_scope=task.target_scope,
         worker_selector=worker_selector,
         gpu_selector=gpu_selector,
@@ -470,7 +470,7 @@ async def _reset_policy_tasks(session, policy_id, parent_attempt):
 
 async def _create_or_rebind_distribution_task(session, policy, source_task, worker):
     operation_key = distribution_operation_key(
-        policy.id, worker.worker_uuid, policy.cache_key
+        policy.id, worker.worker_uuid, policy.request_digest
     )
     task = (
         await session.exec(

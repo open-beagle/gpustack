@@ -26,39 +26,23 @@ from gpustack.schemas.model_preheats import (
 )
 from gpustack.schemas.workers import Worker, WorkerStateEnum
 from gpustack.server.bus import Event, EventType
-from gpustack.server.model_preheat_controller import ReadyProbeResult
 from gpustack.server.model_preheat_worker_reconciler import (
     ModelPreheatWorkerReconciler,
     _create_or_rebind_distribution_task,
 )
 
 
-GENERATION_ID = "preheat-00000000-0000-4000-8000-000000000009"
+ARTIFACT_ID = "a" * 64
 
 
 @dataclass
 class FakeReadyProbe:
-    result: ReadyProbeResult | None
+    result: object | None
     calls: int = 0
 
     async def probe(self, task):
         self.calls += 1
         return self.result
-
-
-class DisablingReadyProbe(FakeReadyProbe):
-    def __init__(self, engine, result):
-        super().__init__(result)
-        self.engine = engine
-
-    async def probe(self, task):
-        result = await super().probe(task)
-        async with AsyncSession(self.engine) as session:
-            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
-            policy.enabled = False
-            session.add(policy)
-            await session.commit()
-        return result
 
 
 async def _database(tmp_path):
@@ -100,8 +84,17 @@ async def _seed(engine, *, state=ModelPreheatExecutionStateEnum.READY):
             include_patterns=[],
             exclude_patterns=[],
             selection_digest="b" * 64,
-            cache_key="c" * 64,
-            generation_id=GENERATION_ID,
+            request_identity={
+                "source": "huggingface",
+                "model_id": "org/model",
+                "requested_revision": None,
+                "include_patterns": [],
+                "exclude_patterns": [],
+            },
+            request_digest="c" * 64,
+            artifact_id=(
+                ARTIFACT_ID if state == ModelPreheatExecutionStateEnum.READY else None
+            ),
             target_scope=ModelPreheatTargetScopeEnum.SAME_GPU_MODEL,
             target_gpu_names=["NVIDIA L40S"],
             target_worker_uuids=[old_worker.worker_uuid],
@@ -117,6 +110,11 @@ async def _seed(engine, *, state=ModelPreheatExecutionStateEnum.READY):
             execution_state=state,
             manifest_digest=(
                 "d" * 64 if state == ModelPreheatExecutionStateEnum.READY else None
+            ),
+            s3_manifest_path=(
+                f"model-storage/huggingface/org/model/{ARTIFACT_ID}/manifest.json"
+                if state == ModelPreheatExecutionStateEnum.READY
+                else None
             ),
         )
         session.add(task)
@@ -144,12 +142,7 @@ async def _new_worker(session, *, worker_id_suffix="a", state=WorkerStateEnum.RE
 
 
 def _ready_result():
-    return ReadyProbeResult(
-        manifest_digest="d" * 64,
-        generation_id=GENERATION_ID,
-        ready_path="model-cache/v1/ready.json",
-        manifest_path="model-cache/v1/generations/current/manifest.json",
-    )
+    return object()
 
 
 def test_ready_task_materializes_policy_once_and_non_ready_task_does_not(tmp_path):
@@ -253,7 +246,7 @@ def test_new_worker_gets_incremental_connectivity_then_idempotent_distribution(
     assert tasks[0].distribution_policy_id is not None
     assert tasks[0].worker_uuid == "new-uuid"
     assert targets == ["old-uuid"]
-    assert probe_calls >= 1
+    assert probe_calls == 0
 
 
 def test_heartbeat_and_temporary_offline_do_not_create_or_skip_work(tmp_path):
@@ -293,7 +286,9 @@ def test_deleted_worker_is_skipped_but_disabled_policy_keeps_existing_task(tmp_p
             policy.enabled = False
             task = ModelPreheatWorkerTask(
                 distribution_policy_id=policy.id,
-                operation_key=f"{policy.id}:{worker.worker_uuid}:{policy.cache_key}",
+                operation_key=(
+                    f"{policy.id}:{worker.worker_uuid}:{policy.request_digest}"
+                ),
                 worker_uuid=worker.worker_uuid,
                 worker_id=worker.id,
                 role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
@@ -389,7 +384,11 @@ def test_policy_disabled_during_strict_ready_probe_does_not_create_work(tmp_path
             connectivity.state = ModelPreheatWorkerTaskStateEnum.READY
             session.add(connectivity)
             await session.commit()
-        reconciler._ready_probe = DisablingReadyProbe(engine, _ready_result())
+        async with AsyncSession(engine) as session:
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            policy.enabled = False
+            session.add(policy)
+            await session.commit()
         await reconciler.reconcile_worker("new-uuid")
         async with AsyncSession(engine) as session:
             tasks = (
@@ -495,7 +494,7 @@ def test_skipped_policy_task_rebinds_latest_same_uuid_registration(tmp_path):
             task = ModelPreheatWorkerTask(
                 distribution_policy_id=policy.id,
                 operation_key=distribution_operation_key(
-                    policy.id, old.worker_uuid, policy.cache_key
+                    policy.id, old.worker_uuid, policy.request_digest
                 ),
                 worker_uuid=old.worker_uuid,
                 worker_id=old.id,
@@ -770,7 +769,7 @@ def test_distribution_error_retry_uses_classification_backoff_and_cas(tmp_path):
             retryable = ModelPreheatWorkerTask(
                 distribution_policy_id=policy.id,
                 operation_key=distribution_operation_key(
-                    policy.id, worker.worker_uuid, policy.cache_key
+                    policy.id, worker.worker_uuid, policy.request_digest
                 ),
                 parent_attempt=source.attempt,
                 worker_uuid=worker.worker_uuid,

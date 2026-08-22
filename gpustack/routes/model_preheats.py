@@ -1,7 +1,6 @@
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
 
 from fastapi import APIRouter, Header, Request
 from sqlalchemy import and_, or_, update
@@ -27,6 +26,8 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatCreate,
     ModelPreheatDesiredStateEnum,
     ModelPreheatExecutionStateEnum,
+    ModelPreheatArtifact,
+    ModelPreheatInventoryManifestStateEnum,
     ModelPreheatTask,
     ModelPreheatTaskLock,
     ModelPreheatTaskPublic,
@@ -34,7 +35,6 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatTargetScopeEnum,
     ModelPreheatWorkerTask,
     ModelPreheatWorkerTaskStateEnum,
-    cache_key_for,
     is_terminal_task,
     operation_key_for,
     selection_digest,
@@ -55,6 +55,7 @@ from gpustack.server.model_preheat_connectivity import (
     mark_profile_stale_if_expired,
 )
 from gpustack.utils.gpu import normalize_gpu_names
+from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
 router = APIRouter()
@@ -161,7 +162,7 @@ async def retry_model_preheat(session: SessionDep, id: int):
     expected_attempt = task.attempt
     operation_key = operation_key_for(
         task.s3_profile_id,
-        task.cache_key,
+        task.request_digest,
         task.target_worker_uuids,
         task.s3_backfill_policy,
     )
@@ -260,11 +261,19 @@ async def create_model_preheat(
         )
     except Exception:
         raise InvalidException(message="remote_revision_resolution_failed") from None
-    cache_key = cache_key_for(
-        task_in.source, task_in.model_id, resolved_revision, pattern_digest
+    identity = ModelPreheatIdentity(
+        source=task_in.source,
+        model_id=task_in.model_id,
+        revision=resolved_revision,
+        requested_revision=task_in.revision,
+        file_patterns=task_in.include_patterns,
+        exclude_patterns=task_in.exclude_patterns,
     )
     operation_key = operation_key_for(
-        profile.id, cache_key, target_worker_uuids, task_in.s3_backfill_policy
+        profile.id,
+        identity.request_digest,
+        target_worker_uuids,
+        task_in.s3_backfill_policy,
     )
 
     existing = await _active_task_for_operation(session, operation_key)
@@ -289,6 +298,7 @@ async def create_model_preheat(
             message=f"credential_encryption_unavailable: {exc}"
         )
 
+    matched_artifact = await _exact_artifact_match(session, profile, identity)
     task = ModelPreheatTask(
         source=task_in.source,
         model_id=task_in.model_id,
@@ -297,8 +307,9 @@ async def create_model_preheat(
         include_patterns=task_in.include_patterns,
         exclude_patterns=task_in.exclude_patterns,
         selection_digest=pattern_digest,
-        cache_key=cache_key,
-        generation_id=f"preheat-{uuid4()}",
+        request_identity=_request_identity(identity),
+        request_digest=identity.request_digest,
+        artifact_id=(matched_artifact.artifact_id if matched_artifact else None),
         seed_worker_uuid=seed_worker.worker_uuid,
         seed_worker_id=seed_worker.id,
         target_scope=task_in.target_scope,
@@ -310,6 +321,10 @@ async def create_model_preheat(
         s3_profile_snapshot_encrypted=profile_snapshot,
         encryption_key_version=cipher.current_key_version,
         s3_backfill_policy=task_in.s3_backfill_policy,
+        s3_manifest_path=(matched_artifact.manifest_path if matched_artifact else None),
+        manifest_digest=(
+            matched_artifact.manifest_digest if matched_artifact else None
+        ),
         keep_new_workers_in_sync=task_in.keep_new_workers_in_sync,
         created_by_user_id=current_user.id,
     )
@@ -588,10 +603,45 @@ def _profile_snapshot(
         "tls_verify": profile.tls_verify,
         "region": profile.region,
         "use_virtual_hosted_style": profile.use_virtual_hosted_style,
+        "source_fallback_enabled": profile.source_fallback_enabled,
         "access_key_encrypted": profile.access_key_encrypted,
         "secret_key_encrypted": profile.secret_key_encrypted,
     }
     return cipher.encrypt(json.dumps(snapshot, separators=(",", ":"), sort_keys=True))
+
+
+def _request_identity(identity: ModelPreheatIdentity) -> dict:
+    return {
+        "source": identity.source,
+        "model_id": identity.model_path,
+        "requested_revision": identity.requested_revision_path,
+        "include_patterns": list(identity.file_patterns),
+        "exclude_patterns": list(identity.exclude_patterns),
+    }
+
+
+async def _exact_artifact_match(session, profile, identity):
+    rows = (
+        await session.exec(
+            select(ModelPreheatArtifact).where(
+                ModelPreheatArtifact.profile_id == profile.id,
+                ModelPreheatArtifact.profile_config_version == profile.config_version,
+                ModelPreheatArtifact.source == identity.source,
+                ModelPreheatArtifact.model_id == identity.model_path,
+                ModelPreheatArtifact.resolved_revision == identity.revision,
+                ModelPreheatArtifact.manifest_state
+                == ModelPreheatInventoryManifestStateEnum.VALID,
+            )
+        )
+    ).all()
+    matches = [
+        row
+        for row in rows
+        if tuple(sorted(row.include_patterns or ())) == tuple(identity.file_patterns)
+        and tuple(sorted(row.exclude_patterns or ()))
+        == tuple(identity.exclude_patterns)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _to_public(task: ModelPreheatTask, deduplicated: bool = False):

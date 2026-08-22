@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import io
 import os
@@ -5,12 +6,9 @@ import secrets
 import shutil
 import socket
 import ssl
-import stat
-import time
-import asyncio
 import threading
+import time
 from dataclasses import dataclass
-from glob import has_magic
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -19,21 +17,16 @@ from gpustack.worker.model_preheat.identity import (
     decode_path,
     encode_path,
 )
-from gpustack.worker.model_preheat.local_cache import (
-    LocalCacheError,
-    LocalCacheState,
-    create_staging_dir,
-    inspect_local_cache,
-    publish_staging,
-    replace_trusted_manifest,
+from gpustack.worker.model_preheat.local_cache import create_staging_dir
+from gpustack.worker.model_preheat.manifest import (
+    ModelPreheatManifestError,
+    build_model_preheat_manifest,
 )
-from gpustack.worker.model_preheat.manifest import build_model_preheat_manifest
 from gpustack.worker.model_preheat.s3_client import (
     ModelPreheatCanceled,
     ModelPreheatS3Client,
     ModelPreheatS3Conflict,
     ModelPreheatS3ManifestError,
-    ReadyGenerationConflict,
 )
 
 
@@ -45,20 +38,34 @@ class TrustedLocalCandidate:
     repository_complete: bool = False
 
 
+def _raise_if_cancelled(cancel_check):
+    if cancel_check is not None and cancel_check():
+        raise ModelPreheatCanceled("canceled")
+
+
+def _staging_manifest_path(staging_dir: Path, encoded_path: str) -> Path:
+    root = staging_dir.resolve()
+    path = (root / decode_path(encoded_path)).resolve()
+    if root not in path.parents:
+        raise ValueError("local_cache_path_escape")
+    return path
+
+
+# 统一 Artifact 执行契约。预热与普通下载共用不可变 Artifact Manifest。
 @dataclass(frozen=True)
 class SeedExecutionRequest:
     cache_dir: Path
     target_dir: Path
-    cache_key: str
     task_id: int
     attempt: int
+    request_digest: str
     identity: ModelPreheatIdentity
-    selection_digest: str
-    generation_id: str
     exclude_patterns: tuple[str, ...] | list[str]
     bucket: str
     prefix: str
-    requested_revision: str | None = None
+    source_fallback_enabled: bool
+    artifact_id: str | None = None
+    manifest_path: str | None = None
     bandwidth_limit_mbps: int | None = None
     resumable_cursor: dict | None = None
     trusted_local_candidate: TrustedLocalCandidate | None = None
@@ -68,16 +75,15 @@ class SeedExecutionRequest:
 class TargetExecutionRequest:
     cache_dir: Path
     target_dir: Path
-    cache_key: str
     task_id: int
     attempt: int
+    request_digest: str
     identity: ModelPreheatIdentity
-    selection_digest: str
-    generation_id: str
     exclude_patterns: tuple[str, ...] | list[str]
     bucket: str
     prefix: str
-    requested_revision: str | None = None
+    artifact_id: str
+    manifest_path: str
     bandwidth_limit_mbps: int | None = None
     resumable_cursor: dict | None = None
     trusted_local_candidate: TrustedLocalCandidate | None = None
@@ -90,149 +96,110 @@ def execute_seed_preheat(
     download_to_staging=None,
     cancel_check=None,
     progress_callback=None,
-) -> dict:
-    staging = None
-    try:
-        reference_manifest = s3_client.read_ready_manifest(
-            request.bucket,
-            request.prefix,
-            request.identity,
-            cache_key=request.cache_key,
-            selection_digest=request.selection_digest,
-        )
-        inspection = inspect_local_cache(
-            request.cache_dir,
-            request.target_dir,
-            request.cache_key,
-            reference_manifest,
-        )
-        if inspection.state == LocalCacheState.VALID:
-            manifest = inspection.manifest
-            replaced_local_manifest = None
-            if (
-                reference_manifest is None
-                and manifest.generation_id != request.generation_id
-            ):
-                replaced_local_manifest = manifest
+):
+    if request.request_digest != request.identity.request_digest:
+        return _error_result("request_digest_mismatch")
+    if request.artifact_id is not None:
+        if request.manifest_path is None:
+            return _error_result("s3_manifest_invalid")
+        if request.trusted_local_candidate is not None:
+            staging = create_staging_dir(
+                request.cache_dir, request.task_id, request.attempt
+            )
+            try:
+                _clear_directory(staging)
+                _copy_candidate(
+                    request.trusted_local_candidate,
+                    staging,
+                    cancel_check=cancel_check,
+                )
                 manifest = build_model_preheat_manifest(
-                    request.target_dir,
+                    staging,
                     request.identity,
-                    cache_key=request.cache_key,
-                    selection_digest=request.selection_digest,
-                    generation_id=request.generation_id,
                     exclude_patterns=request.exclude_patterns,
-                    requested_revision=request.requested_revision,
                 )
-            publish_result = s3_client.publish_generation(
-                request.bucket,
-                request.prefix,
-                manifest,
-                request.target_dir,
-                cancel_check=cancel_check,
-                bandwidth_limit_mbps=request.bandwidth_limit_mbps,
-            )
-            if replaced_local_manifest is not None:
-                replace_trusted_manifest(
-                    request.cache_dir,
-                    request.cache_key,
-                    replaced_local_manifest,
+                if manifest.artifact_id != request.artifact_id:
+                    return _error_result("local_manifest_conflict")
+                stored = s3_client.read_artifact_manifest_path(
+                    request.bucket, request.manifest_path
+                )
+                if (
+                    stored is None
+                    or stored.to_artifact_json_bytes()
+                    != manifest.to_artifact_json_bytes()
+                ):
+                    return _error_result("s3_manifest_invalid")
+                _install_staging(staging, request.target_dir, manifest)
+                _write_local_artifact_marker(request.cache_dir, manifest)
+                return _ready_result(
+                    request,
+                    s3_client,
                     manifest,
+                    transfer_source="current_node",
+                    uploaded=0,
+                    skipped=len(manifest.files) + 1,
+                    downloaded=0,
                 )
-            return _ready_result(
-                request,
-                s3_client,
-                manifest,
-                inspection.state,
-                publish_result.uploaded,
-                publish_result.skipped,
-                0,
-            )
-
-        if reference_manifest is not None:
-            return execute_target_preheat(
-                TargetExecutionRequest(
-                    cache_dir=request.cache_dir,
-                    target_dir=request.target_dir,
-                    cache_key=request.cache_key,
-                    task_id=request.task_id,
-                    attempt=request.attempt,
-                    identity=request.identity,
-                    requested_revision=request.requested_revision,
-                    selection_digest=request.selection_digest,
-                    generation_id=request.generation_id,
-                    exclude_patterns=request.exclude_patterns,
-                    bucket=request.bucket,
-                    prefix=request.prefix,
-                    bandwidth_limit_mbps=request.bandwidth_limit_mbps,
-                    resumable_cursor=request.resumable_cursor,
-                    trusted_local_candidate=request.trusted_local_candidate,
-                ),
-                s3_client,
-                cancel_check=cancel_check,
-                progress_callback=progress_callback,
-            )
-
-        staging = create_staging_dir(
-            request.cache_dir, request.task_id, request.attempt
+            except (ModelPreheatManifestError, ModelPreheatS3Conflict):
+                return _error_result("local_manifest_conflict")
+        target_request = TargetExecutionRequest(
+            cache_dir=request.cache_dir,
+            target_dir=request.target_dir,
+            task_id=request.task_id,
+            attempt=request.attempt,
+            request_digest=request.request_digest,
+            identity=request.identity,
+            exclude_patterns=request.exclude_patterns,
+            bucket=request.bucket,
+            prefix=request.prefix,
+            artifact_id=request.artifact_id,
+            manifest_path=request.manifest_path,
+            bandwidth_limit_mbps=request.bandwidth_limit_mbps,
+            resumable_cursor=request.resumable_cursor,
+            trusted_local_candidate=request.trusted_local_candidate,
         )
-        trusted_candidate_staged = _stage_trusted_local_candidate(
-            request.trusted_local_candidate,
-            staging,
+        return execute_target_preheat(
+            target_request,
+            s3_client,
             cancel_check=cancel_check,
             progress_callback=progress_callback,
         )
-        trusted_candidate_manifest = None
-        if trusted_candidate_staged:
-            trusted_candidate_manifest = _build_trusted_candidate_manifest(
-                request,
-                staging,
-                request.generation_id,
-                cancel_check=cancel_check,
-                progress_callback=progress_callback,
-            )
-            if trusted_candidate_manifest is None:
-                _discard_staging(staging)
-                staging.mkdir(parents=True, exist_ok=True)
-                trusted_candidate_staged = False
-            else:
-                _retain_manifest_files(
-                    staging, trusted_candidate_manifest, cancel_check=cancel_check
-                )
-        if not trusted_candidate_staged:
-            _reuse_previous_seed_staging(request, staging, cancel_check=cancel_check)
-        _raise_if_cancelled(cancel_check)
-        if not trusted_candidate_staged:
-            if download_to_staging is None:
+
+    staging = create_staging_dir(request.cache_dir, request.task_id, request.attempt)
+    transfer_source = request.identity.source
+    try:
+        _clear_directory(staging)
+        candidate = request.trusted_local_candidate
+        if candidate is not None:
+            _copy_candidate(candidate, staging, cancel_check=cancel_check)
+            transfer_source = "current_node"
+        else:
+            if not request.source_fallback_enabled:
+                return _error_result("model_artifact_not_found")
+            downloader = download_to_staging
+            if downloader is None:
                 from gpustack.worker.downloaders import (
                     download_resolved_revision_to_staging,
                 )
 
-                download_to_staging = download_resolved_revision_to_staging
-            download_options = {"exclude_patterns": request.exclude_patterns}
-            if download_to_staging.__module__ == "gpustack.worker.downloaders":
-                download_options.update(
-                    cancel_check=cancel_check,
-                    progress_callback=progress_callback,
-                )
-            download_to_staging(request.identity, staging, **download_options)
-        _raise_if_cancelled(cancel_check)
-        _remove_excluded_files(
-            staging, request.exclude_patterns, cancel_check=cancel_check
-        )
-        manifest = trusted_candidate_manifest or build_model_preheat_manifest(
+                downloader = download_resolved_revision_to_staging
+            downloader(
+                request.identity,
+                staging,
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
+        manifest = build_model_preheat_manifest(
             staging,
             request.identity,
-            cache_key=request.cache_key,
-            selection_digest=request.selection_digest,
-            generation_id=request.generation_id,
             exclude_patterns=request.exclude_patterns,
-            requested_revision=request.requested_revision,
-            cancel_callback=lambda: _raise_if_cancelled(cancel_check),
-            progress_callback=progress_callback,
+            cancel_callback=(
+                (lambda: _raise_if_cancelled(cancel_check))
+                if cancel_check is not None
+                else None
+            ),
         )
-        if reference_manifest is not None and manifest != reference_manifest:
-            return _error_result("checksum_mismatch", staging)
-        publish_result = s3_client.publish_generation(
+        published = s3_client.publish_artifact(
             request.bucket,
             request.prefix,
             manifest,
@@ -240,44 +207,27 @@ def execute_seed_preheat(
             cancel_check=cancel_check,
             bandwidth_limit_mbps=request.bandwidth_limit_mbps,
         )
-        local_result = publish_staging(
-            request.cache_dir,
-            request.target_dir,
-            request.cache_key,
-            staging,
-            manifest,
-        )
-        if local_result.state != LocalCacheState.VALID:
-            return _error_result(
-                local_result.error_code or "local_cache_conflict",
-                staging,
-                local_cache_state=local_result.state,
-            )
+        _install_staging(staging, request.target_dir, manifest)
+        _write_local_artifact_marker(request.cache_dir, manifest)
         return _ready_result(
             request,
             s3_client,
             manifest,
-            local_result.state,
-            publish_result.uploaded,
-            publish_result.skipped,
-            0 if trusted_candidate_staged else len(manifest.files),
+            transfer_source=transfer_source,
+            uploaded=published.uploaded,
+            skipped=published.skipped,
+            downloaded=0,
         )
     except ModelPreheatCanceled:
-        return _error_result("canceled", staging)
+        return _error_result("canceled")
+    except ModelPreheatManifestError:
+        return _error_result("local_manifest_invalid")
     except ModelPreheatS3ManifestError:
-        return _error_result("s3_manifest_invalid", staging)
-    except ReadyGenerationConflict:
-        return _error_result("ready_generation_conflict", staging)
-    except ModelPreheatS3Conflict:
-        return _error_result("s3_object_conflict", staging)
-    except LocalCacheError as exc:
-        return _error_result(str(exc), staging)
-    except OSError:
-        return _error_result("worker_execution_failed", staging)
-    except ValueError:
-        return _error_result("validation_error", staging)
-    except Exception:
-        return _error_result("worker_execution_failed", staging)
+        return _error_result("s3_manifest_invalid")
+    except ModelPreheatS3Conflict as exc:
+        return _error_result(_safe_s3_error(exc))
+    except (OSError, ValueError):
+        return _error_result("worker_execution_failed")
 
 
 def execute_target_preheat(
@@ -286,547 +236,165 @@ def execute_target_preheat(
     *,
     cancel_check=None,
     progress_callback=None,
-) -> dict:
-    staging = None
-    completed_files = []
+):
+    if request.request_digest != request.identity.request_digest:
+        return _error_result("request_digest_mismatch")
     try:
-        manifest = s3_client.read_ready_manifest(
-            request.bucket,
-            request.prefix,
-            request.identity,
-            cache_key=request.cache_key,
-            selection_digest=request.selection_digest,
+        manifest = s3_client.read_artifact_manifest_path(
+            request.bucket, request.manifest_path
         )
-        if manifest is None:
-            return _error_result("s3_ready_not_found")
-        trusted_staging = create_staging_dir(
-            request.cache_dir, request.task_id, request.attempt
-        )
-        if _stage_trusted_local_candidate(
-            request.trusted_local_candidate,
-            trusted_staging,
-            cancel_check=cancel_check,
-            progress_callback=progress_callback,
-        ):
-            candidate_manifest = _build_trusted_candidate_manifest(
-                request,
-                trusted_staging,
-                manifest.generation_id,
-                cancel_check=cancel_check,
-                progress_callback=progress_callback,
-            )
-            if candidate_manifest is not None:
-                _retain_manifest_files(
-                    trusted_staging, candidate_manifest, cancel_check=cancel_check
-                )
-            if candidate_manifest == manifest:
-                local_result = publish_staging(
-                    request.cache_dir,
-                    request.target_dir,
-                    request.cache_key,
-                    trusted_staging,
-                    manifest,
-                    replace_conflicting=True,
-                    cancel_callback=lambda: _raise_if_cancelled(cancel_check),
-                )
-                if local_result.state == LocalCacheState.VALID:
-                    return _ready_result(
-                        request,
-                        s3_client,
-                        manifest,
-                        local_result.state,
-                        0,
-                        len(manifest.files),
-                        0,
-                    )
-            _discard_staging(trusted_staging)
-        inspection = inspect_local_cache(
-            request.cache_dir,
-            request.target_dir,
-            request.cache_key,
-            manifest,
-        )
-        if inspection.state == LocalCacheState.VALID:
-            return _ready_result(
-                request,
-                s3_client,
-                manifest,
-                inspection.state,
-                0,
-                len(manifest.files),
-                0,
-            )
-
-        staging = create_staging_dir(
-            request.cache_dir, request.task_id, request.attempt
-        )
-        _reuse_previous_staging_files(
-            request, staging, manifest, cancel_check=cancel_check
-        )
+        if manifest is None or not _manifest_matches_request(manifest, request):
+            return _error_result("s3_manifest_invalid")
+        target = Path(request.target_dir)
+        target.mkdir(parents=True, exist_ok=True)
         downloaded = 0
-        skipped = 0
-        downloaded_size = 0
+        completed = []
+        completed_size = 0
         for file in manifest.files:
             _raise_if_cancelled(cancel_check)
-            target = _staging_manifest_path(staging, file.path)
-            if _file_matches(target, file.size, file.sha256, cancel_check):
-                skipped += 1
-                completed_files.append(file.path)
-                downloaded_size += file.size
-                _report_progress(
-                    progress_callback,
-                    completed_files,
-                    downloaded_size,
-                    manifest.total_size,
-                )
-                continue
-            for _ in range(3):
-                _raise_if_cancelled(cancel_check)
-                download_options = {}
-                if request.bandwidth_limit_mbps is not None:
-                    download_options["bandwidth_limit_mbps"] = (
-                        request.bandwidth_limit_mbps
-                    )
-                s3_client.download_generation_file(
+            destination = _staging_manifest_path(target, file.path)
+            if not _local_file_matches(destination, file.size, file.sha256):
+                s3_client.download_artifact_file(
                     request.bucket,
                     request.prefix,
                     manifest,
                     file,
-                    target,
-                    **download_options,
+                    destination,
                 )
-                if _file_matches(target, file.size, file.sha256, cancel_check):
-                    downloaded += 1
-                    completed_files.append(file.path)
-                    downloaded_size += file.size
-                    _report_progress(
-                        progress_callback,
-                        completed_files,
-                        downloaded_size,
-                        manifest.total_size,
-                    )
-                    break
-            else:
-                return _error_result(
-                    "checksum_mismatch",
-                    staging,
-                    completed_files,
-                )
-
-        _raise_if_cancelled(cancel_check)
-        local_result = publish_staging(
-            request.cache_dir,
-            request.target_dir,
-            request.cache_key,
-            staging,
-            manifest,
-            replace_conflicting=True,
-            cancel_callback=lambda: _raise_if_cancelled(cancel_check),
-        )
-        if local_result.state != LocalCacheState.VALID:
-            return _error_result(
-                local_result.error_code or "local_cache_conflict",
-                staging,
-                completed_files,
-                local_result.state,
-            )
+                downloaded += 1
+            completed.append(decode_path(file.path))
+            completed_size += file.size
+            if progress_callback is not None:
+                progress_callback(completed, completed_size, manifest.total_size)
+        _write_local_artifact_marker(request.cache_dir, manifest)
         return _ready_result(
             request,
             s3_client,
             manifest,
-            local_result.state,
-            0,
-            skipped,
-            downloaded,
+            transfer_source="s3",
+            uploaded=0,
+            skipped=0,
+            downloaded=downloaded,
         )
     except ModelPreheatCanceled:
-        return _error_result("canceled", staging, completed_files)
+        return _error_result("canceled")
     except ModelPreheatS3ManifestError:
-        return _error_result("s3_manifest_invalid", staging, completed_files)
-    except ModelPreheatS3Conflict:
-        return _error_result("s3_object_conflict", staging, completed_files)
-    except LocalCacheError as exc:
-        return _error_result(str(exc), staging, completed_files)
-    except OSError:
-        return _error_result("worker_execution_failed", staging, completed_files)
-    except ValueError:
-        return _error_result("validation_error", staging, completed_files)
-    except Exception:
-        return _error_result("worker_execution_failed", staging, completed_files)
-
-
-def _report_progress(callback, completed_files, downloaded_size, total_size):
-    if callback is not None:
-        callback(tuple(completed_files), downloaded_size, total_size)
-
-
-def _stage_trusted_local_candidate(
-    candidate,
-    staging: Path,
-    *,
-    cancel_check=None,
-    progress_callback=None,
-) -> bool:
-    if candidate is None:
-        return False
-    try:
-        root_input = Path(candidate.root)
-        if not root_input.is_absolute() or root_input.is_symlink():
-            return False
-        root = root_input.resolve(strict=True)
-        if not root.is_dir():
-            return False
-        root_stat = root.stat()
-        files = {}
-        for raw_path in candidate.paths:
-            _raise_if_cancelled(cancel_check)
-            path_input = Path(raw_path)
-            if not path_input.is_absolute() or path_input.is_symlink():
-                return False
-            path = path_input.resolve(strict=True)
-            if path != root and root not in path.parents:
-                return False
-            candidates = path.rglob("*") if path.is_dir() else (path,)
-            for source in candidates:
-                _raise_if_cancelled(cancel_check)
-                source_stat = source.lstat()
-                if stat.S_ISLNK(source_stat.st_mode):
-                    return False
-                if stat.S_ISDIR(source_stat.st_mode):
-                    continue
-                if not stat.S_ISREG(source_stat.st_mode):
-                    return False
-                resolved = source.resolve(strict=True)
-                if root not in resolved.parents:
-                    return False
-                files[resolved.relative_to(root)] = (resolved, source_stat)
-        if not files:
-            return False
-        _discard_staging(staging)
-        staging.mkdir(parents=True, exist_ok=False)
-        staging_root = staging.resolve()
-        completed_files = []
-        copied_size = 0
-        total_size = sum(source_stat.st_size for _, source_stat in files.values())
-        for relative, (source, source_stat) in sorted(
-            files.items(), key=lambda item: str(item[0])
-        ):
-            _raise_if_cancelled(cancel_check)
-            target = (staging_root / relative).resolve(strict=False)
-            if staging_root not in target.parents:
-                raise LocalCacheError("local_cache_path_escape")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            _copy_stable_snapshot(source, source_stat, target, cancel_check)
-            completed_files.append(relative.as_posix())
-            copied_size += source_stat.st_size
-            _report_progress(
-                progress_callback, completed_files, copied_size, total_size
-            )
-        if not _same_file_identity(root.stat(), root_stat):
-            raise LocalCacheError("trusted_local_candidate_changed")
-        return True
-    except (LocalCacheError, OSError, ValueError):
-        _discard_staging(staging)
-        staging.mkdir(parents=True, exist_ok=True)
-        return False
-
-
-def _discard_staging(staging: Path) -> None:
-    if staging.exists():
-        if staging.is_dir() and not staging.is_symlink():
-            shutil.rmtree(staging)
-        else:
-            staging.unlink()
-
-
-def _copy_stable_snapshot(source, expected_stat, target, cancel_check):
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(source, flags)
-    try:
-        before = os.fstat(descriptor)
-        if not _same_file_identity(before, expected_stat):
-            raise LocalCacheError("trusted_local_candidate_changed")
-        with (
-            os.fdopen(descriptor, "rb", closefd=False) as input_file,
-            target.open("xb") as output_file,
-        ):
-            while True:
-                _raise_if_cancelled(cancel_check)
-                chunk = input_file.read(1024 * 1024)
-                if not chunk:
-                    break
-                output_file.write(chunk)
-            output_file.flush()
-        after = os.fstat(descriptor)
-        path_after = source.lstat()
-        if not _same_file_identity(after, before) or not _same_file_identity(
-            path_after, before
-        ):
-            raise LocalCacheError("trusted_local_candidate_changed")
-    finally:
-        os.close(descriptor)
-
-
-def _same_file_identity(first, second):
-    return all(
-        getattr(first, field) == getattr(second, field)
-        for field in (
-            "st_dev",
-            "st_ino",
-            "st_size",
-            "st_mtime_ns",
-            "st_ctime_ns",
-        )
-    )
-
-
-def _build_trusted_candidate_manifest(
-    request,
-    staging,
-    generation_id,
-    *,
-    cancel_check=None,
-    progress_callback=None,
-):
-    try:
-        manifest = build_model_preheat_manifest(
-            staging,
-            request.identity,
-            cache_key=request.cache_key,
-            selection_digest=request.selection_digest,
-            generation_id=generation_id,
-            exclude_patterns=request.exclude_patterns,
-            requested_revision=request.requested_revision,
-            cancel_callback=lambda: _raise_if_cancelled(cancel_check),
-            progress_callback=progress_callback,
-        )
-        if not _trusted_selection_complete(
-            manifest, request.identity, request.trusted_local_candidate
-        ):
-            return None
-        return manifest
+        return _error_result("s3_manifest_invalid")
+    except ModelPreheatS3Conflict as exc:
+        return _error_result(_safe_s3_error(exc))
     except (OSError, ValueError):
-        return None
+        return _error_result("worker_execution_failed")
 
 
-def _trusted_selection_complete(manifest, identity, candidate) -> bool:
-    selected_paths = [decode_path(file.path) for file in manifest.files]
-    if not selected_paths:
-        return False
-    if candidate is not None and candidate.repository_complete:
-        return True
-    patterns = [decode_path(pattern) for pattern in identity.file_patterns]
-    if not patterns or any(has_magic(pattern) for pattern in patterns):
-        return False
-    return all(pattern in selected_paths for pattern in patterns)
-
-
-def _retain_manifest_files(staging: Path, manifest, *, cancel_check=None) -> None:
-    expected = {decode_path(file.path) for file in manifest.files}
-    root = staging.resolve()
-    for path in sorted(root.rglob("*"), reverse=True):
-        _raise_if_cancelled(cancel_check)
-        if path.is_symlink():
-            raise LocalCacheError("local_cache_path_escape")
-        if path.is_file() and path.relative_to(root).as_posix() not in expected:
-            path.unlink()
-        elif path.is_dir():
-            try:
-                path.rmdir()
-            except OSError:
-                pass
+def _manifest_matches_request(manifest, request) -> bool:
+    return (
+        manifest.artifact_id == request.artifact_id
+        and manifest.identity.source == request.identity.source
+        and manifest.identity.model_path == request.identity.model_path
+        and manifest.identity.revision_path == request.identity.revision_path
+        and tuple(manifest.identity.file_patterns)
+        == tuple(request.identity.file_patterns)
+        and tuple(manifest.exclude_patterns)
+        == tuple(sorted(encode_path(value) for value in request.exclude_patterns))
+    )
 
 
 def _ready_result(
     request,
-    s3_client,
+    client,
     manifest,
-    local_cache_state,
+    *,
+    transfer_source,
     uploaded,
     skipped,
     downloaded,
-) -> dict:
+):
+    manifest_bytes = manifest.to_artifact_json_bytes()
     return {
         "state": "ready",
-        "manifest_digest": manifest.digest,
-        "ready_path": s3_client.ready_object(request.prefix, manifest),
-        "manifest_path": s3_client.manifest_object(request.prefix, manifest),
-        "generation_id": manifest.generation_id,
-        "local_cache_state": local_cache_state.value,
+        "request_digest": request.request_digest,
+        "artifact_id": manifest.artifact_id,
+        "manifest_digest": hashlib.sha256(manifest_bytes).hexdigest(),
+        "manifest_path": client.artifact_manifest_object(request.prefix, manifest),
+        "file_count": len(manifest.files),
+        "total_size": manifest.total_size,
+        "local_cache_state": "valid",
+        "transfer_source": transfer_source,
         "uploaded": uploaded,
         "skipped": skipped,
         "downloaded": downloaded,
-        "total_size": manifest.total_size,
     }
 
 
-def _error_result(
-    error_code,
-    staging_dir=None,
-    completed_files=None,
-    local_cache_state=LocalCacheState.ERROR,
-) -> dict:
-    return {
-        "state": "error",
-        "error_code": error_code,
-        "local_cache_state": local_cache_state.value,
-        "cursor": {
-            "completed_files": list(completed_files or [])[:1024],
-            "staging_exists": bool(staging_dir and Path(staging_dir).exists()),
-        },
+def _error_result(error_code, *args, **kwargs):
+    return {"state": "error", "error_code": error_code}
+
+
+def _safe_s3_error(exc):
+    code = str(exc)
+    allowed = {
+        "checksum_mismatch",
+        "object_content_conflict",
+        "artifact_manifest_conflict",
+        "local_file_content_mismatch",
     }
+    return code if code in allowed else "s3_object_conflict"
 
 
-def _raise_if_cancelled(cancel_check):
-    if cancel_check is not None and cancel_check():
-        raise ModelPreheatCanceled("canceled")
+def _clear_directory(root: Path):
+    root.mkdir(parents=True, exist_ok=True)
+    for child in root.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
-def _staging_manifest_path(staging_dir: Path, encoded_path: str) -> Path:
-    root = staging_dir.resolve()
-    path = (root / decode_path(encoded_path)).resolve()
-    if root not in path.parents:
-        raise LocalCacheError("local_cache_path_escape")
-    return path
+def _copy_candidate(candidate, staging, *, cancel_check=None):
+    root = Path(candidate.root).resolve()
+    if not root.is_dir():
+        raise OSError("trusted_candidate_missing")
+    for path in root.rglob("*"):
+        _raise_if_cancelled(cancel_check)
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(root)
+        destination = (staging / relative).resolve()
+        if staging.resolve() not in destination.parents:
+            raise OSError("trusted_candidate_path_escape")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
 
 
-def _file_matches(
-    path: Path, size: int, expected_sha256: str, cancel_check=None
-) -> bool:
+def _install_staging(staging, target, manifest):
+    target = Path(target)
+    target.mkdir(parents=True, exist_ok=True)
+    for file in manifest.files:
+        source = _staging_manifest_path(staging, file.path)
+        destination = _staging_manifest_path(target, file.path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.preheat")
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+
+
+def _local_file_matches(path, size, sha256):
     if not path.is_file() or path.stat().st_size != size:
         return False
     digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            _raise_if_cancelled(cancel_check)
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest() == expected_sha256
+    return digest.hexdigest() == sha256
 
 
-def _reuse_previous_staging_files(
-    request, staging: Path, manifest, *, cancel_check=None
-) -> None:
-    task_root = Path(request.cache_dir) / ".preheat" / str(request.task_id)
-    if not task_root.is_dir():
-        return
-    try:
-        current_attempt = int(request.attempt)
-    except (TypeError, ValueError):
-        return
-    previous = sorted(
-        (
-            path
-            for path in task_root.iterdir()
-            if path.is_dir()
-            and not path.is_symlink()
-            and path.name.isdigit()
-            and int(path.name) < current_attempt
-        ),
-        key=lambda path: int(path.name),
-        reverse=True,
-    )
-    cursor_files = _cursor_completed_files(request)
-    for file in manifest.files:
-        _raise_if_cancelled(cancel_check)
-        if cursor_files is not None and file.path not in cursor_files:
-            continue
-        target = _staging_manifest_path(staging, file.path)
-        if _file_matches(target, file.size, file.sha256, cancel_check):
-            continue
-        for old_staging in previous:
-            try:
-                source = _staging_manifest_path(old_staging, file.path)
-                matches = _file_matches(source, file.size, file.sha256, cancel_check)
-            except (LocalCacheError, OSError):
-                continue
-            if not matches:
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                _copy_stable_snapshot(source, source.lstat(), target, cancel_check)
-            except (LocalCacheError, OSError):
-                target.unlink(missing_ok=True)
-                continue
-            break
-
-
-def _reuse_previous_seed_staging(request, staging: Path, *, cancel_check=None) -> None:
-    task_root = Path(request.cache_dir) / ".preheat" / str(request.task_id)
-    try:
-        current_attempt = int(request.attempt)
-    except (TypeError, ValueError):
-        return
-    if not task_root.is_dir():
-        return
-    previous = sorted(
-        (
-            path
-            for path in task_root.iterdir()
-            if path.is_dir()
-            and not path.is_symlink()
-            and path.name.isdigit()
-            and int(path.name) < current_attempt
-        ),
-        key=lambda path: int(path.name),
-        reverse=True,
-    )
-    if not previous:
-        return
-    resolved_task_root = task_root.resolve()
-    source_root = previous[0].resolve()
-    if resolved_task_root not in source_root.parents:
-        return
-    target_root = staging.resolve()
-    cursor_files = _cursor_completed_files(request)
-    for source in source_root.rglob("*"):
-        _raise_if_cancelled(cancel_check)
-        try:
-            source_stat = source.lstat()
-        except OSError:
-            continue
-        if not stat.S_ISREG(source_stat.st_mode) or source.is_symlink():
-            continue
-        resolved_source = source.resolve()
-        if source_root not in resolved_source.parents:
-            continue
-        relative = source.relative_to(source_root)
-        if (
-            cursor_files is not None
-            and encode_path(relative.as_posix()) not in cursor_files
-        ):
-            continue
-        target = (target_root / relative).resolve(strict=False)
-        if target_root not in target.parents or target.exists():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            _copy_stable_snapshot(resolved_source, source_stat, target, cancel_check)
-        except (LocalCacheError, OSError):
-            target.unlink(missing_ok=True)
-            continue
-
-
-def _cursor_completed_files(request):
-    cursor = getattr(request, "resumable_cursor", None)
-    if cursor is None:
-        return None
-    return set(cursor.get("completed_files", []))
-
-
-def _remove_excluded_files(
-    staging_dir: Path, exclude_patterns, *, cancel_check=None
-) -> None:
-    root = staging_dir.resolve()
-    decoded_patterns = tuple(decode_path(pattern) for pattern in exclude_patterns)
-    for path in root.rglob("*"):
-        _raise_if_cancelled(cancel_check)
-        if not path.is_file():
-            continue
-        relative_path = path.relative_to(root).as_posix()
-        if any(Path(relative_path).match(pattern) for pattern in decoded_patterns):
-            path.unlink()
+def _write_local_artifact_marker(cache_dir, manifest):
+    directory = Path(cache_dir) / ".gpustack-manifests"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{manifest.artifact_id}.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_bytes(manifest.to_artifact_json_bytes())
+    os.replace(temporary, target)
 
 
 def build_preheat_role_handlers(cache_dir: str | Path) -> dict:
@@ -854,6 +422,8 @@ async def _execute_payload(
         model_id=task["model_id"],
         revision=task["resolved_revision"],
         file_patterns=patterns,
+        requested_revision=task.get("requested_revision"),
+        exclude_patterns=exclude_patterns,
     )
     profile = payload.profile
     endpoint = urlparse(profile.endpoint)
@@ -869,16 +439,15 @@ async def _execute_payload(
     request_fields = {
         "cache_dir": Path(cache_dir),
         "target_dir": preheat_model_target_dir(cache_dir, identity),
-        "cache_key": task["cache_key"],
         "task_id": task.get("id", payload.worker_task_id),
         "attempt": payload.attempt,
+        "request_digest": task["request_digest"],
         "identity": identity,
-        "requested_revision": task.get("requested_revision"),
-        "selection_digest": task["selection_digest"],
-        "generation_id": task["generation_id"],
         "exclude_patterns": exclude_patterns,
         "bucket": profile.bucket,
         "prefix": profile.prefix,
+        "artifact_id": task.get("artifact_id"),
+        "manifest_path": task.get("s3_manifest_path"),
         "bandwidth_limit_mbps": task.get("bandwidth_limit_mbps"),
         "resumable_cursor": getattr(payload, "resumable_cursor", None),
         "trusted_local_candidate": (
@@ -894,6 +463,16 @@ async def _execute_payload(
             else None
         ),
     }
+    if seed:
+        request_fields["source_fallback_enabled"] = bool(
+            profile.source_fallback_enabled
+        )
+        if request_fields["artifact_id"] is None:
+            request_fields.pop("manifest_path")
+    elif (
+        request_fields["artifact_id"] is None or request_fields["manifest_path"] is None
+    ):
+        raise RuntimeError("artifact_not_bound")
     cancel_event = threading.Event()
     execution = execute_seed_preheat if seed else execute_target_preheat
     request_type = SeedExecutionRequest if seed else TargetExecutionRequest

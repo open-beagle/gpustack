@@ -32,7 +32,6 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatTaskLock,
     ModelPreheatWorkerTask,
     ModelPreheatWorkerTaskStateEnum,
-    cache_key_for,
     is_terminal_task,
     operation_key_for,
     selection_digest,
@@ -40,6 +39,7 @@ from gpustack.schemas.model_preheats import (
 from gpustack.server.model_preheat_connectivity import current_ready_workers
 from gpustack.server.model_preheat_revision import resolve_model_preheat_revision
 from gpustack.server.bus import EventType
+from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
 logger = logging.getLogger(__name__)
@@ -928,7 +928,9 @@ async def create_scheduled_model_preheat_task(
     from gpustack.routes.model_preheats import (
         _active_task_for_operation,
         _ensure_profile_available_on_workers,
+        _exact_artifact_match,
         _profile_snapshot,
+        _request_identity,
         _resolve_target_workers,
         _target_snapshot,
     )
@@ -998,12 +1000,17 @@ async def create_scheduled_model_preheat_task(
         task_in.revision,
         token=getattr(config, "huggingface_token", None),
     )
-    cache_key = cache_key_for(
-        task_in.source, task_in.model_id, resolved_revision, pattern_digest
+    identity = ModelPreheatIdentity(
+        source=task_in.source,
+        model_id=task_in.model_id,
+        revision=resolved_revision,
+        requested_revision=task_in.revision,
+        file_patterns=task_in.include_patterns,
+        exclude_patterns=task_in.exclude_patterns,
     )
     operation_key = operation_key_for(
         profile.id,
-        cache_key,
+        identity.request_digest,
         target_worker_uuids,
         task_in.s3_backfill_policy,
     )
@@ -1021,6 +1028,7 @@ async def create_scheduled_model_preheat_task(
         profile_snapshot = _profile_snapshot(cipher, profile)
     except CredentialEncryptionUnavailable as exc:
         raise RuntimeError("credential_encryption_unavailable") from exc
+    matched_artifact = await _exact_artifact_match(session, profile, identity)
     task = ModelPreheatTask(
         source=task_in.source,
         model_id=task_in.model_id,
@@ -1029,8 +1037,9 @@ async def create_scheduled_model_preheat_task(
         include_patterns=task_in.include_patterns,
         exclude_patterns=task_in.exclude_patterns,
         selection_digest=pattern_digest,
-        cache_key=cache_key,
-        generation_id=f"preheat-{uuid4()}",
+        request_identity=_request_identity(identity),
+        request_digest=identity.request_digest,
+        artifact_id=(matched_artifact.artifact_id if matched_artifact else None),
         seed_worker_uuid=seed_worker.worker_uuid,
         seed_worker_id=seed_worker.id,
         target_scope=task_in.target_scope,
@@ -1042,6 +1051,10 @@ async def create_scheduled_model_preheat_task(
         s3_profile_snapshot_encrypted=profile_snapshot,
         encryption_key_version=cipher.current_key_version,
         s3_backfill_policy=task_in.s3_backfill_policy,
+        s3_manifest_path=(matched_artifact.manifest_path if matched_artifact else None),
+        manifest_digest=(
+            matched_artifact.manifest_digest if matched_artifact else None
+        ),
         keep_new_workers_in_sync=task_in.keep_new_workers_in_sync,
         bandwidth_limit_mbps=schedule.bandwidth_limit_mbps,
         schedule_id=schedule.id,

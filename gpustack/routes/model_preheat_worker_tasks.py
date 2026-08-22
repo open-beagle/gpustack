@@ -2,7 +2,6 @@ import hashlib
 import hmac
 import json
 import secrets
-from uuid import UUID
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 
@@ -28,7 +27,8 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatDesiredStateEnum,
     ModelPreheatExecutionStateEnum,
     ModelPreheatExecutionProfile,
-    ModelPreheatPublicationMarker,
+    ModelPreheatArtifact,
+    ModelPreheatInventoryManifestStateEnum,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatTask,
     ModelPreheatTrustedLocalCandidate,
@@ -135,15 +135,22 @@ SAFE_ERROR_CODES = {
     "local_cache_staging_missing",
     "local_manifest_lock_unavailable",
     "local_manifest_write_failed",
+    "model_artifact_not_found",
+    "request_digest_mismatch",
+    "artifact_manifest_conflict",
+    "object_content_conflict",
+    "local_file_content_mismatch",
 }
 PREHEAT_RESULT_FIELDS = {
     "state",
     "error_code",
+    "request_digest",
+    "artifact_id",
     "manifest_digest",
-    "ready_path",
     "manifest_path",
-    "generation_id",
+    "file_count",
     "local_cache_state",
+    "transfer_source",
     "uploaded",
     "skipped",
     "downloaded",
@@ -226,31 +233,6 @@ async def claim_model_preheat_worker_task(
     _validate_task_identity(task, identity)
     if task.distribution_policy_id is not None:
         await _active_distribution_source(session, task.distribution_policy_id)
-    marker_conditions = []
-    if task.role == ModelPreheatWorkerTaskRoleEnum.SEED:
-        parent = await session.get(ModelPreheatTask, task.task_id)
-        if parent is None:
-            _conflict("publication_marker_required")
-        marker_filter = (
-            ModelPreheatPublicationMarker.profile_id == parent.s3_profile_id,
-            ModelPreheatPublicationMarker.selection_key == parent.cache_key,
-            ModelPreheatPublicationMarker.generation_id == parent.generation_id,
-            ModelPreheatPublicationMarker.task_id == parent.id,
-            ModelPreheatPublicationMarker.parent_attempt == task.parent_attempt,
-            ModelPreheatPublicationMarker.profile_config_version
-            == parent.s3_profile_config_version,
-        )
-        marker = (
-            await session.exec(
-                select(ModelPreheatPublicationMarker.id).where(*marker_filter)
-            )
-        ).first()
-        if marker is None:
-            _conflict("publication_marker_required")
-        marker_conditions.append(
-            exists(select(ModelPreheatPublicationMarker.id).where(*marker_filter))
-        )
-
     now = _utcnow()
     lease_token = secrets.token_urlsafe(32)
     lease_token_hash = _hash_token(lease_token)
@@ -273,7 +255,6 @@ async def claim_model_preheat_worker_task(
             ModelPreheatWorkerTask.worker_uuid == identity.worker_uuid,
             _is_current_registration(identity.worker_uuid, identity.worker_id),
             *claim_conditions,
-            *marker_conditions,
         )
         .values(
             worker_id=identity.worker_id,
@@ -466,6 +447,8 @@ async def complete_model_preheat_worker_task(
         return task
     result_payload = _validated_result(task.role, complete.result)
     now = _utcnow()
+    if task.task_id is not None and result_payload.get("state") == "ready":
+        await _bind_preheat_artifact(session, task, result_payload, now)
     result = await session.exec(
         _active_lease_update(worker_task_id, complete, now).values(
             state=ModelPreheatWorkerTaskStateEnum.READY,
@@ -757,7 +740,7 @@ async def _active_distribution_source(session, policy_id):
         or profile.config_version != policy.profile_config_version
         or source_task.s3_profile_config_version != policy.profile_config_version
         or source_task.execution_state != ModelPreheatExecutionStateEnum.READY
-        or source_task.cache_key != policy.cache_key
+        or source_task.request_digest != policy.request_digest
     ):
         _conflict("distribution_source_not_ready")
     return policy, source_task
@@ -851,6 +834,101 @@ async def _aggregate_connectivity(session, task):
         await aggregate_connectivity_check(session, task.connectivity_check_id)
 
 
+async def _bind_preheat_artifact(session, worker_task, result, now):
+    parent = await session.get(ModelPreheatTask, worker_task.task_id)
+    if parent is None or parent.attempt != worker_task.parent_attempt:
+        _conflict("stale_parent_attempt")
+    if result["request_digest"] != parent.request_digest:
+        _conflict("request_digest_mismatch")
+    artifact_id = result["artifact_id"]
+    if not result["manifest_path"].endswith(f"/{artifact_id}/manifest.json"):
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    if parent.artifact_id is not None and parent.artifact_id != artifact_id:
+        _conflict("artifact_binding_conflict")
+    if worker_task.role == ModelPreheatWorkerTaskRoleEnum.SEED:
+        values = {
+            "artifact_id": artifact_id,
+            "s3_manifest_path": result["manifest_path"],
+            "manifest_digest": result["manifest_digest"],
+        }
+        transfer_source = result["transfer_source"]
+        if transfer_source == "current_node":
+            transfer_source = (
+                "current_node"
+                if worker_task.worker_uuid in parent.target_worker_uuids
+                else "peer_via_s3"
+            )
+        values.update(
+            transfer_source=transfer_source,
+            transfer_profile_id=(
+                parent.s3_profile_id
+                if transfer_source in {"peer_via_s3", "s3"}
+                else None
+            ),
+            source_worker_id=(
+                worker_task.worker_id
+                if transfer_source in {"current_node", "peer_via_s3"}
+                else None
+            ),
+        )
+        bound = await session.exec(
+            update(ModelPreheatTask)
+            .where(
+                ModelPreheatTask.id == parent.id,
+                ModelPreheatTask.attempt == parent.attempt,
+                ModelPreheatTask.request_digest == result["request_digest"],
+                or_(
+                    ModelPreheatTask.artifact_id.is_(None),
+                    ModelPreheatTask.artifact_id == artifact_id,
+                ),
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        if bound.rowcount != 1:
+            _conflict("artifact_binding_conflict")
+        inventory = (
+            await session.exec(
+                select(ModelPreheatArtifact).where(
+                    ModelPreheatArtifact.profile_id == parent.s3_profile_id,
+                    ModelPreheatArtifact.profile_config_version
+                    == parent.s3_profile_config_version,
+                    ModelPreheatArtifact.artifact_id == artifact_id,
+                )
+            )
+        ).first()
+        if inventory is None:
+            inventory = ModelPreheatArtifact(
+                profile_id=parent.s3_profile_id,
+                profile_config_version=parent.s3_profile_config_version,
+                artifact_id=artifact_id,
+                source=parent.source,
+                model_id=parent.request_identity["model_id"],
+                resolved_revision=parent.resolved_revision,
+                include_patterns=parent.request_identity.get("include_patterns", []),
+                exclude_patterns=parent.request_identity.get("exclude_patterns", []),
+                manifest_path=result["manifest_path"],
+                manifest_digest=result["manifest_digest"],
+                file_count=result["file_count"],
+                total_size=result["total_size"],
+                manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                last_verified_at=now,
+                created_by_task_id=parent.id,
+            )
+            session.add(inventory)
+        else:
+            inventory.manifest_path = result["manifest_path"]
+            inventory.manifest_digest = result["manifest_digest"]
+            inventory.file_count = result["file_count"]
+            inventory.total_size = result["total_size"]
+            inventory.manifest_state = ModelPreheatInventoryManifestStateEnum.VALID
+            inventory.last_verified_at = now
+            session.add(inventory)
+    elif parent.artifact_id != artifact_id:
+        _conflict("artifact_binding_conflict")
+    await session.flush()
+
+
 async def _task_or_404(session, worker_task_id):
     task = await session.get(ModelPreheatWorkerTask, worker_task_id)
     if task is None:
@@ -940,11 +1018,13 @@ def _validated_preheat_result(value):
         raise HTTPException(422, "Invalid", "invalid_preheat_result")
     if state == "ready":
         required = {
+            "request_digest",
+            "artifact_id",
             "manifest_digest",
-            "ready_path",
             "manifest_path",
-            "generation_id",
+            "file_count",
             "local_cache_state",
+            "transfer_source",
             "uploaded",
             "skipped",
             "downloaded",
@@ -954,10 +1034,12 @@ def _validated_preheat_result(value):
             raise HTTPException(422, "Invalid", "invalid_preheat_result")
     else:
         ready_only = {
+            "request_digest",
+            "artifact_id",
             "manifest_digest",
-            "ready_path",
             "manifest_path",
-            "generation_id",
+            "file_count",
+            "transfer_source",
             "uploaded",
             "skipped",
             "downloaded",
@@ -965,14 +1047,21 @@ def _validated_preheat_result(value):
         }
         if value.get("error_code") is None or ready_only & set(value):
             raise HTTPException(422, "Invalid", "invalid_preheat_result")
-    if "manifest_digest" in value and not _is_sha256(value["manifest_digest"]):
-        raise HTTPException(422, "Invalid", "invalid_preheat_result")
-    for field in ("ready_path", "manifest_path"):
+    for field in ("request_digest", "artifact_id", "manifest_digest"):
+        if field in value and not _is_sha256(value[field]):
+            raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    for field in ("manifest_path",):
         if field in value and not _is_canonical_object_path(value[field]):
             raise HTTPException(422, "Invalid", "invalid_preheat_result")
-    if "generation_id" in value and not _is_safe_generation_id(value["generation_id"]):
+    if value.get("transfer_source") not in {
+        "current_node",
+        "s3",
+        "modelscope",
+        "huggingface",
+        None,
+    }:
         raise HTTPException(422, "Invalid", "invalid_preheat_result")
-    for field in ("uploaded", "skipped", "downloaded", "total_size"):
+    for field in ("uploaded", "skipped", "downloaded", "file_count", "total_size"):
         if field in value and (not isinstance(value[field], int) or value[field] < 0):
             raise HTTPException(422, "Invalid", "invalid_preheat_result")
     cursor = _validated_cursor_value(value.get("cursor"))
@@ -981,9 +1070,13 @@ def _validated_preheat_result(value):
             field: value[field]
             for field in (
                 "state",
+                "request_digest",
+                "artifact_id",
                 "manifest_digest",
-                "generation_id",
+                "manifest_path",
+                "file_count",
                 "local_cache_state",
+                "transfer_source",
                 "uploaded",
                 "skipped",
                 "downloaded",
@@ -1051,16 +1144,6 @@ def _is_sha256(value) -> bool:
         and len(value) == 64
         and all(char in "0123456789abcdef" for char in value)
     )
-
-
-def _is_safe_generation_id(value) -> bool:
-    if not isinstance(value, str) or not value.startswith("preheat-"):
-        return False
-    raw_uuid = value.removeprefix("preheat-")
-    try:
-        return str(UUID(raw_uuid)) == raw_uuid
-    except ValueError:
-        return False
 
 
 def _is_canonical_object_path(value) -> bool:

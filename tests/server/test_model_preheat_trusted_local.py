@@ -5,6 +5,9 @@ from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
+from gpustack.schemas.model_preheat_s3_profiles import (
+    ModelPreheatS3Profile,
+)  # noqa: F401
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
     ModelPreheatTargetScopeEnum,
@@ -74,6 +77,7 @@ def test_probe_finds_ready_model_file_on_any_of_ten_workers(tmp_path):
                 ModelFile(
                     source=SourceEnum.MODEL_SCOPE,
                     model_scope_model_id="Qwen/Test",
+                    resolved_revision="commit-1",
                     worker_id=workers[7].id,
                     resolved_paths=["/models/Qwen/Test"],
                     state=ModelFileStateEnum.READY,
@@ -102,11 +106,14 @@ def test_single_file_candidate_is_not_repository_complete(tmp_path):
         engine = await _database(tmp_path)
         async with AsyncSession(engine) as session:
             task, workers = await _seed(session)
+            task.include_patterns = ["weights/model.bin"]
+            session.add(task)
             session.add(
                 ModelFile(
                     source=SourceEnum.MODEL_SCOPE,
                     model_scope_model_id="Qwen/Test",
                     model_scope_file_path="weights/model.bin",
+                    resolved_revision="commit-1",
                     worker_id=workers[0].id,
                     resolved_paths=["/models/Qwen/Test/weights/model.bin"],
                     state=ModelFileStateEnum.READY,
@@ -160,3 +167,58 @@ def test_probe_ignores_unsupported_ready_model_sources(tmp_path):
         return result
 
     assert asyncio.run(run())["worker-0"].state == "missing"
+
+
+def test_probe_rejects_different_resolved_revision(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        async with AsyncSession(engine) as session:
+            task, workers = await _seed(session)
+            session.add(
+                ModelFile(
+                    source=SourceEnum.MODEL_SCOPE,
+                    model_scope_model_id="Qwen/Test",
+                    requested_revision="master",
+                    resolved_revision="different-commit",
+                    worker_id=workers[0].id,
+                    resolved_paths=["/models/Qwen/Test"],
+                    state=ModelFileStateEnum.READY,
+                )
+            )
+            task_id = task.id
+            await session.commit()
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatTask, task_id)
+        result = await ProductionLocalInventoryProbe(engine).probe(task, ["worker-0"])
+        await engine.dispose()
+        return result["worker-0"]
+
+    assert asyncio.run(run()).state == "missing"
+
+
+def test_probe_rejects_full_repository_for_partial_selection(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        async with AsyncSession(engine) as session:
+            task, workers = await _seed(session)
+            task.include_patterns = ["config.json"]
+            session.add(task)
+            session.add(
+                ModelFile(
+                    source=SourceEnum.MODEL_SCOPE,
+                    model_scope_model_id="Qwen/Test",
+                    resolved_revision="commit-1",
+                    worker_id=workers[0].id,
+                    resolved_paths=["/models/Qwen/Test"],
+                    state=ModelFileStateEnum.READY,
+                )
+            )
+            task_id = task.id
+            await session.commit()
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatTask, task_id)
+        result = await ProductionLocalInventoryProbe(engine).probe(task, ["worker-0"])
+        await engine.dispose()
+        return result["worker-0"]
+
+    assert asyncio.run(run()).state == "missing"

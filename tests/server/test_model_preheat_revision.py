@@ -38,6 +38,26 @@ def test_modelscope_revision_uses_validated_sdk_resolution():
     assert resolved == "release-v1"
 
 
+@pytest.mark.parametrize("moving_revision", ["master", "main", "latest"])
+def test_modelscope_moving_revision_cannot_be_used_as_resolved_revision(
+    moving_revision,
+):
+    class FakeHubApi:
+        def get_valid_revision(self, model_id, revision=None):
+            return moving_revision
+
+    with pytest.raises(
+        ModelPreheatRevisionResolutionError,
+        match="remote_revision_resolution_failed",
+    ):
+        resolve_model_preheat_revision(
+            "modelscope",
+            "org/model",
+            moving_revision,
+            modelscope_api_factory=FakeHubApi,
+        )
+
+
 def test_revision_resolution_wraps_upstream_error_without_message():
     class FailingApi:
         def repo_info(self, *args, **kwargs):

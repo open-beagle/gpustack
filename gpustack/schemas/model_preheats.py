@@ -58,20 +58,13 @@ class ModelPreheatInventoryManifestStateEnum(str, Enum):
     VALID = "valid"
     MISSING = "missing"
     INVALID = "invalid"
+    STALE = "stale"
 
 
 class ModelPreheatInventoryJobStateEnum(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     READY = "ready"
-    ERROR = "error"
-
-
-class ModelPreheatInventoryGenerationStateEnum(str, Enum):
-    REFERENCED = "referenced"
-    ORPHAN = "orphan"
-    DELETING = "deleting"
-    DELETED = "deleted"
     ERROR = "error"
 
 
@@ -113,7 +106,6 @@ class ModelPreheatTask(SQLModel, BaseModelMixin, table=True):
     # 每次实例化任务时再解析不可变 revision 并绑定 Artifact。
     request_identity: dict = Field(sa_column=Column(JSON, nullable=False))
     request_digest: str
-    generation_id: str
     desired_state: ModelPreheatDesiredStateEnum = ModelPreheatDesiredStateEnum.RUNNING
     execution_state: ModelPreheatExecutionStateEnum = (
         ModelPreheatExecutionStateEnum.PENDING
@@ -150,7 +142,6 @@ class ModelPreheatTask(SQLModel, BaseModelMixin, table=True):
     s3_profile_snapshot_encrypted: dict = Field(sa_column=Column(JSON, nullable=False))
     encryption_key_version: str
     s3_backfill_policy: ModelPreheatBackfillPolicyEnum
-    s3_ready_path: Optional[str] = None
     s3_manifest_path: Optional[str] = None
     manifest_digest: Optional[str] = None
     keep_new_workers_in_sync: bool = False
@@ -348,6 +339,7 @@ class ModelPreheatExecutionProfile(SQLModel):
     tls_verify: bool = True
     region: str = ""
     use_virtual_hosted_style: bool = True
+    source_fallback_enabled: bool = True
     access_key: str = Field(repr=False)
     secret_key: str = Field(repr=False)
 
@@ -544,179 +536,6 @@ class ModelPreheatArtifactsPage(SQLModel):
     next_cursor: Optional[str] = None
 
 
-# ---------------------------------------------------------------------------
-# 任务 1→任务 2 过渡兼容（import seam）：
-# 统一 Artifact 库存已由 :class:`ModelPreheatArtifact` 取代，且收敛 migration 已删除
-# 下列旧 generation / cached-model / inventory job / selection lock / publication
-# marker / publish lock 数据表。为让 ``routes/model_preheat_s3_profiles.py`` 与
-# ``server/model_preheat_s3_inventory.py``（任务 5 才重写为统一库存）在任务 2 阶段仍可被
-# 收集与导入，这里以 ``table=False`` 保留这些 Python 类定义：它们不再登记到
-# ``SQLModel.metadata``，因此不会被 create_all 重建、migration 删除的旧表保持不变，
-# 也不伪造旧协议可运行性。任务 5 重写统一库存后应删除这些兼容类与相应路由。
-# ---------------------------------------------------------------------------
-class ModelPreheatCachedModel(SQLModel, table=False):
-    """旧裸目录缓存库存兼容类（表已由 migration 删除，不再持久化）。"""
-
-    id: Optional[int] = None
-    profile_id: int
-    profile_config_version: int
-    revision: int = 1
-    cache_key: str
-    source: str
-    model_id: str
-    resolved_revision: str
-    include_patterns: list[str] = []
-    exclude_patterns: list[str] = []
-    generation_id: str
-    ready_path: str
-    manifest_path: str
-    manifest_digest: str
-    file_count: int
-    total_size: int
-    manifest_state: ModelPreheatInventoryManifestStateEnum
-    last_verified_at: datetime
-    created_by_task_id: Optional[int] = None
-    source_parent_attempt: Optional[int] = None
-    created_at: datetime
-    updated_at: datetime
-
-
-class ModelPreheatInventoryJob(SQLModel, table=False):
-    """旧库存任务兼容类（表已由 migration 删除，不再持久化）。"""
-
-    id: Optional[int] = None
-    profile_id: int
-    profile_config_version: int
-    kind: str = "refresh"
-    state: ModelPreheatInventoryJobStateEnum = ModelPreheatInventoryJobStateEnum.PENDING
-    active_key: Optional[str] = None
-    claim_token: Optional[str] = None
-    cursor: Optional[dict] = None
-    scanned_count: int = 0
-    valid_count: int = 0
-    invalid_count: int = 0
-    orphan_count: int = 0
-    deleted_count: int = 0
-    skipped_count: int = 0
-    failed_count: int = 0
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-    started_at: Optional[datetime] = None
-    scan_started_at: Optional[datetime] = None
-    lease_expires_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
-
-
-class ModelPreheatInventoryScanSnapshot(SQLModel, table=False):
-    """旧库存扫描快照兼容类（表已由 migration 删除，不再持久化）。"""
-
-    id: Optional[int] = None
-    job_id: int
-    cached_model_id: int
-    revision: int
-
-
-class ModelPreheatInventoryGeneration(SQLModel, table=False):
-    """旧库存 generation 兼容类（表已由 migration 删除，不再持久化）。"""
-
-    id: Optional[int] = None
-    profile_id: int
-    generation_key: str
-    selection_key: str
-    cache_key: Optional[str] = None
-    generation_path: str
-    ready_path: str
-    ready_fingerprint: Optional[str] = None
-    ready_generation_path: Optional[str] = None
-    state: ModelPreheatInventoryGenerationStateEnum
-    first_seen_at: datetime
-    last_seen_at: datetime
-    orphaned_at: Optional[datetime] = None
-    deleted_at_s3: Optional[datetime] = None
-    error_code: Optional[str] = None
-
-
-class ModelPreheatInventorySelectionLock(SQLModel, table=False):
-    """旧库存选择锁兼容类（表已由 migration 删除，不再持久化）。"""
-
-    id: Optional[int] = None
-    profile_id: int
-    selection_key: str
-    owner_token: str
-    operation: str
-    lease_expires_at: datetime
-
-
-class ModelPreheatPublicationMarker(SQLModel, table=False):
-    """旧 publication marker 兼容类（表已由 migration 删除，不再持久化）。"""
-
-    id: Optional[int] = None
-    profile_id: int
-    selection_key: str
-    generation_id: str
-    task_id: Optional[int] = None
-    parent_attempt: int
-    profile_config_version: int
-    terminated_at: Optional[datetime] = None
-
-
-class ModelPreheatPublishLock(SQLModel, table=False):
-    """旧 publish lock 兼容类（表已由 migration 删除，不再持久化）。"""
-
-    id: Optional[int] = None
-    s3_profile_id: int
-    cache_key: str
-    task_id: int
-    lease_expires_at: datetime
-
-
-class ModelPreheatCachedModelPublic(SQLModel):
-    cache_key: str
-    source: str
-    model_id: str
-    resolved_revision: str
-    include_patterns: list[str]
-    exclude_patterns: list[str]
-    generation_id: str
-    ready_path: str
-    manifest_path: str
-    manifest_digest: str
-    file_count: int
-    total_size: int
-    manifest_state: ModelPreheatInventoryManifestStateEnum
-    last_verified_at: datetime
-    created_by_task_id: Optional[int] = None
-    created_at: datetime
-    updated_at: datetime
-
-
-class ModelPreheatCachedModelsPage(SQLModel):
-    items: list[ModelPreheatCachedModelPublic]
-    next_cursor: Optional[str] = None
-
-
-class ModelPreheatInventoryJobPublic(SQLModel):
-    id: int
-    profile_id: int
-    profile_config_version: int
-    kind: str
-    state: ModelPreheatInventoryJobStateEnum
-    scanned_count: int
-    valid_count: int
-    invalid_count: int
-    orphan_count: int
-    deleted_count: int
-    skipped_count: int
-    failed_count: int
-    error_code: Optional[str] = None
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
-
-
 class ModelPreheatCreate(SQLModel):
     source: str
     model_id: str
@@ -813,7 +632,6 @@ class ModelPreheatTaskPublic(SQLModel):
     request_identity: dict
     request_digest: str
     artifact_id: Optional[str] = None
-    generation_id: str
     desired_state: ModelPreheatDesiredStateEnum
     execution_state: ModelPreheatExecutionStateEnum
     paused_from_state: Optional[ModelPreheatExecutionStateEnum] = None
@@ -857,14 +675,14 @@ def cache_key_for(
 
 def operation_key_for(
     profile_id: int,
-    cache_key: str,
+    request_digest: str,
     target_worker_uuids: list[str],
     backfill_policy: ModelPreheatBackfillPolicyEnum,
 ) -> str:
     payload = json.dumps(
         {
             "backfill_policy": backfill_policy.value,
-            "cache_key": cache_key,
+            "request_digest": request_digest,
             "profile_id": profile_id,
             "target_worker_uuids": sorted(target_worker_uuids),
         },

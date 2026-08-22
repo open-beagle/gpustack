@@ -52,6 +52,8 @@ def _is_safe_modelscope_revision(value: object) -> bool:
     return (
         isinstance(value, str)
         and 0 < len(value) <= 256
+        and value.lower() not in {"main", "master", "latest"}
+        and not value.lower().startswith("refs/heads/")
         and value not in (".", "..")
         and not value.startswith("/")
         and "/" not in value

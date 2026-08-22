@@ -29,7 +29,6 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatTargetScopeEnum,
     ModelPreheatTask,
     ModelPreheatTaskLock,
-    ModelPreheatPublicationMarker,
     ModelPreheatWorkerTask,
     ModelPreheatWorkerTaskLease,
     ModelPreheatWorkerTaskRoleEnum,
@@ -70,8 +69,15 @@ async def _seed(tmp_path):
             include_patterns=[],
             exclude_patterns=[],
             selection_digest="b" * 64,
-            cache_key="c" * 64,
-            generation_id="preheat-00000000-0000-4000-8000-000000000001",
+            request_identity={
+                "source": "huggingface",
+                "model_id": "org/model",
+                "requested_revision": None,
+                "include_patterns": [],
+                "exclude_patterns": [],
+            },
+            request_digest="c" * 64,
+            artifact_id="a" * 64,
             target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
             target_worker_uuids=["worker-a"],
             target_worker_snapshot=[],
@@ -80,6 +86,10 @@ async def _seed(tmp_path):
             s3_profile_snapshot_encrypted={"ciphertext": "encrypted"},
             encryption_key_version="v1",
             s3_backfill_policy=ModelPreheatBackfillPolicyEnum.WHEN_MISSING,
+            s3_manifest_path=(
+                "model-storage/huggingface/org/model/" + "a" * 64 + "/manifest.json"
+            ),
+            manifest_digest="d" * 64,
             execution_state=ModelPreheatExecutionStateEnum.PUBLISHING,
         )
         session.add(task)
@@ -97,16 +107,6 @@ async def _seed(tmp_path):
             lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
         )
         session.add(child)
-        session.add(
-            ModelPreheatPublicationMarker(
-                profile_id=task.s3_profile_id,
-                selection_key=task.cache_key,
-                generation_id=task.generation_id,
-                task_id=task.id,
-                parent_attempt=task.attempt,
-                profile_config_version=task.s3_profile_config_version,
-            )
-        )
         await session.commit()
         await session.refresh(task)
         await session.refresh(child)
@@ -176,7 +176,7 @@ def test_cancel_clears_all_active_child_leases_and_is_idempotent(tmp_path):
     assert children[0].lease_expires_at is None
 
 
-def test_cancel_blocked_seed_marks_marker_terminated_without_deleting_it(tmp_path):
+def test_cancel_blocked_seed_clears_child_lease(tmp_path):
     async def run():
         engine, task_id, _ = await _seed(tmp_path)
         await _invoke(engine, cancel_model_preheat, task_id)
@@ -185,18 +185,17 @@ def test_cancel_blocked_seed_marks_marker_terminated_without_deleting_it(tmp_pat
         )
         await controller.reconcile_task(task_id)
         async with AsyncSession(engine) as session:
-            marker = (await session.exec(select(ModelPreheatPublicationMarker))).one()
             child = (await session.exec(select(ModelPreheatWorkerTask))).one()
-            result = marker.terminated_at, child.lease_expires_at
+            result = child.state, child.lease_expires_at
         await engine.dispose()
         return result
 
-    terminated_at, lease_expires_at = asyncio.run(run())
-    assert terminated_at is not None
+    state, lease_expires_at = asyncio.run(run())
+    assert state == ModelPreheatWorkerTaskStateEnum.CANCELED
     assert lease_expires_at is None
 
 
-def test_retry_increments_parent_attempt_keeps_generation_and_history(tmp_path):
+def test_retry_increments_parent_attempt_keeps_artifact_and_history(tmp_path):
     async def run():
         engine, task_id, _ = await _seed(tmp_path)
         async with AsyncSession(engine) as session:
@@ -221,7 +220,7 @@ def test_retry_increments_parent_attempt_keeps_generation_and_history(tmp_path):
     first, second, (parent, children), locks = asyncio.run(run())
     assert first.attempt == 2
     assert second.attempt == 2
-    assert parent.generation_id == "preheat-00000000-0000-4000-8000-000000000001"
+    assert parent.artifact_id == "a" * 64
     assert parent.execution_state == ModelPreheatExecutionStateEnum.PENDING
     assert [child.parent_attempt for child in children] == [1]
     assert len(locks) == 1

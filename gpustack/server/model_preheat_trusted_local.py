@@ -127,11 +127,35 @@ def _matches_task(model_file, task) -> bool:
         return False
     if normalized_source != normalized_task_source:
         return False
+    if (
+        not model_file.resolved_revision
+        or model_file.resolved_revision != task.resolved_revision
+    ):
+        return False
+    if not _selection_matches(model_file, task):
+        return False
     if source == SourceEnum.HUGGING_FACE.value:
         return model_file.huggingface_repo_id == task.model_id
     if source == SourceEnum.MODEL_SCOPE.value:
         return model_file.model_scope_model_id == task.model_id
     return False
+
+
+def _selection_matches(model_file, task) -> bool:
+    patterns = tuple(task.include_patterns or ())
+    selected = (
+        model_file.huggingface_filename
+        if model_file.source == SourceEnum.HUGGING_FACE
+        else model_file.model_scope_file_path
+    )
+    if not patterns:
+        return selected is None
+    return (
+        len(patterns) == 1
+        and selected is not None
+        and not has_magic(patterns[0])
+        and posixpath.normpath(patterns[0]) == posixpath.normpath(selected)
+    )
 
 
 def _record(worker_uuid, worker_id, source, model_file, raw_paths):

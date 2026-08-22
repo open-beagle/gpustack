@@ -1,10 +1,4 @@
-import base64
-import hashlib
-import hmac
-import json
-from typing import Literal
-
-from fastapi import APIRouter, Header, Query, Request
+from fastapi import APIRouter, Header, Request
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
@@ -40,14 +34,8 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
 )
 from gpustack.schemas.model_preheats import (
-    ModelPreheatCachedModel,
-    ModelPreheatCachedModelPublic,
-    ModelPreheatCachedModelsPage,
     ModelPreheatConnectivityCheckPublic,
     ModelPreheatConnectivityWorkerPublic,
-    ModelPreheatInventoryJob,
-    ModelPreheatInventoryJobPublic,
-    ModelPreheatInventoryManifestStateEnum,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatWorkerTask,
     ModelPreheatWorkerTaskRoleEnum,
@@ -66,7 +54,6 @@ from gpustack.server.model_preheat_idempotency import (
     get_idempotency_record,
     new_idempotency_record,
 )
-from gpustack.server.model_preheat_s3_inventory import ModelPreheatS3Inventory
 
 router = APIRouter()
 CONNECTIVITY_CHECK_OPERATION = "model_preheat_s3_profile.connectivity_check"
@@ -81,7 +68,6 @@ CONNECTION_CONFIG_FIELDS = {
     "region",
     "use_virtual_hosted_style",
 }
-MAX_INVENTORY_CURSOR_BYTES = 2048
 
 
 class ProfileConfigConflict(Exception):
@@ -120,108 +106,6 @@ async def get_profile(request: Request, session: SessionDep, id: int):
         session, [profile], request.app.state.server_config
     )
     return _to_public(profile)
-
-
-@router.get("/{id}/cached-models", response_model=ModelPreheatCachedModelsPage)
-async def get_cached_models(
-    request: Request,
-    session: SessionDep,
-    id: int,
-    limit: int = Query(default=50, ge=1, le=100),
-    manifest_state: ModelPreheatInventoryManifestStateEnum | None = None,
-    source: str | None = Query(default=None, max_length=32),
-    cursor: str | None = Query(default=None, max_length=MAX_INVENTORY_CURSOR_BYTES),
-):
-    await _get_profile(session, id)
-    filters = {
-        "manifest_state": manifest_state.value if manifest_state else None,
-        "source": source,
-    }
-    last_cache_key = None
-    if cursor is not None:
-        payload = _decode_inventory_cursor(request, cursor)
-        if (
-            payload.get("v") != 1
-            or payload.get("profile_id") != id
-            or payload.get("limit") != limit
-            or payload.get("filters") != filters
-            or not isinstance(payload.get("last_cache_key"), str)
-            or len(payload["last_cache_key"]) > 256
-        ):
-            raise HTTPException(422, "Invalid", "invalid_inventory_cursor")
-        last_cache_key = payload["last_cache_key"]
-
-    statement = select(ModelPreheatCachedModel).where(
-        ModelPreheatCachedModel.profile_id == id
-    )
-    if manifest_state is not None:
-        statement = statement.where(
-            ModelPreheatCachedModel.manifest_state == manifest_state
-        )
-    if source is not None:
-        statement = statement.where(ModelPreheatCachedModel.source == source)
-    if last_cache_key is not None:
-        statement = statement.where(ModelPreheatCachedModel.cache_key > last_cache_key)
-    rows = (
-        await session.exec(
-            statement.order_by(ModelPreheatCachedModel.cache_key.asc()).limit(limit + 1)
-        )
-    ).all()
-    has_more = len(rows) > limit
-    rows = rows[:limit]
-    next_cursor = None
-    if has_more and rows:
-        next_cursor = _encode_inventory_cursor(
-            request,
-            {
-                "v": 1,
-                "profile_id": id,
-                "limit": limit,
-                "filters": filters,
-                "last_cache_key": rows[-1].cache_key,
-            },
-        )
-    return ModelPreheatCachedModelsPage(
-        items=[ModelPreheatCachedModelPublic.model_validate(row) for row in rows],
-        next_cursor=next_cursor,
-    )
-
-
-@router.post(
-    "/{id}/inventory-jobs",
-    response_model=ModelPreheatInventoryJobPublic,
-    status_code=202,
-)
-async def create_inventory_job(
-    request: Request,
-    session: SessionDep,
-    id: int,
-    kind: Literal["refresh", "gc"] = "refresh",
-):
-    profile = await _get_profile(session, id)
-    service = getattr(request.app.state, "model_preheat_s3_inventory", None)
-    if service is None:
-        service = ModelPreheatS3Inventory(
-            session.bind, config=request.app.state.server_config
-        )
-    if kind == "gc":
-        job = await service.create_gc_job(session, profile.id, profile.config_version)
-    else:
-        job = await service.create_refresh_job(
-            session, profile.id, profile.config_version
-        )
-    return ModelPreheatInventoryJobPublic.model_validate(job)
-
-
-@router.get(
-    "/{id}/inventory-jobs/{job_id}", response_model=ModelPreheatInventoryJobPublic
-)
-async def get_inventory_job(session: SessionDep, id: int, job_id: int):
-    await _get_profile(session, id)
-    job = await session.get(ModelPreheatInventoryJob, job_id)
-    if job is None or job.profile_id != id:
-        raise NotFoundException(message="model_preheat_inventory_job_not_found")
-    return ModelPreheatInventoryJobPublic.model_validate(job)
 
 
 @router.post("", response_model=ModelPreheatS3ProfilePublic)
@@ -642,46 +526,6 @@ def _to_public(profile: ModelPreheatS3Profile) -> ModelPreheatS3ProfilePublic:
         created_at=profile.created_at,
         updated_at=profile.updated_at,
     )
-
-
-def _inventory_cursor_key(request: Request) -> bytes:
-    config = request.app.state.server_config
-    key = getattr(config, "model_preheat_inventory_cursor_key", None) or getattr(
-        config, "jwt_secret_key", None
-    )
-    if not isinstance(key, str) or len(key) < 16:
-        raise ServiceUnavailableException(message="inventory_cursor_key_unavailable")
-    return key.encode("utf-8")
-
-
-def _encode_inventory_cursor(request: Request, payload: dict) -> str:
-    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    signature = hmac.new(_inventory_cursor_key(request), body, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(body + signature).rstrip(b"=").decode("ascii")
-
-
-def _decode_inventory_cursor(request: Request, cursor: str) -> dict:
-    try:
-        padding = "=" * (-len(cursor) % 4)
-        raw = base64.urlsafe_b64decode(cursor + padding)
-        if base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii") != cursor:
-            raise ValueError
-        if len(raw) <= 32 or len(raw) > MAX_INVENTORY_CURSOR_BYTES:
-            raise ValueError
-        body, signature = raw[:-32], raw[-32:]
-        expected = hmac.new(
-            _inventory_cursor_key(request), body, hashlib.sha256
-        ).digest()
-        if not hmac.compare_digest(signature, expected):
-            raise ValueError
-        payload = json.loads(body.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError
-        return payload
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(422, "Invalid", "invalid_inventory_cursor") from None
 
 
 async def _connectivity_check_public(session, check, config):

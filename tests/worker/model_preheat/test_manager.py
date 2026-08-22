@@ -21,7 +21,6 @@ from gpustack.model_preheat_credentials import (
 from gpustack.routes import model_preheat_worker_tasks
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
-    ModelPreheatPublicationMarker,
     ModelPreheatTargetScopeEnum,
     ModelPreheatTask,
     ModelPreheatWorkerTask,
@@ -327,8 +326,14 @@ async def _restart_protocol_fixture(tmp_path):
             include_patterns=[],
             exclude_patterns=[],
             selection_digest="selection",
-            cache_key="cache-key",
-            generation_id="preheat-00000000-0000-4000-8000-000000000001",
+            request_identity={
+                "source": "modelscope",
+                "model_id": "Qwen/Test",
+                "requested_revision": None,
+                "include_patterns": [],
+                "exclude_patterns": [],
+            },
+            request_digest="c" * 64,
             seed_worker_uuid=worker.worker_uuid,
             seed_worker_id=worker.id,
             target_scope=ModelPreheatTargetScopeEnum.SEED_WORKER,
@@ -349,16 +354,6 @@ async def _restart_protocol_fixture(tmp_path):
             role=ModelPreheatWorkerTaskRoleEnum.SEED,
         )
         session.add(worker_task)
-        session.add(
-            ModelPreheatPublicationMarker(
-                profile_id=task.s3_profile_id,
-                selection_key=task.cache_key,
-                generation_id=task.generation_id,
-                task_id=task.id,
-                parent_attempt=task.attempt,
-                profile_config_version=task.s3_profile_config_version,
-            )
-        )
         await session.flush()
         worker_id = worker.id
         worker_uuid = worker.worker_uuid
@@ -373,11 +368,15 @@ async def _restart_protocol_fixture(tmp_path):
 def _restart_ready_result():
     return {
         "state": "ready",
+        "request_digest": "c" * 64,
+        "artifact_id": "a" * 64,
         "manifest_digest": "a" * 64,
-        "ready_path": "model-cache/v1/source/model/revision/selection/ready.json",
-        "manifest_path": "model-cache/v1/source/model/revision/selection/generations/g/.gpustack-manifest.json",
-        "generation_id": "preheat-00000000-0000-4000-8000-000000000001",
+        "manifest_path": (
+            "model-storage/modelscope/Qwen/Test/" + "a" * 64 + "/manifest.json"
+        ),
+        "file_count": 1,
         "local_cache_state": "valid",
+        "transfer_source": "modelscope",
         "uploaded": 1,
         "skipped": 0,
         "downloaded": 0,
@@ -611,11 +610,13 @@ def test_registered_seed_handler_is_claimed_and_completed():
             del payload, context
             return {
                 "state": "ready",
+                "request_digest": "c" * 64,
+                "artifact_id": "a" * 64,
                 "manifest_digest": "a" * 64,
-                "ready_path": "ready.json",
                 "manifest_path": "manifest.json",
-                "generation_id": "a" * 64,
+                "file_count": 2,
                 "local_cache_state": "valid",
+                "transfer_source": "s3",
                 "uploaded": 0,
                 "skipped": 2,
                 "downloaded": 0,

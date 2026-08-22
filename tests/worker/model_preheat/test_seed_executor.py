@@ -1,35 +1,18 @@
-import asyncio
 import hashlib
 import json
-import os
-import shutil
 import threading
-from dataclasses import dataclass, field
-from pathlib import Path
-from types import SimpleNamespace
+from dataclasses import dataclass, field, replace
 
-import pytest
-
-from gpustack.worker.model_preheat import local_cache
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
     TargetExecutionRequest,
     TrustedLocalCandidate,
-    build_preheat_role_handlers,
     execute_seed_preheat,
     execute_target_preheat,
 )
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
-from gpustack.worker.model_preheat.local_cache import (
-    inspect_local_cache,
-    write_trusted_manifest,
-)
 from gpustack.worker.model_preheat.manifest import build_model_preheat_manifest
-from gpustack.worker.model_preheat.s3_client import (
-    ModelPreheatCanceled,
-    ModelPreheatS3Client,
-)
-from gpustack.worker import downloaders
+from gpustack.worker.model_preheat.s3_client import ModelPreheatS3Client
 
 
 @dataclass
@@ -67,6 +50,8 @@ class InMemoryMinio:
     def __init__(self):
         self.objects = {}
         self.uploads = []
+        self.downloads = []
+        self._lock = threading.Lock()
 
     def stat_object(self, bucket, name):
         try:
@@ -75,25 +60,33 @@ class InMemoryMinio:
             raise FileNotFoundError(name) from exc
 
     def get_object(self, bucket, name):
+        self.downloads.append(name)
         return Response(self.stat_object(bucket, name).data)
 
     def fput_object(self, bucket, name, file_path, metadata=None):
-        self.uploads.append(name)
         with open(file_path, "rb") as file:
-            self.objects[(bucket, name)] = StoredObject(file.read(), metadata or {})
+            data = file.read()
+        with self._lock:
+            self.uploads.append(name)
+            self.objects[(bucket, name)] = StoredObject(data, metadata or {})
 
     def put_object(self, bucket, name, data, length, content_type=None, metadata=None):
         del content_type
-        self.uploads.append(name)
-        self.objects[(bucket, name)] = StoredObject(data.read(length), metadata or {})
+        payload = data.read(length)
+        with self._lock:
+            self.uploads.append(name)
+            self.objects[(bucket, name)] = StoredObject(payload, metadata or {})
 
     def put_object_if_absent(
         self, bucket, name, data, length, content_type=None, metadata=None
     ):
-        if (bucket, name) in self.objects:
-            return False
-        self.put_object(bucket, name, data, length, content_type, metadata)
-        return True
+        payload = data.read(length)
+        with self._lock:
+            if (bucket, name) in self.objects:
+                return False
+            self.uploads.append(name)
+            self.objects[(bucket, name)] = StoredObject(payload, metadata or {})
+            return True
 
     def list_objects(self, bucket, prefix, recursive=True):
         del recursive
@@ -104,53 +97,13 @@ class InMemoryMinio:
         ]
 
 
-class InterruptedTransferMinio(InMemoryMinio):
-    def __init__(self):
-        super().__init__()
-        self.file_puts = 0
-        self.interrupt_put = False
-        self.interrupt_get = False
-
-    def put_object_if_absent(
-        self, bucket, name, data, length, content_type=None, metadata=None
-    ):
-        if "/files/" in name:
-            self.file_puts += 1
-            if self.interrupt_put and self.file_puts == 2:
-                data.read(max(1, length // 2))
-                self.interrupt_put = False
-                raise OSError("injected upload interruption")
-        return super().put_object_if_absent(
-            bucket, name, data, length, content_type, metadata
-        )
-
-    def get_object(self, bucket, name):
-        response = super().get_object(bucket, name)
-        if not self.interrupt_get or "/files/" not in name:
-            return response
-        self.interrupt_get = False
-        return InterruptedResponse(response._data)
-
-
-class InterruptedResponse(Response):
-    def __init__(self, data):
-        super().__init__(data)
-        self._interrupted = False
-
-    def read(self, length=None):
-        if self._interrupted:
-            raise OSError("injected download interruption")
-        self._interrupted = True
-        chunk_size = max(1, len(self._data) // 2)
-        return super().read(chunk_size)
-
-
-def _identity():
+def _identity(*, requested_revision="master", patterns=None):
     return ModelPreheatIdentity(
         source="modelscope",
         model_id="org/model",
         revision="resolved-commit",
-        file_patterns=["config.json", "weights/model.bin"],
+        requested_revision=requested_revision,
+        file_patterns=patterns or ["config.json", "weights/model.bin"],
     )
 
 
@@ -160,914 +113,202 @@ def _write_model(root):
     (root / "config.json").write_bytes(b"config")
 
 
-def _request(tmp_path):
-    return SeedExecutionRequest(
+def _seed_request(tmp_path, **changes):
+    request = SeedExecutionRequest(
         cache_dir=tmp_path / "cache",
         target_dir=tmp_path / "cache" / "model_scope" / "org" / "model",
-        cache_key="cache-key",
         task_id=8,
         attempt=1,
+        request_digest=_identity().request_digest,
         identity=_identity(),
-        selection_digest="selection-digest",
-        generation_id="parent-generation-id",
-        exclude_patterns=["*.tmp"],
+        exclude_patterns=(),
         bucket="models",
-        prefix="preheat",
+        prefix="model-storage",
+        source_fallback_enabled=True,
+    )
+    return replace(request, **changes)
+
+
+def _target_request(tmp_path, manifest, client):
+    return TargetExecutionRequest(
+        cache_dir=tmp_path / "target-cache",
+        target_dir=tmp_path / "target-cache" / "model_scope" / "org" / "model",
+        task_id=9,
+        attempt=1,
+        request_digest=_identity().request_digest,
+        identity=_identity(),
+        exclude_patterns=(),
+        bucket="models",
+        prefix="model-storage",
+        artifact_id=manifest.artifact_id,
+        manifest_path=client.artifact_manifest_object("model-storage", manifest),
     )
 
 
-def test_seed_reuses_trusted_local_cache_and_publishes_ready(tmp_path):
-    request = _request(tmp_path)
-    _write_model(request.target_dir)
-    manifest = build_model_preheat_manifest(
-        request.target_dir,
-        request.identity,
-        cache_key=request.cache_key,
-        selection_digest=request.selection_digest,
-        generation_id=request.generation_id,
-        exclude_patterns=request.exclude_patterns,
-    )
-    write_trusted_manifest(request.cache_dir, request.cache_key, manifest)
-    minio = InMemoryMinio()
-
-    result = execute_seed_preheat(request, ModelPreheatS3Client(minio))
-
-    assert result["state"] == "ready"
-    assert result["local_cache_state"] == "valid"
-    assert result["manifest_digest"] == manifest.digest
-    assert result["generation_id"] == "parent-generation-id"
-    assert result["ready_path"].endswith("ready.json")
-    assert "access" not in json.dumps(result)
-
-
-def test_seed_publishes_ready_from_trusted_model_file_without_hub_download(tmp_path):
-    trusted_root = tmp_path / "model-files" / "org" / "model"
-    _write_model(trusted_root)
-    request = SeedExecutionRequest(
-        **{
-            **_request(tmp_path).__dict__,
-            "trusted_local_candidate": TrustedLocalCandidate(
-                source="model_file",
-                root=trusted_root,
-                paths=(trusted_root,),
-            ),
-        }
-    )
-
-    result = execute_seed_preheat(
-        request,
-        ModelPreheatS3Client(InMemoryMinio()),
-        download_to_staging=lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("可信本地模型不应重新从 Hub 下载")
+def test_seed_reuses_trusted_local_and_publishes_unified_artifact(tmp_path):
+    root = tmp_path / "trusted"
+    _write_model(root)
+    request = _seed_request(
+        tmp_path,
+        trusted_local_candidate=TrustedLocalCandidate(
+            source="model_file",
+            root=root,
+            paths=(root,),
+            repository_complete=True,
         ),
     )
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 0
-    assert (request.target_dir / "config.json").stat().st_ino != (
-        trusted_root / "config.json"
-    ).stat().st_ino
-
-
-def test_seed_cancels_while_copying_trusted_local_snapshot(tmp_path):
-    trusted_root = tmp_path / "large-model-file"
-    trusted_root.mkdir()
-    (trusted_root / "config.json").write_bytes(b"{}")
-    (trusted_root / "weights").mkdir()
-    (trusted_root / "weights" / "model.bin").write_bytes(b"x" * (3 * 1024 * 1024))
-    request = SeedExecutionRequest(
-        **{
-            **_request(tmp_path).__dict__,
-            "trusted_local_candidate": TrustedLocalCandidate(
-                source="model_file",
-                root=trusted_root,
-                paths=(trusted_root,),
-            ),
-        }
-    )
-    checks = 0
-
-    def cancel_during_copy():
-        nonlocal checks
-        checks += 1
-        return checks >= 10
-
-    result = execute_seed_preheat(
-        request,
-        ModelPreheatS3Client(InMemoryMinio()),
-        cancel_check=cancel_during_copy,
-        download_to_staging=lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("取消后不应回退到 Hub")
-        ),
-    )
-
-    assert result["state"] == "error"
-    assert result["error_code"] == "canceled"
-    assert checks >= 10
-
-
-def test_seed_falls_back_when_trusted_candidate_misses_an_include_pattern(tmp_path):
-    trusted_root = tmp_path / "incomplete-model-file"
-    trusted_root.mkdir()
-    (trusted_root / "config.json").write_bytes(b"{}")
-    request = SeedExecutionRequest(
-        **{
-            **_request(tmp_path).__dict__,
-            "trusted_local_candidate": TrustedLocalCandidate(
-                source="model_file",
-                root=trusted_root,
-                paths=(trusted_root,),
-            ),
-        }
-    )
-    downloads = []
-
-    def download(identity, staging, **kwargs):
-        downloads.append(identity.model_id)
-        _write_model(staging)
-
-    result = execute_seed_preheat(
-        request,
-        ModelPreheatS3Client(InMemoryMinio()),
-        download_to_staging=download,
-    )
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 2
-    assert downloads == ["org/model"]
-
-
-@pytest.mark.parametrize("patterns", [[], ["*.json"]])
-def test_seed_falls_back_for_partial_candidate_with_empty_or_glob_selection(
-    tmp_path, patterns
-):
-    trusted_root = tmp_path / "single-file"
-    trusted_root.mkdir()
-    selected = trusted_root / "config.json"
-    selected.write_bytes(b"config")
-    identity = ModelPreheatIdentity(
-        source="modelscope",
-        model_id="org/model",
-        revision="resolved-commit",
-        file_patterns=patterns,
-    )
-    request = SeedExecutionRequest(
-        **{
-            **_request(tmp_path).__dict__,
-            "identity": identity,
-            "trusted_local_candidate": TrustedLocalCandidate(
-                source="model_file",
-                root=trusted_root,
-                paths=(selected,),
-                repository_complete=False,
-            ),
-        }
-    )
-    downloads = []
-
-    def download(identity, staging, **kwargs):
-        downloads.append(identity.model_id)
-        if patterns:
-            staging.mkdir(parents=True, exist_ok=True)
-            (staging / "config.json").write_bytes(b"config")
-        else:
-            _write_model(staging)
-
-    result = execute_seed_preheat(
-        request,
-        ModelPreheatS3Client(InMemoryMinio()),
-        download_to_staging=download,
-    )
-
-    assert result["state"] == "ready"
-    assert downloads == ["org/model"]
-
-
-def test_seed_reuses_partial_candidate_for_existing_exact_paths(tmp_path):
-    trusted_root = tmp_path / "single-file"
-    selected = trusted_root / "weights" / "model.bin"
-    selected.parent.mkdir(parents=True)
-    selected.write_bytes(b"weights")
-    identity = ModelPreheatIdentity(
-        source="modelscope",
-        model_id="org/model",
-        revision="resolved-commit",
-        file_patterns=["weights/model.bin"],
-    )
-    request = SeedExecutionRequest(
-        **{
-            **_request(tmp_path).__dict__,
-            "identity": identity,
-            "trusted_local_candidate": TrustedLocalCandidate(
-                source="model_file",
-                root=trusted_root,
-                paths=(selected,),
-                repository_complete=False,
-            ),
-        }
-    )
-
-    result = execute_seed_preheat(
-        request,
-        ModelPreheatS3Client(InMemoryMinio()),
-        download_to_staging=lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("精确文件候选不应回退到 Hub")
-        ),
-    )
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 0
-    assert (request.target_dir / "weights" / "model.bin").read_bytes() == b"weights"
-
-
-def test_seed_reuses_complete_repository_with_glob_selection(tmp_path):
-    trusted_root = tmp_path / "complete-repository"
-    _write_model(trusted_root)
-    identity = ModelPreheatIdentity(
-        source="modelscope",
-        model_id="org/model",
-        revision="resolved-commit",
-        file_patterns=["weights/*.bin"],
-    )
-    request = SeedExecutionRequest(
-        **{
-            **_request(tmp_path).__dict__,
-            "identity": identity,
-            "trusted_local_candidate": TrustedLocalCandidate(
-                source="model_file",
-                root=trusted_root,
-                paths=(trusted_root,),
-                repository_complete=True,
-            ),
-        }
-    )
-
-    result = execute_seed_preheat(
-        request,
-        ModelPreheatS3Client(InMemoryMinio()),
-        download_to_staging=lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("完整仓库应按 glob 选择复用")
-        ),
-    )
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 0
-    assert (request.target_dir / "weights" / "model.bin").exists()
-    assert not (request.target_dir / "config.json").exists()
-
-
-def test_seed_falls_back_to_hub_when_trusted_candidate_has_no_selected_files(tmp_path):
-    trusted_root = tmp_path / "unrelated-archive"
-    trusted_root.mkdir()
-    (trusted_root / "notes.txt").write_text("unrelated")
-    request = SeedExecutionRequest(
-        **{
-            **_request(tmp_path).__dict__,
-            "trusted_local_candidate": TrustedLocalCandidate(
-                source="model_archive",
-                root=trusted_root,
-                paths=(trusted_root,),
-            ),
-        }
-    )
-    downloads = []
-
-    def download(identity, staging, **kwargs):
-        downloads.append(identity.model_id)
-        _write_model(staging)
-
-    result = execute_seed_preheat(
-        request,
-        ModelPreheatS3Client(InMemoryMinio()),
-        download_to_staging=download,
-    )
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 2
-    assert downloads == ["org/model"]
-
-
-def test_seed_rebuilds_current_generation_from_valid_old_local_sidecar(
-    tmp_path, monkeypatch
-):
-    request = _request(tmp_path)
-    _write_model(request.target_dir)
-    old_manifest = build_model_preheat_manifest(
-        request.target_dir,
-        request.identity,
-        cache_key=request.cache_key,
-        selection_digest=request.selection_digest,
-        generation_id="old-generation-id",
-        exclude_patterns=request.exclude_patterns,
-    )
-    write_trusted_manifest(request.cache_dir, request.cache_key, old_manifest)
     minio = InMemoryMinio()
-    client = ModelPreheatS3Client(minio)
-
-    result = execute_seed_preheat(request, client)
-    published = client.read_ready_manifest(
-        request.bucket,
-        request.prefix,
-        request.identity,
-        cache_key=request.cache_key,
-        selection_digest=request.selection_digest,
-    )
-
-    assert result["state"] == "ready"
-    assert result["generation_id"] == request.generation_id
-    assert published.generation_id == request.generation_id
-
-    monkeypatch.setattr(
-        client,
-        "download_generation_file",
-        lambda *args, **kwargs: pytest.fail("embedded target 不应下载 S3 文件"),
-    )
-
-    target_result = execute_target_preheat(
-        TargetExecutionRequest(**request.__dict__),
-        client,
-        cancel_check=None,
-    )
-    inspection = inspect_local_cache(
-        request.cache_dir, request.target_dir, request.cache_key, published
-    )
-
-    assert target_result["state"] == "ready"
-    assert target_result["downloaded"] == 0
-    assert inspection.state == "valid"
-    assert inspection.manifest == published
-
-
-def test_seed_downloads_resolved_identity_to_staging_and_skips_existing_objects(
-    tmp_path,
-):
-    request = _request(tmp_path)
-    minio = InMemoryMinio()
-    client = ModelPreheatS3Client(minio)
-    seen = []
-
-    def downloader(identity, staging_dir, **kwargs):
-        seen.append((identity.revision, staging_dir, kwargs))
-        _write_model(staging_dir)
-
-    first = execute_seed_preheat(request, client, download_to_staging=downloader)
-    second_request = SeedExecutionRequest(**{**request.__dict__, "attempt": 2})
-    second = execute_seed_preheat(
-        second_request, client, download_to_staging=downloader
-    )
-
-    assert seen[0][0] == "resolved-commit"
-    assert first["uploaded"] == 3
-    assert second["skipped"] >= 3
-    assert second["state"] == "ready"
-
-
-def test_seed_new_attempt_prefills_previous_partial_before_hub_resume(tmp_path):
-    request = SeedExecutionRequest(**{**_request(tmp_path).__dict__, "attempt": 2})
-    previous = request.cache_dir / ".preheat" / "8" / "1"
-    (previous / ".cache" / "huggingface").mkdir(parents=True)
-    (previous / ".cache" / "huggingface" / "resume.json").write_text("resume")
-    (previous / "config.json").write_bytes(b"config")
-    outside = tmp_path / "outside-secret"
-    outside.write_text("secret")
-    (previous / "escape").symlink_to(outside)
-    (previous / "special").parent.mkdir(parents=True, exist_ok=True)
-    os.mkfifo(previous / "special")
-    seen = []
-
-    def resume_downloader(identity, staging, **kwargs):
-        assert not (staging / "escape").exists()
-        assert not (staging / "special").exists()
-        seen.append(
-            (
-                identity.revision,
-                (staging / "config.json").read_bytes(),
-                (staging / ".cache" / "huggingface" / "resume.json").read_text(),
-            )
-        )
-        shutil.rmtree(staging / ".cache")
-        _write_model(staging)
-
-    result = execute_seed_preheat(
-        request,
-        ModelPreheatS3Client(InMemoryMinio()),
-        download_to_staging=resume_downloader,
-    )
-
-    assert seen == [("resolved-commit", b"config", "resume")]
-    assert result["state"] == "ready"
-
-
-def test_seed_upload_interruption_is_reclaimed_without_publishing_partial_ready(
-    tmp_path,
-):
-    request = _request(tmp_path)
-    minio = InterruptedTransferMinio()
-    minio.interrupt_put = True
-    client = ModelPreheatS3Client(minio)
-
-    def initial_download(identity, staging, exclude_patterns):
-        del identity, exclude_patterns
-        _write_model(staging)
-
-    interrupted = execute_seed_preheat(
-        request,
-        client,
-        download_to_staging=initial_download,
-    )
-
-    assert interrupted["state"] == "error"
-    assert interrupted["error_code"] == "worker_execution_failed"
-    assert interrupted["cursor"]["staging_exists"] is True
-    assert len([name for _, name in minio.objects if "/files/" in name]) == 1
-    assert not any(
-        name.endswith(".gpustack-manifest.json") for _, name in minio.objects
-    )
-    assert not any(name.endswith("ready.json") for _, name in minio.objects)
-
-    resumed_request = SeedExecutionRequest(**{**request.__dict__, "attempt": 2})
-
-    def resumed_download(identity, staging, exclude_patterns):
-        del identity, exclude_patterns
-        assert (staging / "config.json").read_bytes() == b"config"
-        assert (staging / "weights" / "model.bin").read_bytes() == b"weights"
-
-    resumed = execute_seed_preheat(
-        resumed_request,
-        client,
-        download_to_staging=resumed_download,
-    )
-
-    assert resumed["state"] == "ready"
-    assert any(name.endswith(".gpustack-manifest.json") for _, name in minio.objects)
-    assert any(name.endswith("ready.json") for _, name in minio.objects)
-
-
-def test_s3_download_stream_interruption_keeps_staging_for_next_attempt(tmp_path):
-    source_request = _request(tmp_path)
-    _write_model(source_request.target_dir)
-    source_manifest = build_model_preheat_manifest(
-        source_request.target_dir,
-        source_request.identity,
-        cache_key=source_request.cache_key,
-        selection_digest=source_request.selection_digest,
-        generation_id=source_request.generation_id,
-        exclude_patterns=source_request.exclude_patterns,
-    )
-    write_trusted_manifest(
-        source_request.cache_dir, source_request.cache_key, source_manifest
-    )
-    minio = InterruptedTransferMinio()
-    client = ModelPreheatS3Client(minio)
-    assert execute_seed_preheat(source_request, client)["state"] == "ready"
-
-    target_request = TargetExecutionRequest(
-        **{
-            **source_request.__dict__,
-            "cache_dir": tmp_path / "target-cache",
-            "target_dir": tmp_path / "target-cache" / "model",
-            "task_id": 9,
-        }
-    )
-    minio.interrupt_get = True
-
-    interrupted = execute_target_preheat(target_request, client)
-
-    assert interrupted["state"] == "error"
-    assert interrupted["error_code"] == "worker_execution_failed"
-    assert interrupted["cursor"]["staging_exists"] is True
-    assert not target_request.target_dir.exists()
-
-    resumed_request = TargetExecutionRequest(
-        **{**target_request.__dict__, "attempt": 2}
-    )
-    resumed = execute_target_preheat(resumed_request, client)
-
-    assert resumed["state"] == "ready"
-    assert (
-        inspect_local_cache(
-            resumed_request.cache_dir,
-            resumed_request.target_dir,
-            resumed_request.cache_key,
-            source_manifest,
-        ).state.value
-        == "valid"
-    )
-
-
-def test_target_cancellation_during_final_hash_does_not_publish(tmp_path, monkeypatch):
-    source_request = _request(tmp_path / "source")
-    client = ModelPreheatS3Client(InMemoryMinio())
-
-    def download_large_model(identity, staging, **kwargs):
-        _write_model(staging)
-        (staging / "weights" / "model.bin").write_bytes(b"x" * (3 * 1024 * 1024))
-
-    assert (
-        execute_seed_preheat(
-            source_request,
-            client,
-            download_to_staging=download_large_model,
-        )["state"]
-        == "ready"
-    )
-
-    target_request = TargetExecutionRequest(
-        **{
-            **source_request.__dict__,
-            "cache_dir": tmp_path / "target-cache",
-            "target_dir": tmp_path / "target-cache" / "model",
-            "task_id": 9,
-        }
-    )
-    _write_model(target_request.target_dir)
-    (target_request.target_dir / "weights" / "model.bin").write_bytes(b"stale")
-    (target_request.target_dir / "tokenizer.json").write_bytes(b"tokenizer")
-    original_merge = local_cache._merge_unselected_files
-    merge_finished = False
-    final_checks = 0
-
-    def track_merge(*args, **kwargs):
-        nonlocal merge_finished
-        result = original_merge(*args, **kwargs)
-        merge_finished = True
-        return result
-
-    def cancel_during_final_hash():
-        nonlocal final_checks
-        if merge_finished:
-            final_checks += 1
-        return final_checks >= 8
-
-    monkeypatch.setattr(local_cache, "_merge_unselected_files", track_merge)
-
-    result = execute_target_preheat(
-        target_request,
-        client,
-        cancel_check=cancel_during_final_hash,
-    )
-
-    assert result["state"] == "error"
-    assert result["error_code"] == "canceled"
-    assert final_checks >= 8
-    assert (
-        target_request.target_dir / "weights" / "model.bin"
-    ).read_bytes() == b"stale"
-    assert (target_request.target_dir / "tokenizer.json").read_bytes() == b"tokenizer"
-    assert not list(target_request.target_dir.parent.glob(".model.preheat-backup-*"))
-
-
-def test_target_cancellation_after_extra_verification_does_not_replace(
-    tmp_path, monkeypatch
-):
-    source_request = _request(tmp_path / "source")
-    client = ModelPreheatS3Client(InMemoryMinio())
-    assert (
-        execute_seed_preheat(
-            source_request,
-            client,
-            download_to_staging=lambda identity, staging, **kwargs: _write_model(
-                staging
-            ),
-        )["state"]
-        == "ready"
-    )
-
-    target_request = TargetExecutionRequest(
-        **{
-            **source_request.__dict__,
-            "cache_dir": tmp_path / "target-cache",
-            "target_dir": tmp_path / "target-cache" / "model",
-            "task_id": 9,
-        }
-    )
-    _write_model(target_request.target_dir)
-    (target_request.target_dir / "weights" / "model.bin").write_bytes(b"stale")
-    (target_request.target_dir / "tokenizer.json").write_bytes(b"tokenizer")
-    original_verify = local_cache._verify_directory
-    canceled = False
-
-    def cancel_after_merged_verification(root, manifest, **kwargs):
-        nonlocal canceled
-        result = original_verify(root, manifest, **kwargs)
-        if Path(
-            root
-        ) == target_request.cache_dir / ".preheat" / "9" / "1" and kwargs.get(
-            "allow_extra"
-        ):
-            canceled = True
-        return result
-
-    monkeypatch.setattr(
-        local_cache, "_verify_directory", cancel_after_merged_verification
-    )
-
-    result = execute_target_preheat(
-        target_request, client, cancel_check=lambda: canceled
-    )
-
-    assert canceled is True
-    assert result["state"] == "error"
-    assert result["error_code"] == "canceled"
-    assert (
-        target_request.target_dir / "weights" / "model.bin"
-    ).read_bytes() == b"stale"
-    assert (target_request.target_dir / "tokenizer.json").read_bytes() == b"tokenizer"
-    staging = target_request.cache_dir / ".preheat" / "9" / "1"
-    assert not (staging / "tokenizer.json").exists()
-    assert not list(target_request.target_dir.parent.glob(".model.preheat-backup-*"))
-
-
-def test_seed_reports_s3_conflict_when_cancel_cleanup_never_succeeds(tmp_path):
-    request = _request(tmp_path)
-    minio = InMemoryMinio()
-    canceled = threading.Event()
-    original_put = minio.put_object_if_absent
-
-    def cancel_after_manifest(bucket_name, object_name, *args, **kwargs):
-        written = original_put(bucket_name, object_name, *args, **kwargs)
-        if object_name.endswith(".gpustack-manifest.json"):
-            canceled.set()
-        return written
-
-    minio.put_object_if_absent = cancel_after_manifest
-    minio.remove_object = lambda *args: (_ for _ in ()).throw(OSError())
-    client = ModelPreheatS3Client(
-        minio,
-        cancel_cleanup_attempts=2,
-        cancel_cleanup_sleep=lambda delay: None,
-    )
-
-    result = execute_seed_preheat(
-        request,
-        client,
-        download_to_staging=lambda identity, staging, **kwargs: _write_model(staging),
-        cancel_check=canceled.is_set,
-    )
-
-    assert result["state"] == "error"
-    assert result["error_code"] == "s3_object_conflict"
-
-
-def test_seed_with_existing_ready_downloads_generation_instead_of_hub(tmp_path):
-    source_request = SeedExecutionRequest(
-        **{
-            **_request(tmp_path / "source").__dict__,
-            "generation_id": "historical-generation-id",
-        }
-    )
-    minio = InMemoryMinio()
-    client = ModelPreheatS3Client(minio)
-    source_result = execute_seed_preheat(
-        source_request,
-        client,
-        download_to_staging=lambda identity, staging, **kwargs: _write_model(staging),
-    )
-    request = SeedExecutionRequest(
-        **{
-            **_request(tmp_path / "target").__dict__,
-            "task_id": 9,
-            "generation_id": "new-parent-generation-id",
-        }
-    )
-    ready_object = source_result["ready_path"]
-    original_ready = minio.objects[("models", ready_object)].data
-
-    result = execute_seed_preheat(
-        request,
-        client,
-        download_to_staging=lambda *_: pytest.fail("不得重新从 Hub 下载"),
-    )
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 2
-    assert result["generation_id"] == "historical-generation-id"
-    assert minio.objects[("models", ready_object)].data == original_ready
-    assert (request.target_dir / "weights" / "model.bin").read_bytes() == b"weights"
-
-
-def test_seed_cancellation_never_writes_generation_manifest_or_ready(tmp_path):
-    request = _request(tmp_path)
-    minio = InMemoryMinio()
+    hub_calls = []
 
     result = execute_seed_preheat(
         request,
         ModelPreheatS3Client(minio),
-        download_to_staging=lambda identity, staging, **kwargs: _write_model(staging),
-        cancel_check=lambda: True,
+        download_to_staging=lambda *args, **kwargs: hub_calls.append(True),
     )
 
-    assert result["state"] == "error"
-    assert result["error_code"] == "canceled"
+    assert result["state"] == "ready"
+    assert result["transfer_source"] == "current_node"
+    assert len(result["artifact_id"]) == 64
+    assert len(result["manifest_digest"]) == 64
+    assert result["manifest_path"].endswith(f"/{result['artifact_id']}/manifest.json")
+    assert hub_calls == []
     assert not any(
-        name.endswith(".gpustack-manifest.json") for _, name in minio.objects
+        "generations" in name or name.endswith("ready.json") for name in minio.uploads
     )
-    assert not any(name.endswith("ready.json") for _, name in minio.objects)
 
 
-def test_resolved_revision_download_uses_public_hubs_and_explicit_staging(
-    tmp_path, monkeypatch
-):
+def test_seed_falls_back_to_hub_then_must_publish(tmp_path):
+    request = _seed_request(tmp_path)
+    minio = InMemoryMinio()
     calls = []
 
-    def huggingface(**kwargs):
-        calls.append(("huggingface", kwargs))
+    def download(identity, staging, **kwargs):
+        calls.append((identity.revision, kwargs))
+        _write_model(staging)
 
-    def modelscope(**kwargs):
-        calls.append(("modelscope", kwargs))
-
-    monkeypatch.setattr(downloaders, "snapshot_download", huggingface)
-    monkeypatch.setattr(downloaders, "modelscope_snapshot_download", modelscope)
-    huggingface_identity = ModelPreheatIdentity(
-        source="huggingface",
-        model_id="org/model",
-        revision="sha-123",
-        file_patterns=["weights/*.bin"],
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(minio),
+        download_to_staging=download,
     )
 
-    downloaders.download_resolved_revision_to_staging(
-        huggingface_identity, tmp_path / "hf", exclude_patterns=["*.tmp"]
-    )
-    downloaders.download_resolved_revision_to_staging(
-        _identity(), tmp_path / "ms", exclude_patterns=["*.tmp"]
-    )
-
-    assert calls[0][1]["revision"] == "sha-123"
-    assert calls[0][1]["local_dir"] == str(tmp_path / "hf")
-    assert calls[0][1]["ignore_patterns"] == ["*.tmp"]
-    assert calls[1][1]["revision"] == "resolved-commit"
-    assert calls[1][1]["local_dir"] == str(tmp_path / "ms")
-    assert calls[1][1]["ignore_patterns"] == ["*.tmp"]
+    assert calls and calls[0][0] == "resolved-commit"
+    assert result["transfer_source"] == "modelscope"
+    assert ("models", result["manifest_path"]) in minio.objects
 
 
-def test_empty_include_passes_none_to_hub_downloaders(tmp_path, monkeypatch):
+def test_seed_disabled_fallback_never_calls_hub(tmp_path):
+    request = _seed_request(tmp_path, source_fallback_enabled=False)
     calls = []
 
-    monkeypatch.setattr(
-        downloaders,
-        "snapshot_download",
-        lambda **kwargs: calls.append(("huggingface", kwargs)),
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(InMemoryMinio()),
+        download_to_staging=lambda *args, **kwargs: calls.append(True),
     )
-    monkeypatch.setattr(
-        downloaders,
-        "modelscope_snapshot_download",
-        lambda **kwargs: calls.append(("modelscope", kwargs)),
-    )
-    for source in ("huggingface", "modelscope"):
-        identity = ModelPreheatIdentity(
-            source=source,
-            model_id="org/model",
-            revision="resolved-commit",
-            file_patterns=[],
-        )
-        downloaders.download_resolved_revision_to_staging(
-            identity,
-            tmp_path / source,
-            exclude_patterns=["*.tmp"],
-        )
 
-    assert [kwargs["allow_patterns"] for _, kwargs in calls] == [None, None]
+    assert result == {"state": "error", "error_code": "model_artifact_not_found"}
+    assert calls == []
 
 
-def test_modelscope_download_stops_at_file_boundary_and_reports_cursor(
-    tmp_path, monkeypatch
-):
-    class FakeModelScopeHubApi:
-        def list_repo_files(self, model_id, repo_type, *, revision, recursive):
-            assert model_id == "org/model"
-            assert repo_type == "model"
-            assert revision == "resolved-commit"
-            assert recursive is True
-            return [
-                SimpleNamespace(path="config.json", size=2),
-                SimpleNamespace(path="weights/model.bin", size=3),
-            ]
-
-    downloaded = []
-    canceled = False
-
-    def download_file(*, model_id, file_path, revision, local_dir):
-        assert model_id == "org/model"
-        assert revision == "resolved-commit"
-        target = Path(local_dir) / file_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"x")
-        downloaded.append(file_path)
-
-    def report_progress(completed, downloaded_size, total_size):
-        nonlocal canceled
-        assert list(completed) == ["config.json"]
-        assert (downloaded_size, total_size) == (2, 5)
-        canceled = True
-
-    monkeypatch.setattr(downloaders, "ModelScopeHubApi", FakeModelScopeHubApi)
-    monkeypatch.setattr(downloaders, "model_file_download", download_file)
-
-    with pytest.raises(ModelPreheatCanceled):
-        downloaders.download_resolved_revision_to_staging(
-            _identity(),
-            tmp_path / "staging",
-            cancel_check=lambda: canceled,
-            progress_callback=report_progress,
-        )
-    assert downloaded == ["config.json"]
-
-
-def test_modelscope_hub_runtime_dependency_is_declared_and_locked():
-    declared = set()
-    in_runtime_dependencies = False
-    for line in (
-        (Path.cwd() / "pyproject.toml").read_text(encoding="utf-8").splitlines()
-    ):
-        stripped = line.strip()
-        if stripped.startswith("["):
-            in_runtime_dependencies = stripped == "[tool.poetry.dependencies]"
-            continue
-        if (
-            in_runtime_dependencies
-            and stripped
-            and not stripped.startswith("#")
-            and "=" in stripped
-        ):
-            declared.add(stripped.split("=", 1)[0].strip())
-
-    locked = set()
-    in_package = False
-    for line in (Path.cwd() / "poetry.lock").read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if stripped == "[[package]]":
-            in_package = True
-            continue
-        if stripped.startswith("["):
-            in_package = False
-            continue
-        if in_package and stripped.startswith("name = "):
-            locked.add(stripped.removeprefix("name = ").strip('"'))
-
-    assert "modelscope-hub" in declared
-    assert "modelscope-hub" in locked
-
-
-def test_handler_cancellation_waits_for_thread_and_never_publishes_ready(
-    tmp_path, monkeypatch
-):
+def test_bound_artifact_seed_reuses_trusted_local_without_s3_file_download(tmp_path):
+    source = tmp_path / "source"
+    _write_model(source)
+    manifest = build_model_preheat_manifest(source, _identity())
     minio = InMemoryMinio()
     client = ModelPreheatS3Client(minio)
-    started = threading.Event()
-
-    def slow_download(identity, staging_dir, **kwargs):
-        del identity, kwargs
-        _write_model(staging_dir)
-        started.set()
-        threading.Event().wait(0.05)
-
-    monkeypatch.setattr(
-        "gpustack.worker.model_preheat.s3_client.ModelPreheatS3Client.from_minio",
-        classmethod(lambda cls, **kwargs: client),
-    )
-    monkeypatch.setattr(
-        downloaders,
-        "download_resolved_revision_to_staging",
-        slow_download,
-    )
-    payload = SimpleNamespace(
-        worker_task_id=8,
-        attempt=1,
-        task={
-            "id": 8,
-            "source": "modelscope",
-            "model_id": "org/model",
-            "resolved_revision": "resolved-commit",
-            "include_patterns": ["config.json", "weights/model.bin"],
-            "exclude_patterns": [],
-            "cache_key": "cache-key",
-            "selection_digest": "selection-digest",
-            "generation_id": "parent-generation-id",
-        },
-        profile=SimpleNamespace(
-            endpoint="https://s3.example.invalid",
-            access_key="access-key",
-            secret_key="secret-key",
-            tls_enabled=True,
-            tls_verify=True,
-            region="",
-            bucket="models",
-            prefix="preheat",
-            use_virtual_hosted_style=False,
+    client.publish_artifact("models", "model-storage", manifest, source)
+    minio.downloads.clear()
+    request = _seed_request(
+        tmp_path,
+        artifact_id=manifest.artifact_id,
+        manifest_path=client.artifact_manifest_object("model-storage", manifest),
+        trusted_local_candidate=TrustedLocalCandidate(
+            source="model_file",
+            root=source,
+            paths=(source,),
+            repository_complete=True,
         ),
     )
-    handler = build_preheat_role_handlers(tmp_path / "cache")["seed"]
 
-    async def run():
-        running = asyncio.create_task(handler(payload, None))
-        await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
-        running.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await running
+    result = execute_seed_preheat(request, client)
 
-    asyncio.run(run())
+    assert result["state"] == "ready"
+    assert result["transfer_source"] == "current_node"
+    assert not any("/files/" in name for name in minio.downloads)
 
-    assert not any(
-        name.endswith(".gpustack-manifest.json") for _, name in minio.objects
+
+def test_target_downloads_only_missing_or_invalid_files(tmp_path):
+    source = tmp_path / "source"
+    _write_model(source)
+    manifest = build_model_preheat_manifest(source, _identity())
+    minio = InMemoryMinio()
+    client = ModelPreheatS3Client(minio)
+    client.publish_artifact("models", "model-storage", manifest, source)
+    request = _target_request(tmp_path, manifest, client)
+    request.target_dir.mkdir(parents=True)
+    (request.target_dir / "config.json").write_bytes(b"config")
+    (request.target_dir / "weights").mkdir()
+    (request.target_dir / "weights" / "model.bin").write_bytes(b"stale")
+    minio.downloads.clear()
+
+    result = execute_target_preheat(request, client)
+
+    file_downloads = [name for name in minio.downloads if "/files/" in name]
+    assert result["state"] == "ready"
+    assert result["transfer_source"] == "s3"
+    assert result["downloaded"] == 1
+    assert len(file_downloads) == 1
+    assert file_downloads[0].endswith("/files/weights/model.bin")
+
+
+def test_target_rejects_manifest_for_different_file_selection(tmp_path):
+    source = tmp_path / "source"
+    _write_model(source)
+    full = build_model_preheat_manifest(source, _identity(patterns=["**"]))
+    minio = InMemoryMinio()
+    client = ModelPreheatS3Client(minio)
+    client.publish_artifact("models", "model-storage", full, source)
+    request = _target_request(tmp_path, full, client)
+
+    result = execute_target_preheat(request, client)
+
+    assert result == {"state": "error", "error_code": "s3_manifest_invalid"}
+
+
+def test_requested_revision_does_not_change_artifact_manifest(tmp_path):
+    root = tmp_path / "source"
+    _write_model(root)
+    moving = build_model_preheat_manifest(root, _identity(requested_revision="master"))
+    immutable = build_model_preheat_manifest(
+        root, _identity(requested_revision="resolved-commit")
     )
-    assert not any(name.endswith("ready.json") for _, name in minio.objects)
+
+    assert moving.artifact_id == immutable.artifact_id
+    assert moving.to_artifact_json_bytes() == immutable.to_artifact_json_bytes()
+    assert "requested_revision" not in json.loads(moving.to_artifact_json_bytes())
+
+
+def test_two_publishers_converge_to_one_manifest(tmp_path):
+    root = tmp_path / "source"
+    _write_model(root)
+    manifest = build_model_preheat_manifest(root, _identity())
+    minio = InMemoryMinio()
+    client = ModelPreheatS3Client(minio)
+    results = []
+
+    def publish():
+        results.append(
+            client.publish_artifact("models", "model-storage", manifest, root)
+        )
+
+    threads = [threading.Thread(target=publish) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    manifest_names = [name for name in minio.uploads if name.endswith("/manifest.json")]
+    assert len(results) == 2
+    assert len(manifest_names) == 1
+    assert hashlib.sha256(minio.objects[("models", manifest_names[0])].data).hexdigest()
