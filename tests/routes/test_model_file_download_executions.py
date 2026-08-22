@@ -85,7 +85,9 @@ async def _create_tables(engine):
         await connection.run_sync(SQLModel.metadata.create_all)
 
 
-async def _seed(engine, key, *, with_profile=True, filename=None):
+async def _seed(
+    engine, key, *, with_profile=True, filename=None, requested_revision="main"
+):
     async with AsyncSession(engine, expire_on_commit=False) as session:
         worker = Worker(
             name="worker-a",
@@ -117,7 +119,7 @@ async def _seed(engine, key, *, with_profile=True, filename=None):
             source=SourceEnum.HUGGING_FACE,
             huggingface_repo_id="org/model",
             huggingface_filename=filename,
-            requested_revision="main",
+            requested_revision=requested_revision,
             worker_id=worker.id,
             source_index="hf:org/model",
         )
@@ -219,6 +221,116 @@ def test_claim_matches_task3_concrete_file_selection(tmp_path):
     )
     assert response.status_code == 200
     assert response.json()["artifact_id"] == "b" * 64
+    asyncio.run(engine.dispose())
+
+
+def test_immutable_revision_claims_exact_artifact_without_hub_metadata(tmp_path):
+    app, engine, key = _app(tmp_path)
+    _, model_file_id, _ = asyncio.run(
+        _seed(engine, key, filename="model.bin", requested_revision=SHA)
+    )
+    metadata_calls = []
+
+    def unavailable(*args, **kwargs):
+        metadata_calls.append((args, kwargs))
+        raise RuntimeError("hub unavailable")
+
+    app.state.model_file_download_revision_resolver = unavailable
+    app.state.model_file_download_file_listing_resolver = unavailable
+
+    async def seed_artifact():
+        async with AsyncSession(engine) as session:
+            execution = (
+                await session.exec(
+                    select(ModelFileDownloadExecution).where(
+                        ModelFileDownloadExecution.model_file_id == model_file_id
+                    )
+                )
+            ).one()
+            session.add(
+                ModelPreheatArtifact(
+                    profile_id=execution.default_profile_id,
+                    profile_config_version=execution.default_profile_config_version,
+                    artifact_id="f" * 64,
+                    source="huggingface",
+                    model_id="org/model",
+                    resolved_revision=SHA,
+                    include_patterns=["model.bin", "model.bin/**"],
+                    exclude_patterns=[],
+                    manifest_path="storage/huggingface/org/model/"
+                    + "f" * 64
+                    + "/manifest.json",
+                    manifest_digest="e" * 64,
+                    file_count=1,
+                    total_size=12,
+                    manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                    last_verified_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed_artifact())
+    response = TestClient(app).post(
+        f"/v1/model-files/{model_file_id}/download-executions/claim"
+    )
+    assert response.status_code == 200
+    assert response.json()["artifact_id"] == "f" * 64
+    assert metadata_calls == []
+    asyncio.run(engine.dispose())
+
+
+def test_immutable_revision_does_not_claim_partial_glob_artifact_offline(tmp_path):
+    app, engine, key = _app(tmp_path)
+    _, model_file_id, _ = asyncio.run(
+        _seed(engine, key, filename="*.gguf", requested_revision=SHA)
+    )
+    metadata_calls = []
+
+    def unavailable(*args, **kwargs):
+        metadata_calls.append((args, kwargs))
+        raise RuntimeError("hub unavailable")
+
+    app.state.model_file_download_revision_resolver = unavailable
+    app.state.model_file_download_file_listing_resolver = unavailable
+
+    async def seed_partial_artifact():
+        async with AsyncSession(engine) as session:
+            execution = (
+                await session.exec(
+                    select(ModelFileDownloadExecution).where(
+                        ModelFileDownloadExecution.model_file_id == model_file_id
+                    )
+                )
+            ).one()
+            session.add(
+                ModelPreheatArtifact(
+                    profile_id=execution.default_profile_id,
+                    profile_config_version=execution.default_profile_config_version,
+                    artifact_id="d" * 64,
+                    source="huggingface",
+                    model_id="org/model",
+                    resolved_revision=SHA,
+                    include_patterns=["model-1.gguf", "model-1.gguf/**"],
+                    exclude_patterns=[],
+                    manifest_path="storage/huggingface/org/model/"
+                    + "d" * 64
+                    + "/manifest.json",
+                    manifest_digest="e" * 64,
+                    file_count=1,
+                    total_size=12,
+                    manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                    last_verified_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed_partial_artifact())
+    response = TestClient(app).post(
+        f"/v1/model-files/{model_file_id}/download-executions/claim"
+    )
+    assert response.status_code == 200
+    assert response.json()["artifact_id"] is None
+    assert metadata_calls == []
     asyncio.run(engine.dispose())
 
 

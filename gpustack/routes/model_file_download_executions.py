@@ -5,6 +5,7 @@ import fnmatch
 import json
 import re
 from datetime import datetime, timezone
+from glob import has_magic
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -149,6 +150,7 @@ async def _claim_pending_execution(request, session, execution, model_file, iden
                     model_id,
                     resolved_revision,
                     request_identity.get("include_patterns") or [],
+                    immutable_revision=_is_immutable_revision(requested_revision),
                 )
                 if execution.default_profile_id is not None
                 else None
@@ -245,9 +247,8 @@ async def _authorize_execution(session, execution, model_file, identity) -> Work
 async def _resolve_revision(request, source, model_id, requested_revision) -> str:
     if not isinstance(model_id, str) or not model_id:
         raise HTTPException(409, "invalid_model_identity", "invalid_model_identity")
-    if isinstance(requested_revision, str):
-        if _COMMIT_SHA.fullmatch(requested_revision):
-            return requested_revision.lower()
+    if _is_immutable_revision(requested_revision):
+        return requested_revision.lower()
     resolver = getattr(
         request.app.state,
         "model_file_download_revision_resolver",
@@ -268,10 +269,22 @@ async def _resolve_revision(request, source, model_id, requested_revision) -> st
 
 
 async def _resolve_artifact_selection(
-    request, source, model_id, resolved_revision, requested_patterns
+    request,
+    source,
+    model_id,
+    resolved_revision,
+    requested_patterns,
+    *,
+    immutable_revision=False,
 ):
     if not requested_patterns:
         return []
+    if immutable_revision:
+        if any(has_magic(pattern) for pattern in requested_patterns):
+            # 固定 revision 禁止访问 Hub；glob 完整集合无法由局部库存离线证明。
+            return None
+        return _artifact_patterns_for_paths(requested_patterns)
+
     lister = getattr(
         request.app.state,
         "model_file_download_file_listing_resolver",
@@ -307,13 +320,23 @@ async def _resolve_artifact_selection(
     )
     if not selected:
         return None
+    return _artifact_patterns_for_paths(selected)
+
+
+def _is_immutable_revision(revision) -> bool:
+    return isinstance(revision, str) and _COMMIT_SHA.fullmatch(revision) is not None
+
+
+def _artifact_patterns_for_paths(paths):
     try:
+        for path in paths:
+            encode_path(path)
         _, concrete_patterns = compute_scan_spec(
-            [f"/repository/{path}" for path in selected],
+            [f"/repository/{path}" for path in paths],
             repository_complete=False,
         )
         return sorted(encode_path(pattern) for pattern in concrete_patterns)
-    except ValueError:
+    except (ModelPreheatIdentityError, ValueError):
         # 任务 3 无法表达跨父目录或重名源路径时，不存在可精确复用的 Artifact。
         return None
 
