@@ -12,6 +12,7 @@ from gpustack.model_preheat_credentials import (
 )
 from gpustack.schemas.model_file_download_executions import (
     ModelFileDownloadExecution,
+    ModelFileDownloadExecutionProfilePin,
 )
 from gpustack.schemas.model_files import ModelFile
 from gpustack.schemas.model_preheat_s3_profiles import (
@@ -64,6 +65,14 @@ async def create_model_file_with_download_execution(session, model_file, config)
         encryption_key_version=key_version,
     )
     session.add(execution)
+    await session.flush()
+    if profile is not None:
+        session.add(
+            ModelFileDownloadExecutionProfilePin(
+                execution_id=execution.id,
+                profile_id=profile.id,
+            )
+        )
     await session.commit()
     await session.refresh(model_file)
     await ModelFile._publish_event(EventType.CREATED, model_file)

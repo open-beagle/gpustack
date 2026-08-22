@@ -101,6 +101,27 @@ class ModelFileDownloadExecution(SQLModel, BaseModelMixin, table=True):
     )
 
 
+class ModelFileDownloadExecutionProfilePin(SQLModel, table=True):
+    """以 RESTRICT 外键保护已创建下载执行固定的 Profile。"""
+
+    __tablename__ = "model_file_download_execution_profile_pins"
+
+    execution_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_file_download_executions.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        ),
+    )
+    profile_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_s3_profiles.id", ondelete="RESTRICT"),
+            index=True,
+            nullable=False,
+        ),
+    )
+
+
 class ModelFileDownloadExecutionPublic(SQLModel):
     """Public schema 不返回凭据快照或加密字段。"""
 

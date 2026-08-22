@@ -1,13 +1,14 @@
 """Worker 私有的普通模型下载执行配置领取端点。"""
 
 import asyncio
+import fnmatch
 import json
 import re
 from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
-from sqlalchemy import and_
+from sqlalchemy import and_, update
 from sqlmodel import select
 
 from gpustack.api.exceptions import (
@@ -39,7 +40,7 @@ from gpustack.server.model_preheat_worker_identity import (
     ModelPreheatWorkerPrincipal,
     get_model_preheat_worker_identity,
 )
-from gpustack.worker.model_preheat.identity import encode_path
+from gpustack.worker.model_preheat.identity import decode_path, encode_path
 
 
 router = APIRouter()
@@ -72,7 +73,25 @@ async def claim_model_file_download_execution(
     model_file = await session.get(ModelFile, model_file_id)
     if model_file is None:
         raise NotFoundException(message="model_file_not_found")
+    pinned_model_file_id = model_file.id
     await _authorize_execution(session, execution, model_file, identity)
+
+    if execution.claimed_by_worker_uuid not in {None, identity.worker_uuid}:
+        raise HTTPException(403, "worker_not_authorized", "worker_not_authorized")
+    if execution.state in {
+        ModelFileDownloadExecutionStateEnum.ERROR,
+        ModelFileDownloadExecutionStateEnum.CANCELED,
+    }:
+        raise HTTPException(409, "execution_not_claimable", "execution_not_claimable")
+
+    if execution.state == ModelFileDownloadExecutionStateEnum.PENDING:
+        execution = await _claim_pending_execution(
+            request, session, execution, model_file, identity
+        )
+    elif execution.resolved_revision is None:
+        raise HTTPException(
+            409, "execution_revision_not_pinned", "execution_revision_not_pinned"
+        )
 
     resolved_revision = execution.resolved_revision
     artifact_id = execution.artifact_id
@@ -82,46 +101,11 @@ async def claim_model_file_download_execution(
     source = request_identity.get("source")
     model_id = request_identity.get("model_id")
     requested_revision = request_identity.get("requested_revision")
-    if source in {"huggingface", "modelscope"} and not resolved_revision:
-        resolved_revision = await _resolve_revision(
-            request, source, model_id, requested_revision
-        )
-        artifact = await _exact_artifact(
-            session,
-            execution,
-            source,
-            model_id,
-            resolved_revision,
-            request_identity.get("include_patterns") or [],
-            request_identity.get("exclude_patterns") or [],
-        )
-        artifact_id = artifact.artifact_id if artifact is not None else None
-        manifest_path = artifact.manifest_path if artifact is not None else None
-        artifact_total_size = artifact.total_size if artifact is not None else None
-        execution.resolved_revision = resolved_revision
-        execution.artifact_id = artifact_id
-        execution.manifest_path = manifest_path
-        execution.artifact_total_size = artifact_total_size
-        model_file.requested_revision = requested_revision
-        model_file.resolved_revision = resolved_revision
-    elif not resolved_revision:
-        resolved_revision = requested_revision or "not_applicable"
-        execution.resolved_revision = resolved_revision
-
-    if execution.claimed_by_worker_uuid not in {None, identity.worker_uuid}:
-        raise HTTPException(403, "worker_not_authorized", "worker_not_authorized")
-    execution.claimed_by_worker_uuid = identity.worker_uuid
-    execution.claimed_at = execution.claimed_at or datetime.now(timezone.utc)
-    execution.state = ModelFileDownloadExecutionStateEnum.RUNNING
-    session.add(execution)
-    session.add(model_file)
-    await session.commit()
-
     profile, fallback_enabled = _execution_profile(request, execution)
     response.headers["Cache-Control"] = "no-store"
     return ModelFileDownloadExecutionClaimed(
         execution_id=execution.id,
-        model_file_id=model_file.id,
+        model_file_id=pinned_model_file_id,
         request_identity=request_identity,
         request_digest=execution.request_digest,
         source=source,
@@ -136,6 +120,85 @@ async def claim_model_file_download_execution(
         source_fallback_enabled=fallback_enabled,
         profile=profile,
     )
+
+
+async def _claim_pending_execution(request, session, execution, model_file, identity):
+    execution_id = execution.id
+    request_identity = execution.request_identity or {}
+    source = request_identity.get("source")
+    model_id = request_identity.get("model_id")
+    requested_revision = request_identity.get("requested_revision")
+    resolved_revision = execution.resolved_revision
+    artifact_id = execution.artifact_id
+    manifest_path = execution.manifest_path
+    artifact_total_size = execution.artifact_total_size
+
+    if resolved_revision is None:
+        if source in {"huggingface", "modelscope"}:
+            resolved_revision = await _resolve_revision(
+                request, source, model_id, requested_revision
+            )
+            artifact = await _exact_artifact(
+                session,
+                execution,
+                source,
+                model_id,
+                resolved_revision,
+                request_identity.get("include_patterns") or [],
+                request_identity.get("exclude_patterns") or [],
+            )
+            artifact_id = artifact.artifact_id if artifact is not None else None
+            manifest_path = artifact.manifest_path if artifact is not None else None
+            artifact_total_size = artifact.total_size if artifact is not None else None
+        else:
+            resolved_revision = requested_revision or "not_applicable"
+
+    claimed_at = datetime.now(timezone.utc)
+    result = await session.exec(
+        update(ModelFileDownloadExecution)
+        .where(
+            and_(
+                ModelFileDownloadExecution.id == execution.id,
+                ModelFileDownloadExecution.state
+                == ModelFileDownloadExecutionStateEnum.PENDING,
+            )
+        )
+        .values(
+            resolved_revision=resolved_revision,
+            artifact_id=artifact_id,
+            manifest_path=manifest_path,
+            artifact_total_size=artifact_total_size,
+            claimed_by_worker_uuid=identity.worker_uuid,
+            claimed_at=claimed_at,
+            state=ModelFileDownloadExecutionStateEnum.RUNNING,
+        )
+    )
+    if result.rowcount == 1:
+        if source in {"huggingface", "modelscope"}:
+            model_file.requested_revision = requested_revision
+            model_file.resolved_revision = resolved_revision
+            session.add(model_file)
+        await session.commit()
+    else:
+        await session.rollback()
+
+    pinned = (
+        await session.exec(
+            select(ModelFileDownloadExecution)
+            .where(ModelFileDownloadExecution.id == execution_id)
+            .execution_options(populate_existing=True)
+        )
+    ).one_or_none()
+    if pinned is None:
+        raise NotFoundException(message="model_file_download_execution_not_found")
+    if pinned.claimed_by_worker_uuid != identity.worker_uuid:
+        raise HTTPException(403, "worker_not_authorized", "worker_not_authorized")
+    if pinned.state not in {
+        ModelFileDownloadExecutionStateEnum.RUNNING,
+        ModelFileDownloadExecutionStateEnum.READY,
+    }:
+        raise HTTPException(409, "execution_not_claimable", "execution_not_claimable")
+    return pinned
 
 
 async def _authorize_execution(session, execution, model_file, identity) -> Worker:
@@ -216,15 +279,42 @@ async def _exact_artifact(
             )
         )
     ).all()
-    expected_include = sorted(encode_path(item) for item in include_patterns)
     expected_exclude = sorted(encode_path(item) for item in exclude_patterns)
     matched = [
         row
         for row in rows
-        if list(row.include_patterns) == expected_include
+        if _artifact_selection_matches(row.include_patterns, include_patterns)
         and list(row.exclude_patterns) == expected_exclude
     ]
     return matched[0] if len(matched) == 1 else None
+
+
+def _artifact_selection_matches(artifact_patterns, requested_patterns) -> bool:
+    """匹配普通下载的 glob 与任务 3 固定的具体文件名/子树 pattern。"""
+    requested = list(requested_patterns or [])
+    actual = list(artifact_patterns or [])
+    if not requested:
+        return not actual
+
+    roots = {pattern for pattern in actual if not pattern.endswith("/**")}
+    expected_actual = {pattern for root in roots for pattern in (root, f"{root}/**")}
+    if set(actual) != expected_actual or len(actual) != len(expected_actual):
+        return False
+
+    decoded_roots = [decode_path(root) for root in roots]
+    if not decoded_roots:
+        return False
+    if any(
+        not any(fnmatch.fnmatchcase(root, pattern) for pattern in requested)
+        for root in decoded_roots
+    ):
+        return False
+
+    required = [pattern for pattern in requested if "mmproj" not in pattern.lower()]
+    return all(
+        any(fnmatch.fnmatchcase(root, pattern) for root in decoded_roots)
+        for pattern in required
+    )
 
 
 def _execution_profile(request, execution):

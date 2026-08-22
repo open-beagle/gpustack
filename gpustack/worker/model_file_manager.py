@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import platform
+import socket
 import time
 import threading
 from typing import Dict
@@ -17,6 +18,13 @@ from huggingface_hub._local_folder import get_local_download_paths
 from huggingface_hub.file_download import get_hf_file_metadata, hf_hub_url
 import huggingface_hub.constants
 from huggingface_hub.utils import build_hf_headers
+from minio.error import S3Error
+from urllib3.exceptions import (
+    ConnectTimeoutError,
+    MaxRetryError,
+    NewConnectionError,
+    ReadTimeoutError,
+)
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
@@ -45,12 +53,38 @@ def _download_error_code(exc: Exception) -> str:
         "model_artifact_not_found",
         "s3_manifest_invalid",
         "s3_manifest_missing",
+        "s3_authentication_failed",
         "network_timeout",
     }
     if message in stable_codes:
         return message
     if type(exc).__name__ == "ModelPreheatS3ManifestError":
         return "s3_manifest_invalid"
+    if isinstance(exc, S3Error) and exc.code in {
+        "AccessDenied",
+        "AuthorizationHeaderMalformed",
+        "ExpiredToken",
+        "InvalidAccessKeyId",
+        "InvalidToken",
+        "SignatureDoesNotMatch",
+        "TokenRefreshRequired",
+    }:
+        return "s3_authentication_failed"
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            socket.timeout,
+            ConnectTimeoutError,
+            ReadTimeoutError,
+            NewConnectionError,
+        ),
+    ):
+        return "network_timeout"
+    if isinstance(exc, MaxRetryError) and isinstance(exc.reason, Exception):
+        nested = _download_error_code(exc.reason)
+        if nested == "network_timeout":
+            return nested
     return "worker_execution_failed"
 
 

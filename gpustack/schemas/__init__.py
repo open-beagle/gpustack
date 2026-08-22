@@ -20,6 +20,11 @@ from gpustack.schemas.model_files import (
     ModelFilePublic,
     ModelFilesPublic,
 )
+from gpustack.schemas.model_file_download_executions import (
+    ModelFileDownloadExecutionClaimed,
+    ModelFileDownloadExecutionComplete,
+    ModelFileDownloadExecutionFail,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTask,
     ModelPreheatWorkerTaskClaim,
@@ -109,6 +114,9 @@ __all__ = [
     "ModelFileUpdate",
     "ModelFilePublic",
     "ModelFilesPublic",
+    "ModelFileDownloadExecutionClaimed",
+    "ModelFileDownloadExecutionComplete",
+    "ModelFileDownloadExecutionFail",
     "ModelPreheatWorkerTask",
     "ModelPreheatWorkerTaskClaim",
     "ModelPreheatWorkerTaskClaimed",

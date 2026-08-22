@@ -1,7 +1,7 @@
 from typing import Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-from sqlmodel import String, cast, func, or_
+from sqlmodel import String, cast, func, or_, select
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
@@ -18,6 +18,10 @@ from gpustack.schemas.model_files import (
     ModelFileStateEnum,
     ModelFileUpdate,
     ModelFilesPublic,
+)
+from gpustack.schemas.model_file_download_executions import (
+    ModelFileDownloadExecution,
+    ModelFileDownloadExecutionStateEnum,
 )
 from gpustack.server.model_file_download_execution_service import (
     create_model_file_with_download_execution,
@@ -212,6 +216,24 @@ async def reset_model_file(session: SessionDep, id: int):
         raise NotFoundException(message=f"Model file {id} not found")
 
     try:
+        execution = (
+            await session.exec(
+                select(ModelFileDownloadExecution).where(
+                    ModelFileDownloadExecution.model_file_id == id
+                )
+            )
+        ).first()
+        if execution is not None:
+            execution.state = ModelFileDownloadExecutionStateEnum.PENDING
+            execution.claimed_by_worker_uuid = None
+            execution.claimed_at = None
+            execution.transfer_source = None
+            execution.transfer_profile_id = None
+            execution.source_worker_id = None
+            execution.state_message = None
+            execution.error_code = None
+            execution.finished_at = None
+            session.add(execution)
         model_file.state = ModelFileStateEnum.DOWNLOADING
         model_file.download_progress = 0
         model_file.state_message = ""

@@ -40,7 +40,6 @@ from gpustack.config.config import Config
 from gpustack.worker.model_preheat.identity import (
     ModelPreheatIdentity,
     decode_path,
-    encode_path,
 )
 from gpustack.worker.model_preheat.s3_client import (
     ModelPreheatS3Client,
@@ -253,10 +252,6 @@ def _download_execution_artifact(execution, local_dir, cache_dir) -> List[str]:
         or manifest.identity.source != execution.source
         or decode_path(manifest.identity.model_path) != execution.model_id
         or decode_path(manifest.identity.revision_path) != execution.resolved_revision
-        or list(manifest.identity.file_patterns)
-        != sorted(encode_path(item) for item in execution.include_patterns)
-        or list(manifest.exclude_patterns)
-        != sorted(encode_path(item) for item in execution.exclude_patterns)
         or client.artifact_manifest_object(profile.prefix, manifest)
         != execution.manifest_path
     ):

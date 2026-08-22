@@ -2,9 +2,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from minio.error import S3Error
+from urllib3.exceptions import MaxRetryError, ReadTimeoutError
 
 from gpustack.schemas.models import SourceEnum
 from gpustack.worker import downloaders
+from gpustack.worker.model_file_manager import _download_error_code
+from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
+from gpustack.worker.model_preheat.manifest import ModelPreheatManifest
 from gpustack.worker.model_preheat.s3_client import ModelPreheatS3ManifestError
 
 
@@ -87,6 +92,47 @@ def test_s3_failure_never_silently_falls_back(tmp_path):
     hub.assert_not_called()
 
 
+def test_s3_manifest_accepts_task3_concrete_selection_for_raw_request(tmp_path):
+    manifest = ModelPreheatManifest(
+        identity=ModelPreheatIdentity(
+            source="huggingface",
+            model_id="org/model",
+            revision="a" * 40,
+            file_patterns=["model.gguf", "model.gguf/**"],
+        ),
+        files=(),
+    )
+    execution = _execution(
+        include_patterns=["model.gguf"],
+        artifact_id=manifest.artifact_id,
+        manifest_path="storage/huggingface/org/model/artifact/manifest.json",
+        profile=SimpleNamespace(
+            endpoint="https://s3.example.com",
+            access_key="access",
+            secret_key="secret",
+            tls_enabled=True,
+            tls_verify=True,
+            region="",
+            use_virtual_hosted_style=True,
+            bucket="models",
+            prefix="storage",
+        ),
+    )
+    client = SimpleNamespace(
+        read_artifact_manifest_path=lambda bucket, path: manifest,
+        artifact_manifest_object=lambda prefix, value: execution.manifest_path,
+    )
+    with patch.object(
+        downloaders.ModelPreheatS3Client, "from_minio", return_value=client
+    ):
+        assert (
+            downloaders._download_execution_artifact(
+                execution, str(tmp_path / "model"), str(tmp_path)
+            )
+            == []
+        )
+
+
 def test_confirmed_miss_falls_back_to_resolved_revision_without_upload(tmp_path):
     execution = _execution()
     with (
@@ -104,3 +150,14 @@ def test_confirmed_miss_falls_back_to_resolved_revision_without_upload(tmp_path)
     assert result == ["/model"]
     assert hub.call_args.kwargs["revision"] == "a" * 40
     s3.assert_not_called()
+
+
+def test_s3_authentication_error_has_stable_code():
+    error = S3Error(None, "AccessDenied", "denied", None, None, None)
+    assert _download_error_code(error) == "s3_authentication_failed"
+
+
+def test_s3_timeout_has_stable_code():
+    timeout = ReadTimeoutError(None, "/models", "timed out")
+    error = MaxRetryError(None, "/models", reason=timeout)
+    assert _download_error_code(error) == "network_timeout"

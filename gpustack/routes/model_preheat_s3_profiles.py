@@ -32,6 +32,9 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ProfilesPublic,
     ModelPreheatS3ProfileUpdate,
 )
+from gpustack.schemas.model_file_download_executions import (
+    ModelFileDownloadExecutionProfilePin,
+)
 from gpustack.schemas.model_preheat_schedules import ModelPreheatSchedule
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
@@ -502,6 +505,19 @@ async def delete_profile(request: Request, session: SessionDep, id: int):
             409,
             "default_profile_not_deletable",
             "default_profile_not_deletable",
+        )
+    download_execution = (
+        await session.exec(
+            select(ModelFileDownloadExecutionProfilePin.execution_id).where(
+                ModelFileDownloadExecutionProfilePin.profile_id == profile.id
+            )
+        )
+    ).first()
+    if download_execution is not None:
+        raise HTTPException(
+            409,
+            "model_file_download_execution_uses_profile",
+            "model_file_download_execution_uses_profile",
         )
     schedule = (
         await session.exec(

@@ -38,15 +38,16 @@ DEDUPE_REVISION = "d2e3f4a5b6c7"
 LEASE_REVISION = "e3f4a5b6c7d8"
 # 任务 4：普通下载首次领取时固定 resolved revision 与 Artifact 命中。
 DOWNLOAD_REVISION = "f4a5b6c7d8e9"
+# 任务 4 复审：固定 Profile 引用增加数据库级删除保护。
+PROFILE_PIN_REVISION = "a5b6c7d8e9f0"
 
-MIGRATION_ROOT = (
-    Path(__file__).resolve().parents[2] / "gpustack/migrations/versions"
-)
+MIGRATION_ROOT = Path(__file__).resolve().parents[2] / "gpustack/migrations/versions"
 
 NEW_TABLES = (
     "model_preheat_artifacts",
     "model_storage_sync_tasks",
     "model_file_download_executions",
+    "model_file_download_execution_profile_pins",
     "model_storage_sync_task_dedupe_slots",
 )
 DROPPED_TABLES = (
@@ -66,7 +67,10 @@ DIGEST = "d" * 64
 def _alembic_config(tmp_path: Path, name: str = "m.db") -> Config:
     database_path = tmp_path / name
     config = Config()
-    config.set_main_option("script_location", str(Path(__file__).resolve().parents[2] / "gpustack/migrations"))
+    config.set_main_option(
+        "script_location",
+        str(Path(__file__).resolve().parents[2] / "gpustack/migrations"),
+    )
     config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
     return config
 
@@ -200,7 +204,7 @@ def _table_names(engine) -> set:
 
 
 def test_revision_graph_heads_at_download_revision():
-    assert validate_revision_graph() == DOWNLOAD_REVISION
+    assert validate_revision_graph() == PROFILE_PIN_REVISION
 
 
 def test_upgrade_creates_unified_tables_and_drops_legacy(tmp_path):
@@ -212,14 +216,14 @@ def test_upgrade_creates_unified_tables_and_drops_legacy(tmp_path):
         assert table not in tables, f"legacy table {table} not dropped"
     with engine.connect() as connection:
         assert (
-            connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-            == DOWNLOAD_REVISION
+            connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalar_one()
+            == PROFILE_PIN_REVISION
         )
     download_columns = {
         column["name"]
-        for column in sa.inspect(engine).get_columns(
-            "model_file_download_executions"
-        )
+        for column in sa.inspect(engine).get_columns("model_file_download_executions")
     }
     assert {
         "resolved_revision",
@@ -227,6 +231,19 @@ def test_upgrade_creates_unified_tables_and_drops_legacy(tmp_path):
         "manifest_path",
         "artifact_total_size",
     } <= download_columns
+    pin_foreign_keys = {
+        tuple(foreign_key["constrained_columns"]): (
+            foreign_key["referred_table"],
+            (foreign_key.get("options") or {}).get("ondelete"),
+        )
+        for foreign_key in sa.inspect(engine).get_foreign_keys(
+            "model_file_download_execution_profile_pins"
+        )
+    }
+    assert pin_foreign_keys == {
+        ("execution_id",): ("model_file_download_executions", "CASCADE"),
+        ("profile_id",): ("model_preheat_s3_profiles", "RESTRICT"),
+    }
 
 
 def test_upgrade_profile_fields_and_no_persistent_is_default(tmp_path):
@@ -260,8 +277,7 @@ def test_default_slot_unique_constraint_rejects_second_default(tmp_path):
             "secret_key_encrypted, encryption_key_version, config_version, connectivity_state, "
             "provisioning_source, provisioning_key, system_managed, default_slot, "
             "source_fallback_enabled, created_at, updated_at) VALUES "
-            "('p1','http://x','b','',1,1,1,'{}','{}','v1',1,'pending','manual',NULL,0,'global',1,?,?)"
-            ,
+            "('p1','http://x','b','',1,1,1,'{}','{}','v1',1,'pending','manual',NULL,0,'global',1,?,?)",
             (now, now),
         )
         import pytest
@@ -273,8 +289,7 @@ def test_default_slot_unique_constraint_rejects_second_default(tmp_path):
                 "secret_key_encrypted, encryption_key_version, config_version, connectivity_state, "
                 "provisioning_source, provisioning_key, system_managed, default_slot, "
                 "source_fallback_enabled, created_at, updated_at) VALUES "
-                "('p2','http://x','b','',1,1,1,'{}','{}','v1',1,'pending','manual',NULL,0,'global',1,?,?)"
-                ,
+                "('p2','http://x','b','',1,1,1,'{}','{}','v1',1,'pending','manual',NULL,0,'global',1,?,?)",
                 (now, now),
             )
 
@@ -314,8 +329,7 @@ def test_upgrade_backfills_task_request_identity_and_digest(tmp_path):
             "generation_id, target_scope, target_worker_uuids, target_worker_snapshot, "
             "s3_profile_snapshot_encrypted, encryption_key_version, s3_backfill_policy, "
             "s3_profile_id, s3_profile_config_version, created_at, updated_at) VALUES "
-            "(1,'modelscope','Qwen/Qwen3-32B','master','sha',?,?,?,'ck','gen','selected_workers',?,?,'{}','v1','when_missing',7,1,?,?)"
-            ,
+            "(1,'modelscope','Qwen/Qwen3-32B','master','sha',?,?,?,'ck','gen','selected_workers',?,?,'{}','v1','when_missing',7,1,?,?)",
             (
                 json.dumps([], separators=(",", ":")),
                 json.dumps([], separators=(",", ":")),
@@ -485,11 +499,17 @@ def test_downgrade_restores_empty_structure(tmp_path):
     for table in NEW_TABLES:
         assert table not in tables, f"downgrade should drop {table}"
     with engine.connect() as connection:
-        version = connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+        version = connection.exec_driver_sql(
+            "SELECT version_num FROM alembic_version"
+        ).scalar_one()
     assert version == BASELINE_HEAD
-    profile_cols = {c["name"] for c in sa.inspect(engine).get_columns("model_preheat_s3_profiles")}
+    profile_cols = {
+        c["name"] for c in sa.inspect(engine).get_columns("model_preheat_s3_profiles")
+    }
     assert "is_default" in profile_cols
-    task_cols = {c["name"] for c in sa.inspect(engine).get_columns("model_preheat_tasks")}
+    task_cols = {
+        c["name"] for c in sa.inspect(engine).get_columns("model_preheat_tasks")
+    }
     assert "cache_key" in task_cols
     assert "request_digest" not in task_cols
 
@@ -497,9 +517,14 @@ def test_downgrade_restores_empty_structure(tmp_path):
 def _migration_columns() -> dict:
     files = (
         MIGRATION_ROOT / f"2026_08_20_1000-{UNIFY_REVISION}_unify_model_storage.py",
-        MIGRATION_ROOT / f"2026_08_20_1100-{DEDUPE_REVISION}_add_model_storage_sync_dedupe_slots.py",
-        MIGRATION_ROOT / f"2026_08_22_1000-{LEASE_REVISION}_add_model_storage_sync_lease.py",
-        MIGRATION_ROOT / f"2026_08_22_1200-{DOWNLOAD_REVISION}_pin_model_file_download_claim.py",
+        MIGRATION_ROOT
+        / f"2026_08_20_1100-{DEDUPE_REVISION}_add_model_storage_sync_dedupe_slots.py",
+        MIGRATION_ROOT
+        / f"2026_08_22_1000-{LEASE_REVISION}_add_model_storage_sync_lease.py",
+        MIGRATION_ROOT
+        / f"2026_08_22_1200-{DOWNLOAD_REVISION}_pin_model_file_download_claim.py",
+        MIGRATION_ROOT
+        / f"2026_08_22_1300-{PROFILE_PIN_REVISION}_protect_download_execution_profile.py",
     )
     # 多文件对同一表的列定义需**合并**（create_table 全量 + add_column 增量），
     # 而不是后者覆盖前者。
@@ -532,10 +557,7 @@ def _migration_file_columns(path: Path) -> dict:
                 and isinstance(arg.args[0], ast.Constant)
             }
         # op.add_column("table", sa.Column("col", ...))：增量加列 migration。
-        elif (
-            call.func.attr == "add_column"
-            and isinstance(call.args[0], ast.Constant)
-        ):
+        elif call.func.attr == "add_column" and isinstance(call.args[0], ast.Constant):
             table = call.args[0].value
             new_columns = set()
             for arg in call.args[1:]:
@@ -565,6 +587,7 @@ def test_new_tables_match_schema_on_all_supported_dialects():
         model_storage_sync.ModelStorageSyncTask,
         model_storage_sync.ModelStorageSyncTaskDedupeSlot,
         download.ModelFileDownloadExecution,
+        download.ModelFileDownloadExecutionProfilePin,
     )
     for model in models:
         assert migration_columns[model.__tablename__] == set(
@@ -627,6 +650,19 @@ def _load_unify_migration_module():
     return module
 
 
+def _load_profile_pin_migration_module():
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "gpustack/migrations/versions/2026_08_22_1300-a5b6c7d8e9f0_protect_download_execution_profile.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_protect_download_execution_profile", str(path)
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class _DialectConnection:
     """暴露 dialect 的最小连接替身，供 Alembic 离线 DDL 渲染。"""
 
@@ -679,3 +715,20 @@ def test_migration_ddl_path_renders_on_all_supported_dialects(dialect):
         "model_storage_protocol_version",
     ):
         assert probe in combined, f"expected {probe!r} in {dialect.name} migration DDL"
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    [postgresql.dialect(), mysql.dialect()],
+    ids=["postgresql", "mysql"],
+)
+def test_profile_pin_migration_ddl_renders_on_all_supported_dialects(dialect):
+    module = _load_profile_pin_migration_module()
+    combined = (
+        _render_migration_ddl(dialect, module.upgrade)
+        + "\n"
+        + (_render_migration_ddl(dialect, module.downgrade))
+    )
+    assert "model_file_download_execution_profile_pins" in combined
+    assert "ON DELETE RESTRICT" in combined
+    assert "ON DELETE CASCADE" in combined
