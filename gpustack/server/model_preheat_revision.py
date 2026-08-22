@@ -61,7 +61,7 @@ def resolve_model_preheat_revision(
             return commit.lower()
         if not _is_safe_modelscope_revision(resolved):
             raise ValueError("invalid_modelscope_revision")
-        return _modelscope_filelist_fingerprint(
+        return modelscope_filelist_revision(
             modelscope_file_api_factory().list_repo_files(
                 model_id,
                 "model",
@@ -140,7 +140,7 @@ def _extract_modelscope_commit(value):
     return None
 
 
-def _modelscope_filelist_fingerprint(rows) -> str:
+def modelscope_filelist_revision(rows) -> str:
     files = []
     for row in rows:
         if isinstance(row, dict):

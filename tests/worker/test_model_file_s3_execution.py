@@ -153,14 +153,27 @@ def test_confirmed_miss_falls_back_to_resolved_revision_without_upload(tmp_path)
 
 
 def test_modelscope_filelist_revision_falls_back_with_requested_revision(tmp_path):
+    files = [
+        type(
+            "File",
+            (),
+            {"path": "model.bin", "size": 10, "blob_id": "a" * 64},
+        )()
+    ]
+    from gpustack.server.model_preheat_revision import modelscope_filelist_revision
+
     execution = _execution(
         source="modelscope",
         requested_revision="release",
-        resolved_revision="modelscope-filelist-v1-" + "a" * 64,
+        resolved_revision=modelscope_filelist_revision(files),
     )
-    with patch.object(
-        downloaders.ModelScopeDownloader, "download", return_value=["/model"]
-    ) as hub:
+    with (
+        patch.object(
+            downloaders.ModelScopeDownloader, "download", return_value=["/model"]
+        ) as hub,
+        patch.object(downloaders, "ModelScopeHubApi") as hub_api,
+    ):
+        hub_api.return_value.list_repo_files.return_value = files
         result = downloaders.download_model(
             _model(SourceEnum.MODEL_SCOPE),
             cache_dir=str(tmp_path),

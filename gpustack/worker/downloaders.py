@@ -45,7 +45,11 @@ from gpustack.worker.model_preheat.s3_client import (
     ModelPreheatS3Client,
     ModelPreheatS3ManifestError,
 )
-from gpustack.server.model_preheat_revision import modelscope_upstream_revision
+from gpustack.server.model_preheat_revision import (
+    is_modelscope_filelist_revision,
+    modelscope_filelist_revision,
+    modelscope_upstream_revision,
+)
 
 logger = logging.getLogger(__name__)
 S3_PROFILE_CENTER = "center"
@@ -221,17 +225,30 @@ def download_model_with_execution(
             cache_dir=os.path.join(cache_dir, "huggingface"),
             revision=execution.resolved_revision,
         )
-    return ModelScopeDownloader.download(
+    expected_revision = execution.resolved_revision
+    upstream_revision = modelscope_upstream_revision(
+        expected_revision, execution.requested_revision
+    )
+    _verify_modelscope_filelist_revision(
+        model.model_scope_model_id,
+        upstream_revision,
+        expected_revision,
+    )
+    result = ModelScopeDownloader.download(
         model_id=model.model_scope_model_id,
         file_path=model.model_scope_file_path,
         extra_file_path=get_mmproj_filename(model),
         local_dir=local_dir,
         cache_dir=os.path.join(cache_dir, "model_scope"),
         cfg=None,
-        revision=modelscope_upstream_revision(
-            execution.resolved_revision, execution.requested_revision
-        ),
+        revision=upstream_revision,
     )
+    _verify_modelscope_filelist_revision(
+        model.model_scope_model_id,
+        upstream_revision,
+        expected_revision,
+    )
+    return result
 
 
 def _download_execution_artifact(execution, local_dir, cache_dir) -> List[str]:
@@ -297,7 +314,8 @@ def download_resolved_revision_to_staging(
     destination = Path(staging_dir)
     destination.mkdir(parents=True, exist_ok=True)
     model_id = decode_path(identity.model_path)
-    revision = decode_path(identity.revision_path)
+    resolved_revision = decode_path(identity.revision_path)
+    revision = resolved_revision
     patterns = [decode_path(pattern) for pattern in identity.file_patterns]
     ignored_patterns = list(exclude_patterns or [])
 
@@ -345,6 +363,11 @@ def download_resolved_revision_to_staging(
             revision,
             identity.requested_revision,
         )
+        _verify_modelscope_filelist_revision(
+            model_id,
+            revision,
+            resolved_revision,
+        )
         if cancel_check is None and progress_callback is None:
             modelscope_snapshot_download(
                 model_id=model_id,
@@ -353,6 +376,11 @@ def download_resolved_revision_to_staging(
                 allow_patterns=patterns or None,
                 ignore_patterns=ignored_patterns or None,
                 max_workers=ModelScopeDownloader._max_workers,
+            )
+            _verify_modelscope_filelist_revision(
+                model_id,
+                revision,
+                resolved_revision,
             )
             return str(destination)
         files = sorted(
@@ -376,8 +404,28 @@ def download_resolved_revision_to_staging(
             cancel_check,
             progress_callback,
         )
+        _verify_modelscope_filelist_revision(
+            model_id,
+            revision,
+            resolved_revision,
+        )
         return str(destination)
     raise ValueError("unsupported_preheat_source")
+
+
+def _verify_modelscope_filelist_revision(model_id, upstream_revision, expected):
+    if not is_modelscope_filelist_revision(expected):
+        return
+    current = modelscope_filelist_revision(
+        ModelScopeHubApi().list_repo_files(
+            model_id,
+            "model",
+            revision=upstream_revision,
+            recursive=True,
+        )
+    )
+    if current != expected:
+        raise ValueError("modelscope_revision_changed")
 
 
 def _preheat_file_selected(path, patterns, ignored_patterns):

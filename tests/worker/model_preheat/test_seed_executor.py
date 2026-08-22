@@ -4,6 +4,8 @@ import threading
 from dataclasses import dataclass, field, replace
 from unittest.mock import patch
 
+import pytest
+
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
     TargetExecutionRequest,
@@ -233,19 +235,65 @@ def test_seed_hub_fallback_receives_token_and_exclude_patterns(tmp_path):
 
 
 def test_modelscope_filelist_revision_downloads_requested_upstream_revision(tmp_path):
+    files = [
+        type(
+            "File",
+            (),
+            {"path": "model.bin", "size": 10, "blob_id": "b" * 64},
+        )()
+    ]
+    from gpustack.server.model_preheat_revision import modelscope_filelist_revision
+
     identity = ModelPreheatIdentity(
         source="modelscope",
         model_id="org/model",
-        revision="modelscope-filelist-v1-" + "a" * 64,
+        revision=modelscope_filelist_revision(files),
         requested_revision="release",
         file_patterns=(),
     )
-    with patch(
-        "gpustack.worker.downloaders.modelscope_snapshot_download"
-    ) as snapshot_download:
+    with (
+        patch(
+            "gpustack.worker.downloaders.modelscope_snapshot_download"
+        ) as snapshot_download,
+        patch("gpustack.worker.downloaders.ModelScopeHubApi") as hub_api,
+    ):
+        hub_api.return_value.list_repo_files.return_value = files
         download_resolved_revision_to_staging(identity, tmp_path / "staging")
 
     assert snapshot_download.call_args.kwargs["revision"] == "release"
+
+
+def test_modelscope_filelist_revision_change_rejects_download(tmp_path):
+    from gpustack.server.model_preheat_revision import modelscope_filelist_revision
+
+    before = [
+        type(
+            "File",
+            (),
+            {"path": "model.bin", "size": 10, "blob_id": "a" * 64},
+        )()
+    ]
+    after = [
+        type(
+            "File",
+            (),
+            {"path": "model.bin", "size": 10, "blob_id": "b" * 64},
+        )()
+    ]
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="org/model",
+        revision=modelscope_filelist_revision(before),
+        requested_revision="release",
+        file_patterns=(),
+    )
+    with (
+        patch("gpustack.worker.downloaders.modelscope_snapshot_download"),
+        patch("gpustack.worker.downloaders.ModelScopeHubApi") as hub_api,
+        pytest.raises(ValueError, match="modelscope_revision_changed"),
+    ):
+        hub_api.return_value.list_repo_files.side_effect = [before, after]
+        download_resolved_revision_to_staging(identity, tmp_path / "staging")
 
 
 def test_download_preserves_raw_special_character_exclude_patterns(tmp_path):
