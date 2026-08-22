@@ -10,6 +10,7 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3Profile,
 )  # noqa: F401
 from gpustack.schemas.model_preheats import (
+    ModelPreheatDesiredStateEnum,
     ModelPreheatBackfillPolicyEnum,
     ModelPreheatExecutionStateEnum,
     ModelPreheatTargetScopeEnum,
@@ -68,6 +69,7 @@ async def _seed(engine, targets=("worker-a", "worker-b"), artifact_id=None):
                 port=10150,
                 worker_uuid=name,
                 state=WorkerStateEnum.READY,
+                model_storage_protocol_version=1,
             )
             session.add(worker)
             workers[name] = worker
@@ -197,6 +199,64 @@ def test_all_locations_missing_uses_requested_seed_for_public_fallback(tmp_path)
     assert [(child.worker_uuid, child.role) for child in children] == [
         ("worker-a", ModelPreheatWorkerTaskRoleEnum.SEED)
     ]
+
+
+def test_inventory_probe_pause_does_not_create_stale_attempt_child(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+
+        class PausingProbe(FakeInventoryProbe):
+            async def probe(self, task, worker_uuids):
+                async with AsyncSession(engine) as session:
+                    current = await session.get(ModelPreheatTask, task.id)
+                    current.desired_state = ModelPreheatDesiredStateEnum.PAUSED
+                    session.add(current)
+                    await session.commit()
+                return await super().probe(task, worker_uuids)
+
+        await ModelPreheatController(
+            engine, inventory_probe=PausingProbe({})
+        ).reconcile_task(task_id)
+        children = await _children(engine, task_id)
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+        await engine.dispose()
+        return parent, children
+
+    parent, children = asyncio.run(run())
+    assert parent.desired_state == ModelPreheatDesiredStateEnum.PAUSED
+    assert parent.execution_state == ModelPreheatExecutionStateEnum.PENDING
+    assert children == []
+
+
+def test_inventory_probe_retry_does_not_create_old_attempt_child(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+
+        class RetryingProbe(FakeInventoryProbe):
+            async def probe(self, task, worker_uuids):
+                async with AsyncSession(engine) as session:
+                    current = await session.get(ModelPreheatTask, task.id)
+                    current.attempt += 1
+                    session.add(current)
+                    await session.commit()
+                return await super().probe(task, worker_uuids)
+
+        await ModelPreheatController(
+            engine, inventory_probe=RetryingProbe({})
+        ).reconcile_task(task_id)
+        children = await _children(engine, task_id)
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+        await engine.dispose()
+        return parent, children
+
+    parent, children = asyncio.run(run())
+    assert parent.attempt == 2
+    assert parent.execution_state == ModelPreheatExecutionStateEnum.PENDING
+    assert children == []
 
 
 def test_seed_completion_uses_bound_artifact_for_distribution(tmp_path):

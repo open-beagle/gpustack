@@ -2,6 +2,7 @@ import hashlib
 import json
 import threading
 from dataclasses import dataclass, field, replace
+from unittest.mock import patch
 
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
@@ -10,6 +11,7 @@ from gpustack.worker.model_preheat.executor import (
     execute_seed_preheat,
     execute_target_preheat,
 )
+from gpustack.worker.downloaders import download_resolved_revision_to_staging
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 from gpustack.worker.model_preheat.manifest import build_model_preheat_manifest
 from gpustack.worker.model_preheat.s3_client import ModelPreheatS3Client
@@ -197,6 +199,55 @@ def test_seed_falls_back_to_hub_then_must_publish(tmp_path):
     assert ("models", result["manifest_path"]) in minio.objects
 
 
+def test_seed_hub_fallback_receives_token_and_exclude_patterns(tmp_path):
+    identity = _identity(patterns=["**"])
+    request = _seed_request(
+        tmp_path,
+        identity=identity,
+        request_digest=identity.request_digest,
+        exclude_patterns=("private/**",),
+    )
+    calls = []
+
+    def download(identity, staging, **kwargs):
+        calls.append(kwargs)
+        _write_model(staging)
+
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(InMemoryMinio()),
+        download_to_staging=download,
+        source_token="hf-secret-token",
+    )
+
+    assert result["state"] == "ready"
+    assert calls == [
+        {
+            "token": "hf-secret-token",
+            "exclude_patterns": ("private/**",),
+            "cancel_check": None,
+            "progress_callback": None,
+        }
+    ]
+    assert "hf-secret-token" not in json.dumps(result)
+
+
+def test_modelscope_filelist_revision_downloads_requested_upstream_revision(tmp_path):
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="org/model",
+        revision="modelscope-filelist-v1-" + "a" * 64,
+        requested_revision="release",
+        file_patterns=(),
+    )
+    with patch(
+        "gpustack.worker.downloaders.modelscope_snapshot_download"
+    ) as snapshot_download:
+        download_resolved_revision_to_staging(identity, tmp_path / "staging")
+
+    assert snapshot_download.call_args.kwargs["revision"] == "release"
+
+
 def test_seed_disabled_fallback_never_calls_hub(tmp_path):
     request = _seed_request(tmp_path, source_fallback_enabled=False)
     calls = []
@@ -217,8 +268,6 @@ def test_bound_artifact_seed_reuses_trusted_local_without_s3_file_download(tmp_p
     manifest = build_model_preheat_manifest(source, _identity())
     minio = InMemoryMinio()
     client = ModelPreheatS3Client(minio)
-    client.publish_artifact("models", "model-storage", manifest, source)
-    minio.downloads.clear()
     request = _seed_request(
         tmp_path,
         artifact_id=manifest.artifact_id,
@@ -235,7 +284,7 @@ def test_bound_artifact_seed_reuses_trusted_local_without_s3_file_download(tmp_p
 
     assert result["state"] == "ready"
     assert result["transfer_source"] == "current_node"
-    assert not any("/files/" in name for name in minio.downloads)
+    assert minio.downloads == []
 
 
 def test_target_downloads_only_missing_or_invalid_files(tmp_path):

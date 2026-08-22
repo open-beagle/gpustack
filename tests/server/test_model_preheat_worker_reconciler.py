@@ -73,6 +73,7 @@ async def _seed(engine, *, state=ModelPreheatExecutionStateEnum.READY):
             port=10150,
             worker_uuid="old-uuid",
             state=WorkerStateEnum.READY,
+            model_storage_protocol_version=1,
         )
         session.add(profile)
         session.add(old_worker)
@@ -125,7 +126,13 @@ async def _seed(engine, *, state=ModelPreheatExecutionStateEnum.READY):
         return task_id, profile_id
 
 
-async def _new_worker(session, *, worker_id_suffix="a", state=WorkerStateEnum.READY):
+async def _new_worker(
+    session,
+    *,
+    worker_id_suffix="a",
+    state=WorkerStateEnum.READY,
+    protocol_version=1,
+):
     worker = Worker(
         name=f"new-worker-{worker_id_suffix}",
         hostname=f"new-host-{worker_id_suffix}",
@@ -133,6 +140,7 @@ async def _new_worker(session, *, worker_id_suffix="a", state=WorkerStateEnum.RE
         port=10150,
         worker_uuid="new-uuid",
         state=state,
+        model_storage_protocol_version=protocol_version,
         labels={"gpu_names": "NVIDIA L40S"},
     )
     session.add(worker)
@@ -192,6 +200,37 @@ def test_manually_disabled_policy_is_not_reenabled_by_materialization(tmp_path):
         return policy
 
     assert asyncio.run(run()).enabled is False
+
+
+def test_protocol_mismatch_worker_gets_no_connectivity_or_distribution(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(
+            engine, ready_probe=FakeReadyProbe(_ready_result())
+        )
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine) as session:
+            worker = await _new_worker(session, protocol_version=0)
+            worker_uuid = worker.worker_uuid
+        await reconciler.reconcile_worker(worker_uuid)
+        async with AsyncSession(engine) as session:
+            checks = (await session.exec(select(ModelPreheatS3ConnectivityCheck))).all()
+            tasks = (
+                await session.exec(
+                    select(ModelPreheatWorkerTask).where(
+                        ModelPreheatWorkerTask.worker_uuid == worker_uuid
+                    )
+                )
+            ).all()
+            observation = await session.get(ModelPreheatWorkerObservation, worker_uuid)
+        await engine.dispose()
+        return checks, tasks, observation
+
+    checks, tasks, observation = asyncio.run(run())
+    assert checks == []
+    assert tasks == []
+    assert observation.ready is False
 
 
 def test_new_worker_gets_incremental_connectivity_then_idempotent_distribution(

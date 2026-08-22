@@ -40,6 +40,7 @@ from gpustack.server.bus import Event, EventType
 from gpustack.utils import hub
 from gpustack.utils.file import delete_path
 from gpustack.worker import downloaders
+from gpustack.server.model_preheat_revision import modelscope_upstream_revision
 
 
 logger = logging.getLogger(__name__)
@@ -1038,7 +1039,14 @@ class ModelFileDownloadTask:
             cache_dir=self._config.cache_dir,
             ollama_library_base_url=self._config.ollama_library_base_url,
             cfg=None if self._execution else self._config,
-            revision=(self._execution.resolved_revision if self._execution else None),
+            revision=(
+                modelscope_upstream_revision(
+                    self._execution.resolved_revision,
+                    self._execution.requested_revision,
+                )
+                if self._execution and self._execution.source == "modelscope"
+                else (self._execution.resolved_revision if self._execution else None)
+            ),
         )
 
         (size, file_paths) = hub.match_file_and_calculate_size(

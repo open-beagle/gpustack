@@ -102,6 +102,7 @@ async def _seed(engine, key, *, artifact_id=None):
             port=10150,
             worker_uuid="worker-uuid",
             state=WorkerStateEnum.READY,
+            model_storage_protocol_version=1,
         )
         profile = ModelPreheatS3Profile(
             name="storage",
@@ -206,6 +207,29 @@ def test_claim_and_payload_keep_credentials_private(tmp_path):
     assert payload.json()["profile"]["access_key"] == "access-plain"
     assert "access-plain" not in public.text
     assert claim["lease_token"] not in public.text
+    asyncio.run(engine.dispose())
+
+
+def test_claim_rejects_worker_without_storage_protocol(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    child_id, _, _ = asyncio.run(_seed(engine, key))
+
+    async def downgrade_protocol():
+        async with AsyncSession(engine) as session:
+            worker = await session.get(Worker, 1)
+            worker.model_storage_protocol_version = 0
+            session.add(worker)
+            await session.commit()
+
+    asyncio.run(downgrade_protocol())
+    with TestClient(app) as client:
+        response = client.post(
+            f"{API_PREFIX}/{child_id}/claim",
+            json={"worker_uuid": "worker-uuid", "worker_id": 1},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["message"] == "model_storage_protocol_mismatch"
     asyncio.run(engine.dispose())
 
 

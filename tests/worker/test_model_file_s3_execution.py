@@ -152,6 +152,25 @@ def test_confirmed_miss_falls_back_to_resolved_revision_without_upload(tmp_path)
     s3.assert_not_called()
 
 
+def test_modelscope_filelist_revision_falls_back_with_requested_revision(tmp_path):
+    execution = _execution(
+        source="modelscope",
+        requested_revision="release",
+        resolved_revision="modelscope-filelist-v1-" + "a" * 64,
+    )
+    with patch.object(
+        downloaders.ModelScopeDownloader, "download", return_value=["/model"]
+    ) as hub:
+        result = downloaders.download_model(
+            _model(SourceEnum.MODEL_SCOPE),
+            cache_dir=str(tmp_path),
+            execution=execution,
+        )
+
+    assert result == ["/model"]
+    assert hub.call_args.kwargs["revision"] == "release"
+
+
 def test_s3_authentication_error_has_stable_code():
     error = S3Error(None, "AccessDenied", "denied", None, None, None)
     assert _download_error_code(error) == "s3_authentication_failed"

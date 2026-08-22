@@ -27,9 +27,6 @@ def test_remote_revision_files_are_adapted_to_manifest_contract():
             ),
             RemoteRevisionFile(path="config.json", size=3, sha256="b" * 64),
         ],
-        cache_key="cache-key",
-        selection_digest="selection-digest",
-        generation_id="generation-id",
     )
 
     assert [file.path for file in manifest.files] == [
@@ -50,9 +47,6 @@ def test_remote_revision_raw_paths_are_canonically_encoded():
             ),
             RemoteRevisionFile(path="配置 文件.json", size=3, sha256="b" * 64),
         ],
-        cache_key="cache-key",
-        selection_digest="selection-digest",
-        generation_id="generation-id",
     )
 
     assert [file.path for file in manifest.files] == [

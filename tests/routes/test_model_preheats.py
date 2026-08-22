@@ -46,6 +46,7 @@ from gpustack.schemas.workers import (
 )
 from gpustack.server.db import get_session
 from gpustack.server.model_preheat_connectivity import aggregate_connectivity_check
+from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
 API_PREFIX = "/v1/model-preheats"
@@ -126,6 +127,7 @@ async def _seed(session, profile_state=ModelPreheatS3ConnectivityStateEnum.AVAIL
             port=10150,
             worker_uuid="z-uuid",
             state=WorkerStateEnum.READY,
+            model_storage_protocol_version=1,
         ),
         Worker(
             name="worker-a",
@@ -134,6 +136,7 @@ async def _seed(session, profile_state=ModelPreheatS3ConnectivityStateEnum.AVAIL
             port=10150,
             worker_uuid="a-uuid",
             state=WorkerStateEnum.READY,
+            model_storage_protocol_version=1,
         ),
     ]
     session.add(profile)
@@ -265,6 +268,62 @@ def test_creation_resolves_requested_revision_before_persisting(tmp_path):
     assert response.json()["requested_revision"] == "release-branch"
     assert response.json()["resolved_revision"] == "a" * 40
     assert calls == [("huggingface", "Qwen/Qwen-Image-2512", "release-branch", None)]
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+
+def test_creation_preserves_raw_special_character_patterns_and_digest(tmp_path):
+    app, engine = _test_app(tmp_path)
+
+    async def seed():
+        async with AsyncSession(engine) as session:
+            return await _seed(session)
+
+    profile, workers = asyncio.run(seed())
+    include_patterns = ["权重/模型 文件%.bin", "config.json"]
+    with TestClient(app) as client:
+        response = client.post(
+            API_PREFIX,
+            json=payload(
+                profile.id,
+                [workers[0].id],
+                include_patterns=include_patterns,
+            ),
+        )
+
+    expected = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="Qwen/Qwen-Image-2512",
+        revision="commit-123",
+        requested_revision="commit-123",
+        file_patterns=include_patterns,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["include_patterns"] == ["权重/模型 文件%.bin", "config.json"]
+    assert response.json()["request_digest"] == expected.request_digest
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+
+def test_creation_rejects_worker_without_storage_protocol(tmp_path):
+    app, engine = _test_app(tmp_path)
+
+    async def seed():
+        async with AsyncSession(engine) as session:
+            profile, workers = await _seed(session)
+            profile_id = profile.id
+            worker_id = workers[0].id
+            workers[0].model_storage_protocol_version = 0
+            session.add(workers[0])
+            await session.commit()
+            return profile_id, worker_id
+
+    profile_id, worker_id = asyncio.run(seed())
+    with TestClient(app) as client:
+        response = client.post(API_PREFIX, json=payload(profile_id, [worker_id]))
+
+    assert response.status_code == 422
+    assert response.json()["message"] == "target_workers_not_online"
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 

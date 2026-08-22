@@ -45,6 +45,7 @@ from gpustack.worker.model_preheat.s3_client import (
     ModelPreheatS3Client,
     ModelPreheatS3ManifestError,
 )
+from gpustack.server.model_preheat_revision import modelscope_upstream_revision
 
 logger = logging.getLogger(__name__)
 S3_PROFILE_CENTER = "center"
@@ -227,7 +228,9 @@ def download_model_with_execution(
         local_dir=local_dir,
         cache_dir=os.path.join(cache_dir, "model_scope"),
         cfg=None,
-        revision=execution.resolved_revision,
+        revision=modelscope_upstream_revision(
+            execution.resolved_revision, execution.requested_revision
+        ),
     )
 
 
@@ -338,6 +341,10 @@ def download_resolved_revision_to_staging(
         shutil.rmtree(destination / ".cache", ignore_errors=True)
         return str(destination)
     if identity.source == "modelscope":
+        revision = modelscope_upstream_revision(
+            revision,
+            identity.requested_revision,
+        )
         if cancel_check is None and progress_callback is None:
             modelscope_snapshot_download(
                 model_id=model_id,

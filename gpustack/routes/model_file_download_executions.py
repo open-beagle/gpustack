@@ -36,7 +36,10 @@ from gpustack.schemas.model_preheats import (
 )
 from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
 from gpustack.server.deps import SessionDep
-from gpustack.server.model_preheat_revision import resolve_model_preheat_revision
+from gpustack.server.model_preheat_revision import (
+    modelscope_upstream_revision,
+    resolve_model_preheat_revision,
+)
 from gpustack.server.model_storage_scan_spec import compute_scan_spec
 from gpustack.server.model_preheat_worker_identity import (
     ModelPreheatWorkerPrincipal,
@@ -149,6 +152,7 @@ async def _claim_pending_execution(request, session, execution, model_file, iden
                     source,
                     model_id,
                     resolved_revision,
+                    requested_revision,
                     request_identity.get("include_patterns") or [],
                     immutable_revision=_is_immutable_revision(requested_revision),
                 )
@@ -273,6 +277,7 @@ async def _resolve_artifact_selection(
     source,
     model_id,
     resolved_revision,
+    requested_revision,
     requested_patterns,
     *,
     immutable_revision=False,
@@ -295,7 +300,11 @@ async def _resolve_artifact_selection(
             lister,
             source,
             model_id,
-            resolved_revision,
+            (
+                modelscope_upstream_revision(resolved_revision, requested_revision)
+                if source == "modelscope"
+                else resolved_revision
+            ),
             token=getattr(request.app.state.server_config, "huggingface_token", None),
         )
     except Exception:

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import delete, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -18,7 +19,11 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTaskStateEnum,
     is_terminal_task,
 )
-from gpustack.schemas.workers import Worker, WorkerStateEnum
+from gpustack.schemas.workers import (
+    MODEL_STORAGE_PROTOCOL_VERSION,
+    Worker,
+    WorkerStateEnum,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -110,7 +115,9 @@ class ModelPreheatController:
         try:
             async with AsyncSession(self._engine) as session:
                 await self._reconcile(session, task_id)
-                task = await session.get(ModelPreheatTask, task_id)
+                task = await session.get(
+                    ModelPreheatTask, task_id, populate_existing=True
+                )
                 if task is not None and is_terminal_task(task):
                     await session.exec(
                         delete(ModelPreheatTaskLock).where(
@@ -166,16 +173,46 @@ class ModelPreheatController:
         ]
 
         if not children:
+            expected_attempt = task.attempt
+            expected_state = task.execution_state
             inventory = await self._inventory_probe.probe(task, sorted(all_workers))
+            task = await _reload_running_task(
+                session, task.id, expected_attempt, expected_state
+            )
+            if task is None:
+                return
+            all_workers = await _current_workers(session)
+            targets = {
+                worker_uuid: all_workers[worker_uuid]
+                for worker_uuid in task.target_worker_uuids
+                if worker_uuid in all_workers
+            }
+            if not targets:
+                await _cas_parent_update(
+                    session,
+                    task,
+                    execution_state=ModelPreheatExecutionStateEnum.ERROR,
+                    state_message="no_available_targets",
+                    progress=100,
+                    finished_at=datetime.now(timezone.utc),
+                )
+                return
             valid_targets = sorted(
                 worker_uuid
                 for worker_uuid in targets
                 if getattr(inventory.get(worker_uuid), "state", None) == "valid"
             )
-            task.local_cache_hit_worker_uuids = valid_targets
             if len(valid_targets) == len(targets):
-                task.transfer_source = "current_node"
-                _finish(task, ModelPreheatExecutionStateEnum.READY)
+                await _cas_parent_update(
+                    session,
+                    task,
+                    execution_state=ModelPreheatExecutionStateEnum.READY,
+                    local_cache_hit_worker_uuids=valid_targets,
+                    transfer_source="current_node",
+                    state_message=None,
+                    progress=100,
+                    finished_at=datetime.now(timezone.utc),
+                )
                 return
             target_candidates = sorted(
                 worker_uuid
@@ -189,12 +226,32 @@ class ModelPreheatController:
             )
             if target_candidates or peer_candidates:
                 seed_uuid = (target_candidates or peer_candidates)[0]
-                _create_seed(session, task, all_workers[seed_uuid], inventory)
+                worker = all_workers[seed_uuid]
+                if not await _cas_parent_update(
+                    session,
+                    task,
+                    execution_state=ModelPreheatExecutionStateEnum.STAGING,
+                    local_cache_hit_worker_uuids=valid_targets,
+                    seed_worker_uuid=worker.worker_uuid,
+                    seed_worker_id=worker.id,
+                    seed_source=getattr(
+                        inventory.get(worker.worker_uuid), "source", None
+                    ),
+                    started_at=task.started_at or datetime.now(timezone.utc),
+                ):
+                    return
+                _add_seed_child(session, task, worker)
                 return
             if task.artifact_id and task.s3_manifest_path:
-                task.execution_state = ModelPreheatExecutionStateEnum.DISTRIBUTING
-                task.transfer_source = "s3"
-                task.transfer_profile_id = task.s3_profile_id
+                if not await _cas_parent_update(
+                    session,
+                    task,
+                    execution_state=ModelPreheatExecutionStateEnum.DISTRIBUTING,
+                    local_cache_hit_worker_uuids=valid_targets,
+                    transfer_source="s3",
+                    transfer_profile_id=task.s3_profile_id,
+                ):
+                    return
                 _create_distribution_tasks(session, task, targets, set(valid_targets))
                 return
             seed_uuid = (
@@ -202,7 +259,19 @@ class ModelPreheatController:
                 if task.seed_worker_uuid in targets
                 else sorted(targets)[0]
             )
-            _create_seed(session, task, targets[seed_uuid], inventory)
+            worker = targets[seed_uuid]
+            if not await _cas_parent_update(
+                session,
+                task,
+                execution_state=ModelPreheatExecutionStateEnum.STAGING,
+                local_cache_hit_worker_uuids=valid_targets,
+                seed_worker_uuid=worker.worker_uuid,
+                seed_worker_id=worker.id,
+                seed_source=getattr(inventory.get(worker.worker_uuid), "source", None),
+                started_at=task.started_at or datetime.now(timezone.utc),
+            ):
+                return
+            _add_seed_child(session, task, worker)
             return
 
         active_seed = next(
@@ -263,7 +332,50 @@ async def _current_workers(session):
         worker_uuid: worker
         for worker_uuid, worker in latest.items()
         if worker.state == WorkerStateEnum.READY
+        and worker.model_storage_protocol_version == MODEL_STORAGE_PROTOCOL_VERSION
     }
+
+
+async def _reload_running_task(session, task_id, attempt, execution_state):
+    return (
+        await session.exec(
+            select(ModelPreheatTask)
+            .where(
+                ModelPreheatTask.id == task_id,
+                ModelPreheatTask.attempt == attempt,
+                ModelPreheatTask.desired_state == ModelPreheatDesiredStateEnum.RUNNING,
+                ModelPreheatTask.execution_state == execution_state,
+            )
+            .execution_options(populate_existing=True)
+        )
+    ).first()
+
+
+async def _cas_parent_update(session, task, *, execution_state, **values):
+    result = await session.exec(
+        update(ModelPreheatTask)
+        .where(
+            ModelPreheatTask.id == task.id,
+            ModelPreheatTask.attempt == task.attempt,
+            ModelPreheatTask.desired_state == ModelPreheatDesiredStateEnum.RUNNING,
+            ModelPreheatTask.execution_state == task.execution_state,
+        )
+        .values(execution_state=execution_state, **values)
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
+
+
+def _add_seed_child(session, task, worker):
+    session.add(
+        ModelPreheatWorkerTask(
+            task_id=task.id,
+            parent_attempt=task.attempt,
+            worker_uuid=worker.worker_uuid,
+            worker_id=worker.id,
+            role=ModelPreheatWorkerTaskRoleEnum.SEED,
+        )
+    )
 
 
 def _create_seed(session, task, worker, inventory):

@@ -94,6 +94,7 @@ def execute_seed_preheat(
     s3_client,
     *,
     download_to_staging=None,
+    source_token=None,
     cancel_check=None,
     progress_callback=None,
 ):
@@ -120,15 +121,6 @@ def execute_seed_preheat(
                 )
                 if manifest.artifact_id != request.artifact_id:
                     return _error_result("local_manifest_conflict")
-                stored = s3_client.read_artifact_manifest_path(
-                    request.bucket, request.manifest_path
-                )
-                if (
-                    stored is None
-                    or stored.to_artifact_json_bytes()
-                    != manifest.to_artifact_json_bytes()
-                ):
-                    return _error_result("s3_manifest_invalid")
                 _install_staging(staging, request.target_dir, manifest)
                 _write_local_artifact_marker(request.cache_dir, manifest)
                 return _ready_result(
@@ -186,6 +178,8 @@ def execute_seed_preheat(
             downloader(
                 request.identity,
                 staging,
+                token=source_token,
+                exclude_patterns=request.exclude_patterns,
                 cancel_check=cancel_check,
                 progress_callback=progress_callback,
             )
@@ -397,9 +391,17 @@ def _write_local_artifact_marker(cache_dir, manifest):
     os.replace(temporary, target)
 
 
-def build_preheat_role_handlers(cache_dir: str | Path) -> dict:
+def build_preheat_role_handlers(
+    cache_dir: str | Path, huggingface_token: str | None = None
+) -> dict:
     async def seed_handler(payload, context):
-        return await _execute_payload(payload, context, cache_dir, seed=True)
+        return await _execute_payload(
+            payload,
+            context,
+            cache_dir,
+            seed=True,
+            huggingface_token=huggingface_token,
+        )
 
     async def target_handler(payload, context):
         return await _execute_payload(payload, context, cache_dir, seed=False)
@@ -408,15 +410,18 @@ def build_preheat_role_handlers(cache_dir: str | Path) -> dict:
 
 
 async def _execute_payload(
-    payload, context, cache_dir: str | Path, *, seed: bool
+    payload,
+    context,
+    cache_dir: str | Path,
+    *,
+    seed: bool,
+    huggingface_token: str | None = None,
 ) -> dict:
     from gpustack.worker.downloaders import preheat_model_target_dir
 
     task = payload.task
-    patterns = [decode_path(pattern) for pattern in task.get("include_patterns") or []]
-    exclude_patterns = [
-        decode_path(pattern) for pattern in (task.get("exclude_patterns") or [])
-    ]
+    patterns = list(task.get("include_patterns") or [])
+    exclude_patterns = list(task.get("exclude_patterns") or [])
     identity = ModelPreheatIdentity(
         source=task["source"],
         model_id=task["model_id"],
@@ -500,13 +505,18 @@ async def _execute_payload(
         )
         future.result()
 
+    execution_kwargs = {
+        "cancel_check": cancel_event.is_set,
+        "progress_callback": report_progress,
+    }
+    if seed:
+        execution_kwargs["source_token"] = huggingface_token
     worker = asyncio.create_task(
         asyncio.to_thread(
             execution,
             request_type(**request_fields),
             client,
-            cancel_check=cancel_event.is_set,
-            progress_callback=report_progress,
+            **execution_kwargs,
         )
     )
     try:

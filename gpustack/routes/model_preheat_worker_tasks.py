@@ -46,7 +46,7 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTaskStateEnum,
     is_terminal_task,
 )
-from gpustack.schemas.workers import Worker
+from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
 from gpustack.server.bus import EventType
 from gpustack.server.deps import EngineDep, ListParamsDep, SessionDep
 from gpustack.server.model_preheat_connectivity import aggregate_connectivity_check
@@ -756,6 +756,8 @@ async def _validate_current_registration(session, worker_uuid: str, worker_id: i
     ).first()
     if current is None or current.id != worker_id:
         _conflict("stale_worker_registration")
+    if current.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
+        _conflict("model_storage_protocol_mismatch")
     return current
 
 
@@ -976,7 +978,16 @@ def _is_current_registration(worker_uuid, worker_id):
         .where(Worker.worker_uuid == worker_uuid)
         .scalar_subquery()
     )
-    return latest_id == worker_id
+    return and_(
+        latest_id == worker_id,
+        exists(
+            select(Worker.id).where(
+                Worker.id == worker_id,
+                Worker.worker_uuid == worker_uuid,
+                Worker.model_storage_protocol_version == MODEL_STORAGE_PROTOCOL_VERSION,
+            )
+        ),
+    )
 
 
 def _validated_result(role, value):

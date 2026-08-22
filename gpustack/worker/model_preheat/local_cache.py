@@ -18,6 +18,7 @@ from gpustack.worker.model_preheat.manifest import (
     MAX_MANIFEST_BYTES,
     ManifestFile,
     ModelPreheatManifest,
+    parse_artifact_manifest,
 )
 
 
@@ -743,38 +744,7 @@ def _read_trusted_manifest(
 
 
 def _manifest_from_payload(payload: dict) -> ModelPreheatManifest:
-    if not isinstance(payload, dict) or not isinstance(payload.get("identity"), dict):
-        raise ValueError("invalid_manifest")
-    identity_payload = payload["identity"]
-    identity = ModelPreheatIdentity(
-        source=identity_payload["source"],
-        model_id=decode_path(identity_payload["model_id"]),
-        revision=decode_path(identity_payload["revision"]),
-        file_patterns=tuple(
-            decode_path(pattern) for pattern in identity_payload["file_patterns"]
-        ),
-    )
-    files = tuple(
-        ManifestFile(path=file["path"], size=file["size"], sha256=file["sha256"])
-        for file in payload["files"]
-    )
-    manifest = ModelPreheatManifest(
-        identity=identity,
-        files=files,
-        cache_key=payload["cache_key"],
-        selection_digest=payload["selection_digest"],
-        generation_id=payload["generation_id"],
-        exclude_patterns=tuple(
-            decode_path(pattern) for pattern in payload.get("exclude_patterns", [])
-        ),
-        requested_revision=decode_path(
-            payload.get("requested_revision", identity.revision_path)
-        ),
-        schema_version=payload.get("schema_version", 1),
-    )
-    if payload != manifest.to_dict():
-        raise ValueError("invalid_manifest")
-    return manifest
+    return parse_artifact_manifest(payload)
 
 
 def _verify_directory(

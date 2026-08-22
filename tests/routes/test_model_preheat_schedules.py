@@ -27,7 +27,6 @@ from gpustack.schemas.model_preheats import ModelPreheatCreate, ModelPreheatTask
 from gpustack.schemas.users import User
 from gpustack.server.db import get_session
 from gpustack.worker.downloaders import _preheat_file_selected
-from gpustack.worker.model_preheat.identity import decode_path
 
 
 def _load_schedule_migrations(prefix):
@@ -1117,20 +1116,26 @@ def test_schedule_patterns_survive_create_unrelated_patch_and_worker_matching(tm
         s3_profile_id=profile_id,
     )
     assert task_input.include_patterns == [
-        "%E9%85%8D%E7%BD%AE/%5B0-9%5D.json",
-        "dir%20with%20space/*.txt",
-        "weights/my%20model%3F.safetensors",
+        "配置/[0-9].json",
+        "dir with space/*.txt",
+        "weights/my model?.safetensors",
     ]
-    assert task_input.exclude_patterns == ["%E9%85%8D%E7%BD%AE/%5B5-9%5D.json"]
-    decoded_include = [decode_path(value) for value in task_input.include_patterns]
-    decoded_exclude = [decode_path(value) for value in task_input.exclude_patterns]
+    assert task_input.exclude_patterns == ["配置/[5-9].json"]
     assert _preheat_file_selected(
-        "weights/my model1.safetensors", decoded_include, decoded_exclude
+        "weights/my model1.safetensors",
+        task_input.include_patterns,
+        task_input.exclude_patterns,
     )
-    assert _preheat_file_selected("配置/3.json", decoded_include, decoded_exclude)
-    assert not _preheat_file_selected("配置/7.json", decoded_include, decoded_exclude)
     assert _preheat_file_selected(
-        "dir with space/readme.txt", decoded_include, decoded_exclude
+        "配置/3.json", task_input.include_patterns, task_input.exclude_patterns
+    )
+    assert not _preheat_file_selected(
+        "配置/7.json", task_input.include_patterns, task_input.exclude_patterns
+    )
+    assert _preheat_file_selected(
+        "dir with space/readme.txt",
+        task_input.include_patterns,
+        task_input.exclude_patterns,
     )
 
     asyncio.run(_drop_tables(engine))

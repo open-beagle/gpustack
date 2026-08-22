@@ -22,11 +22,11 @@ def test_huggingface_branch_resolves_to_commit_sha():
     assert resolved == "a" * 40
 
 
-def test_modelscope_revision_uses_validated_sdk_resolution():
+def test_modelscope_revision_uses_commit_when_sdk_proves_it():
     class FakeHubApi:
         def get_valid_revision(self, model_id, revision=None):
             assert (model_id, revision) == ("org/model", "release")
-            return "release-v1"
+            return "c" * 40
 
     resolved = resolve_model_preheat_revision(
         "modelscope",
@@ -35,27 +35,80 @@ def test_modelscope_revision_uses_validated_sdk_resolution():
         modelscope_api_factory=FakeHubApi,
     )
 
-    assert resolved == "release-v1"
+    assert resolved == "c" * 40
 
 
-@pytest.mark.parametrize("moving_revision", ["master", "main", "latest"])
-def test_modelscope_moving_revision_cannot_be_used_as_resolved_revision(
-    moving_revision,
-):
+def test_modelscope_moving_revision_uses_remote_file_fingerprint():
     class FakeHubApi:
         def get_valid_revision(self, model_id, revision=None):
-            return moving_revision
+            return revision or "master"
 
-    with pytest.raises(
-        ModelPreheatRevisionResolutionError,
-        match="remote_revision_resolution_failed",
-    ):
+    class FakeFileApi:
+        def __init__(self, blob_id):
+            self.blob_id = blob_id
+
+        def list_repo_files(self, model_id, repo_type, *, revision, recursive):
+            assert (model_id, repo_type, revision, recursive) == (
+                "org/model",
+                "model",
+                "release",
+                True,
+            )
+            return [
+                type(
+                    "File",
+                    (),
+                    {"path": "model.bin", "size": 10, "blob_id": self.blob_id},
+                )()
+            ]
+
+    first = resolve_model_preheat_revision(
+        "modelscope",
+        "org/model",
+        "release",
+        modelscope_api_factory=FakeHubApi,
+        modelscope_file_api_factory=lambda: FakeFileApi("a" * 64),
+    )
+    second = resolve_model_preheat_revision(
+        "modelscope",
+        "org/model",
+        "release",
+        modelscope_api_factory=FakeHubApi,
+        modelscope_file_api_factory=lambda: FakeFileApi("b" * 64),
+    )
+
+    assert first.startswith("modelscope-filelist-v1-")
+    assert second.startswith("modelscope-filelist-v1-")
+    assert first != second
+
+
+def test_modelscope_aliases_with_same_files_share_fingerprint():
+    class FakeHubApi:
+        def get_valid_revision(self, model_id, revision=None):
+            return revision
+
+    class FakeFileApi:
+        def list_repo_files(self, model_id, repo_type, *, revision, recursive):
+            return [
+                type(
+                    "File",
+                    (),
+                    {"path": "model.bin", "size": 10, "blob_id": "a" * 64},
+                )()
+            ]
+
+    resolved = {
         resolve_model_preheat_revision(
             "modelscope",
             "org/model",
-            moving_revision,
+            alias,
             modelscope_api_factory=FakeHubApi,
+            modelscope_file_api_factory=FakeFileApi,
         )
+        for alias in ("release", "stable")
+    }
+
+    assert len(resolved) == 1
 
 
 def test_revision_resolution_wraps_upstream_error_without_message():
@@ -86,7 +139,7 @@ def test_default_revision_is_resolved_for_both_hubs():
     class FakeHubApi:
         def get_valid_revision(self, model_id, revision=None):
             assert revision is None
-            return "master-fixed"
+            return "d" * 40
 
     assert (
         resolve_model_preheat_revision(
@@ -104,5 +157,5 @@ def test_default_revision_is_resolved_for_both_hubs():
             None,
             modelscope_api_factory=FakeHubApi,
         )
-        == "master-fixed"
+        == "d" * 40
     )

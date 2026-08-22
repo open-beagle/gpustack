@@ -593,12 +593,13 @@ class ModelPreheatCreate(SQLModel):
     @classmethod
     def normalize_patterns(cls, values: list[str]):
         try:
-            normalized = sorted(encode_path(value) for value in values)
+            normalized = sorted((encode_path(value), value) for value in values)
         except ModelPreheatIdentityError as exc:
             raise ValueError(str(exc)) from exc
-        if len(normalized) != len(set(normalized)):
+        encoded = [item[0] for item in normalized]
+        if len(encoded) != len(set(encoded)):
             raise ValueError("duplicate_pattern")
-        return normalized
+        return [item[1] for item in normalized]
 
     @model_validator(mode="after")
     def validate_target_scope(self):

@@ -30,11 +30,7 @@ def manifest_from_remote_revision(
     identity: ModelPreheatIdentity,
     files: list[RemoteRevisionFile],
     *,
-    cache_key: str,
-    selection_digest: str,
-    generation_id: str,
     exclude_patterns: tuple[str, ...] | list[str] = (),
-    requested_revision: str | None = None,
 ) -> ModelPreheatManifest:
     return ModelPreheatManifest(
         identity=identity,
@@ -51,11 +47,7 @@ def manifest_from_remote_revision(
                 key=lambda item: item.path,
             )
         ),
-        cache_key=cache_key,
-        selection_digest=selection_digest,
-        generation_id=generation_id,
         exclude_patterns=exclude_patterns,
-        requested_revision=requested_revision,
     )
 
 

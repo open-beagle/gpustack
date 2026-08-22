@@ -24,7 +24,11 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTaskRoleEnum,
     ModelPreheatWorkerTaskStateEnum,
 )
-from gpustack.schemas.workers import Worker, WorkerStateEnum
+from gpustack.schemas.workers import (
+    MODEL_STORAGE_PROTOCOL_VERSION,
+    Worker,
+    WorkerStateEnum,
+)
 from gpustack.server.bus import EventType
 from gpustack.server.model_preheat_connectivity import (
     create_or_reuse_connectivity_check,
@@ -102,6 +106,8 @@ class ModelPreheatWorkerReconciler:
             worker_uuids = [
                 worker.worker_uuid
                 for worker in await current_registered_workers(session)
+                if worker.model_storage_protocol_version
+                == MODEL_STORAGE_PROTOCOL_VERSION
             ]
         for worker_uuid in worker_uuids:
             await self.reconcile_worker(worker_uuid)
@@ -152,7 +158,11 @@ class ModelPreheatWorkerReconciler:
                 return
             workers = await current_registered_workers(session)
         for worker in workers:
-            if worker.state == WorkerStateEnum.READY:
+            if (
+                worker.state == WorkerStateEnum.READY
+                and worker.model_storage_protocol_version
+                == MODEL_STORAGE_PROTOCOL_VERSION
+            ):
                 await self._evaluate_worker(worker, policy_ids=[policy_id])
         async with AsyncSession(self._engine) as session:
             policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
@@ -166,13 +176,29 @@ class ModelPreheatWorkerReconciler:
             worker = await _latest_worker(session, worker_uuid)
             if worker is None:
                 return
-            if worker.state != WorkerStateEnum.READY:
-                await _record_worker_state(session, worker)
+            if (
+                worker.state != WorkerStateEnum.READY
+                or worker.model_storage_protocol_version
+                != MODEL_STORAGE_PROTOCOL_VERSION
+            ):
+                await _record_worker_state(
+                    session,
+                    worker,
+                    force_not_ready=(
+                        worker.model_storage_protocol_version
+                        != MODEL_STORAGE_PROTOCOL_VERSION
+                    ),
+                )
                 return
         await self._ensure_connectivity_checks(worker)
         async with AsyncSession(self._engine) as session:
             current = await _latest_worker(session, worker_uuid)
-            if current is None or current.id != worker.id:
+            if (
+                current is None
+                or current.id != worker.id
+                or current.model_storage_protocol_version
+                != MODEL_STORAGE_PROTOCOL_VERSION
+            ):
                 return
             await _record_worker_state(session, current)
             worker = await _latest_worker(session, worker_uuid)
@@ -201,6 +227,8 @@ class ModelPreheatWorkerReconciler:
                 )
 
     async def _evaluate_worker(self, worker, policy_ids=None):
+        if worker.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
+            return
         async with AsyncSession(self._engine) as session:
             statement = select(ModelPreheatDistributionPolicy).where(
                 ModelPreheatDistributionPolicy.enabled.is_(True)
@@ -254,6 +282,8 @@ class ModelPreheatWorkerReconciler:
                     != policy.profile_config_version
                     or current_worker is None
                     or current_worker.id != worker.id
+                    or current_worker.model_storage_protocol_version
+                    != MODEL_STORAGE_PROTOCOL_VERSION
                     or source_task.execution_state
                     != ModelPreheatExecutionStateEnum.READY
                 ):
@@ -400,6 +430,8 @@ def _selectors_for_task(task):
 
 
 def _policy_matches_worker(policy, worker):
+    if worker.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
+        return False
     selected_uuids = set(policy.worker_selector.get("worker_uuids", []))
     if selected_uuids and worker.worker_uuid not in selected_uuids:
         return False
@@ -554,10 +586,10 @@ async def _latest_worker(session, worker_uuid):
     ).first()
 
 
-async def _record_worker_state(session, worker):
+async def _record_worker_state(session, worker, *, force_not_ready=False):
     fingerprint = _network_fingerprint(worker)
     observation = await session.get(ModelPreheatWorkerObservation, worker.worker_uuid)
-    is_ready = worker.state == WorkerStateEnum.READY
+    is_ready = worker.state == WorkerStateEnum.READY and not force_not_ready
     if observation is None:
         observation = ModelPreheatWorkerObservation(
             worker_uuid=worker.worker_uuid,

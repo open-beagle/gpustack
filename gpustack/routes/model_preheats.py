@@ -39,7 +39,7 @@ from gpustack.schemas.model_preheats import (
     operation_key_for,
     selection_digest,
 )
-from gpustack.schemas.workers import Worker
+from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
 from gpustack.server.deps import CurrentAdminUserDep, ListParamsDep, SessionDep
 from gpustack.server.model_preheat_idempotency import (
     canonical_request_hash,
@@ -435,7 +435,11 @@ async def _active_task_for_operation(session, operation_key: str):
 
 
 async def _resolve_target_workers(session, task_in: ModelPreheatCreate):
-    ready_workers = await current_ready_workers(session)
+    ready_workers = [
+        worker
+        for worker in await current_ready_workers(session)
+        if worker.model_storage_protocol_version == MODEL_STORAGE_PROTOCOL_VERSION
+    ]
     if not ready_workers:
         raise InvalidException(message="no_online_workers")
     workers_by_id = {worker.id: worker for worker in ready_workers}

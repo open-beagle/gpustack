@@ -71,6 +71,7 @@ async def _add_worker(session, worker_uuid):
         port=10150,
         worker_uuid=worker_uuid,
         state=WorkerStateEnum.READY,
+        model_storage_protocol_version=1,
     )
     session.add(worker)
     await session.flush()

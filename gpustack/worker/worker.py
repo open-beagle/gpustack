@@ -246,13 +246,18 @@ class Worker:
         model_storage_sync_manager = ModelStorageSyncManager(
             worker_id=self._worker_id, clientset=self._clientset, cfg=self._config
         )
-        self._create_async_task(model_storage_sync_manager.watch_model_storage_sync_tasks())
+        self._create_async_task(
+            model_storage_sync_manager.watch_model_storage_sync_tasks()
+        )
 
         model_preheat_manager = ModelPreheatManager(
             worker_id=self._worker_id,
             worker_uuid=self._worker_uuid,
             clientset=self._clientset,
-            role_handlers=build_preheat_role_handlers(self._config.cache_dir),
+            role_handlers=build_preheat_role_handlers(
+                self._config.cache_dir,
+                huggingface_token=self._config.huggingface_token,
+            ),
             idle_check=serve_manager.is_idle,
         )
         self._create_async_task(model_preheat_manager.watch_model_preheat_tasks())
