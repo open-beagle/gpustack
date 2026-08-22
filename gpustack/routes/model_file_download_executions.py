@@ -36,11 +36,15 @@ from gpustack.schemas.model_preheats import (
 from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
 from gpustack.server.deps import SessionDep
 from gpustack.server.model_preheat_revision import resolve_model_preheat_revision
+from gpustack.server.model_storage_scan_spec import compute_scan_spec
 from gpustack.server.model_preheat_worker_identity import (
     ModelPreheatWorkerPrincipal,
     get_model_preheat_worker_identity,
 )
-from gpustack.worker.model_preheat.identity import decode_path, encode_path
+from gpustack.worker.model_preheat.identity import (
+    ModelPreheatIdentityError,
+    encode_path,
+)
 
 
 router = APIRouter()
@@ -138,13 +142,24 @@ async def _claim_pending_execution(request, session, execution, model_file, iden
             resolved_revision = await _resolve_revision(
                 request, source, model_id, requested_revision
             )
+            expected_include_patterns = (
+                await _resolve_artifact_selection(
+                    request,
+                    source,
+                    model_id,
+                    resolved_revision,
+                    request_identity.get("include_patterns") or [],
+                )
+                if execution.default_profile_id is not None
+                else None
+            )
             artifact = await _exact_artifact(
                 session,
                 execution,
                 source,
                 model_id,
                 resolved_revision,
-                request_identity.get("include_patterns") or [],
+                expected_include_patterns,
                 request_identity.get("exclude_patterns") or [],
             )
             artifact_id = artifact.artifact_id if artifact is not None else None
@@ -252,16 +267,86 @@ async def _resolve_revision(request, source, model_id, requested_revision) -> st
         ) from None
 
 
+async def _resolve_artifact_selection(
+    request, source, model_id, resolved_revision, requested_patterns
+):
+    if not requested_patterns:
+        return []
+    lister = getattr(
+        request.app.state,
+        "model_file_download_file_listing_resolver",
+        _list_revision_files,
+    )
+    try:
+        files = await asyncio.to_thread(
+            lister,
+            source,
+            model_id,
+            resolved_revision,
+            token=getattr(request.app.state.server_config, "huggingface_token", None),
+        )
+    except Exception:
+        raise ServiceUnavailableException(
+            message="file_selection_resolution_unavailable"
+        ) from None
+
+    valid_files = []
+    try:
+        for path in files:
+            if isinstance(path, str):
+                encode_path(path)
+                valid_files.append(path)
+    except ModelPreheatIdentityError:
+        return None
+    selected = sorted(
+        {
+            path
+            for path in valid_files
+            if any(fnmatch.fnmatch(path, pattern) for pattern in requested_patterns)
+        }
+    )
+    if not selected:
+        return None
+    try:
+        _, concrete_patterns = compute_scan_spec(
+            [f"/repository/{path}" for path in selected],
+            repository_complete=False,
+        )
+        return sorted(encode_path(pattern) for pattern in concrete_patterns)
+    except ValueError:
+        # 任务 3 无法表达跨父目录或重名源路径时，不存在可精确复用的 Artifact。
+        return None
+
+
+def _list_revision_files(source, model_id, resolved_revision, *, token=None):
+    if source == "huggingface":
+        from huggingface_hub import HfApi
+
+        return HfApi(token=token).list_repo_files(
+            repo_id=model_id, revision=resolved_revision
+        )
+
+    from modelscope_hub.api import HubApi
+
+    rows = HubApi().list_repo_files(
+        model_id,
+        "model",
+        revision=resolved_revision,
+        recursive=True,
+    )
+    return [row.path if hasattr(row, "path") else str(row) for row in rows]
+
+
 async def _exact_artifact(
     session,
     execution,
     source,
     model_id,
     resolved_revision,
-    include_patterns,
+    expected_include_patterns,
     exclude_patterns,
 ):
-    if execution.default_profile_id is None:
+    if execution.default_profile_id is None or expected_include_patterns is None:
         return None
     rows = (
         await session.exec(
@@ -279,42 +364,15 @@ async def _exact_artifact(
             )
         )
     ).all()
+    expected_include = sorted(expected_include_patterns)
     expected_exclude = sorted(encode_path(item) for item in exclude_patterns)
     matched = [
         row
         for row in rows
-        if _artifact_selection_matches(row.include_patterns, include_patterns)
+        if list(row.include_patterns) == expected_include
         and list(row.exclude_patterns) == expected_exclude
     ]
     return matched[0] if len(matched) == 1 else None
-
-
-def _artifact_selection_matches(artifact_patterns, requested_patterns) -> bool:
-    """匹配普通下载的 glob 与任务 3 固定的具体文件名/子树 pattern。"""
-    requested = list(requested_patterns or [])
-    actual = list(artifact_patterns or [])
-    if not requested:
-        return not actual
-
-    roots = {pattern for pattern in actual if not pattern.endswith("/**")}
-    expected_actual = {pattern for root in roots for pattern in (root, f"{root}/**")}
-    if set(actual) != expected_actual or len(actual) != len(expected_actual):
-        return False
-
-    decoded_roots = [decode_path(root) for root in roots]
-    if not decoded_roots:
-        return False
-    if any(
-        not any(fnmatch.fnmatchcase(root, pattern) for pattern in requested)
-        for root in decoded_roots
-    ):
-        return False
-
-    required = [pattern for pattern in requested if "mmproj" not in pattern.lower()]
-    return all(
-        any(fnmatch.fnmatchcase(root, pattern) for root in decoded_roots)
-        for pattern in required
-    )
 
 
 def _execution_profile(request, execution):

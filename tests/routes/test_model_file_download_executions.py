@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel, select
@@ -60,6 +61,9 @@ def _app(tmp_path):
     )
     app.state.model_file_download_revision_resolver = (
         lambda source, model_id, revision, token=None: SHA
+    )
+    app.state.model_file_download_file_listing_resolver = (
+        lambda source, model_id, revision, token=None: ["model.gguf"]
     )
 
     async def session_override():
@@ -215,6 +219,73 @@ def test_claim_matches_task3_concrete_file_selection(tmp_path):
     )
     assert response.status_code == 200
     assert response.json()["artifact_id"] == "b" * 64
+    asyncio.run(engine.dispose())
+
+
+@pytest.mark.parametrize(
+    ("artifact_patterns", "expected_artifact_id"),
+    [
+        (["model-1.gguf", "model-1.gguf/**"], None),
+        (
+            [
+                "model-1.gguf",
+                "model-1.gguf/**",
+                "model-2.gguf",
+                "model-2.gguf/**",
+            ],
+            "d" * 64,
+        ),
+    ],
+)
+def test_claim_requires_complete_artifact_for_glob_selection(
+    tmp_path, artifact_patterns, expected_artifact_id
+):
+    app, engine, key = _app(tmp_path)
+    _, model_file_id, _ = asyncio.run(_seed(engine, key, filename="*.gguf"))
+    app.state.model_file_download_file_listing_resolver = (
+        lambda source, model_id, revision, token=None: [
+            "model-1.gguf",
+            "model-2.gguf",
+        ]
+    )
+
+    async def seed_incomplete_artifact():
+        async with AsyncSession(engine) as session:
+            execution = (
+                await session.exec(
+                    select(ModelFileDownloadExecution).where(
+                        ModelFileDownloadExecution.model_file_id == model_file_id
+                    )
+                )
+            ).one()
+            session.add(
+                ModelPreheatArtifact(
+                    profile_id=execution.default_profile_id,
+                    profile_config_version=execution.default_profile_config_version,
+                    artifact_id="d" * 64,
+                    source="huggingface",
+                    model_id="org/model",
+                    resolved_revision=SHA,
+                    include_patterns=artifact_patterns,
+                    exclude_patterns=[],
+                    manifest_path="storage/huggingface/org/model/"
+                    + "d" * 64
+                    + "/manifest.json",
+                    manifest_digest="e" * 64,
+                    file_count=len(artifact_patterns) // 2,
+                    total_size=12,
+                    manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                    last_verified_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed_incomplete_artifact())
+    response = TestClient(app).post(
+        f"/v1/model-files/{model_file_id}/download-executions/claim"
+    )
+    assert response.status_code == 200
+    assert response.json()["artifact_id"] == expected_artifact_id
     asyncio.run(engine.dispose())
 
 
