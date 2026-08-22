@@ -47,6 +47,7 @@ def new_idempotency_record(
     request_hash: str,
     resource_id: int,
     response_status: int = 200,
+    resource_type: str = "model_preheat_task",
 ) -> Optional[ModelPreheatIdempotencyRecord]:
     if not idempotency_key:
         return None
@@ -55,7 +56,7 @@ def new_idempotency_record(
         operation=operation,
         idempotency_key=idempotency_key,
         request_hash=request_hash,
-        resource_type="model_preheat_task",
+        resource_type=resource_type,
         resource_id=resource_id,
         response_status=response_status,
         expires_at=datetime.now(timezone.utc) + IDEMPOTENCY_TTL,

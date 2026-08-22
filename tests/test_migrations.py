@@ -6,7 +6,8 @@ from gpustack.migrations.validate import validate_revision_graph
 
 
 def test_alembic_revision_graph_has_one_resolvable_head():
-    assert validate_revision_graph() == "c1d2e3f4a5b6"
+    # 任务 3 定向复审后追加 lease migration：唯一 head 前移到 lease revision。
+    assert validate_revision_graph() == "e3f4a5b6c7d8"
 
 
 def test_alembic_upgrades_existing_model_cache_head_to_schedule_head(tmp_path):

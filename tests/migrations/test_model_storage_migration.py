@@ -32,6 +32,10 @@ from gpustack.migrations.validate import validate_revision_graph
 # 收敛 migration 前置基线 head。
 BASELINE_HEAD = "b0307846729c"
 UNIFY_REVISION = "c1d2e3f4a5b6"
+# 任务 3 子阶段 B：活动同步任务数据库级去重槽（新增 head）。
+DEDUPE_REVISION = "d2e3f4a5b6c7"
+# 任务 3 定向复审：同步任务执行 lease 与完成结果固定字段（新增 head）。
+LEASE_REVISION = "e3f4a5b6c7d8"
 
 MIGRATION_ROOT = (
     Path(__file__).resolve().parents[2] / "gpustack/migrations/versions"
@@ -41,6 +45,7 @@ NEW_TABLES = (
     "model_preheat_artifacts",
     "model_storage_sync_tasks",
     "model_file_download_executions",
+    "model_storage_sync_task_dedupe_slots",
 )
 DROPPED_TABLES = (
     "model_cache_tasks",
@@ -192,8 +197,9 @@ def _table_names(engine) -> set:
         return set(sa.inspect(connection).get_table_names())
 
 
-def test_revision_graph_heads_at_unify_revision():
-    assert validate_revision_graph() == UNIFY_REVISION
+def test_revision_graph_heads_at_lease_revision():
+    # 任务 3 定向复审后追加 lease migration：唯一 head 前移到 lease revision。
+    assert validate_revision_graph() == LEASE_REVISION
 
 
 def test_upgrade_creates_unified_tables_and_drops_legacy(tmp_path):
@@ -206,7 +212,7 @@ def test_upgrade_creates_unified_tables_and_drops_legacy(tmp_path):
     with engine.connect() as connection:
         assert (
             connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-            == UNIFY_REVISION
+            == LEASE_REVISION
         )
 
 
@@ -476,7 +482,22 @@ def test_downgrade_restores_empty_structure(tmp_path):
 
 
 def _migration_columns() -> dict:
-    tree = ast.parse((MIGRATION_ROOT / f"2026_08_20_1000-{UNIFY_REVISION}_unify_model_storage.py").read_text())
+    files = (
+        MIGRATION_ROOT / f"2026_08_20_1000-{UNIFY_REVISION}_unify_model_storage.py",
+        MIGRATION_ROOT / f"2026_08_20_1100-{DEDUPE_REVISION}_add_model_storage_sync_dedupe_slots.py",
+        MIGRATION_ROOT / f"2026_08_22_1000-{LEASE_REVISION}_add_model_storage_sync_lease.py",
+    )
+    # 多文件对同一表的列定义需**合并**（create_table 全量 + add_column 增量），
+    # 而不是后者覆盖前者。
+    merged: dict = {}
+    for path in files:
+        for name, columns in _migration_file_columns(path).items():
+            merged.setdefault(name, set()).update(columns)
+    return merged
+
+
+def _migration_file_columns(path: Path) -> dict:
+    tree = ast.parse(path.read_text())
     columns: dict = {}
     for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
         if not isinstance(call.func, ast.Attribute) or not call.args:
@@ -491,6 +512,23 @@ def _migration_columns() -> dict:
                 and arg.args
                 and isinstance(arg.args[0], ast.Constant)
             }
+        # op.add_column("table", sa.Column("col", ...))：增量加列 migration。
+        elif (
+            call.func.attr == "add_column"
+            and isinstance(call.args[0], ast.Constant)
+        ):
+            table = call.args[0].value
+            new_columns = set()
+            for arg in call.args[1:]:
+                if (
+                    isinstance(arg, ast.Call)
+                    and isinstance(arg.func, ast.Attribute)
+                    and arg.func.attr == "Column"
+                    and arg.args
+                    and isinstance(arg.args[0], ast.Constant)
+                ):
+                    new_columns.add(arg.args[0].value)
+            columns.setdefault(table, set()).update(new_columns)
     return columns
 
 
@@ -506,6 +544,7 @@ def test_new_tables_match_schema_on_all_supported_dialects():
     models = (
         model_preheats.ModelPreheatArtifact,
         model_storage_sync.ModelStorageSyncTask,
+        model_storage_sync.ModelStorageSyncTaskDedupeSlot,
         download.ModelFileDownloadExecution,
     )
     for model in models:
