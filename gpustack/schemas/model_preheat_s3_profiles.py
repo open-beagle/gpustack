@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from pydantic import field_validator
 from pydantic import computed_field
-from sqlalchemy import Column, String, UniqueConstraint
+from sqlalchemy import Column, Enum as SQLEnum, String, UniqueConstraint
 from sqlmodel import Field, SQLModel, Text
 
 from gpustack.mixins import BaseModelMixin
@@ -154,7 +154,16 @@ class ModelPreheatS3Profile(ModelPreheatS3ProfileBase, BaseModelMixin, table=Tru
     provisioning_key: Optional[str] = None
     system_managed: bool = False
     lifecycle_state: ModelPreheatS3ProfileLifecycleStateEnum = Field(
-        default=ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
+        default=ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE,
+        sa_column=Column(
+            SQLEnum(
+                ModelPreheatS3ProfileLifecycleStateEnum,
+                values_callable=lambda enum_class: [item.value for item in enum_class],
+                native_enum=False,
+                length=32,
+            ),
+            nullable=False,
+        ),
     )
     active_storage_key: Optional[str] = Field(
         default=None, sa_column=Column(String(64), nullable=True)
