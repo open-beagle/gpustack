@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from fastapi import APIRouter, Depends, FastAPI
+from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 import pytest
@@ -638,6 +638,21 @@ async def _set_task_terminal(app, task_id, **fields):
         await session.commit()
 
 
+async def _change_profile_target(app, profile_id):
+    async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+        profile = await session.get(ModelPreheatS3Profile, profile_id)
+        profile.endpoint = "https://new-s3.example.com"
+        profile.bucket = "new-models"
+        profile.prefix = "new-prefix"
+        profile.config_version += 1
+        session.add(profile)
+        await session.commit()
+
+
+def _request(app):
+    return Request({"type": "http", "app": app})
+
+
 def test_detail_separates_source_transfer_profile_and_worker(app, client):
     profile_id, model_file_id = _run(app, _seed_ids(app))
     created = client.post(
@@ -657,17 +672,109 @@ def test_detail_separates_source_transfer_profile_and_worker(app, client):
             **{"source_worker_id": created.json()["worker_id"]},
         ),
     )
+    # 当前 Profile 后续修改不得改写任务历史目标。
+    _run(app, _change_profile_target(app, profile_id))
     response = client.get(DETAIL.format(id=task_id))
     assert response.status_code == 200
     body = response.json()
     assert body["source"] == "modelscope"
     assert body["transfer_source"] == "s3"
     assert body["profile"]["id"] == profile_id
+    assert body["profile"]["name"] == "center-cache"
+    assert body["profile"]["endpoint"] == "https://s3.example.com"
+    assert body["profile"]["bucket"] == "models"
+    assert body["profile"]["prefix"] == ""
     assert body["profile"]["config_version"] == 3
     assert body["source_worker_id"] == body["worker_id"]
     assert body["source_worker_name"] == "worker-a"
     assert body["artifact_id"] == "a" * 64
+    assert "access_key" not in body["profile"]
+    assert "secret_key" not in body["profile"]
     assert "credential_snapshot_encrypted" not in body
+
+    listing = client.get(API).json()["items"][0]
+    assert listing["source_worker_name"] == "worker-a"
+    assert listing["profile_name"] == "center-cache"
+    assert listing["profile_endpoint"] == "https://s3.example.com"
+    assert listing["profile_bucket"] == "models"
+    assert listing["profile_prefix"] == ""
+    assert listing["started_at"] is None
+    assert listing["finished_at"] is None
+    assert "access_key" not in listing
+    assert "secret_key" not in listing
+
+    async def initial_stream_event():
+        stream = model_storage._stream_sync_tasks(
+            _engine(app), cipher=_cipher_from_app(app)
+        )
+        try:
+            return json.loads(await anext(stream))
+        finally:
+            await stream.aclose()
+
+    stream_data = _run(app, initial_stream_event())["data"]
+    assert stream_data["source_worker_name"] == "worker-a"
+    assert stream_data["profile_name"] == "center-cache"
+    assert stream_data["profile_endpoint"] == "https://s3.example.com"
+    assert stream_data["profile_bucket"] == "models"
+    assert stream_data["profile_prefix"] == ""
+    assert "access_key" not in stream_data
+    assert "secret_key" not in stream_data
+    assert "credential_snapshot_encrypted" not in stream_data
+
+
+def test_sync_history_decryption_unavailable_degrades_without_credentials(app, client):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = client.post(
+        API, json={"model_file_id": model_file_id, "profile_id": profile_id}
+    )
+    task_id = created.json()["id"]
+
+    original_key = app.state.server_config.model_preheat_credential_key
+    app.state.server_config.model_preheat_credential_key = None
+    try:
+        detail_response = client.get(DETAIL.format(id=task_id))
+        list_response = client.get(API)
+        assert detail_response.status_code == 200
+        assert list_response.status_code == 200
+
+        detail = detail_response.json()
+        listing = list_response.json()["items"][0]
+        assert detail["profile"]["id"] == profile_id
+        assert detail["profile"]["name"] == "center-cache"
+        assert detail["profile"]["config_version"] == 3
+        for field in ("endpoint", "bucket", "prefix"):
+            assert detail["profile"][field] is None
+            assert listing[f"profile_{field}"] is None
+
+        async def initial_stream_event():
+            stream = model_storage._stream_sync_tasks(
+                _engine(app), cipher=_cipher_from_app(app)
+            )
+            try:
+                return json.loads(await anext(stream))
+            finally:
+                await stream.aclose()
+
+        stream_data = _run(app, initial_stream_event())["data"]
+        assert stream_data["profile_name"] == "center-cache"
+        for field in ("endpoint", "bucket", "prefix"):
+            assert stream_data[f"profile_{field}"] is None
+
+        serialized = json.dumps(
+            {"detail": detail, "listing": listing, "stream": stream_data}
+        )
+        for forbidden in (
+            "AK",
+            "SK",
+            "access_key",
+            "secret_key",
+            "credential_snapshot_encrypted",
+            "lease_token_encrypted",
+        ):
+            assert forbidden not in serialized
+    finally:
+        app.state.server_config.model_preheat_credential_key = original_key
 
 
 def test_cancel_active_task_marks_canceled(app, client):
@@ -959,6 +1066,7 @@ def test_worker_execution_payload_returns_credentials_only_for_authorized(app):
             response = client.get(WORKER_EXEC.format(id=task_id))
             assert response.status_code == 200, response.text
             body = response.json()
+            assert body["state"] == "publishing"
             # 执行 payload 含明文 S3 凭据与可信本地源路径。
             assert body["profile"]["access_key"] == "AK"
             assert body["source_paths"] == ["/models/Qwen/Test"]
@@ -971,6 +1079,18 @@ def test_worker_execution_payload_returns_credentials_only_for_authorized(app):
             }
             assert "/models/" not in json.dumps(body["request_identity"])
             assert response.headers.get("cache-control") == "no-store"
+            detail = client.get(DETAIL.format(id=task_id)).json()
+            assert detail["state"] == "publishing"
+            assert detail["started_at"] is not None
+            first_started_at = detail["started_at"]
+
+            replay = client.get(WORKER_EXEC.format(id=task_id))
+            assert replay.status_code == 200
+            assert replay.json()["state"] == "publishing"
+            assert (
+                client.get(DETAIL.format(id=task_id)).json()["started_at"]
+                == first_started_at
+            )
 
         async def used_at():
             async with AsyncSession(app.state.test_engine) as session:
@@ -978,6 +1098,33 @@ def test_worker_execution_payload_returns_credentials_only_for_authorized(app):
                 return profile.ever_used_at
 
         assert _run(app, used_at()) is not None
+    finally:
+        app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
+
+
+def test_worker_execution_payload_rejects_terminal_task(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = _create_task(app, profile_id, model_file_id)
+    worker_id, worker_uuid = created["worker_id"], created["worker_uuid"]
+    _run(
+        app,
+        _set_task_terminal(
+            app,
+            created["id"],
+            state=ModelStorageSyncTaskStateEnum.CANCELED,
+            finished_at=datetime.now(timezone.utc),
+        ),
+    )
+
+    async def override():
+        return _worker_principal(worker_id, worker_uuid)
+
+    app.dependency_overrides[get_model_preheat_worker_identity] = override
+    try:
+        with TestClient(app) as client:
+            response = client.get(WORKER_EXEC.format(id=created["id"]))
+            assert response.status_code == 409
+            assert response.json()["message"] == "sync_task_already_terminal"
     finally:
         app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
 
@@ -1154,7 +1301,7 @@ def test_worker_tasks_root_watch_route_uses_authenticated_principal_fields(
     """私有根 watch 端点：watch 分支把认证 principal 的 worker_id/worker_uuid
     作为 ``streaming`` 字段传入，并返回 SSE 响应。
 
-    直接调用路由函数并 mock ``ModelStorageSyncTask.streaming``（返回有限
+    直接调用路由函数并 mock ``_stream_sync_tasks``（返回有限
     异步生成器），不驱动真实无限 SSE 流，从而：
     - 断言 watch 分支以认证 Worker 的 ``worker_id``/``worker_uuid`` 过滤
       （身份隔离的唯一数据来源）；
@@ -1173,14 +1320,13 @@ def test_worker_tasks_root_watch_route_uses_authenticated_principal_fields(
 
     captured: dict = {}
 
-    async def fake_streaming(
-        cls, engine, fields=None, fuzzy_fields=None, filter_func=None
-    ):
+    async def fake_streaming(engine, fields=None, cipher=None):
         captured["fields"] = fields
+        captured["cipher"] = cipher
         yield '{"type":"CREATED","data":{"id":1}}\n\n'
         yield  # 让生成器正常结束，避免无限流
 
-    monkeypatch.setattr(ModelStorageSyncTask, "streaming", classmethod(fake_streaming))
+    monkeypatch.setattr(model_storage, "_stream_sync_tasks", fake_streaming)
 
     # watch 分支：字段必须来自认证 principal。
     params = ListParams(page=1, perPage=100, watch=True)
@@ -1192,6 +1338,7 @@ def test_worker_tasks_root_watch_route_uses_authenticated_principal_fields(
     def call_and_consume(worker_id):
         response = asyncio.run(
             model_storage.list_or_watch_model_storage_sync_tasks(
+                request=_request(app),
                 engine=_engine(app),
                 session=None,
                 params=params,
@@ -1210,6 +1357,7 @@ def test_worker_tasks_root_watch_route_uses_authenticated_principal_fields(
     }
     call_and_consume(None)
     assert captured["fields"] == expected_fields
+    assert isinstance(captured["cipher"], ModelPreheatCredentialCipher)
 
     # 客户端 worker_id 与 principal 一致：合法，仍按 principal 字段过滤。
     captured.clear()
@@ -1221,6 +1369,7 @@ def test_worker_tasks_root_watch_route_uses_authenticated_principal_fields(
     with pytest.raises(HTTPException) as excinfo:
         asyncio.run(
             model_storage.list_or_watch_model_storage_sync_tasks(
+                request=_request(app),
                 engine=_engine(app),
                 session=None,
                 params=params,

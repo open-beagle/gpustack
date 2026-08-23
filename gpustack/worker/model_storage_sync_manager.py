@@ -1,6 +1,6 @@
 """Worker 侧模型同步执行器（任务 3 步骤 2）。
 
-监听本 Worker 的模型同步任务（``worker_id`` 匹配、``state=pending``），
+监听本 Worker 的模型同步任务（``worker_id`` 匹配、``state=pending/publishing``），
 通过受 Worker 身份约束的 ``execution-payload`` 端点拉取一次性执行配置
 （解密后的 S3 连接配置 + **冻结**的文件选择扫描规约），扫描本地模型并调用任务 1 的统一
 发布器（:meth:`ModelPreheatS3Client.publish_artifact` +
@@ -97,7 +97,11 @@ class ModelStorageSyncManager:
                 active[1].set()
             return
         if (
-            task.state != ModelStorageSyncTaskStateEnum.PENDING
+            task.state
+            not in {
+                ModelStorageSyncTaskStateEnum.PENDING,
+                ModelStorageSyncTaskStateEnum.PUBLISHING,
+            }
             or task.id in self._active
         ):
             return

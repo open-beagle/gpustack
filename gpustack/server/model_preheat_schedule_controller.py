@@ -24,6 +24,7 @@ from gpustack.schemas.model_preheat_schedules import (
     ModelPreheatScheduleRun,
     ModelPreheatScheduleRunStateEnum,
     ModelPreheatScheduleRunTriggerEnum,
+    ModelPreheatScheduleTriggerModeEnum,
     next_window_start_utc,
     window_end_utc,
 )
@@ -116,7 +117,9 @@ class ModelPreheatScheduleController:
             schedule_ids = (
                 await session.exec(
                     select(ModelPreheatSchedule.id).where(
-                        ModelPreheatSchedule.enabled.is_(True)
+                        ModelPreheatSchedule.enabled.is_(True),
+                        ModelPreheatSchedule.trigger_mode
+                        == ModelPreheatScheduleTriggerModeEnum.SCHEDULED,
                     )
                 )
             ).all()
@@ -143,6 +146,8 @@ class ModelPreheatScheduleController:
     ) -> ModelPreheatScheduleRun:
         if not self._feature_enabled():
             raise ScheduleDisabled("model_preheat_disabled")
+        if not schedule.enabled:
+            raise ScheduleDisabled("model_preheat_schedule_disabled")
         operation_key = manual_run_operation_key(created_by_user_id, idempotency_key)
         now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         schedule_id = schedule.id
@@ -373,7 +378,12 @@ class ModelPreheatScheduleController:
         while True:
             async with AsyncSession(self._engine) as session:
                 schedule = await session.get(ModelPreheatSchedule, schedule_id)
-                if schedule is None or not schedule.enabled:
+                if (
+                    schedule is None
+                    or not schedule.enabled
+                    or schedule.trigger_mode
+                    != ModelPreheatScheduleTriggerModeEnum.SCHEDULED
+                ):
                     return
                 window_start = schedule.next_window_start_utc
                 if window_start is None:
@@ -440,7 +450,11 @@ class ModelPreheatScheduleController:
             await session.commit()
             return run
         schedule = await session.get(ModelPreheatSchedule, schedule_id)
-        if schedule is None or not schedule.enabled:
+        if (
+            schedule is None
+            or not schedule.enabled
+            or schedule.trigger_mode != ModelPreheatScheduleTriggerModeEnum.SCHEDULED
+        ):
             await session.rollback()
             return None
         slot = await self._available_slot(session, schedule)
@@ -573,6 +587,8 @@ class ModelPreheatScheduleController:
             .where(
                 ModelPreheatSchedule.id == schedule.id,
                 ModelPreheatSchedule.enabled.is_(True),
+                ModelPreheatSchedule.trigger_mode
+                == ModelPreheatScheduleTriggerModeEnum.SCHEDULED,
                 ModelPreheatSchedule.next_window_start_utc == window_start,
             )
             .values(

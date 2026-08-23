@@ -108,11 +108,22 @@ async def _stream_model_files(engine, fields=None, filter_func=None):
         if event.type == EventType.HEARTBEAT:
             yield "\n\n"
             continue
-        if not ModelFile._match_fields(event, fields):
-            continue
-        if filter_func and not ModelFile._safe_filter(filter_func, event.data):
-            continue
         async with AsyncSession(engine) as session:
+            if (
+                event.type != EventType.CREATED
+                and getattr(event.data, "id", None) is not None
+                and (
+                    getattr(event.data, "created_at", None) is None
+                    or getattr(event.data, "updated_at", None) is None
+                )
+            ):
+                persisted = await session.get(ModelFile, event.data.id)
+                if persisted is not None:
+                    event.data = persisted
+            if not ModelFile._match_fields(event, fields):
+                continue
+            if filter_func and not ModelFile._safe_filter(filter_func, event.data):
+                continue
             event.data = (await _model_files_public(session, [event.data]))[0]
         yield ModelFile._format_event(event)
 

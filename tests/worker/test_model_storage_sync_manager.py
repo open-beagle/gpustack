@@ -213,7 +213,7 @@ def test_handle_event_filters_other_workers_and_non_pending(tmp_path):
         )
     )
     assert manager._active == {}
-    # 本 Worker 但非 pending：忽略。
+    # 本 Worker 但非可执行状态：忽略。
     manager._handle_event(
         Event(
             type=EventType.CREATED,
@@ -221,6 +221,50 @@ def test_handle_event_filters_other_workers_and_non_pending(tmp_path):
         )
     )
     assert manager._active == {}
+
+
+def test_initial_publishing_event_is_resumed_once_after_worker_restart(
+    tmp_path, monkeypatch
+):
+    """Worker 重启后的初始 publishing 快照会重领 payload，重复事件不重复执行。"""
+    from gpustack.server.bus import Event, EventType
+
+    manager = _make_manager(tmp_path)
+    scheduled = []
+
+    class _Placeholder:
+        def add_done_callback(self, callback):
+            pass
+
+    def _fake_create_task(coro):
+        scheduled.append(coro)
+        coro.close()
+        return _Placeholder()
+
+    monkeypatch.setattr(msm.asyncio, "create_task", _fake_create_task)
+    task = ModelStorageSyncTaskPublic(
+        id=8,
+        model_file_id=1,
+        worker_id=7,
+        worker_uuid="worker-a-uuid",
+        profile_id=1,
+        profile_config_version=1,
+        request_digest="d" * 64,
+        source="modelscope",
+        model_id="Qwen/Test",
+        resolved_revision="sha",
+        state=ModelStorageSyncTaskStateEnum.PUBLISHING,
+        file_count=0,
+        total_size=0,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    manager._handle_event(Event(type=EventType.CREATED, data=task.model_dump()))
+    manager._handle_event(Event(type=EventType.UPDATED, data=task.model_dump()))
+
+    assert len(scheduled) == 1
+    assert 8 in manager._active
 
 
 def test_handle_event_cancel_via_updated_stops_active_task(tmp_path, monkeypatch):

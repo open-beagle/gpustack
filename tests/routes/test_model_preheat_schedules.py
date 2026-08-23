@@ -262,6 +262,23 @@ def test_schedule_input_rejects_invalid_time_and_concurrency():
         with pytest.raises(ValueError):
             ModelPreheatScheduleCreate(**(base | update))
 
+    manual = ModelPreheatScheduleCreate(
+        **(
+            base
+            | {
+                "name": "manual",
+                "trigger_mode": "manual",
+                "cron_expression": None,
+            }
+        )
+    )
+    assert manual.trigger_mode.value == "manual"
+    assert manual.cron_expression is None
+    with pytest.raises(ValueError, match="cron_expression_required"):
+        ModelPreheatScheduleCreate(
+            **(base | {"cron_expression": None, "trigger_mode": "scheduled"})
+        )
+
 
 def test_model_preheat_feature_flag_defaults_off_and_accepts_explicit_enable(tmp_path):
     assert Config(data_dir=str(tmp_path)).model_preheat_enabled is False
@@ -321,6 +338,8 @@ def test_schedule_schema_and_migration_are_portable():
         "operation_key",
     ]
     assert ModelPreheatScheduleRun.__table__.c.operation_key.nullable is False
+    assert ModelPreheatSchedule.__table__.c.cron_expression.nullable is True
+    assert ModelPreheatSchedule.__table__.c.trigger_mode.nullable is False
     assert "uix_preheat_schedule_run_operation" in unique_constraints
     assert "uix_preheat_schedule_slot" in unique_constraints
     task_schedule_fk = next(
@@ -344,6 +363,66 @@ def test_schedule_schema_and_migration_are_portable():
             .split()
         )
         assert "operation_key VARCHAR(64) NOT NULL" in run_ddl
+
+
+def test_schedule_trigger_mode_migration_preserves_scheduled_and_allows_manual(
+    tmp_path,
+):
+    migration_path = Path(
+        "gpustack/migrations/versions/"
+        "2026_08_23_1800-e9f0a1b2c3d4_add_schedule_trigger_mode.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "schedule_trigger_mode_migration", migration_path
+    )
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    engine = create_engine(f"sqlite:///{tmp_path / 'trigger-mode.db'}")
+
+    with engine.connect() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE model_preheat_schedules ("
+            "id INTEGER PRIMARY KEY, cron_expression VARCHAR(255) NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO model_preheat_schedules "
+            "(id, cron_expression) VALUES (1, '0 1 * * *')"
+        )
+        context = MigrationContext.configure(connection)
+        migration.op = Operations(context)
+        migration.upgrade()
+
+        columns = {
+            column["name"]: column
+            for column in inspect(connection).get_columns("model_preheat_schedules")
+        }
+        assert columns["cron_expression"]["nullable"] is True
+        assert columns["trigger_mode"]["nullable"] is False
+        assert (
+            connection.exec_driver_sql(
+                "SELECT trigger_mode FROM model_preheat_schedules WHERE id = 1"
+            ).scalar_one()
+            == "scheduled"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO model_preheat_schedules "
+            "(id, trigger_mode, cron_expression) VALUES (2, 'manual', NULL)"
+        )
+
+        migration.downgrade()
+        columns = {
+            column["name"]: column
+            for column in inspect(connection).get_columns("model_preheat_schedules")
+        }
+        assert "trigger_mode" not in columns
+        assert columns["cron_expression"]["nullable"] is False
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM model_preheat_schedules "
+                "WHERE cron_expression IS NULL"
+            ).scalar_one()
+            == 0
+        )
 
 
 def test_schedule_migration_executes_on_sqlite_and_compiles_for_server_dialects(
@@ -1092,6 +1171,54 @@ def test_schedule_admin_crud_validates_profile_and_hides_internal_keys(tmp_path)
     assert "must-not-leak" not in str(created.json())
     assert deleted.status_code == 200
     assert missing.status_code == 404
+
+
+def test_manual_schedule_can_be_saved_without_cron_and_run_now(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id = asyncio.run(_seed_profile(engine))
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/model-preheat-schedules",
+            json=_payload(
+                profile_id,
+                name="manual-policy",
+                trigger_mode="manual",
+                cron_expression=None,
+            ),
+        )
+        missing_cron = client.patch(
+            f"/v1/model-preheat-schedules/{created.json()['id']}",
+            json={"trigger_mode": "scheduled"},
+        )
+        scheduled = client.patch(
+            f"/v1/model-preheat-schedules/{created.json()['id']}",
+            json={"trigger_mode": "scheduled", "cron_expression": "0 2 * * *"},
+        )
+        manual_again = client.patch(
+            f"/v1/model-preheat-schedules/{created.json()['id']}",
+            json={"trigger_mode": "manual"},
+        )
+        run = client.post(
+            f"/v1/model-preheat-schedules/{created.json()['id']}/run-now",
+            headers={"Idempotency-Key": "manual-run"},
+        )
+
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+    assert created.status_code == 200, created.text
+    assert created.json()["trigger_mode"] == "manual"
+    assert created.json()["cron_expression"] is None
+    assert created.json()["next_window_start_utc"] is None
+    assert missing_cron.status_code == 422
+    assert scheduled.status_code == 200, scheduled.text
+    assert scheduled.json()["next_window_start_utc"] is not None
+    assert manual_again.status_code == 200, manual_again.text
+    assert manual_again.json()["cron_expression"] is None
+    assert manual_again.json()["next_window_start_utc"] is None
+    assert run.status_code == 200, run.text
+    assert run.json()["trigger"] == "manual"
 
 
 def test_schedule_patterns_survive_create_unrelated_patch_and_worker_matching(tmp_path):

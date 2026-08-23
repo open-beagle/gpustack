@@ -31,6 +31,7 @@ from sqlalchemy import and_, update
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
@@ -818,6 +819,7 @@ async def _bind_idempotency_key_to_existing_task(
 
 @router.get("/model-storage-sync-tasks", response_model=ModelStorageSyncTasksPublic)
 async def list_model_storage_sync_tasks(
+    request: Request,
     engine: EngineDep,
     session: SessionDep,
     params: ListParamsDep,
@@ -834,14 +836,22 @@ async def list_model_storage_sync_tasks(
         fields["state"] = state
     if params.watch:
         return StreamingResponse(
-            ModelStorageSyncTask.streaming(engine, fields=fields),
+            _stream_sync_tasks(
+                engine, fields=fields, cipher=_cipher_from_request(request)
+            ),
             media_type="text/event-stream",
         )
-    return await ModelStorageSyncTask.paginated_by_query(
+    page = await ModelStorageSyncTask.paginated_by_query(
         session=session,
         fields=fields,
         page=params.page,
         per_page=params.perPage,
+    )
+    return ModelStorageSyncTasksPublic(
+        items=await _sync_tasks_public(
+            session, page.items, _cipher_from_request(request)
+        ),
+        pagination=page.pagination,
     )
 
 
@@ -849,11 +859,11 @@ async def list_model_storage_sync_tasks(
     "/model-storage-sync-tasks/{id}",
     response_model=ModelStorageSyncTaskDetail,
 )
-async def get_model_storage_sync_task(session: SessionDep, id: int):
+async def get_model_storage_sync_task(request: Request, session: SessionDep, id: int):
     task = await ModelStorageSyncTask.one_by_id(session, id)
     if task is None:
         raise NotFoundException(message="model_storage_sync_task_not_found")
-    return await _to_detail(session, task)
+    return await _to_detail(session, task, _cipher_from_request(request))
 
 
 async def _latest_ready_worker_for_model_file(session, model_file: ModelFile) -> Worker:
@@ -1154,7 +1164,7 @@ def _to_public(task: ModelStorageSyncTask) -> ModelStorageSyncTaskPublic:
         total_size=task.total_size,
         transfer_source=task.transfer_source,
         transfer_profile_id=task.transfer_profile_id,
-        source_worker_id=task.source_worker_id,
+        source_worker_id=task.source_worker_id or task.worker_id,
         created_at=task.created_at,
         updated_at=task.updated_at,
         started_at=task.started_at,
@@ -1162,21 +1172,106 @@ def _to_public(task: ModelStorageSyncTask) -> ModelStorageSyncTaskPublic:
     )
 
 
-async def _to_detail(session, task: ModelStorageSyncTask) -> ModelStorageSyncTaskDetail:
+async def _sync_tasks_public(session, tasks, cipher):
+    profile_ids = {task.profile_id for task in tasks}
+    worker_ids = {task.source_worker_id or task.worker_id for task in tasks}
+    profiles = {}
+    if profile_ids:
+        profile_rows = (
+            await session.exec(
+                select(ModelPreheatS3Profile).where(
+                    ModelPreheatS3Profile.id.in_(profile_ids)
+                )
+            )
+        ).all()
+        profiles = {profile.id: profile for profile in profile_rows}
+    workers = {}
+    if worker_ids:
+        worker_rows = (
+            await session.exec(select(Worker).where(Worker.id.in_(worker_ids)))
+        ).all()
+        workers = {worker.id: worker for worker in worker_rows}
+
+    result = []
+    for task in tasks:
+        public = _to_public(task)
+        profile = profiles.get(task.profile_id)
+        frozen_profile = _frozen_sync_profile(task, cipher)
+        source_worker_id = task.source_worker_id or task.worker_id
+        worker = workers.get(source_worker_id)
+        result.append(
+            public.model_copy(
+                update={
+                    "source_worker_name": worker.name if worker is not None else None,
+                    "profile_name": profile.name if profile is not None else None,
+                    "profile_endpoint": frozen_profile.get("endpoint"),
+                    "profile_bucket": frozen_profile.get("bucket"),
+                    "profile_prefix": frozen_profile.get("prefix"),
+                }
+            )
+        )
+    return result
+
+
+async def _stream_sync_tasks(engine, fields=None, cipher=None):
+    async for event in ModelStorageSyncTask.subscribe(engine):
+        if event.type == EventType.HEARTBEAT:
+            yield "\n\n"
+            continue
+        if not ModelStorageSyncTask._match_fields(event, fields):
+            continue
+        async with AsyncSession(engine) as session:
+            event.data = (await _sync_tasks_public(session, [event.data], cipher))[0]
+        yield ModelStorageSyncTask._format_event(event)
+
+
+def _frozen_sync_profile(task, cipher):
+    if cipher is None or not hasattr(task, "credential_snapshot_encrypted"):
+        return {}
+    try:
+        snapshot = _decrypt_execution_snapshot(cipher, task)
+    except (ModelPreheatCredentialError, KeyError, TypeError, ValueError):
+        return {}
+    return {
+        field: snapshot.get(field)
+        for field in (
+            "endpoint",
+            "bucket",
+            "prefix",
+            "tls_enabled",
+            "tls_verify",
+            "region",
+            "use_virtual_hosted_style",
+        )
+    }
+
+
+async def _to_detail(
+    session, task: ModelStorageSyncTask, cipher
+) -> ModelStorageSyncTaskDetail:
     profile = await ModelPreheatS3Profile.one_by_id(session, task.profile_id)
+    frozen_profile = _frozen_sync_profile(task, cipher)
     profile_public = (
         ModelStorageSyncTaskProfilePublic(
             id=profile.id,
             name=profile.name,
-            config_version=profile.config_version,
+            endpoint=frozen_profile.get("endpoint"),
+            bucket=frozen_profile.get("bucket"),
+            prefix=frozen_profile.get("prefix"),
+            tls_enabled=frozen_profile.get("tls_enabled"),
+            tls_verify=frozen_profile.get("tls_verify"),
+            region=frozen_profile.get("region"),
+            use_virtual_hosted_style=frozen_profile.get("use_virtual_hosted_style"),
+            config_version=task.profile_config_version,
             system_managed=profile.system_managed,
         )
         if profile is not None
         else None
     )
     source_worker_name = None
-    if task.source_worker_id is not None:
-        source_worker = await Worker.one_by_id(session, task.source_worker_id)
+    source_worker_id = task.source_worker_id or task.worker_id
+    if source_worker_id is not None:
+        source_worker = await Worker.one_by_id(session, source_worker_id)
         if source_worker is not None:
             source_worker_name = source_worker.name
     return ModelStorageSyncTaskDetail(
@@ -1192,7 +1287,7 @@ async def _to_detail(session, task: ModelStorageSyncTask) -> ModelStorageSyncTas
         profile=profile_public,
         transfer_source=task.transfer_source,
         transfer_profile_id=task.transfer_profile_id,
-        source_worker_id=task.source_worker_id,
+        source_worker_id=source_worker_id,
         source_worker_name=source_worker_name,
         artifact_id=task.artifact_id,
         state=task.state,
@@ -1308,6 +1403,7 @@ def _minio_client_factory(
     response_model=ModelStorageSyncTasksPublic,
 )
 async def list_or_watch_model_storage_sync_tasks(
+    request: Request,
     engine: EngineDep,
     session: SessionDep,
     params: ListParamsDep,
@@ -1334,7 +1430,9 @@ async def list_or_watch_model_storage_sync_tasks(
     }
     if params.watch:
         return StreamingResponse(
-            ModelStorageSyncTask.streaming(engine, fields=fields),
+            _stream_sync_tasks(
+                engine, fields=fields, cipher=_cipher_from_request(request)
+            ),
             media_type="text/event-stream",
         )
     page = await ModelStorageSyncTask.paginated_by_query(
@@ -1346,7 +1444,9 @@ async def list_or_watch_model_storage_sync_tasks(
     # 显式 Public 转换：逐条转为 Public schema（ORM → Public），
     # 敏感字段不进入响应。
     return ModelStorageSyncTasksPublic(
-        items=[_to_public(item) for item in page.items],
+        items=await _sync_tasks_public(
+            session, page.items, _cipher_from_request(request)
+        ),
         pagination=page.pagination,
     )
 
@@ -1386,7 +1486,70 @@ async def get_model_storage_sync_execution_payload(
     if current is None or current.id != task.worker_id:
         raise HTTPException(403, "worker_not_current", "worker_not_current")
 
-    # 签发执行 payload 即表示 Worker 将开始真实存储操作；只允许 NULL -> 时间。
+    if task.state in _TERMINAL_STATES:
+        raise ConflictException(message="sync_task_already_terminal")
+    if task.state not in {
+        ModelStorageSyncTaskStateEnum.PENDING,
+        ModelStorageSyncTaskStateEnum.PUBLISHING,
+    }:
+        raise ConflictException(message="sync_task_conflict")
+
+    cipher = _cipher_from_request(request)
+    try:
+        snapshot = _decrypt_execution_snapshot(cipher, task)
+        profile = _execution_profile_from_snapshot(cipher, snapshot)
+    except (ModelPreheatCredentialError, KeyError, TypeError, ValueError):
+        raise ServiceUnavailableException(message="execution_credentials_unavailable")
+    if task.lease_token_encrypted is None:
+        raise ServiceUnavailableException(message="execution_credentials_unavailable")
+    try:
+        lease_token = cipher.decrypt(task.lease_token_encrypted)
+    except (ModelPreheatCredentialError, KeyError, TypeError, ValueError):
+        raise ServiceUnavailableException(message="execution_credentials_unavailable")
+
+    # 领取与开始时间使用状态 CAS；并发重复领取在 publishing 状态幂等返回同一
+    # 冻结 payload，终态和其他中间状态不得重新领取。
+    now = datetime.now(timezone.utc)
+    transitioned = False
+    if task.state == ModelStorageSyncTaskStateEnum.PENDING:
+        claim = await session.exec(
+            update(ModelStorageSyncTask)
+            .where(
+                ModelStorageSyncTask.id == task.id,
+                ModelStorageSyncTask.worker_uuid == identity.worker_uuid,
+                ModelStorageSyncTask.state == ModelStorageSyncTaskStateEnum.PENDING,
+            )
+            .values(
+                state=ModelStorageSyncTaskStateEnum.PUBLISHING,
+                started_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if claim.rowcount == 0:
+            await session.rollback()
+            task = await ModelStorageSyncTask.one_by_id(session, task_id)
+            if task is None:
+                raise NotFoundException(message="model_storage_sync_task_not_found")
+            if task.state in _TERMINAL_STATES:
+                raise ConflictException(message="sync_task_already_terminal")
+            if task.state != ModelStorageSyncTaskStateEnum.PUBLISHING:
+                raise ConflictException(message="sync_task_conflict")
+        else:
+            transitioned = True
+    elif task.started_at is None:
+        await session.exec(
+            update(ModelStorageSyncTask)
+            .where(
+                ModelStorageSyncTask.id == task.id,
+                ModelStorageSyncTask.worker_uuid == identity.worker_uuid,
+                ModelStorageSyncTask.state == ModelStorageSyncTaskStateEnum.PUBLISHING,
+                ModelStorageSyncTask.started_at.is_(None),
+            )
+            .values(started_at=now)
+            .execution_options(synchronize_session=False)
+        )
+
+    # 签发执行 payload 即表示 Worker 已开始真实存储操作；只允许 NULL -> 时间。
     await session.exec(
         update(ModelPreheatS3Profile)
         .where(
@@ -1399,21 +1562,8 @@ async def get_model_storage_sync_execution_payload(
     task = await ModelStorageSyncTask.one_by_id(session, task_id)
     if task is None:
         raise NotFoundException(message="model_storage_sync_task_not_found")
-
-    cipher = _cipher_from_request(request)
-    try:
-        snapshot = _decrypt_execution_snapshot(cipher, task)
-        profile = _execution_profile_from_snapshot(cipher, snapshot)
-    except (ModelPreheatCredentialError, KeyError, TypeError, ValueError):
-        raise ServiceUnavailableException(message="execution_credentials_unavailable")
-    if task.lease_token_encrypted is None:
-        # lease 快照缺失（密钥不可用/历史数据）：无法签发可校验的一次性
-        # lease，稳定失败而不是发放无保护凭据。
-        raise ServiceUnavailableException(message="execution_credentials_unavailable")
-    try:
-        lease_token = cipher.decrypt(task.lease_token_encrypted)
-    except (ModelPreheatCredentialError, KeyError, TypeError, ValueError):
-        raise ServiceUnavailableException(message="execution_credentials_unavailable")
+    if transitioned:
+        await ModelStorageSyncTask._publish_event(EventType.UPDATED, task)
     response.headers["Cache-Control"] = "no-store"
     # 物理执行语义来自加密私有快照；canonical request_identity 不含绝对路径。
     scan_spec = snapshot.get("scan_spec") or {}

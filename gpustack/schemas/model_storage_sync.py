@@ -155,6 +155,11 @@ class ModelStorageSyncTaskPublic(SQLModel):
     transfer_source: Optional[ModelFileTransferSourceEnum] = None
     transfer_profile_id: Optional[int] = None
     source_worker_id: Optional[int] = None
+    source_worker_name: Optional[str] = None
+    profile_name: Optional[str] = None
+    profile_endpoint: Optional[str] = None
+    profile_bucket: Optional[str] = None
+    profile_prefix: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     started_at: Optional[datetime] = None
@@ -237,6 +242,13 @@ class ModelStorageSyncTaskProfilePublic(SQLModel):
 
     id: int
     name: str
+    endpoint: Optional[str] = None
+    bucket: Optional[str] = None
+    prefix: Optional[str] = None
+    tls_enabled: Optional[bool] = None
+    tls_verify: Optional[bool] = None
+    region: Optional[str] = None
+    use_virtual_hosted_style: Optional[bool] = None
     config_version: int
     system_managed: bool
 

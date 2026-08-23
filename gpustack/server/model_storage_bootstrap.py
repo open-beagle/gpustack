@@ -102,7 +102,16 @@ def parse_local_s3_target(config) -> Optional[dict]:
     endpoint = _build_endpoint(host, getattr(config, "worker_local_s3_ssl", False))
     parsed = urlparse(prefix_uri)
     bucket = parsed.netloc
-    prefix = normalize_model_preheat_s3_prefix(parsed.path.strip("/"))
+    legacy_modelscope_prefix = normalize_model_preheat_s3_prefix(parsed.path.strip("/"))
+    prefix_parts = (
+        legacy_modelscope_prefix.split("/") if legacy_modelscope_prefix else []
+    )
+    # worker-local-s3-modelscope-prefix 指向旧 ModelScope 镜像根，而统一 Artifact
+    # 布局会自行追加 source=modelscope。只在该配置边界剥离末段精确 source，
+    # 不对任意路径做全局重复段去重。
+    if prefix_parts and prefix_parts[-1].lower() == "modelscope":
+        prefix_parts.pop()
+    prefix = "/".join(prefix_parts)
     if not endpoint or not bucket:
         return None
     return {

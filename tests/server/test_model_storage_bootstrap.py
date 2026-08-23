@@ -38,6 +38,7 @@ from gpustack.server.model_storage_bootstrap import (
     bootstrap_worker_local_s3_profile,
     parse_local_s3_target,
 )
+from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
 def _config(**overrides):
@@ -117,6 +118,39 @@ def test_parse_local_s3_target_fallback_false_and_ssl():
     assert target["bucket"] == "custom-bucket"
     assert target["prefix"] == "cache/prefix"
     assert target["source_fallback_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "uri,expected_prefix",
+    [
+        ("s3://bd-wind/cache/modelscope", "cache"),
+        ("s3://bd-wind/modelscope", ""),
+        ("s3://bd-wind//cache//ModelScope///", "cache"),
+        ("s3://bd-wind/cache/modelscope/modelscope", "cache/modelscope"),
+        ("s3://bd-wind/cache/huggingface", "cache/huggingface"),
+    ],
+)
+def test_parse_local_s3_target_separates_legacy_modelscope_root(uri, expected_prefix):
+    config = _config(worker_local_s3_modelscope_prefix=uri)
+
+    target = parse_local_s3_target(config)
+
+    assert target["prefix"] == expected_prefix
+    assert config.worker_local_s3_modelscope_prefix == uri
+
+
+def test_legacy_modelscope_root_produces_single_source_segment_in_unified_key():
+    target = parse_local_s3_target(
+        _config(worker_local_s3_modelscope_prefix="s3://bd-wind/cache/modelscope")
+    )
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="Qwen/Test",
+        revision="commit",
+        file_patterns=(),
+    )
+
+    assert identity.artifact_prefix(target["prefix"]) == "cache/modelscope/Qwen/Test"
 
 
 def test_parse_local_s3_target_not_configured():

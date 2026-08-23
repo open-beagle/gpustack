@@ -26,6 +26,11 @@ class ModelPreheatScheduleRunTriggerEnum(str, Enum):
     MANUAL = "manual"
 
 
+class ModelPreheatScheduleTriggerModeEnum(str, Enum):
+    MANUAL = "manual"
+    SCHEDULED = "scheduled"
+
+
 class ModelPreheatScheduleRunStateEnum(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -42,7 +47,13 @@ class ModelPreheatSchedule(SQLModel, BaseModelMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(sa_column=Column(String(255), nullable=False))
     enabled: bool = True
-    cron_expression: str = Field(sa_column=Column(String(255), nullable=False))
+    trigger_mode: ModelPreheatScheduleTriggerModeEnum = Field(
+        default=ModelPreheatScheduleTriggerModeEnum.SCHEDULED,
+        sa_column=Column(String(32), nullable=False),
+    )
+    cron_expression: Optional[str] = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
     timezone: str = Field(sa_column=Column(String(64), nullable=False))
     window_duration_minutes: int
     max_concurrency: int = 1
@@ -148,7 +159,10 @@ class ModelPreheatScheduleRun(SQLModel, BaseModelMixin, table=True):
 
 class ModelPreheatScheduleBase(SQLModel):
     name: str
-    cron_expression: str
+    trigger_mode: ModelPreheatScheduleTriggerModeEnum = (
+        ModelPreheatScheduleTriggerModeEnum.SCHEDULED
+    )
+    cron_expression: Optional[str] = None
     timezone: str = "UTC"
     window_duration_minutes: int = Field(ge=1, le=10080)
     max_concurrency: int = Field(default=1, ge=1, le=32)
@@ -180,6 +194,8 @@ class ModelPreheatScheduleBase(SQLModel):
     @field_validator("cron_expression")
     @classmethod
     def validate_cron_expression(cls, value):
+        if value is None:
+            return None
         try:
             CronTrigger.from_crontab(value, timezone=timezone.utc)
         except (TypeError, ValueError) as exc:
@@ -238,6 +254,11 @@ class ModelPreheatScheduleBase(SQLModel):
 
     @model_validator(mode="after")
     def validate_target(self):
+        if self.trigger_mode == ModelPreheatScheduleTriggerModeEnum.SCHEDULED:
+            if self.cron_expression is None:
+                raise ValueError("cron_expression_required")
+        else:
+            self.cron_expression = None
         if (
             self.target_scope == ModelPreheatTargetScopeEnum.SELECTED_WORKERS
             and not self.target_worker_uuids
@@ -271,6 +292,7 @@ class ModelPreheatScheduleUpdate(SQLModel):
 
     name: Optional[str] = None
     enabled: Optional[bool] = None
+    trigger_mode: Optional[ModelPreheatScheduleTriggerModeEnum] = None
     cron_expression: Optional[str] = None
     timezone: Optional[str] = None
     window_duration_minutes: Optional[int] = Field(default=None, ge=1, le=10080)
@@ -328,6 +350,11 @@ ModelPreheatScheduleRunsPublic = PaginatedList[ModelPreheatScheduleRunPublic]
 def next_window_start_utc(schedule, after: datetime) -> datetime:
     if after.tzinfo is None:
         raise ValueError("timezone_aware_datetime_required")
+    if (
+        schedule.trigger_mode != ModelPreheatScheduleTriggerModeEnum.SCHEDULED
+        or schedule.cron_expression is None
+    ):
+        raise ValueError("scheduled_trigger_required")
     zone = ZoneInfo(schedule.timezone)
     trigger = CronTrigger.from_crontab(schedule.cron_expression, timezone=zone)
     cursor = (after.astimezone(timezone.utc) + timedelta(microseconds=1)).astimezone(

@@ -17,6 +17,7 @@ from gpustack.schemas.model_preheat_schedules import (
     ModelPreheatSchedule,
     ModelPreheatScheduleRun,
     ModelPreheatScheduleRunStateEnum,
+    ModelPreheatScheduleTriggerModeEnum,
 )
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
@@ -81,12 +82,22 @@ async def _add_worker(session, worker_uuid):
     return worker
 
 
-async def _seed_schedule(engine, *, max_concurrency=1):
+async def _seed_schedule(
+    engine,
+    *,
+    max_concurrency=1,
+    trigger_mode=ModelPreheatScheduleTriggerModeEnum.SCHEDULED,
+):
     async with AsyncSession(engine) as session:
         await _add_worker(session, "worker-a")
         schedule = ModelPreheatSchedule(
             name="hourly",
-            cron_expression="0 * * * *",
+            trigger_mode=trigger_mode,
+            cron_expression=(
+                "0 * * * *"
+                if trigger_mode == ModelPreheatScheduleTriggerModeEnum.SCHEDULED
+                else None
+            ),
             timezone="UTC",
             window_duration_minutes=30,
             max_concurrency=max_concurrency,
@@ -100,13 +111,44 @@ async def _seed_schedule(engine, *, max_concurrency=1):
             seed_worker_uuid="worker-a",
             s3_profile_id=1,
             s3_backfill_policy=ModelPreheatBackfillPolicyEnum.WHEN_MISSING,
-            next_window_start_utc=datetime(2026, 8, 12, 0, 0, tzinfo=UTC),
+            next_window_start_utc=(
+                datetime(2026, 8, 12, 0, 0, tzinfo=UTC)
+                if trigger_mode == ModelPreheatScheduleTriggerModeEnum.SCHEDULED
+                else None
+            ),
             created_by_user_id=1,
         )
         session.add(schedule)
         await session.commit()
         await session.refresh(schedule)
         return schedule.id
+
+
+def test_manual_schedule_is_not_ticked_but_can_run_now(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        schedule_id = await _seed_schedule(
+            engine, trigger_mode=ModelPreheatScheduleTriggerModeEnum.MANUAL
+        )
+        creator = RecordingTaskCreator()
+        controller = ModelPreheatScheduleController(engine, task_creator=creator)
+
+        await controller.tick(datetime(2026, 8, 12, 1, 0, tzinfo=UTC))
+        async with AsyncSession(engine) as session:
+            assert (await session.exec(select(ModelPreheatScheduleRun))).all() == []
+            schedule = await session.get(ModelPreheatSchedule, schedule_id)
+            manual_run = await controller.run_now(
+                session,
+                schedule,
+                created_by_user_id=1,
+                idempotency_key="manual-mode-run",
+                now=datetime(2026, 8, 12, 1, 0, tzinfo=UTC),
+            )
+            assert manual_run.state == ModelPreheatScheduleRunStateEnum.RUNNING
+        assert len(creator.calls) == 1
+        await engine.dispose()
+
+    asyncio.run(run())
 
 
 class RecordingTaskCreator:

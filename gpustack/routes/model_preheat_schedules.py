@@ -19,6 +19,7 @@ from gpustack.schemas.model_preheat_schedules import (
     ModelPreheatScheduleRun,
     ModelPreheatScheduleRunPublic,
     ModelPreheatScheduleRunStateEnum,
+    ModelPreheatScheduleTriggerModeEnum,
     ModelPreheatScheduleRunsPublic,
     ModelPreheatSchedulesPublic,
     ModelPreheatScheduleUpdate,
@@ -75,8 +76,11 @@ async def create_model_preheat_schedule(
         **schedule_in.model_dump(),
         created_by_user_id=current_user.id,
     )
-    schedule.next_window_start_utc = next_window_start_utc(
-        schedule_in, datetime.now(timezone.utc)
+    schedule.next_window_start_utc = (
+        next_window_start_utc(schedule_in, datetime.now(timezone.utc))
+        if schedule.enabled
+        and schedule.trigger_mode == ModelPreheatScheduleTriggerModeEnum.SCHEDULED
+        else None
     )
     session.add(schedule)
     try:
@@ -142,7 +146,9 @@ async def update_model_preheat_schedule(
     schedule = await _schedule_or_404(session, id)
     update_data = schedule_in.model_dump(exclude_unset=True)
     schedule_was_enabled = schedule.enabled
-    timing_changed = bool({"cron_expression", "timezone"} & update_data.keys())
+    timing_changed = bool(
+        {"trigger_mode", "cron_expression", "timezone"} & update_data.keys()
+    )
     enabled = update_data.pop("enabled", schedule.enabled)
     candidate_data = {
         field: getattr(schedule, field)
@@ -157,7 +163,10 @@ async def update_model_preheat_schedule(
     for field, value in candidate.model_dump().items():
         setattr(schedule, field, value)
     schedule.enabled = enabled
-    if not enabled:
+    if (
+        not enabled
+        or schedule.trigger_mode == ModelPreheatScheduleTriggerModeEnum.MANUAL
+    ):
         schedule.next_window_start_utc = None
     elif not schedule_was_enabled or timing_changed:
         schedule.next_window_start_utc = next_window_start_utc(

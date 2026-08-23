@@ -14,6 +14,7 @@ from gpustack.routes.model_files import (
     get_model_file,
     update_model_file,
 )
+from gpustack.server.bus import EventType
 from gpustack.schemas.links import ModelInstanceModelFileLink
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
 from gpustack.schemas.model_storage_sync import (
@@ -145,6 +146,20 @@ async def _run_model_file_crud(tmp_path):
         assert updated_event["data"]["state_message"] == "ordinary-update"
         assert updated_event["data"]["transfer_profile_name"] == "center-cache"
         assert updated_event["data"]["source_worker_name"] == "worker-a"
+
+        next_event = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0.05)
+        incomplete_event = ModelFile(
+            id=created.id,
+            source=SourceEnum.LOCAL_PATH,
+            local_path="/models/original.gguf",
+            worker_id=worker.id,
+            state=ModelFileStateEnum.READY,
+        )
+        await ModelFile._publish_event(EventType.UPDATED, incomplete_event)
+        reloaded_event = json.loads(await asyncio.wait_for(next_event, timeout=2))
+        assert reloaded_event["data"]["created_at"] is not None
+        assert reloaded_event["data"]["updated_at"] is not None
         await stream.aclose()
 
         sync_task = ModelStorageSyncTask(
