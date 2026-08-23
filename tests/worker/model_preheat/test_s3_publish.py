@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from minio import Minio
+from minio.datatypes import Part
 import urllib3
 
 from gpustack.worker.model_preheat.identity import (
@@ -16,15 +17,12 @@ from gpustack.worker.model_preheat.identity import (
 )
 from gpustack.worker.model_preheat.manifest import (
     ManifestFile,
-    ModelPreheatManifest,
     build_model_preheat_manifest,
 )
 from gpustack.worker.model_preheat.s3_client import (
     ModelPreheatCanceled,
-    ModelPreheatS3ManifestConflict,
     ModelPreheatS3Client,
     ModelPreheatS3Conflict,
-    ModelPreheatS3ManifestError,
 )
 
 
@@ -222,6 +220,86 @@ class ExecuteConditionalMinio(BasicMinio):
 
 class NoConditionalMinio(BasicMinio):
     pass
+
+
+class ResumableMultipartMinio(BasicMinio):
+    def __init__(self):
+        super().__init__()
+        self.uploads = {}
+        self.part_uploads = []
+        self.failed_once = False
+
+    def _list_multipart_uploads(self, bucket_name, prefix=None, **kwargs):
+        del kwargs
+        uploads = [
+            SimpleNamespace(
+                object_name=upload["object_name"],
+                upload_id=upload_id,
+                initiated_time=None,
+            )
+            for upload_id, upload in self.uploads.items()
+            if upload["bucket_name"] == bucket_name
+            and upload["object_name"].startswith(prefix or "")
+        ]
+        return SimpleNamespace(uploads=uploads, is_truncated=False)
+
+    def _create_multipart_upload(self, bucket_name, object_name, headers):
+        upload_id = f"upload-{len(self.uploads) + 1}"
+        self.uploads[upload_id] = {
+            "bucket_name": bucket_name,
+            "object_name": object_name,
+            "headers": headers,
+            "parts": {},
+        }
+        return upload_id
+
+    def _list_parts(self, bucket_name, object_name, upload_id, **kwargs):
+        del bucket_name, object_name, kwargs
+        parts = [
+            Part(number, hashlib.md5(data).hexdigest(), size=len(data))
+            for number, data in sorted(self.uploads[upload_id]["parts"].items())
+        ]
+        return SimpleNamespace(
+            parts=parts,
+            is_truncated=False,
+            next_part_number_marker=None,
+        )
+
+    def _upload_part(
+        self, bucket_name, object_name, data, headers, upload_id, part_number
+    ):
+        del bucket_name, object_name, headers
+        if part_number == 2 and not self.failed_once:
+            self.failed_once = True
+            raise RuntimeError("simulated_part_failure")
+        self.part_uploads.append(part_number)
+        self.uploads[upload_id]["parts"][part_number] = data
+        return hashlib.md5(data).hexdigest()
+
+    def _complete_multipart_upload(
+        self, bucket_name, object_name, upload_id, parts, ssec=None
+    ):
+        del parts, ssec
+        upload = self.uploads.pop(upload_id)
+        payload = b"".join(
+            upload["parts"][number] for number in sorted(upload["parts"])
+        )
+        metadata = {
+            key[len("x-amz-meta-") :]: value
+            for key, value in upload["headers"].items()
+            if key.startswith("x-amz-meta-")
+        }
+        self.puts.append(object_name)
+        self.objects[(bucket_name, object_name)] = StoredObject(
+            payload,
+            metadata=metadata,
+        )
+
+
+class UnsupportedResumeMinio(ResumableMultipartMinio):
+    def _list_parts(self, bucket_name, object_name, upload_id, **kwargs):
+        del bucket_name, object_name, upload_id, kwargs
+        raise _S3CodeError("NotImplemented")
 
 
 class SdkLikeConditionalMinio:
@@ -837,23 +915,24 @@ def test_artifact_publish_is_idempotent_when_manifest_matches(tmp_path):
     assert minio.puts.count(file_object) == 1
 
 
-def test_artifact_publish_fails_when_manifest_content_conflicts(tmp_path):
+def test_artifact_publish_overwrites_manifest_when_digest_differs(tmp_path):
     manifest = _artifact_manifest(tmp_path)
     minio = InMemoryMinio()
     client = ModelPreheatS3Client(minio)
     manifest_object = client.artifact_manifest_object(PREFIX, manifest)
 
-    # 同一 artifact_id 前缀下存在语义不同的 Manifest（内容冲突）。
     conflicting = json.loads(manifest.to_artifact_json_bytes().decode("utf-8"))
     conflicting["files"][0]["sha256"] = "1" * 64
     minio.objects[("bucket", manifest_object)] = StoredObject(
         json.dumps(conflicting, sort_keys=True).encode("utf-8")
     )
 
-    with pytest.raises(
-        ModelPreheatS3ManifestConflict, match="artifact_manifest_conflict"
-    ):
-        client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
+    result = client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
+
+    assert result.ready_written is True
+    assert minio.objects[("bucket", manifest_object)].data == (
+        manifest.to_artifact_json_bytes()
+    )
 
 
 def test_artifact_publish_repairs_missing_files_and_keeps_existing(tmp_path):
@@ -878,7 +957,7 @@ def test_artifact_publish_skips_only_content_verified_files(tmp_path):
     minio = InMemoryMinio()
     client = ModelPreheatS3Client(minio)
     file_object = client.artifact_file_object(PREFIX, manifest, manifest.files[0])
-    # 正确内容 + 正确大小 + 元数据；跳过只允许在流式重算后确认一致。
+    # 大小和受管摘要元数据一致时，仅通过 HEAD 即可跳过。
     minio.objects[("bucket", file_object)] = StoredObject(
         b"weights",
         metadata={"sha256": manifest.files[0].sha256},
@@ -893,23 +972,117 @@ def test_artifact_publish_skips_only_content_verified_files(tmp_path):
     assert file_object not in minio.puts
 
 
-def test_artifact_publish_detects_same_size_tampered_remote_content(tmp_path):
-    """同尺寸篡改：大小与元数据 sha256 都对，但远端内容不同 → 必须失败。"""
+def test_artifact_publish_uploads_only_changed_files_in_multi_file_model(tmp_path):
+    (tmp_path / "model-a.bin").write_bytes(b"weights-a")
+    (tmp_path / "model-b.bin").write_bytes(b"weights-b")
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="org/model",
+        revision="8f73c6a91b",
+        file_patterns=["*.bin"],
+        requested_revision="master",
+    )
+    manifest = build_model_preheat_manifest(tmp_path, identity)
+    minio = InMemoryMinio()
+    client = ModelPreheatS3Client(minio)
+    client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
+    first_object = client.artifact_file_object(PREFIX, manifest, manifest.files[0])
+    second_object = client.artifact_file_object(PREFIX, manifest, manifest.files[1])
+    minio.objects[("bucket", second_object)].metadata["sha256"] = "0" * 64
+    minio.puts.clear()
+
+    result = client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
+
+    assert result.uploaded == 1
+    assert result.skipped == 2
+    assert first_object not in minio.puts
+    assert minio.puts == [second_object]
+
+
+def test_artifact_publish_resumes_incomplete_large_file_parts(tmp_path, monkeypatch):
+    from gpustack.worker.model_preheat import s3_client as s3_client_module
+
+    monkeypatch.setattr(s3_client_module, "CONDITIONAL_SINGLE_PUT_MAX_SIZE", 4)
+    monkeypatch.setattr(s3_client_module, "CONDITIONAL_MULTIPART_PART_SIZE", 4)
+    content = b"abcdefghijkl"
+    manifest = _artifact_manifest(tmp_path, content=content)
+    minio = ResumableMultipartMinio()
+    client = ModelPreheatS3Client(minio)
+
+    with pytest.raises(RuntimeError, match="simulated_part_failure"):
+        client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
+    assert minio.part_uploads == [1]
+
+    result = client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
+
+    file_object = client.artifact_file_object(PREFIX, manifest, manifest.files[0])
+    assert result.ready_written is True
+    assert minio.part_uploads == [1, 2, 3]
+    assert minio.objects[("bucket", file_object)].data == content
+
+
+def test_artifact_publish_falls_back_when_list_parts_is_unsupported(
+    tmp_path, monkeypatch
+):
+    from gpustack.worker.model_preheat import s3_client as s3_client_module
+
+    monkeypatch.setattr(s3_client_module, "CONDITIONAL_SINGLE_PUT_MAX_SIZE", 4)
+    content = b"abcdefghijkl"
+    manifest = _artifact_manifest(tmp_path, content=content)
+    minio = UnsupportedResumeMinio()
+    client = ModelPreheatS3Client(minio)
+
+    result = client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
+
+    file_object = client.artifact_file_object(PREFIX, manifest, manifest.files[0])
+    assert result.ready_written is True
+    assert minio.objects[("bucket", file_object)].data == content
+
+
+def test_resumed_parts_only_limit_actual_upload_traffic(monkeypatch):
+    from gpustack.worker.model_preheat import s3_client as s3_client_module
+
+    monkeypatch.setattr(s3_client_module, "CONDITIONAL_MULTIPART_PART_SIZE", 4)
+    consumed = []
+    limiter = SimpleNamespace(consume=consumed.append)
+    monkeypatch.setattr(s3_client_module, "_BandwidthLimiter", lambda _: limiter)
+    content = b"abcdefghijkl"
+    minio = ResumableMultipartMinio()
+    minio.failed_once = True
+    upload_id = minio._create_multipart_upload("bucket", "object", {})
+    minio.uploads[upload_id]["parts"][1] = content[:4]
+
+    handled = ModelPreheatS3Client(minio)._resumable_multipart_put(
+        "bucket",
+        "object",
+        io.BytesIO(content),
+        len(content),
+        "application/octet-stream",
+        {"sha256": hashlib.sha256(content).hexdigest()},
+        bandwidth_limit_mbps=1,
+    )
+
+    assert handled is True
+    assert consumed == [4, 4]
+
+
+def test_artifact_publish_skips_same_size_object_with_matching_digest_metadata(
+    tmp_path,
+):
     manifest = _artifact_manifest(tmp_path)
     minio = InMemoryMinio()
     client = ModelPreheatS3Client(minio)
     file_object = client.artifact_file_object(PREFIX, manifest, manifest.files[0])
-    # 内容被篡改为同长度 b"tampered"，元数据仍声明原始 sha256。
     minio.objects[("bucket", file_object)] = StoredObject(
-        b"tampered",
+        b"corrupt",
         metadata={"sha256": manifest.files[0].sha256},
     )
 
-    with pytest.raises(ModelPreheatS3Conflict, match="object_content_conflict"):
-        client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
+    result = client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
 
-    # 绝不覆盖被篡改的远端对象。
-    assert minio.objects[("bucket", file_object)].data == b"tampered"
+    assert result.skipped == 1
+    assert minio.objects[("bucket", file_object)].data == b"corrupt"
+    assert file_object not in minio.puts
 
 
 def test_artifact_publish_detects_local_file_content_mismatch(tmp_path):
@@ -927,27 +1100,20 @@ def test_artifact_publish_detects_local_file_content_mismatch(tmp_path):
     assert minio.objects == {}
 
 
-def test_artifact_publish_detects_file_content_conflict(tmp_path):
+def test_artifact_publish_overwrites_file_when_digest_metadata_differs(tmp_path):
     manifest = _artifact_manifest(tmp_path)
     minio = InMemoryMinio()
     client = ModelPreheatS3Client(minio)
     file_object = client.artifact_file_object(PREFIX, manifest, manifest.files[0])
-    original = minio.put_object_if_absent
+    minio.objects[("bucket", file_object)] = StoredObject(
+        b"different" * 8,
+        metadata={"sha256": "0" * 64},
+    )
 
-    def inject_conflict(bucket_name, object_name, *args, **kwargs):
-        if object_name == file_object:
-            minio.objects[(bucket_name, object_name)] = StoredObject(
-                b"different" * 8,
-                metadata={"sha256": "0" * 64},
-            )
-        return original(bucket_name, object_name, *args, **kwargs)
+    result = client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
 
-    minio.put_object_if_absent = inject_conflict
-
-    with pytest.raises(ModelPreheatS3Conflict, match="object_content_conflict"):
-        client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
-
-    assert minio.objects[("bucket", file_object)].data == b"different" * 8
+    assert result.uploaded == 2
+    assert minio.objects[("bucket", file_object)].data == b"weights"
 
 
 def test_artifact_conditional_manifest_write_returns_false_on_412(tmp_path):
@@ -971,113 +1137,45 @@ def test_artifact_conditional_manifest_write_returns_false_on_412(tmp_path):
     assert manifest_call["headers"]["If-None-Match"] == "*"
 
 
-def test_artifact_publish_manifest_without_conditional_capability_fails_closed(
-    tmp_path,
-):
-    """SDK 不支持条件写时拒绝发布 Manifest，避免覆盖并发 Artifact。"""
+def test_artifact_publish_uses_standard_put_without_conditional_requests(tmp_path):
+    manifest = _artifact_manifest(tmp_path)
+    minio = ExecuteConditionalMinio()
+    client = ModelPreheatS3Client(minio)
+
+    result = client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
+
+    assert result.ready_written is True
+    assert minio.execute_calls == []
+    file_object = client.artifact_file_object(PREFIX, manifest, manifest.files[0])
+    manifest_object = client.artifact_manifest_object(PREFIX, manifest)
+    assert minio.objects[("bucket", file_object)].data == b"weights"
+    assert minio.objects[("bucket", manifest_object)].data == (
+        manifest.to_artifact_json_bytes()
+    )
+
+
+def test_artifact_publish_supports_client_without_conditional_capability(tmp_path):
     manifest = _artifact_manifest(tmp_path)
     minio = NoConditionalMinio()
     client = ModelPreheatS3Client(minio)
     manifest_object = client.artifact_manifest_object(PREFIX, manifest)
 
-    with pytest.raises(ModelPreheatS3Conflict, match="conditional_create_unsupported"):
-        client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
+    result = client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
 
-    assert ("bucket", manifest_object) not in minio.objects
+    assert result.ready_written is True
+    assert ("bucket", manifest_object) in minio.objects
 
 
-def test_artifact_publish_reads_invalid_manifest_and_fails_closed(tmp_path):
-    """路径上存在非法 Manifest 时绝不覆盖，按冲突失败闭合。"""
+def test_artifact_publish_overwrites_invalid_manifest(tmp_path):
     manifest = _artifact_manifest(tmp_path)
     minio = InMemoryMinio()
     client = ModelPreheatS3Client(minio)
     manifest_object = client.artifact_manifest_object(PREFIX, manifest)
     minio.objects[("bucket", manifest_object)] = StoredObject(b"not json")
 
-    with pytest.raises(
-        ModelPreheatS3ManifestConflict, match="artifact_manifest_conflict"
-    ):
-        client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
-
-
-def test_concurrent_artifact_publishers_converge_to_one_manifest(tmp_path):
-    """Manifest 缺失→条件写返回 False（412）→重读到同一内容→收敛。
-
-    走真实小对象条件写（presigned + If-None-Match，已存在返回 412→False）：
-    在 Manifest 条件写 PUT 到达前的那一刻，模拟并发发布者已写入相同内容，
-    本次 PUT 触发真实 412，随后必须重读一致并收敛，而不是覆盖或误判冲突。
-    """
-    manifest = _artifact_manifest(tmp_path)
-    minio = ExecuteConditionalMinio()
-    client = ModelPreheatS3Client(minio)
-    manifest_object = client.artifact_manifest_object(PREFIX, manifest)
-    seeded = {"done": False}
-    original_urlopen = minio.urlopen
-
-    def racing_urlopen(method, url, body=None, headers=None, **kwargs):
-        bucket_name, object_name = url.removeprefix("s3://").split("/", 1)
-        if (
-            not seeded["done"]
-            and object_name == manifest_object
-            and (headers or {}).get("If-None-Match") == "*"
-            and (bucket_name, object_name) not in minio.objects
-        ):
-            # 并发发布者已先一步写入相同的 Manifest：触发真实 412。
-            seeded["done"] = True
-            minio.objects[(bucket_name, object_name)] = StoredObject(
-                manifest.to_artifact_json_bytes(),
-                metadata={"sha256": "0" * 64},
-            )
-        return original_urlopen(method, url, body=body, headers=headers, **kwargs)
-
-    minio.urlopen = racing_urlopen
-
     result = client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
 
-    stored = json.loads(minio.objects[("bucket", manifest_object)].data)
-    assert stored["artifact_id"] == manifest.artifact_id
-    # 条件写 412 后重读一致 → 收敛为幂等成功。
-    assert result.ready_written is False
-    # 最终 Manifest 内容与发布方语义一致。
-    assert (
-        client.read_artifact_manifest("bucket", PREFIX, manifest).to_artifact_dict()
-        == manifest.to_artifact_dict()
+    assert result.ready_written is True
+    assert minio.objects[("bucket", manifest_object)].data == (
+        manifest.to_artifact_json_bytes()
     )
-
-
-def test_concurrent_artifact_publishers_conflict_when_manifest_differs(tmp_path):
-    """条件写 412 但重读到不同 artifact_id → 冲突失败闭合。"""
-    manifest = _artifact_manifest(tmp_path)
-    minio = ExecuteConditionalMinio()
-    client = ModelPreheatS3Client(minio)
-    manifest_object = client.artifact_manifest_object(PREFIX, manifest)
-    seeded = {"done": False}
-
-    conflicting = json.loads(manifest.to_artifact_json_bytes().decode("utf-8"))
-    conflicting["files"][0]["sha256"] = "1" * 64
-    conflicting_bytes = json.dumps(conflicting, sort_keys=True).encode("utf-8")
-    original_urlopen = minio.urlopen
-
-    def racing_urlopen(method, url, body=None, headers=None, **kwargs):
-        bucket_name, object_name = url.removeprefix("s3://").split("/", 1)
-        if (
-            not seeded["done"]
-            and object_name == manifest_object
-            and (headers or {}).get("If-None-Match") == "*"
-            and (bucket_name, object_name) not in minio.objects
-        ):
-            # 并发发布者先写入不同内容的 Manifest：触发真实 412。
-            seeded["done"] = True
-            minio.objects[(bucket_name, object_name)] = StoredObject(
-                conflicting_bytes, metadata={"sha256": "0" * 64}
-            )
-        return original_urlopen(method, url, body=body, headers=headers, **kwargs)
-
-    minio.urlopen = racing_urlopen
-
-    with pytest.raises(
-        ModelPreheatS3ManifestConflict, match="artifact_manifest_conflict"
-    ):
-        client.publish_artifact("bucket", PREFIX, manifest, tmp_path)
-    # 并发写入的冲突 Manifest 未被覆盖。
-    assert minio.objects[("bucket", manifest_object)].data == conflicting_bytes

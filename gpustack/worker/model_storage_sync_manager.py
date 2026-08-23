@@ -35,7 +35,9 @@ from gpustack.worker.model_preheat.manifest import (
     build_model_preheat_manifest,
 )
 from gpustack.worker.model_preheat.s3_client import (
+    ModelPreheatCanceled,
     ModelPreheatS3Client,
+    ModelPreheatS3Conflict,
     ModelPreheatS3ManifestError,
 )
 
@@ -94,14 +96,19 @@ class ModelStorageSyncManager:
             if active:
                 active[1].set()
             return
-        if task.state != ModelStorageSyncTaskStateEnum.PENDING or task.id in self._active:
+        if (
+            task.state != ModelStorageSyncTaskStateEnum.PENDING
+            or task.id in self._active
+        ):
             return
         cancel_event = threading.Event()
         execution = asyncio.create_task(self._execute(task, cancel_event))
         self._active[task.id] = (execution, cancel_event)
         execution.add_done_callback(lambda _: self._active.pop(task.id, None))
 
-    async def _execute(self, task: ModelStorageSyncTaskPublic, cancel_event: threading.Event):
+    async def _execute(
+        self, task: ModelStorageSyncTaskPublic, cancel_event: threading.Event
+    ):
         payload = None
         try:
             payload = await self._client.aget_execution_payload(task.id)
@@ -122,12 +129,27 @@ class ModelStorageSyncManager:
                     manifest_path=result.get("manifest_path"),
                 ),
             )
-        except ModelStorageSyncCanceled:
+        except (ModelStorageSyncCanceled, ModelPreheatCanceled):
             # 任务取消：不写 Manifest，不回写 ready。
             return
         except Exception as exc:
+            error_detail = (
+                str(exc)
+                if isinstance(
+                    exc,
+                    (
+                        ModelPreheatS3Conflict,
+                        ModelPreheatS3ManifestError,
+                        ModelPreheatIdentityError,
+                        ModelPreheatManifestError,
+                    ),
+                )
+                else type(exc).__name__
+            )
             logger.error(
-                "Model storage sync failed for task %s: %s", task.id, type(exc).__name__
+                "Model storage sync failed for task %s: %s",
+                task.id,
+                error_detail,
             )
             # 执行 payload 都拉取失败时没有可用 lease：失败回写无法通过
             # lease 校验（Server 稳定 409），只记录日志，不重复调用。
@@ -143,7 +165,6 @@ class ModelStorageSyncManager:
                 )
             except Exception:
                 logger.debug("Model storage sync task %s no longer exists", task.id)
-
 
     def _publish(self, payload, cancel_event: threading.Event) -> dict:
         """扫描可信本地源路径并发布统一 Artifact（复用任务 1 发布器）。
@@ -254,6 +275,13 @@ def _scan_spec_root_matches_source_paths(payload) -> bool:
 
 
 def _stable_error_code(exc: Exception) -> str:
-    if isinstance(exc, (ModelPreheatS3ManifestError, ModelPreheatIdentityError, ModelPreheatManifestError)):
+    if isinstance(
+        exc,
+        (
+            ModelPreheatS3ManifestError,
+            ModelPreheatIdentityError,
+            ModelPreheatManifestError,
+        ),
+    ):
         return "manifest_invalid"
     return "worker_execution_failed"

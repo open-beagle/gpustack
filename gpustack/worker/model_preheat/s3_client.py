@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import ssl
 import time
@@ -83,13 +84,16 @@ class _BandwidthLimiter:
 
 
 class _RateLimitedReader:
-    def __init__(self, source, limiter, expected_length):
+    def __init__(self, source, limiter, expected_length, cancel_check=None):
         self._source = source
         self._limiter = limiter
         self._expected_length = expected_length
         self._transferred = 0
+        self._cancel_check = cancel_check
 
     def read(self, size=-1):
+        if self._cancel_check is not None and self._cancel_check():
+            raise ModelPreheatCanceled("canceled")
         remaining = self._expected_length - self._transferred
         if remaining <= 0:
             return b""
@@ -356,16 +360,12 @@ class ModelPreheatS3Client:
         cancel_check=None,
         bandwidth_limit_mbps: int | None = None,
     ) -> PublishResult:
-        """按统一 Artifact 协议发布：校验已有文件、补传缺失文件、
-        全量校验、最后条件写 Manifest。
+        """按统一 Artifact 协议增量发布文件，最后写入 Manifest。
 
-        Manifest 已存在且内容一致时幂等成功；内容冲突或路径上存在
-        非法 Manifest 时失败闭合；
-        不创建 `ready.json`。并发发布者依靠对象级幂等校验与
-        Manifest 条件写入收敛到同一有效 Artifact。
-
-        内容完整性不信任 metadata：远端文件通过流式重算 SHA-256 校验，
-        本地文件在发布时流式重算 SHA-256 后再上传。
+        本地文件在发布前流式重算 SHA-256。S3 对象仅通过 HEAD 返回的
+        大小和 SHA-256 元数据判断是否可跳过；不一致或缺少可信摘要时
+        使用普通 PutObject 覆盖。这样既避免回读和重复上传流量，也兼容
+        不支持条件 PUT 的私有 S3。
         profile_prefix 必须显式传入并安全透传到所有对象 Key。
         """
         root = Path(root_dir).resolve()
@@ -377,7 +377,6 @@ class ModelPreheatS3Client:
         for file in manifest.files:
             self._raise_if_cancelled(cancel_check)
             local_path = self._local_manifest_path(root, file)
-            # 本地完整性：流式重算 SHA-256，不能只信 Manifest 声明值。
             local_sha256 = self._sha256_file_bytes(
                 local_path,
                 cancel_check=cancel_check,
@@ -391,7 +390,7 @@ class ModelPreheatS3Client:
             ):
                 skipped += 1
                 continue
-            written = self._put_file_if_absent(
+            self._put_file(
                 bucket_name,
                 object_name,
                 local_path,
@@ -404,33 +403,15 @@ class ModelPreheatS3Client:
                 bandwidth_limit_mbps=bandwidth_limit_mbps,
             )
             self._raise_if_cancelled(cancel_check)
-            if not written:
-                if self._remote_object_matches(
-                    bucket_name, object_name, file.size, file.sha256
-                ):
-                    skipped += 1
-                    continue
-                raise ModelPreheatS3Conflict("object_content_conflict")
             uploaded += 1
 
-        for file in manifest.files:
-            object_name = self.artifact_file_object(profile_prefix, manifest, file)
-            if not self._remote_object_matches(
-                bucket_name, object_name, file.size, file.sha256
-            ):
-                raise ModelPreheatS3Conflict("object_content_conflict")
-
         self._raise_if_cancelled(cancel_check)
-        try:
-            existing = self.read_artifact_manifest(
-                bucket_name, profile_prefix, manifest
-            )
-        except (ModelPreheatS3ManifestError, ModelPreheatManifestError):
-            # 路径上已存在无法解析的 Manifest：绝不覆盖，按冲突失败闭合。
-            raise ModelPreheatS3ManifestConflict("artifact_manifest_conflict") from None
-        if existing is not None:
-            # artifact_id 是身份核心字段的内容摘要，相同即语义一致，幂等成功；
-            # 本运行已补传的文件计入 uploaded。
+        manifest_bytes = manifest.to_artifact_json_bytes()
+        manifest_sha256 = self._sha256_bytes(manifest_bytes)
+        manifest_object = self.artifact_manifest_object(profile_prefix, manifest)
+        if self._remote_object_matches(
+            bucket_name, manifest_object, len(manifest_bytes), manifest_sha256
+        ):
             return PublishResult(
                 uploaded=uploaded,
                 skipped=skipped + 1,
@@ -438,11 +419,7 @@ class ModelPreheatS3Client:
                 ready_digest=manifest.artifact_id,
                 generation_prefix=manifest.artifact_prefix(profile_prefix),
             )
-
-        manifest_bytes = manifest.to_artifact_json_bytes()
-        manifest_sha256 = self._sha256_bytes(manifest_bytes)
-        manifest_object = self.artifact_manifest_object(profile_prefix, manifest)
-        written_manifest = self._put_bytes_if_absent(
+        self._put_bytes(
             bucket_name,
             manifest_object,
             manifest_bytes,
@@ -454,32 +431,6 @@ class ModelPreheatS3Client:
             },
         )
         self._raise_if_cancelled(cancel_check)
-        if not written_manifest:
-            try:
-                existing = self.read_artifact_manifest(
-                    bucket_name, profile_prefix, manifest
-                )
-            except (ModelPreheatS3ManifestError, ModelPreheatManifestError):
-                # 条件写失败后重读到非法 Manifest：按冲突失败闭合。
-                raise ModelPreheatS3ManifestConflict(
-                    "artifact_manifest_conflict"
-                ) from None
-            if existing is not None:
-                # 条件写失败但内容一致：并发发布者已写入同一 Manifest。
-                return PublishResult(
-                    uploaded=uploaded,
-                    skipped=skipped,
-                    ready_written=False,
-                    ready_digest=manifest.artifact_id,
-                    generation_prefix=manifest.artifact_prefix(profile_prefix),
-                )
-            raise ModelPreheatS3Conflict("object_content_conflict")
-
-        if not self._remote_object_matches(
-            bucket_name, manifest_object, len(manifest_bytes), manifest_sha256
-        ):
-            raise ModelPreheatS3Conflict("object_content_conflict")
-
         return PublishResult(
             uploaded=uploaded + 1,
             skipped=skipped,
@@ -586,29 +537,16 @@ class ModelPreheatS3Client:
         cancel_check=None,
         bandwidth_limit_mbps: int | None = None,
     ) -> bool:
-        """校验远端对象与声明的大小、SHA-256 一致。
-
-        不能只信 metadata：先比对对象大小，再通过 `get_object` 流式
-        读取完整内容并重新计算 SHA-256。内容读取或摘要不一致都判定
-        不匹配，由调用方按冲突失败闭合。
-        """
+        """通过 HEAD 的大小和受管 SHA-256 元数据判断是否可跳过上传。"""
         try:
             stat = self._client.stat_object(bucket_name, object_name)
         except Exception as exc:
             if self._is_not_found(exc):
                 return False
             raise
-        if getattr(stat, "size", None) != size:
-            return False
-        return (
-            self._stream_sha256(
-                bucket_name,
-                object_name,
-                cancel_check=cancel_check,
-                bandwidth_limit_mbps=bandwidth_limit_mbps,
-            )
-            == sha256
-        )
+        del cancel_check, bandwidth_limit_mbps
+        metadata = self._normalized_metadata(getattr(stat, "metadata", {}) or {})
+        return getattr(stat, "size", None) == size and metadata.get("sha256") == sha256
 
     def _stream_sha256(
         self,
@@ -657,6 +595,279 @@ class ModelPreheatS3Client:
                 cancel_check=cancel_check,
                 bandwidth_limit_mbps=bandwidth_limit_mbps,
             )
+
+    def _put_file(
+        self,
+        bucket_name: str,
+        object_name: str,
+        path: Path,
+        metadata: dict[str, str],
+        cancel_check=None,
+        bandwidth_limit_mbps: int | None = None,
+    ) -> None:
+        with path.open("rb") as source:
+            self._put_stream(
+                bucket_name,
+                object_name,
+                source,
+                path.stat().st_size,
+                "application/octet-stream",
+                metadata,
+                cancel_check=cancel_check,
+                bandwidth_limit_mbps=bandwidth_limit_mbps,
+            )
+
+    def _put_bytes(
+        self,
+        bucket_name: str,
+        object_name: str,
+        payload: bytes,
+        *,
+        content_type: str,
+        metadata: dict[str, str],
+    ) -> None:
+        self._put_stream(
+            bucket_name,
+            object_name,
+            io.BytesIO(payload),
+            len(payload),
+            content_type,
+            metadata,
+            resumable=False,
+        )
+
+    def _put_stream(
+        self,
+        bucket_name,
+        object_name,
+        source,
+        length,
+        content_type,
+        metadata,
+        cancel_check=None,
+        bandwidth_limit_mbps: int | None = None,
+        resumable: bool = True,
+    ) -> None:
+        if resumable and length > CONDITIONAL_SINGLE_PUT_MAX_SIZE:
+            try:
+                if self._resumable_multipart_put(
+                    bucket_name,
+                    object_name,
+                    source,
+                    length,
+                    content_type,
+                    metadata,
+                    cancel_check=cancel_check,
+                    bandwidth_limit_mbps=bandwidth_limit_mbps,
+                ):
+                    return
+            except Exception as exc:
+                if not self._is_multipart_resume_unsupported(exc):
+                    raise
+                self._rewind_upload_source(source)
+        source = _RateLimitedReader(
+            source,
+            _BandwidthLimiter(bandwidth_limit_mbps),
+            length,
+            cancel_check=cancel_check,
+        )
+        self._client.put_object(
+            bucket_name,
+            object_name,
+            source,
+            length,
+            content_type=content_type,
+            metadata=metadata,
+        )
+        source.validate_complete()
+
+    @staticmethod
+    def _rewind_upload_source(source) -> None:
+        seek = getattr(source, "seek", None)
+        if not callable(seek):
+            raise ModelPreheatS3Conflict("upload_source_not_rewindable")
+        seek(0)
+
+    def _resumable_multipart_put(
+        self,
+        bucket_name,
+        object_name,
+        source,
+        length,
+        content_type,
+        metadata,
+        cancel_check=None,
+        bandwidth_limit_mbps: int | None = None,
+    ) -> bool:
+        methods = self._multipart_resume_methods()
+        if methods is None:
+            return False
+        list_uploads, list_parts, create, upload_part, complete = methods
+        upload_id = self._get_or_create_resumable_upload(
+            list_uploads,
+            create,
+            bucket_name,
+            object_name,
+            content_type,
+            metadata,
+        )
+        if upload_id is None:
+            return False
+        completed_parts = self._listed_multipart_parts(
+            list_parts,
+            bucket_name,
+            object_name,
+            upload_id,
+        )
+        parts = self._upload_resumable_parts(
+            upload_part,
+            bucket_name,
+            object_name,
+            upload_id,
+            source,
+            length,
+            completed_parts,
+            cancel_check,
+            bandwidth_limit_mbps,
+        )
+        self._raise_if_cancelled(cancel_check)
+        complete(bucket_name, object_name, upload_id, parts)
+        return True
+
+    def _multipart_resume_methods(self):
+        list_uploads = getattr(self._client, "_list_multipart_uploads", None)
+        list_parts = getattr(self._client, "_list_parts", None)
+        create = getattr(self._client, "_create_multipart_upload", None)
+        upload_part = getattr(self._client, "_upload_part", None)
+        complete = getattr(self._client, "_complete_multipart_upload", None)
+        methods = (list_uploads, list_parts, create, upload_part, complete)
+        return methods if all(callable(method) for method in methods) else None
+
+    def _get_or_create_resumable_upload(
+        self,
+        list_uploads,
+        create,
+        bucket_name,
+        object_name,
+        content_type,
+        metadata,
+    ):
+        try:
+            uploads = list_uploads(
+                bucket_name,
+                prefix=object_name,
+                max_uploads=1000,
+            ).uploads
+        except Exception as exc:
+            if self._is_multipart_resume_unsupported(exc):
+                return None
+            raise
+        matching_uploads = [
+            upload
+            for upload in uploads
+            if upload.object_name == object_name and upload.upload_id
+        ]
+        if matching_uploads:
+            return max(
+                matching_uploads,
+                key=lambda upload: (
+                    upload.initiated_time.timestamp()
+                    if upload.initiated_time is not None
+                    else float("-inf")
+                ),
+            ).upload_id
+
+        headers = {"Content-Type": content_type}
+        headers.update({f"x-amz-meta-{key}": value for key, value in metadata.items()})
+        try:
+            return create(bucket_name, object_name, headers)
+        except Exception as exc:
+            if self._is_multipart_resume_unsupported(exc):
+                return None
+            raise
+
+    def _upload_resumable_parts(
+        self,
+        upload_part,
+        bucket_name,
+        object_name,
+        upload_id,
+        source,
+        length,
+        completed_parts,
+        cancel_check,
+        bandwidth_limit_mbps,
+    ) -> list[Part]:
+        part_size = max(
+            CONDITIONAL_MULTIPART_PART_SIZE,
+            (length + MAX_MULTIPART_COUNT - 1) // MAX_MULTIPART_COUNT,
+        )
+        limiter = _BandwidthLimiter(bandwidth_limit_mbps)
+        parts = []
+        remaining = length
+        part_number = 1
+        while remaining:
+            self._raise_if_cancelled(cancel_check)
+            expected = min(part_size, remaining)
+            data = _read_exact(source, expected, cancel_check)
+            existing = completed_parts.get(part_number)
+            local_etag = hashlib.md5(data, usedforsecurity=False).hexdigest()
+            if (
+                existing is not None
+                and existing.size == expected
+                and existing.etag.strip('"') == local_etag
+            ):
+                etag = existing.etag.strip('"')
+            else:
+                etag = upload_part(
+                    bucket_name,
+                    object_name,
+                    data,
+                    None,
+                    upload_id,
+                    part_number,
+                )
+                limiter.consume(len(data))
+            parts.append(Part(part_number, etag))
+            remaining -= expected
+            part_number += 1
+        if source.read(1):
+            raise ModelPreheatS3Conflict("upload_source_size_mismatch")
+        return parts
+
+    @staticmethod
+    def _listed_multipart_parts(
+        list_parts,
+        bucket_name,
+        object_name,
+        upload_id,
+    ) -> dict[int, Part]:
+        parts = {}
+        marker = None
+        while True:
+            result = list_parts(
+                bucket_name,
+                object_name,
+                upload_id,
+                max_parts=1000,
+                part_number_marker=marker,
+            )
+            parts.update({part.part_number: part for part in result.parts})
+            if not result.is_truncated:
+                return parts
+            marker = result.next_part_number_marker
+
+    @staticmethod
+    def _is_multipart_resume_unsupported(exc: Exception) -> bool:
+        code = getattr(exc, "code", None)
+        response = getattr(exc, "response", None)
+        status = getattr(exc, "status", None) or getattr(response, "status", None)
+        return code in {"NotImplemented", "MethodNotAllowed"} or status in {
+            405,
+            501,
+            "405",
+            "501",
+        }
 
     def _put_bytes_if_absent(
         self,
