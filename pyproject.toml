@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "gpustack"
-version = "0.7.7"
+version = "0.7.8"
 description = "GPUStack"
 authors = ["GPUStack Authors <contact@gpustack.ai>"]
 readme = "README.md"
