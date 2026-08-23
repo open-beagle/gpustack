@@ -431,12 +431,11 @@ async def _execute_payload(
         exclude_patterns=exclude_patterns,
     )
     profile = payload.profile
-    endpoint = urlparse(profile.endpoint)
     client = ModelPreheatS3Client.from_minio(
         endpoint=profile.endpoint,
         access_key=profile.access_key,
         secret_key=profile.secret_key,
-        secure=endpoint.scheme == "https" and profile.tls_enabled,
+        secure=bool(profile.tls_enabled),
         tls_verify=profile.tls_verify,
         region=profile.region or None,
         use_virtual_hosted_style=profile.use_virtual_hosted_style,
@@ -622,14 +621,17 @@ def execute_profile_connectivity_check(
 ) -> dict:
     started = time.monotonic()
     endpoint = profile["endpoint"]
-    parsed = urlparse(endpoint)
+    tls_enabled = bool(profile.get("tls_enabled", True))
+    effective_endpoint = _endpoint_with_tls_enabled(endpoint, tls_enabled)
     try:
         client = client_factory(
-            endpoint=parsed.netloc,
+            endpoint=endpoint,
             access_key=profile["access_key"],
             secret_key=profile["secret_key"],
-            secure=parsed.scheme == "https" and profile.get("tls_enabled", True),
+            secure=tls_enabled,
+            tls_verify=profile.get("tls_verify", True),
             region=profile.get("region") or None,
+            use_virtual_hosted_style=profile.get("use_virtual_hosted_style", True),
         )
     except Exception:
         return _failure("client", "s3_client_initialization_failed", started)
@@ -639,9 +641,15 @@ def execute_profile_connectivity_check(
         profile.get("prefix", ""),
         check_id,
         worker_uuid,
-        endpoint=endpoint,
+        endpoint=effective_endpoint,
         tls_verify=profile.get("tls_verify", True),
     )
+
+
+def _endpoint_with_tls_enabled(endpoint: str, tls_enabled: bool) -> str:
+    """使用显式 TLS 开关生成与 MinIO 客户端一致的网络探测地址。"""
+    parsed = urlparse(endpoint)
+    return parsed._replace(scheme="https" if tls_enabled else "http").geturl()
 
 
 def _probe_network(endpoint: str, tls_verify: bool):

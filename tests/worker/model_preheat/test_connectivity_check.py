@@ -88,6 +88,56 @@ def test_profile_connectivity_check_sanitizes_client_factory_exception():
 
 
 @pytest.mark.parametrize(
+    ("endpoint", "tls_enabled", "probe_endpoint"),
+    [
+        ("http://s3.example.com", True, "https://s3.example.com"),
+        ("https://s3.example.com", False, "http://s3.example.com"),
+    ],
+)
+def test_profile_connectivity_check_uses_tls_enabled_for_client_and_probe(
+    monkeypatch, endpoint, tls_enabled, probe_endpoint
+):
+    captured = {}
+    probed = []
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return MemoryS3()
+
+    def network_probe(endpoint, tls_verify):
+        probed.append((endpoint, tls_verify))
+
+    monkeypatch.setattr(executor, "_probe_network", network_probe)
+    result = execute_profile_connectivity_check(
+        {
+            "endpoint": endpoint,
+            "bucket": "models",
+            "access_key": "access-key",
+            "secret_key": "secret-key",
+            "tls_enabled": tls_enabled,
+            "tls_verify": False,
+            "use_virtual_hosted_style": False,
+            "region": "us-east-1",
+        },
+        3,
+        "worker-uuid",
+        client_factory,
+    )
+
+    assert result["state"] == "ready"
+    assert captured == {
+        "endpoint": endpoint,
+        "access_key": "access-key",
+        "secret_key": "secret-key",
+        "secure": tls_enabled,
+        "tls_verify": False,
+        "region": "us-east-1",
+        "use_virtual_hosted_style": False,
+    }
+    assert probed == [(probe_endpoint, False)]
+
+
+@pytest.mark.parametrize(
     ("failure", "stage", "code"),
     [
         ("auth", "auth", "s3_authentication_failed"),

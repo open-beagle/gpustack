@@ -4,7 +4,8 @@
 
 - 完整 ``worker-local-s3-*`` 配置按 ``provisioning_key=worker_local_s3`` 幂等创建或更新
   系统 Profile；默认 URI 为 ``s3://bd-wind/model-storage``；
-- ``worker_local_s3_modelscope_fallback`` 映射到 ``source_fallback_enabled``；
+- ``worker_local_s3_modelscope_fallback`` 仅作为首次创建时
+  ``source_fallback_enabled`` 的默认值；
 - 仅当系统中当前没有默认 Profile 时才把系统 Profile 占为 ``global``；
   UI 选择手工默认后，重启不得抢回默认状态；
 - 连接或凭据变化时递增 ``config_version`` 并重置连通性为 ``pending``；
@@ -41,15 +42,13 @@ logger = logging.getLogger(__name__)
 LOCAL_S3_PROFILE_NAME = "Local S3"
 DEFAULT_LOCAL_S3_URI = "s3://bd-wind/model-storage"
 
-# 引导时需要保持一致的连接/凭据字段；任一变化即视为配置变化。
-_CONFIG_FIELDS = (
+# 引导时由启动参数管理的连接字段。TLS、寻址和模型源回退可由 UI 在系统
+# Profile 上调整，重启时必须保留其数据库值。
+_BOOTSTRAP_CONNECTION_FIELDS = (
     "endpoint",
     "bucket",
     "prefix",
-    "tls_enabled",
-    "tls_verify",
     "region",
-    "use_virtual_hosted_style",
 )
 
 
@@ -320,11 +319,13 @@ async def bootstrap_worker_local_s3_profile(
             await session.commit()
         return profile
 
-    # 已存在：幂等更新。连接/凭据是否变化决定 config_version 是否递增。
+    # 已存在：仅启动参数管理的连接字段和凭据可被引导更新。TLS、寻址及模型
+    # 源回退由 UI 管理，必须保留数据库值；因此 fallback 单独变化不会使配置
+    # 版本递增或让连通性失效。
     connection_changed = any(
         not _field_equal(field, getattr(existing, field), target[field])
-        for field in _CONFIG_FIELDS
-    ) or existing.source_fallback_enabled != target["source_fallback_enabled"]
+        for field in _BOOTSTRAP_CONNECTION_FIELDS
+    )
     stored_access, stored_secret = await _stored_credentials(existing)
     # 凭据比较基于解密后的明文，避免 AES-GCM 每次 nonce 不同导致的“假变化”。
     credential_changed = (
@@ -343,14 +344,10 @@ async def bootstrap_worker_local_s3_profile(
     existing_profile.endpoint = target["endpoint"]
     existing_profile.bucket = target["bucket"]
     existing_profile.prefix = target["prefix"]
-    existing_profile.tls_enabled = target["tls_enabled"]
-    existing_profile.tls_verify = target["tls_verify"]
     existing_profile.region = target["region"]
-    existing_profile.use_virtual_hosted_style = target["use_virtual_hosted_style"]
     existing_profile.access_key_encrypted = access_key_encrypted
     existing_profile.secret_key_encrypted = secret_key_encrypted
     existing_profile.encryption_key_version = cipher.current_key_version
-    existing_profile.source_fallback_enabled = target["source_fallback_enabled"]
     existing_profile.config_version += 1
     existing_profile.connectivity_state = ModelPreheatS3ConnectivityStateEnum.PENDING
     existing_profile.last_connectivity_check_id = None

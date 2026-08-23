@@ -4,8 +4,6 @@ import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional, Protocol
 
-from minio import Minio
-
 from gpustack.api.exceptions import HTTPException
 from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTaskClaim,
@@ -21,6 +19,7 @@ from gpustack.server.bus import Event, EventType
 from gpustack.worker.model_preheat.executor import (
     execute_profile_connectivity_check,
 )
+from gpustack.worker.model_preheat.s3_client import ModelPreheatS3Client
 
 
 logger = logging.getLogger(__name__)
@@ -446,7 +445,7 @@ class ModelPreheatManager:
             profile,
             check_id,
             self._worker_uuid,
-            Minio,
+            ModelPreheatS3Client.from_minio,
         )
         try:
             result = await future

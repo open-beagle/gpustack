@@ -138,6 +138,9 @@ def test_bootstrap_creates_system_profile_and_takes_default_when_none(tmp_path):
             assert profile.default_slot == DEFAULT_SLOT_GLOBAL
             assert profile.bucket == "bd-wind"
             assert profile.prefix == "model-storage"
+            assert profile.tls_enabled is False
+            assert profile.tls_verify is True
+            assert profile.use_virtual_hosted_style is True
             assert profile.source_fallback_enabled is True
             assert profile.config_version == 1
             assert (
@@ -192,6 +195,68 @@ def test_bootstrap_config_change_increments_version_and_resets_connectivity(tmp_
                 == ModelPreheatS3ConnectivityStateEnum.PENDING
             )
             assert refreshed.last_connectivity_check_id is None
+
+    asyncio.run(run())
+
+
+def test_bootstrap_restart_preserves_ui_managed_runtime_s3_options(tmp_path):
+    async def run():
+        async with _session(tmp_path) as session:
+            cipher = _cipher()
+            profile = await bootstrap_worker_local_s3_profile(
+                _config(), session, cipher
+            )
+            profile.tls_enabled = False
+            profile.tls_verify = False
+            profile.use_virtual_hosted_style = False
+            profile.source_fallback_enabled = False
+            await session.commit()
+
+            refreshed = await bootstrap_worker_local_s3_profile(
+                _config(
+                    worker_local_s3_host="s3-new.internal.example.com",
+                    worker_local_s3_ssl=True,
+                    worker_local_s3_use_virtual_hosted_style=True,
+                    worker_local_s3_modelscope_fallback=True,
+                ),
+                session,
+                cipher,
+            )
+
+            assert refreshed.endpoint == "https://s3-new.internal.example.com"
+            assert refreshed.tls_enabled is False
+            assert refreshed.tls_verify is False
+            assert refreshed.use_virtual_hosted_style is False
+            assert refreshed.source_fallback_enabled is False
+            assert refreshed.config_version == 2
+
+    asyncio.run(run())
+
+
+def test_bootstrap_fallback_change_does_not_invalidate_connectivity(tmp_path):
+    async def run():
+        async with _session(tmp_path) as session:
+            cipher = _cipher()
+            profile = await bootstrap_worker_local_s3_profile(
+                _config(), session, cipher
+            )
+            profile.connectivity_state = ModelPreheatS3ConnectivityStateEnum.AVAILABLE
+            profile.last_connectivity_check_id = 7
+            await session.commit()
+
+            refreshed = await bootstrap_worker_local_s3_profile(
+                _config(worker_local_s3_modelscope_fallback=False),
+                session,
+                cipher,
+            )
+
+            assert refreshed.source_fallback_enabled is True
+            assert refreshed.config_version == 1
+            assert (
+                refreshed.connectivity_state
+                == ModelPreheatS3ConnectivityStateEnum.AVAILABLE
+            )
+            assert refreshed.last_connectivity_check_id == 7
 
     asyncio.run(run())
 

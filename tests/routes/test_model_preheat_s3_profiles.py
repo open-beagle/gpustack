@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
 import httpx
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel, select
@@ -23,6 +24,7 @@ from gpustack.model_preheat_credentials import (
     generate_model_preheat_credential_key,
 )
 from gpustack.routes import model_preheat_s3_profiles
+from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.model_preheat_s3_profiles import (
     DEFAULT_SLOT_GLOBAL,
     ModelPreheatS3ConnectivityStateEnum,
@@ -31,9 +33,13 @@ from gpustack.schemas.model_preheat_s3_profiles import (
 from gpustack.schemas.model_preheat_schedules import ModelPreheatSchedule
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
+    ModelPreheatTask,
     ModelPreheatTargetScopeEnum,
 )
+from gpustack.schemas.model_storage_sync import ModelStorageSyncTask
+from gpustack.schemas.models import SourceEnum
 from gpustack.schemas.users import User
+from gpustack.schemas.workers import Worker
 from gpustack.server.db import get_session
 
 
@@ -150,6 +156,126 @@ def test_profile_delete_returns_conflict_when_schedule_references_it(app, client
     response = client.delete(f"{API_PREFIX}/{created['id']}")
     assert response.status_code == 409
     assert response.json()["reason"] == "model_preheat_schedule_uses_profile"
+
+
+def test_profile_delete_returns_conflict_when_preheat_task_references_it(app, client):
+    created = create_profile(client)
+
+    async def seed_task():
+        async with AsyncSession(app.state.test_engine) as session:
+            session.add(
+                ModelPreheatTask(
+                    source="modelscope",
+                    model_id="org/model",
+                    resolved_revision="revision-a",
+                    include_patterns=[],
+                    exclude_patterns=[],
+                    selection_digest="selection-digest",
+                    request_identity={"source": "modelscope", "model_id": "org/model"},
+                    request_digest="request-digest",
+                    target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
+                    target_worker_uuids=["worker-a"],
+                    target_worker_snapshot=[],
+                    s3_profile_id=created["id"],
+                    s3_profile_config_version=created["config_version"],
+                    s3_profile_snapshot_encrypted={"ciphertext": "encrypted"},
+                    encryption_key_version="v1",
+                    s3_backfill_policy=ModelPreheatBackfillPolicyEnum.WHEN_MISSING,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed_task())
+    response = client.delete(f"{API_PREFIX}/{created['id']}")
+    assert response.status_code == 409
+    assert response.json()["reason"] == "model_preheat_task_uses_profile"
+
+
+def test_profile_delete_returns_conflict_when_sync_task_references_it(app, client):
+    created = create_profile(client)
+
+    async def seed_sync_task():
+        async with AsyncSession(app.state.test_engine) as session:
+            worker = Worker(
+                name="worker-a",
+                hostname="worker-a",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="worker-a-uuid",
+            )
+            session.add(worker)
+            await session.flush()
+            model_file = ModelFile(
+                source=SourceEnum.MODEL_SCOPE,
+                model_scope_model_id="org/model",
+                worker_id=worker.id,
+                state=ModelFileStateEnum.READY,
+                resolved_paths=["/models/org/model"],
+                requested_revision="master",
+                resolved_revision="revision-a",
+            )
+            session.add(model_file)
+            await session.flush()
+            session.add(
+                ModelStorageSyncTask(
+                    model_file_id=model_file.id,
+                    worker_id=worker.id,
+                    worker_uuid=worker.worker_uuid,
+                    profile_id=created["id"],
+                    profile_config_version=created["config_version"],
+                    request_identity={"source": "modelscope", "model_id": "org/model"},
+                    request_digest="request-digest",
+                    source="modelscope",
+                    model_id="org/model",
+                    resolved_revision="revision-a",
+                    credential_snapshot_encrypted={"ciphertext": "encrypted"},
+                    encryption_key_version="v1",
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed_sync_task())
+    response = client.delete(f"{API_PREFIX}/{created['id']}")
+    assert response.status_code == 409
+    assert response.json()["reason"] == "model_storage_sync_task_uses_profile"
+
+
+def test_profile_delete_integrity_error_rolls_back_shared_session(
+    app, client, monkeypatch
+):
+    created = create_profile(client)
+
+    class TrackingSession(AsyncSession):
+        rollback_count = 0
+
+        async def rollback(self):
+            self.rollback_count += 1
+            await super().rollback()
+
+    shared_sessions = []
+
+    async def shared_session_override():
+        if not shared_sessions:
+            shared_sessions.append(TrackingSession(app.state.test_engine))
+        yield shared_sessions[0]
+
+    async def fail_delete(_profile, _session):
+        raise IntegrityError("DELETE", {}, RuntimeError("foreign key restrict"))
+
+    app.dependency_overrides[get_session] = shared_session_override
+    monkeypatch.setattr(ModelPreheatS3Profile, "delete", fail_delete)
+    try:
+        response = client.delete(f"{API_PREFIX}/{created['id']}")
+        assert response.status_code == 409
+        assert response.json()["reason"] == "profile_is_in_use"
+        assert shared_sessions[0].rollback_count == 1
+
+        # 同一依赖会话必须已恢复，可继续执行一次真实查询。
+        response = client.get(f"{API_PREFIX}/{created['id']}")
+        assert response.status_code == 200, response.text
+    finally:
+        if shared_sessions:
+            client.portal.call(shared_sessions[0].close)
 
 
 def test_profile_route_is_registered_on_v1_admin_router():
@@ -744,11 +870,7 @@ def test_delete_requires_configured_credential_key(app):
 
 def test_update_system_managed_profile_is_forbidden(client, app):
     created = create_profile(client)
-    asyncio.run(
-        _update_stored_profile(
-            app, created["id"], {"system_managed": True}
-        )
-    )
+    asyncio.run(_update_stored_profile(app, created["id"], {"system_managed": True}))
     response = client.patch(
         f"{API_PREFIX}/{created['id']}", json={"description": "blocked"}
     )
@@ -759,24 +881,26 @@ def test_update_system_managed_profile_is_forbidden(client, app):
     assert stored.description == "central cache"
 
 
-def test_delete_system_managed_profile_is_forbidden(client, app):
+def test_delete_system_managed_profile_is_allowed(client, app):
     created = create_profile(client)
     asyncio.run(_update_stored_profile(app, created["id"], {"system_managed": True}))
     response = client.delete(f"{API_PREFIX}/{created['id']}")
-    assert response.status_code == 409
-    assert response.json()["reason"] == "system_profile_not_deletable"
+    assert response.status_code == 200, response.text
+    assert client.get(f"{API_PREFIX}/{created['id']}").status_code == 404
 
 
-def test_delete_current_default_profile_is_forbidden(client, app):
+def test_delete_system_managed_current_default_profile_is_allowed(client, app):
     created = create_profile(client, default_slot=DEFAULT_SLOT_GLOBAL)
+    asyncio.run(_update_stored_profile(app, created["id"], {"system_managed": True}))
     response = client.delete(f"{API_PREFIX}/{created['id']}")
-    assert response.status_code == 409
-    assert response.json()["reason"] == "default_profile_not_deletable"
+    assert response.status_code == 200, response.text
+    response = client.get(API_PREFIX)
+    assert response.status_code == 200
+    assert response.json()["items"] == []
 
 
 def test_update_system_managed_profile_allows_only_default_slot_reselect(client, app):
-    """system_managed Profile 允许仅 PATCH default_slot 重新选择默认，
-    但禁止连接/凭据及其他任何字段变化。"""
+    """system_managed Profile 允许仅 PATCH default_slot 重新选择默认。"""
     system = create_profile(client, name="system")
     asyncio.run(
         _update_stored_profile(
@@ -806,6 +930,48 @@ def test_update_system_managed_profile_allows_only_default_slot_reselect(client,
     assert stored_system.config_version == 1
 
 
+def test_update_system_managed_profile_allows_runtime_s3_options(client, app):
+    created = create_profile(client)
+    asyncio.run(_update_stored_profile(app, created["id"], {"system_managed": True}))
+    asyncio.run(
+        _update_stored_profile(
+            app,
+            created["id"],
+            {
+                "connectivity_state": ModelPreheatS3ConnectivityStateEnum.AVAILABLE,
+                "last_connectivity_check_id": 42,
+                "last_connectivity_checked_at": datetime(2026, 8, 10, 10, 0, 0),
+            },
+        )
+    )
+
+    response = client.patch(
+        f"{API_PREFIX}/{created['id']}",
+        json={
+            "default_slot": "global",
+            "tls_enabled": False,
+            "tls_verify": False,
+            "use_virtual_hosted_style": False,
+            "source_fallback_enabled": False,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["default_slot"] == "global"
+    assert response.json()["tls_enabled"] is False
+    assert response.json()["tls_verify"] is False
+    assert response.json()["use_virtual_hosted_style"] is False
+    assert response.json()["source_fallback_enabled"] is False
+    assert response.json()["config_version"] == 2
+    assert response.json()["connectivity_state"] == "no_workers"
+    stored = asyncio.run(_stored_profile(app, created["id"]))
+    assert stored.endpoint == "https://s3.example.com"
+    assert stored.bucket == "models"
+    assert stored.prefix == "datamodel/team-a"
+    assert stored.last_connectivity_check_id is None
+    assert stored.last_connectivity_checked_at is None
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -814,8 +980,8 @@ def test_update_system_managed_profile_allows_only_default_slot_reselect(client,
         {"access_key": "new-access"},
         {"secret_key": "new-secret"},
         {"prefix": "datamodel/other"},
-        {"tls_enabled": False},
-        {"source_fallback_enabled": False},
+        {"bucket": "other-models"},
+        {"region": "cn-beijing-1"},
         {"name": "renamed"},
     ],
     ids=[
@@ -824,8 +990,8 @@ def test_update_system_managed_profile_allows_only_default_slot_reselect(client,
         "access_key",
         "secret_key",
         "prefix",
-        "tls_enabled",
-        "source_fallback_enabled",
+        "bucket",
+        "region",
         "name",
     ],
 )

@@ -37,9 +37,11 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatConnectivityCheckPublic,
     ModelPreheatConnectivityWorkerPublic,
     ModelPreheatS3ConnectivityCheck,
+    ModelPreheatTask,
     ModelPreheatWorkerTask,
     ModelPreheatWorkerTaskRoleEnum,
 )
+from gpustack.schemas.model_storage_sync import ModelStorageSyncTask
 from gpustack.schemas.workers import Worker
 from gpustack.server.deps import CurrentAdminUserDep, ListParamsDep, SessionDep
 from gpustack.server.model_preheat_connectivity import (
@@ -67,6 +69,13 @@ CONNECTION_CONFIG_FIELDS = {
     "tls_verify",
     "region",
     "use_virtual_hosted_style",
+}
+SYSTEM_MANAGED_EDITABLE_FIELDS = {
+    "default_slot",
+    "tls_enabled",
+    "tls_verify",
+    "use_virtual_hosted_style",
+    "source_fallback_enabled",
 }
 
 
@@ -159,12 +168,13 @@ async def update_profile(
     profile_in: ModelPreheatS3ProfileUpdate,
 ):
     profile = await _get_profile(session, id)
-    # 系统引导 Profile（worker-local-s3）由 Server 管理，UI 可查看/检测/选择，
-    # 仅允许重新选择默认槽位（default_slot），连接/凭据及其他字段一律禁止
-    # 直接编辑：连接/凭据变化只能通过启动参数在重启时更新。
+    # 系统引导 Profile（worker-local-s3）的定位与凭据由 Server 管理；UI 只可
+    # 调整运行策略和默认选择。TLS/寻址改变后同样必须重新校验连通性。
     cipher = _cipher_from_request(request)
     update_data = profile_in.model_dump(exclude_unset=True)
-    if profile.system_managed and set(update_data) != {"default_slot"}:
+    if profile.system_managed and not set(update_data).issubset(
+        SYSTEM_MANAGED_EDITABLE_FIELDS
+    ):
         raise HTTPException(
             403,
             "system_profile_read_only",
@@ -375,21 +385,6 @@ async def delete_profile(request: Request, session: SessionDep, id: int):
     ).first()
     if policy is not None:
         raise HTTPException(409, "Conflict", "distribution_policy_uses_profile")
-    # 系统引导 Profile 不允许删除（避免破坏启动引导与任务/策略外键）。
-    if profile.system_managed:
-        raise HTTPException(
-            409,
-            "system_profile_not_deletable",
-            "system_profile_not_deletable",
-        )
-    # 当前默认 Profile 不允许直接删除：必须先把另一条 Profile 设为默认，
-    # 避免删除瞬间改变普通下载行为。
-    if profile.default_slot == DEFAULT_SLOT_GLOBAL:
-        raise HTTPException(
-            409,
-            "default_profile_not_deletable",
-            "default_profile_not_deletable",
-        )
     download_execution = (
         await session.exec(
             select(ModelFileDownloadExecutionProfilePin.execution_id).where(
@@ -416,8 +411,37 @@ async def delete_profile(request: Request, session: SessionDep, id: int):
             "model_preheat_schedule_uses_profile",
             "model_preheat_schedule_uses_profile",
         )
+    task = (
+        await session.exec(
+            select(ModelPreheatTask.id).where(
+                ModelPreheatTask.s3_profile_id == profile.id
+            )
+        )
+    ).first()
+    if task is not None:
+        raise HTTPException(
+            409,
+            "model_preheat_task_uses_profile",
+            "model_preheat_task_uses_profile",
+        )
+    sync_task = (
+        await session.exec(
+            select(ModelStorageSyncTask.id).where(
+                ModelStorageSyncTask.profile_id == profile.id
+            )
+        )
+    ).first()
+    if sync_task is not None:
+        raise HTTPException(
+            409,
+            "model_storage_sync_task_uses_profile",
+            "model_storage_sync_task_uses_profile",
+        )
     try:
         await profile.delete(session)
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(409, "profile_is_in_use", "profile_is_in_use")
     except Exception as exc:
         raise InternalServerErrorException(
             message=f"Failed to delete model preheat S3 profile: {type(exc).__name__}"

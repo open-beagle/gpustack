@@ -184,7 +184,6 @@ class ModelPreheatS3Client:
         parsed = urlparse(endpoint)
         if parsed.scheme in ("http", "https"):
             endpoint = parsed.netloc
-            secure = parsed.scheme == "https" and secure
         else:
             endpoint = endpoint.rstrip("/")
         http_client = None
@@ -206,6 +205,22 @@ class ModelPreheatS3Client:
         else:
             minio_client.disable_virtual_style_endpoint()
         return cls(minio_client)
+
+    def list_objects(self, *args, **kwargs):
+        """透传 SDK 的对象枚举，供连通性检查使用。"""
+        return self._client.list_objects(*args, **kwargs)
+
+    def put_object(self, *args, **kwargs):
+        """透传 SDK 的对象写入，供连通性检查使用。"""
+        return self._client.put_object(*args, **kwargs)
+
+    def get_object(self, *args, **kwargs):
+        """透传 SDK 的对象读取，供连通性检查使用。"""
+        return self._client.get_object(*args, **kwargs)
+
+    def remove_object(self, *args, **kwargs):
+        """透传 SDK 的对象删除，供连通性检查使用。"""
+        return self._client.remove_object(*args, **kwargs)
 
     def artifact_manifest_object(
         self,

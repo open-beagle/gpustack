@@ -652,6 +652,44 @@ def test_minio_tls_verify_false_uses_unverified_transport(monkeypatch):
     assert captured["virtual"] is True
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "secure"),
+    [
+        ("http://s3.example.invalid", True),
+        ("https://s3.example.invalid", False),
+    ],
+)
+def test_minio_explicit_secure_overrides_endpoint_scheme(
+    monkeypatch, endpoint, secure
+):
+    captured = {}
+
+    class FakeMinio:
+        def __init__(self, endpoint, **kwargs):
+            captured["endpoint"] = endpoint
+            captured["secure"] = kwargs["secure"]
+
+        def enable_virtual_style_endpoint(self):
+            pass
+
+        def disable_virtual_style_endpoint(self):
+            pass
+
+    monkeypatch.setattr("gpustack.worker.model_preheat.s3_client.Minio", FakeMinio)
+
+    ModelPreheatS3Client.from_minio(
+        endpoint,
+        "access-key",
+        "secret-key",
+        secure=secure,
+    )
+
+    assert captured == {
+        "endpoint": "s3.example.invalid",
+        "secure": secure,
+    }
+
+
 def test_minio_can_disable_virtual_hosted_style(monkeypatch):
     captured = {}
 
