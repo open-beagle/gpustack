@@ -47,6 +47,9 @@ from gpustack.server.model_preheat_schedule_controller import (
     ScheduleConcurrencyLimit,
     create_scheduled_model_preheat_task,
 )
+from gpustack.server.model_preheat_s3_profile_lifecycle import (
+    ModelPreheatS3ProfileNotActive,
+)
 
 
 UTC = timezone.utc
@@ -548,6 +551,71 @@ def test_default_task_creator_builds_real_scheduled_task_without_plain_credentia
     assert worker_uuids == ["worker-a"]
     assert "access-secret" not in str(encrypted_snapshot)
     assert "secret-secret" not in str(encrypted_snapshot)
+
+
+def test_default_task_creator_rejects_profile_maintained_before_final_lock(
+    tmp_path, monkeypatch
+):
+    async def skip_connectivity_check(session, profile, config, workers):
+        del session, profile, config, workers
+
+    async def reject_stale_active_profile(*args, **kwargs):
+        del args, kwargs
+        raise ModelPreheatS3ProfileNotActive
+
+    monkeypatch.setattr(
+        model_preheats,
+        "_ensure_profile_available_on_workers",
+        skip_connectivity_check,
+    )
+    monkeypatch.setattr(
+        model_preheat_schedule_controller,
+        "resolve_model_preheat_revision",
+        lambda source, model_id, revision, token=None: revision,
+    )
+    monkeypatch.setattr(
+        model_preheat_schedule_controller,
+        "lock_active_profile_for_new_work",
+        reject_stale_active_profile,
+    )
+
+    async def run():
+        engine = await _database(tmp_path)
+        schedule_id = await _seed_schedule(engine)
+        async with AsyncSession(engine) as session:
+            session.add(
+                ModelPreheatS3Profile(
+                    id=1,
+                    name="profile",
+                    endpoint="https://s3.example.com",
+                    bucket="models",
+                    access_key_encrypted={"ciphertext": "access-secret"},
+                    secret_key_encrypted={"ciphertext": "secret-secret"},
+                    encryption_key_version="v1",
+                )
+            )
+            schedule = await session.get(ModelPreheatSchedule, schedule_id)
+            schedule.target_scope = ModelPreheatTargetScopeEnum.SELECTED_WORKERS
+            schedule.target_worker_uuids = ["worker-a"]
+            session.add(schedule)
+            await session.commit()
+        config = SimpleNamespace(
+            model_preheat_credential_key=generate_model_preheat_credential_key(),
+            model_preheat_credential_key_version="v1",
+            model_preheat_credential_old_keys=None,
+            huggingface_token=None,
+        )
+        async with AsyncSession(engine) as session:
+            schedule = await session.get(ModelPreheatSchedule, schedule_id)
+            with pytest.raises(
+                RuntimeError, match="model_preheat_s3_profile_in_maintenance"
+            ):
+                await create_scheduled_model_preheat_task(session, schedule, 1, config)
+            task_count = len((await session.exec(select(ModelPreheatTask))).all())
+        await engine.dispose()
+        return task_count
+
+    assert asyncio.run(run()) == 0
 
 
 def test_default_task_creator_rejects_busy_target_worker(tmp_path):

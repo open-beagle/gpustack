@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel, select
@@ -19,9 +20,16 @@ from gpustack.model_preheat_credentials import (
 )
 from gpustack.routes import model_file_download_executions
 from gpustack.routes.model_files import reset_model_file
-from gpustack.routes.model_preheat_s3_profiles import delete_profile
+from gpustack.routes.model_preheat_s3_profiles import (
+    _detach_unclaimed_download_executions,
+    delete_profile,
+)
 from gpustack.api.exceptions import HTTPException
-from gpustack.schemas.model_file_download_executions import ModelFileDownloadExecution
+from gpustack.schemas.model_file_download_executions import (
+    ModelFileDownloadExecution,
+    ModelFileDownloadExecutionProfilePin,
+    ModelFileDownloadExecutionStateEnum,
+)
 from gpustack.schemas.model_files import ModelFile, ModelFilePublic
 from gpustack.schemas.model_preheat_s3_profiles import (
     DEFAULT_SLOT_GLOBAL,
@@ -34,8 +42,12 @@ from gpustack.schemas.model_preheats import (
 from gpustack.schemas.models import SourceEnum
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import get_session
+from gpustack.server import model_file_download_execution_service
 from gpustack.server.model_file_download_execution_service import (
     create_model_file_with_download_execution,
+)
+from gpustack.server.model_preheat_s3_profile_lifecycle import (
+    ModelPreheatS3ProfileNotActive,
 )
 from gpustack.server.model_preheat_worker_identity import (
     get_model_preheat_worker_identity,
@@ -493,7 +505,7 @@ def test_error_execution_requires_explicit_reset_before_reclaim(tmp_path):
     asyncio.run(engine.dispose())
 
 
-def test_profile_referenced_by_download_execution_cannot_be_deleted(tmp_path):
+def test_profile_referenced_by_unclaimed_download_execution_can_be_deleted(tmp_path):
     app, engine, key = _app(tmp_path)
     _, model_file_id, _ = asyncio.run(_seed(engine, key))
 
@@ -510,20 +522,126 @@ def test_profile_referenced_by_download_execution_cannot_be_deleted(tmp_path):
                 ModelPreheatS3Profile, execution.default_profile_id
             )
             profile_id = profile.id
+            execution_id = execution.id
             profile.default_slot = None
             session.add(profile)
             await session.commit()
             request = SimpleNamespace(app=app)
-            try:
-                await delete_profile(request, session, profile_id)
-            except HTTPException as exc:
-                return exc
-            return None
+            await delete_profile(request, session, profile_id)
+            refreshed_execution = await session.get(
+                ModelFileDownloadExecution, execution_id
+            )
+            refreshed_profile = await session.get(ModelPreheatS3Profile, profile_id)
+            return refreshed_execution, refreshed_profile
 
-    error = asyncio.run(attempt_delete())
-    assert error is not None
-    assert error.status_code == 409
-    assert error.message == "model_file_download_execution_uses_profile"
+    execution, profile = asyncio.run(attempt_delete())
+    assert profile is None
+    assert execution.default_profile_id is None
+    assert execution.default_profile_config_version is None
+    assert execution.credential_snapshot_encrypted is None
+    assert execution.encryption_key_version is None
+    response = TestClient(app).post(
+        f"/v1/model-files/{model_file_id}/download-executions/claim"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["profile"] is None
+    assert "access-value" not in response.text
+    assert "secret-value" not in response.text
+    asyncio.run(engine.dispose())
+
+
+def test_download_claim_wins_delete_detach_interleave(tmp_path):
+    app, engine, key = _app(tmp_path)
+    _, model_file_id, _ = asyncio.run(_seed(engine, key))
+
+    async def interleave():
+        async with AsyncSession(engine) as delete_session:
+            execution = (
+                await delete_session.exec(
+                    select(ModelFileDownloadExecution).where(
+                        ModelFileDownloadExecution.model_file_id == model_file_id
+                    )
+                )
+            ).one()
+            execution_id = execution.id
+            profile_id = execution.default_profile_id
+
+            async with AsyncSession(engine) as claim_session:
+                claimed_at = datetime.now(timezone.utc)
+                claimed = await claim_session.exec(
+                    update(ModelFileDownloadExecution)
+                    .where(
+                        ModelFileDownloadExecution.id == execution_id,
+                        ModelFileDownloadExecution.state
+                        == ModelFileDownloadExecutionStateEnum.PENDING,
+                    )
+                    .values(
+                        state=ModelFileDownloadExecutionStateEnum.RUNNING,
+                        claimed_by_worker_uuid="worker-uuid",
+                        claimed_at=claimed_at,
+                    )
+                )
+                assert claimed.rowcount == 1
+                await claim_session.exec(
+                    update(ModelPreheatS3Profile)
+                    .where(ModelPreheatS3Profile.id == profile_id)
+                    .values(ever_used_at=claimed_at)
+                )
+                await claim_session.commit()
+
+            detached = await _detach_unclaimed_download_executions(
+                delete_session, profile_id, [execution_id]
+            )
+            assert detached is False
+
+        async with AsyncSession(engine) as session:
+            stored_execution = await session.get(
+                ModelFileDownloadExecution, execution_id
+            )
+            stored_profile = await session.get(ModelPreheatS3Profile, profile_id)
+            pin = await session.get(ModelFileDownloadExecutionProfilePin, execution_id)
+            return stored_execution, stored_profile, pin
+
+    execution, profile, pin = asyncio.run(interleave())
+    assert execution.state == ModelFileDownloadExecutionStateEnum.RUNNING
+    assert execution.default_profile_id == profile.id
+    assert execution.credential_snapshot_encrypted is not None
+    assert profile.ever_used_at is not None
+    assert pin.profile_id == profile.id
+    asyncio.run(engine.dispose())
+
+
+def test_claim_marks_profile_used_and_prevents_delete(tmp_path):
+    app, engine, key = _app(tmp_path)
+    _, model_file_id, _ = asyncio.run(_seed(engine, key))
+    response = TestClient(app).post(
+        f"/v1/model-files/{model_file_id}/download-executions/claim"
+    )
+    assert response.status_code == 200, response.text
+
+    async def attempt_delete():
+        async with AsyncSession(engine) as session:
+            execution = (
+                await session.exec(
+                    select(ModelFileDownloadExecution).where(
+                        ModelFileDownloadExecution.model_file_id == model_file_id
+                    )
+                )
+            ).one()
+            profile = await session.get(
+                ModelPreheatS3Profile, execution.default_profile_id
+            )
+            assert profile.ever_used_at is not None
+            profile_id = profile.id
+            profile.default_slot = None
+            session.add(profile)
+            await session.commit()
+            with pytest.raises(HTTPException) as exc_info:
+                await delete_profile(SimpleNamespace(app=app), session, profile_id)
+            assert exc_info.value.status_code == 409
+            assert exc_info.value.message == "profile_has_been_used"
+
+    asyncio.run(attempt_delete())
     asyncio.run(engine.dispose())
 
 
@@ -596,4 +714,43 @@ def test_no_default_profile_creates_explicit_source_fallback_execution(tmp_path)
     assert response.status_code == 200
     assert response.json()["profile"] is None
     assert response.json()["source_fallback_enabled"] is True
+    asyncio.run(engine.dispose())
+
+
+def test_default_profile_maintenance_race_falls_back_without_credentials(
+    tmp_path, monkeypatch
+):
+    app, engine, key = _app(tmp_path)
+
+    async def reject_stale_active_profile(*args, **kwargs):
+        del args, kwargs
+        raise ModelPreheatS3ProfileNotActive
+
+    monkeypatch.setattr(
+        model_file_download_execution_service,
+        "lock_active_profile_for_new_work",
+        reject_stale_active_profile,
+    )
+    _, model_file_id, _ = asyncio.run(_seed(engine, key))
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            execution = (
+                await session.exec(
+                    select(ModelFileDownloadExecution).where(
+                        ModelFileDownloadExecution.model_file_id == model_file_id
+                    )
+                )
+            ).one()
+            pins = (
+                await session.exec(select(ModelFileDownloadExecutionProfilePin))
+            ).all()
+            return execution, pins
+
+    execution, pins = asyncio.run(inspect())
+    assert execution.default_profile_id is None
+    assert execution.default_profile_config_version is None
+    assert execution.credential_snapshot_encrypted is None
+    assert execution.encryption_key_version is None
+    assert pins == []
     asyncio.run(engine.dispose())

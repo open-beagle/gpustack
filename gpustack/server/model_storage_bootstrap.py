@@ -17,6 +17,7 @@ import logging
 from typing import Optional
 from urllib.parse import urlparse
 
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -29,7 +30,9 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     PROVISIONING_KEY_WORKER_LOCAL_S3,
     ModelPreheatS3ConnectivityStateEnum,
     ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
     ModelPreheatS3ProvisioningSourceEnum,
+    model_preheat_s3_storage_key,
     normalize_model_preheat_s3_prefix,
 )
 from gpustack.server.model_storage_credential_key import (
@@ -72,7 +75,11 @@ def _is_default_slot_constraint_error(exc: IntegrityError) -> bool:
     combined = "\n".join(texts)
     if "uix_model_preheat_s3_profiles_default_slot" in combined:
         return True
-    return "UNIQUE constraint failed: model_preheat_s3_profiles.default_slot" in combined
+    return (
+        "UNIQUE constraint failed: model_preheat_s3_profiles.default_slot" in combined
+    )
+
+
 def parse_local_s3_target(config) -> Optional[dict]:
     """把 ``worker-local-s3-*`` 启动参数解析为系统 Profile 的目标字段。
 
@@ -83,7 +90,9 @@ def parse_local_s3_target(config) -> Optional[dict]:
     host = (getattr(config, "worker_local_s3_host", "") or "").strip()
     access_key = getattr(config, "worker_local_s3_access_key", "") or ""
     secret_key = getattr(config, "worker_local_s3_secret_key", "") or ""
-    prefix_uri = (getattr(config, "worker_local_s3_modelscope_prefix", "") or "").strip()
+    prefix_uri = (
+        getattr(config, "worker_local_s3_modelscope_prefix", "") or ""
+    ).strip()
     if not host or not access_key or not secret_key:
         return None
     if not prefix_uri.startswith("s3://"):
@@ -151,7 +160,11 @@ async def _maybe_occupy_default_slot(
 
     单独提交，冲突（并发抢占）时回退非默认，不影响已提交的连接/凭据更新。
     """
-    if not want_default or profile.default_slot == DEFAULT_SLOT_GLOBAL:
+    if (
+        not want_default
+        or profile.lifecycle_state != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
+        or profile.default_slot == DEFAULT_SLOT_GLOBAL
+    ):
         return
     try:
         profile.default_slot = DEFAULT_SLOT_GLOBAL
@@ -162,7 +175,9 @@ async def _maybe_occupy_default_slot(
         await session.refresh(profile)
 
 
-async def _find_system_profile(session: AsyncSession) -> Optional[ModelPreheatS3Profile]:
+async def _find_system_profile(
+    session: AsyncSession,
+) -> Optional[ModelPreheatS3Profile]:
     profile_id = (
         await session.exec(
             select(ModelPreheatS3Profile.id).where(
@@ -222,6 +237,9 @@ async def bootstrap_worker_local_s3_profile(
 
     access_key_encrypted = cipher.encrypt(target["access_key"])
     secret_key_encrypted = cipher.encrypt(target["secret_key"])
+    target_storage_key = model_preheat_s3_storage_key(
+        target["endpoint"], target["bucket"]
+    )
 
     async def _stored_credentials(profile):
         try:
@@ -247,6 +265,7 @@ async def bootstrap_worker_local_s3_profile(
                 ModelPreheatS3Profile.secret_key_encrypted,
                 ModelPreheatS3Profile.source_fallback_enabled,
                 ModelPreheatS3Profile.default_slot,
+                ModelPreheatS3Profile.lifecycle_state,
             ).where(
                 ModelPreheatS3Profile.provisioning_key
                 == PROVISIONING_KEY_WORKER_LOCAL_S3
@@ -255,17 +274,28 @@ async def bootstrap_worker_local_s3_profile(
     ).first()
 
     any_default = (
-        (
-            await session.exec(
-                select(ModelPreheatS3Profile).where(
-                    ModelPreheatS3Profile.default_slot == DEFAULT_SLOT_GLOBAL
-                )
+        await session.exec(
+            select(ModelPreheatS3Profile).where(
+                ModelPreheatS3Profile.default_slot == DEFAULT_SLOT_GLOBAL,
+                ModelPreheatS3Profile.lifecycle_state
+                == ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE,
             )
-        ).first()
-        is not None
-    )
+        )
+    ).first() is not None
     # 仅当系统当前没有默认 Profile 时，引导 Profile 才占 global；否则不抢回。
-    want_default = not any_default
+    active_manual_collision = (
+        await session.exec(
+            select(ModelPreheatS3Profile.id).where(
+                ModelPreheatS3Profile.active_storage_key == target_storage_key,
+                or_(
+                    ModelPreheatS3Profile.provisioning_key.is_(None),
+                    ModelPreheatS3Profile.provisioning_key
+                    != PROVISIONING_KEY_WORKER_LOCAL_S3,
+                ),
+            )
+        )
+    ).first()
+    want_default = not any_default and active_manual_collision is None
 
     if existing is None:
         profile = ModelPreheatS3Profile(
@@ -284,6 +314,14 @@ async def bootstrap_worker_local_s3_profile(
             provisioning_source=ModelPreheatS3ProvisioningSourceEnum.WORKER_LOCAL_S3,
             provisioning_key=PROVISIONING_KEY_WORKER_LOCAL_S3,
             system_managed=True,
+            lifecycle_state=(
+                ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+                if active_manual_collision is not None
+                else ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
+            ),
+            active_storage_key=(
+                None if active_manual_collision is not None else target_storage_key
+            ),
             default_slot=DEFAULT_SLOT_GLOBAL if want_default else None,
             source_fallback_enabled=target["source_fallback_enabled"],
             connectivity_state=ModelPreheatS3ConnectivityStateEnum.PENDING,
@@ -329,17 +367,34 @@ async def bootstrap_worker_local_s3_profile(
     stored_access, stored_secret = await _stored_credentials(existing)
     # 凭据比较基于解密后的明文，避免 AES-GCM 每次 nonce 不同导致的“假变化”。
     credential_changed = (
-        stored_access != target["access_key"]
-        or stored_secret != target["secret_key"]
+        stored_access != target["access_key"] or stored_secret != target["secret_key"]
     )
     existing_id = existing.id
     if not connection_changed and not credential_changed:
         existing_profile = await session.get(ModelPreheatS3Profile, existing_id)
+        if (
+            active_manual_collision is not None
+            and existing_profile.lifecycle_state
+            != ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+        ):
+            existing_profile.lifecycle_state = (
+                ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+            )
+            existing_profile.active_storage_key = None
+            existing_profile.default_slot = None
+            session.add(existing_profile)
+            await session.commit()
+            await session.refresh(existing_profile)
         # 配置未变但系统当前无默认 Profile 时，仍需占 global（重启不抢回 UI 手工默认）。
         await _maybe_occupy_default_slot(session, existing_profile, want_default)
         return existing_profile
 
     existing_profile = await session.get(ModelPreheatS3Profile, existing_id)
+
+    # 维护由管理员显式控制；启动参数刷新凭据和连接绝不把它自动恢复为 active。
+    desired_lifecycle = existing_profile.lifecycle_state
+    if active_manual_collision is not None:
+        desired_lifecycle = ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
 
     existing_profile.endpoint = target["endpoint"]
     existing_profile.bucket = target["bucket"]
@@ -348,6 +403,14 @@ async def bootstrap_worker_local_s3_profile(
     existing_profile.access_key_encrypted = access_key_encrypted
     existing_profile.secret_key_encrypted = secret_key_encrypted
     existing_profile.encryption_key_version = cipher.current_key_version
+    existing_profile.lifecycle_state = desired_lifecycle
+    existing_profile.active_storage_key = (
+        target_storage_key
+        if desired_lifecycle == ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
+        else None
+    )
+    if desired_lifecycle == ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE:
+        existing_profile.default_slot = None
     existing_profile.config_version += 1
     existing_profile.connectivity_state = ModelPreheatS3ConnectivityStateEnum.PENDING
     existing_profile.last_connectivity_check_id = None

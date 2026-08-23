@@ -1,11 +1,12 @@
 from datetime import datetime
 from enum import Enum
+import hashlib
 from typing import Optional
 from urllib.parse import urlparse
 
 from pydantic import field_validator
 from pydantic import computed_field
-from sqlalchemy import Column, UniqueConstraint
+from sqlalchemy import Column, String, UniqueConstraint
 from sqlmodel import Field, SQLModel, Text
 
 from gpustack.mixins import BaseModelMixin
@@ -25,6 +26,11 @@ class ModelPreheatS3ConnectivityStateEnum(str, Enum):
 class ModelPreheatS3ProvisioningSourceEnum(str, Enum):
     MANUAL = "manual"
     WORKER_LOCAL_S3 = "worker_local_s3"
+
+
+class ModelPreheatS3ProfileLifecycleStateEnum(str, Enum):
+    ACTIVE = "active"
+    MAINTENANCE = "maintenance"
 
 
 PROVISIONING_KEY_WORKER_LOCAL_S3 = "worker_local_s3"
@@ -51,6 +57,51 @@ def normalize_model_preheat_s3_prefix(prefix: Optional[str]) -> str:
     return "/".join(parts)
 
 
+def model_preheat_s3_storage_key(endpoint: str, bucket: str) -> str:
+    """生成跨数据库一致的 S3 位置标识，不包含受系统控制的 prefix。"""
+    parsed = urlparse(endpoint)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid_endpoint_port") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("invalid_endpoint_port")
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if port in {80, 443} and (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        port = None
+    normalized_endpoint = f"{scheme}://{host}"
+    if port is not None:
+        normalized_endpoint = f"{normalized_endpoint}:{port}"
+    location = f"{normalized_endpoint}|{bucket.strip().lower()}"
+    return hashlib.sha256(location.encode("utf-8")).hexdigest()
+
+
+def validate_model_preheat_s3_endpoint(value: str) -> str:
+    """校验新写入的 Endpoint；Public/ORM 必须能承载待修复的历史值。"""
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("invalid_endpoint_scheme")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid_endpoint_port") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("invalid_endpoint_port")
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("invalid_endpoint_format")
+    return value
+
+
 class ModelPreheatS3ProfileBase(SQLModel):
     name: str
     description: Optional[str] = Field(
@@ -63,14 +114,6 @@ class ModelPreheatS3ProfileBase(SQLModel):
     tls_verify: bool = True
     region: Optional[str] = ""
     use_virtual_hosted_style: bool = True
-
-    @field_validator("endpoint")
-    @classmethod
-    def validate_endpoint(cls, value: str):
-        parsed = urlparse(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("invalid_endpoint_scheme")
-        return value
 
     @field_validator("prefix")
     @classmethod
@@ -93,6 +136,11 @@ class ModelPreheatS3Profile(ModelPreheatS3ProfileBase, BaseModelMixin, table=Tru
         UniqueConstraint(
             "default_slot", name="uix_model_preheat_s3_profiles_default_slot"
         ),
+        # active Profile 的 Endpoint + Bucket 必须唯一；维护中的历史/重复配置保留。
+        UniqueConstraint(
+            "active_storage_key",
+            name="uix_model_preheat_s3_profiles_active_storage_key",
+        ),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -105,6 +153,15 @@ class ModelPreheatS3Profile(ModelPreheatS3ProfileBase, BaseModelMixin, table=Tru
     )
     provisioning_key: Optional[str] = None
     system_managed: bool = False
+    lifecycle_state: ModelPreheatS3ProfileLifecycleStateEnum = Field(
+        default=ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
+    )
+    active_storage_key: Optional[str] = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    ever_used_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
     default_slot: Optional[str] = None
     source_fallback_enabled: bool = True
     connectivity_state: ModelPreheatS3ConnectivityStateEnum = Field(
@@ -124,6 +181,11 @@ class ModelPreheatS3ProfileCreate(ModelPreheatS3ProfileBase):
     source_fallback_enabled: bool = True
     default_slot: Optional[str] = None
 
+    @field_validator("endpoint")
+    @classmethod
+    def validate_endpoint(cls, value: str):
+        return validate_model_preheat_s3_endpoint(value)
+
 
 class ModelPreheatS3ProfileUpdate(SQLModel):
     name: Optional[str] = None
@@ -139,13 +201,14 @@ class ModelPreheatS3ProfileUpdate(SQLModel):
     use_virtual_hosted_style: Optional[bool] = None
     source_fallback_enabled: Optional[bool] = None
     default_slot: Optional[str] = None
+    lifecycle_state: Optional[ModelPreheatS3ProfileLifecycleStateEnum] = None
 
     @field_validator("endpoint")
     @classmethod
     def validate_endpoint(cls, value: Optional[str]):
         if value is None:
             return value
-        return ModelPreheatS3ProfileBase.validate_endpoint(value)
+        return validate_model_preheat_s3_endpoint(value)
 
     @field_validator("prefix")
     @classmethod
@@ -161,6 +224,8 @@ class ModelPreheatS3ProfilePublic(ModelPreheatS3ProfileBase):
     provisioning_source: ModelPreheatS3ProvisioningSourceEnum
     provisioning_key: Optional[str] = None
     system_managed: bool
+    lifecycle_state: ModelPreheatS3ProfileLifecycleStateEnum
+    ever_used_at: Optional[datetime] = None
     default_slot: Optional[str] = None
     source_fallback_enabled: bool
     config_version: int

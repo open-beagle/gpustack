@@ -25,6 +25,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ConnectivityStateEnum,
     ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
 )
 from gpustack.schemas.model_preheats import (
     ModelPreheatConnectivityCheckStateEnum,
@@ -161,6 +162,65 @@ def test_connectivity_check_reuses_same_explicit_target_snapshot_only(tmp_path):
                     (check_a.id, "worker-a-uuid"),
                     (check_b_id, "worker-b-uuid"),
                 }
+        finally:
+            await _tables(engine, SQLModel.metadata.drop_all)
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_worker_lifecycle_check_does_not_replace_profile_presentation_pointer(
+    tmp_path,
+):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'lifecycle-pointer.db'}",
+            poolclass=NullPool,
+        )
+        await _tables(engine, SQLModel.metadata.create_all)
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                profile = _profile()
+                session.add_all(
+                    [
+                        profile,
+                        _worker("worker-a", "worker-a-uuid"),
+                        _worker("worker-b", "worker-b-uuid"),
+                    ]
+                )
+                await session.commit()
+
+                full_check = await create_or_reuse_connectivity_check(session, profile)
+                assert profile.last_connectivity_check_id == full_check.id
+
+                lifecycle_check = await create_or_reuse_connectivity_check(
+                    session,
+                    profile,
+                    target_worker_uuids=["worker-a-uuid"],
+                    scope_discriminator="worker-lifecycle",
+                    update_profile_pointer=False,
+                )
+                assert lifecycle_check.id != full_check.id
+                assert profile.last_connectivity_check_id == full_check.id
+
+                repeated_lifecycle_check = await create_or_reuse_connectivity_check(
+                    session,
+                    profile,
+                    target_worker_uuids=["worker-a-uuid"],
+                    scope_discriminator="worker-lifecycle",
+                    update_profile_pointer=False,
+                )
+                assert repeated_lifecycle_check.id == lifecycle_check.id
+                assert profile.last_connectivity_check_id == full_check.id
+
+                profile.last_connectivity_check_id = None
+                session.add(profile)
+                await session.commit()
+                repeated_full_check = await create_or_reuse_connectivity_check(
+                    session, profile
+                )
+                assert repeated_full_check.id == full_check.id
+                assert profile.last_connectivity_check_id == full_check.id
         finally:
             await _tables(engine, SQLModel.metadata.drop_all)
             await engine.dispose()
@@ -560,6 +620,11 @@ def test_old_registration_terminal_result_is_invalid_after_reregistration(
                     profile.connectivity_state
                     != ModelPreheatS3ConnectivityStateEnum.AVAILABLE
                 )
+                assert (
+                    profile.lifecycle_state
+                    == ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
+                )
+                assert profile.ever_used_at is None
         finally:
             await _tables(engine, SQLModel.metadata.drop_all)
             await engine.dispose()

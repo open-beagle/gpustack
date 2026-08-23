@@ -131,10 +131,12 @@ def test_refresh_rebuilds_current_version_and_marks_old_version_stale(
                     )
                 )
             ).all()
+            refreshed_profile = await session.get(ModelPreheatS3Profile, profile_id)
+            ever_used_at = refreshed_profile.ever_used_at
         await engine.dispose()
-        return counts, rows
+        return counts, rows, ever_used_at
 
-    counts, rows = asyncio.run(run())
+    counts, rows, ever_used_at = asyncio.run(run())
 
     assert counts == {"scanned": 1, "valid": 1, "invalid": 0, "deleted": 1}
     assert [(row.profile_config_version, row.artifact_id) for row in rows] == [
@@ -143,6 +145,7 @@ def test_refresh_rebuilds_current_version_and_marks_old_version_stale(
     ]
     assert rows[0].manifest_state == ModelPreheatInventoryManifestStateEnum.STALE
     assert rows[1].manifest_state == ModelPreheatInventoryManifestStateEnum.VALID
+    assert ever_used_at is not None
 
 
 def test_gc_is_explicitly_unsupported():

@@ -15,7 +15,10 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     distribution_operation_key,
     distribution_selector_digest,
 )
-from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_preheat_s3_profiles import (
+    ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatExecutionStateEnum,
     ModelPreheatTargetScopeEnum,
@@ -206,7 +209,14 @@ class ModelPreheatWorkerReconciler:
 
     async def _ensure_connectivity_checks(self, worker):
         async with AsyncSession(self._engine) as session:
-            profiles = (await session.exec(select(ModelPreheatS3Profile))).all()
+            profiles = (
+                await session.exec(
+                    select(ModelPreheatS3Profile).where(
+                        ModelPreheatS3Profile.lifecycle_state
+                        == ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
+                    )
+                )
+            ).all()
             profile_ids = [profile.id for profile in profiles]
         for profile_id in profile_ids:
             async with AsyncSession(self._engine) as session:
@@ -224,6 +234,7 @@ class ModelPreheatWorkerReconciler:
                     idempotency_scope_key=scope,
                     request_hash=hashlib.sha256(scope.encode("utf-8")).hexdigest(),
                     scope_discriminator=_network_fingerprint(worker),
+                    update_profile_pointer=False,
                 )
 
     async def _evaluate_worker(self, worker, policy_ids=None):
@@ -248,6 +259,8 @@ class ModelPreheatWorkerReconciler:
                 if (
                     source_task is None
                     or profile is None
+                    or profile.lifecycle_state
+                    != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
                     or not policy.enabled
                     or policy.profile_config_version != profile.config_version
                     or source_task.s3_profile_config_version
@@ -276,6 +289,8 @@ class ModelPreheatWorkerReconciler:
                     not source_task.artifact_id
                     or not source_task.s3_manifest_path
                     or not source_task.manifest_digest
+                    or profile.lifecycle_state
+                    != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
                     or not policy.enabled
                     or policy.profile_config_version != profile.config_version
                     or source_task.s3_profile_config_version
@@ -351,7 +366,11 @@ async def _ensure_policy(session, task):
     profile = await session.get(
         ModelPreheatS3Profile, task.s3_profile_id, populate_existing=True
     )
-    if profile is None or task.s3_profile_config_version != profile.config_version:
+    if (
+        profile is None
+        or profile.lifecycle_state != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
+        or task.s3_profile_config_version != profile.config_version
+    ):
         return None
     worker_selector, gpu_selector = _selectors_for_task(task)
     selector_digest = distribution_selector_digest(worker_selector, gpu_selector)

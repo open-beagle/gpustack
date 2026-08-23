@@ -273,6 +273,24 @@ async def claim_model_preheat_worker_task(
         await session.rollback()
         await _task_or_404(session, worker_task_id)
         _conflict("task_not_claimable")
+    profile_id = None
+    if task.task_id is not None:
+        parent = await session.get(ModelPreheatTask, task.task_id)
+        profile_id = parent.s3_profile_id if parent is not None else None
+    elif task.distribution_policy_id is not None:
+        policy = await session.get(
+            ModelPreheatDistributionPolicy, task.distribution_policy_id
+        )
+        profile_id = policy.profile_id if policy is not None else None
+    if profile_id is not None:
+        await session.exec(
+            update(ModelPreheatS3Profile)
+            .where(
+                ModelPreheatS3Profile.id == profile_id,
+                ModelPreheatS3Profile.ever_used_at.is_(None),
+            )
+            .values(ever_used_at=now)
+        )
     await session.commit()
     task = await _refresh_task(session, worker_task_id)
     await _publish(task)
@@ -444,7 +462,7 @@ async def complete_model_preheat_worker_task(
     )
     if task.state == ModelPreheatWorkerTaskStateEnum.READY:
         await _aggregate_connectivity(session, task)
-        return task
+        return await _refresh_task(session, worker_task_id)
     result_payload = _validated_result(task.role, complete.result)
     now = _utcnow()
     if task.task_id is not None and result_payload.get("state") == "ready":
@@ -469,10 +487,11 @@ async def complete_model_preheat_worker_task(
             idempotent_state=ModelPreheatWorkerTaskStateEnum.READY,
         )
         await _aggregate_connectivity(session, task)
-        return task
+        return await _refresh_task(session, worker_task_id)
     await session.commit()
     task = await _refresh_task(session, worker_task_id)
     await _aggregate_connectivity(session, task)
+    task = await _refresh_task(session, worker_task_id)
     await _publish(task)
     return task
 
@@ -496,7 +515,7 @@ async def fail_model_preheat_worker_task(
     result_payload = _validated_result(task.role, failure.result)
     if task.state == ModelPreheatWorkerTaskStateEnum.ERROR:
         await _aggregate_connectivity(session, task)
-        return task
+        return await _refresh_task(session, worker_task_id)
     now = _utcnow()
     result = await session.exec(
         _active_lease_update(worker_task_id, failure, now).values(
@@ -519,10 +538,11 @@ async def fail_model_preheat_worker_task(
             idempotent_state=ModelPreheatWorkerTaskStateEnum.ERROR,
         )
         await _aggregate_connectivity(session, task)
-        return task
+        return await _refresh_task(session, worker_task_id)
     await session.commit()
     task = await _refresh_task(session, worker_task_id)
     await _aggregate_connectivity(session, task)
+    task = await _refresh_task(session, worker_task_id)
     await _publish(task)
     return task
 
@@ -926,6 +946,14 @@ async def _bind_preheat_artifact(session, worker_task, result, now):
             inventory.manifest_state = ModelPreheatInventoryManifestStateEnum.VALID
             inventory.last_verified_at = now
             session.add(inventory)
+        await session.exec(
+            update(ModelPreheatS3Profile)
+            .where(
+                ModelPreheatS3Profile.id == parent.s3_profile_id,
+                ModelPreheatS3Profile.ever_used_at.is_(None),
+            )
+            .values(ever_used_at=now)
+        )
     elif parent.artifact_id != artifact_id:
         _conflict("artifact_binding_conflict")
     await session.flush()

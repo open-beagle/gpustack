@@ -44,7 +44,10 @@ from gpustack.model_preheat_credentials import (
     ModelPreheatCredentialError,
 )
 from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
-from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_preheat_s3_profiles import (
+    ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatArtifactPublic,
@@ -82,6 +85,10 @@ from gpustack.server.model_preheat_idempotency import (
     canonical_request_hash,
     get_idempotency_record,
     new_idempotency_record,
+)
+from gpustack.server.model_preheat_s3_profile_lifecycle import (
+    ModelPreheatS3ProfileNotActive,
+    lock_active_profile_for_new_work,
 )
 from gpustack.server.bus import EventType
 from gpustack.server.model_storage_connection_test import (
@@ -256,6 +263,8 @@ async def create_model_storage_sync_task(
     profile = await ModelPreheatS3Profile.one_by_id(session, pf_id)
     if profile is None:
         raise NotFoundException(message="s3_profile_not_found")
+    if profile.lifecycle_state != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE:
+        raise HTTPException(409, "Conflict", "s3_profile_in_maintenance")
     # IntegrityError 回滚前缓存 model_file/profile 标量：回滚后 ORM 实例属性
     # 访问会触发过期重载（MissingGreenlet），恢复路径只允许使用这里缓存的
     # 纯 Python 标量（id/config_version/源路径/扫描规约）。
@@ -324,6 +333,10 @@ async def create_model_storage_sync_task(
     # 库存精确命中时直接绑定 artifact_id；否则保持 NULL 供 Worker CAS 绑定。
     artifact_id = await _exact_artifact_match(session, profile, identity)
     worker = await _latest_ready_worker_for_model_file(session, model_file)
+    try:
+        await lock_active_profile_for_new_work(session, pf_id, pf_config_version)
+    except ModelPreheatS3ProfileNotActive:
+        raise HTTPException(409, "Conflict", "s3_profile_in_maintenance") from None
 
     task = ModelStorageSyncTask(
         model_file_id=mf_id,
@@ -1049,6 +1062,20 @@ async def get_model_storage_sync_execution_payload(
     if current is None or current.id != task.worker_id:
         raise HTTPException(403, "worker_not_current", "worker_not_current")
 
+    # 签发执行 payload 即表示 Worker 将开始真实存储操作；只允许 NULL -> 时间。
+    await session.exec(
+        update(ModelPreheatS3Profile)
+        .where(
+            ModelPreheatS3Profile.id == task.profile_id,
+            ModelPreheatS3Profile.ever_used_at.is_(None),
+        )
+        .values(ever_used_at=datetime.now(timezone.utc))
+    )
+    await session.commit()
+    task = await ModelStorageSyncTask.one_by_id(session, task_id)
+    if task is None:
+        raise NotFoundException(message="model_storage_sync_task_not_found")
+
     cipher = _cipher_from_request(request)
     try:
         snapshot = _decrypt_execution_snapshot(cipher, task)
@@ -1353,6 +1380,14 @@ async def _upsert_sync_task_artifact(
     existing.total_size = complete.total_size
     existing.manifest_state = ModelPreheatInventoryManifestStateEnum.VALID
     existing.last_verified_at = now
+    await session.exec(
+        update(ModelPreheatS3Profile)
+        .where(
+            ModelPreheatS3Profile.id == profile.id,
+            ModelPreheatS3Profile.ever_used_at.is_(None),
+        )
+        .values(ever_used_at=now)
+    )
     await session.flush()
 
 

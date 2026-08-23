@@ -28,7 +28,9 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     DEFAULT_SLOT_GLOBAL,
     ModelPreheatS3ConnectivityStateEnum,
     ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
     ModelPreheatS3ProvisioningSourceEnum,
+    model_preheat_s3_storage_key,
 )
 from gpustack.server.model_storage_bootstrap import (
     DEFAULT_LOCAL_S3_URI,
@@ -155,12 +157,8 @@ def test_bootstrap_is_idempotent_on_restart(tmp_path):
     async def run():
         async with _session(tmp_path) as session:
             cipher = _cipher()
-            first = await bootstrap_worker_local_s3_profile(
-                _config(), session, cipher
-            )
-            second = await bootstrap_worker_local_s3_profile(
-                _config(), session, cipher
-            )
+            first = await bootstrap_worker_local_s3_profile(_config(), session, cipher)
+            second = await bootstrap_worker_local_s3_profile(_config(), session, cipher)
             assert first.id == second.id
             rows = list((await session.exec(select(ModelPreheatS3Profile))).all())
             assert len(rows) == 1
@@ -170,16 +168,70 @@ def test_bootstrap_is_idempotent_on_restart(tmp_path):
     asyncio.run(run())
 
 
+def test_bootstrap_does_not_reactivate_explicit_maintenance_profile(tmp_path):
+    async def run():
+        async with _session(tmp_path) as session:
+            cipher = _cipher()
+            first = await bootstrap_worker_local_s3_profile(_config(), session, cipher)
+            first.lifecycle_state = ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+            first.active_storage_key = None
+            first.default_slot = None
+            session.add(first)
+            await session.commit()
+
+            restarted = await bootstrap_worker_local_s3_profile(
+                _config(), session, cipher
+            )
+
+            assert restarted.id == first.id
+            assert (
+                restarted.lifecycle_state
+                == ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+            )
+            assert restarted.active_storage_key is None
+            assert restarted.default_slot is None
+
+    asyncio.run(run())
+
+
+def test_bootstrap_same_active_manual_storage_creates_system_maintenance(tmp_path):
+    async def run():
+        async with _session(tmp_path) as session:
+            target = parse_local_s3_target(_config())
+            manual = _manual_profile(
+                endpoint=target["endpoint"],
+                bucket=target["bucket"],
+                active_storage_key=model_preheat_s3_storage_key(
+                    target["endpoint"], target["bucket"]
+                ),
+                default_slot=DEFAULT_SLOT_GLOBAL,
+            )
+            session.add(manual)
+            await session.commit()
+
+            system = await bootstrap_worker_local_s3_profile(
+                _config(), session, _cipher()
+            )
+
+            assert system.system_managed is True
+            assert (
+                system.lifecycle_state
+                == ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+            )
+            assert system.active_storage_key is None
+            assert system.default_slot is None
+            refreshed_manual = await session.get(ModelPreheatS3Profile, manual.id)
+            assert refreshed_manual.default_slot == DEFAULT_SLOT_GLOBAL
+
+    asyncio.run(run())
+
+
 def test_bootstrap_config_change_increments_version_and_resets_connectivity(tmp_path):
     async def run():
         async with _session(tmp_path) as session:
             cipher = _cipher()
-            first = await bootstrap_worker_local_s3_profile(
-                _config(), session, cipher
-            )
-            first.connectivity_state = (
-                ModelPreheatS3ConnectivityStateEnum.AVAILABLE
-            )
+            first = await bootstrap_worker_local_s3_profile(_config(), session, cipher)
+            first.connectivity_state = ModelPreheatS3ConnectivityStateEnum.AVAILABLE
             first.last_connectivity_check_id = 7
             await session.commit()
 
@@ -356,9 +408,7 @@ def test_bootstrap_unchanged_config_still_occupies_global_when_no_default(
             manual.default_slot = None
             await session.commit()
 
-            second = await bootstrap_worker_local_s3_profile(
-                _config(), session, cipher
-            )
+            second = await bootstrap_worker_local_s3_profile(_config(), session, cipher)
             assert second.id == profile_id
             assert second.config_version == 1
             assert second.default_slot == DEFAULT_SLOT_GLOBAL
@@ -383,16 +433,13 @@ def test_bootstrap_does_not_fake_success_on_real_name_conflict(tmp_path):
             await session.commit()
 
             with pytest.raises(IntegrityError):
-                await bootstrap_worker_local_s3_profile(
-                    _config(), session, _cipher()
-                )
+                await bootstrap_worker_local_s3_profile(_config(), session, _cipher())
 
             system_rows = list(
                 (
                     await session.exec(
                         select(ModelPreheatS3Profile).where(
-                            ModelPreheatS3Profile.provisioning_key
-                            == "worker_local_s3"
+                            ModelPreheatS3Profile.provisioning_key == "worker_local_s3"
                         )
                     )
                 ).all()
@@ -452,8 +499,7 @@ def test_bootstrap_concurrent_first_create_adopts_winner(tmp_path, monkeypatch):
                 (
                     await session.exec(
                         select(ModelPreheatS3Profile).where(
-                            ModelPreheatS3Profile.provisioning_key
-                            == "worker_local_s3"
+                            ModelPreheatS3Profile.provisioning_key == "worker_local_s3"
                         )
                     )
                 ).all()
@@ -573,8 +619,7 @@ def test_bootstrap_double_stale_adopts_winner_on_second_integrity_error(
                 (
                     await session.exec(
                         select(ModelPreheatS3Profile).where(
-                            ModelPreheatS3Profile.provisioning_key
-                            == "worker_local_s3"
+                            ModelPreheatS3Profile.provisioning_key == "worker_local_s3"
                         )
                     )
                 ).all()
@@ -617,8 +662,6 @@ def test_bootstrap_first_create_real_integrity_error_still_raises(
 
             monkeypatch.setattr(session, "exec", stale_exec)
             with pytest.raises(IntegrityError):
-                await bootstrap_worker_local_s3_profile(
-                    _config(), session, _cipher()
-                )
+                await bootstrap_worker_local_s3_profile(_config(), session, _cipher())
 
     asyncio.run(run())

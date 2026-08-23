@@ -155,6 +155,15 @@ class ModelPreheatS3Inventory:
                     setattr(artifact, field, value)
                 artifact.last_verified_at = now
             session.add(artifact)
+        if records:
+            await session.exec(
+                update(ModelPreheatS3Profile)
+                .where(
+                    ModelPreheatS3Profile.id == profile_id,
+                    ModelPreheatS3Profile.ever_used_at.is_(None),
+                )
+                .values(ever_used_at=now)
+            )
         await session.commit()
         return {
             "scanned": scanned,

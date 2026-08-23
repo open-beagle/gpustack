@@ -113,7 +113,7 @@ def profile_payload(**overrides):
         "description": "central cache",
         "endpoint": "https://s3.example.com",
         "bucket": "models",
-        "prefix": "datamodel//team-a/",
+        "prefix": "",
         "access_key": ACCESS_KEY,
         "secret_key": SECRET_KEY,
         "tls_enabled": True,
@@ -129,6 +129,113 @@ def create_profile(client, **overrides):
     response = client.post(API_PREFIX, json=profile_payload(**overrides))
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def test_manual_profile_prefix_is_system_controlled(client):
+    response = client.post(
+        API_PREFIX,
+        json=profile_payload(prefix="model-storage/team-a"),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["message"] == "manual_profile_prefix_forbidden"
+
+
+def test_maintenance_clears_default_and_reactivation_requires_explicit_default(client):
+    created = create_profile(client, default_slot="global")
+
+    maintenance = client.patch(
+        f"{API_PREFIX}/{created['id']}", json={"lifecycle_state": "maintenance"}
+    )
+    assert maintenance.status_code == 200, maintenance.text
+    assert maintenance.json()["lifecycle_state"] == "maintenance"
+    assert maintenance.json()["default_slot"] is None
+
+    restored = client.patch(
+        f"{API_PREFIX}/{created['id']}", json={"lifecycle_state": "active"}
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["default_slot"] is None
+
+    defaulted = client.patch(
+        f"{API_PREFIX}/{created['id']}", json={"default_slot": "global"}
+    )
+    assert defaulted.status_code == 200, defaulted.text
+    assert defaulted.json()["default_slot"] == "global"
+
+
+def test_active_profiles_cannot_share_endpoint_and_bucket(client):
+    create_profile(client)
+
+    response = client.post(API_PREFIX, json=profile_payload(name="same-storage"))
+
+    assert response.status_code == 409
+    assert response.json()["message"] == "profile_storage_conflict"
+
+
+def test_profile_detail_remains_available_for_maintenance_and_used_profile(client, app):
+    created = create_profile(client)
+    asyncio.run(
+        _update_stored_profile(
+            app,
+            created["id"],
+            {
+                "lifecycle_state": "maintenance",
+                "ever_used_at": datetime.now(timezone.utc),
+            },
+        )
+    )
+
+    response = client.get(f"{API_PREFIX}/{created['id']}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["lifecycle_state"] == "maintenance"
+    edited = client.patch(
+        f"{API_PREFIX}/{created['id']}", json={"description": "still editable"}
+    )
+    assert edited.status_code == 200, edited.text
+    checked = client.post(f"{API_PREFIX}/{created['id']}/connectivity-checks")
+    assert checked.status_code == 422
+    assert checked.json()["message"] == "no_online_workers"
+
+
+def test_migrated_invalid_endpoint_remains_readable_and_repairable(client, app):
+    async def seed_invalid_profile():
+        async with AsyncSession(app.state.test_engine) as session:
+            cipher = ModelPreheatCredentialCipher(
+                current_key=app.state.server_config.model_preheat_credential_key,
+                current_key_version="v1",
+            )
+            profile = ModelPreheatS3Profile(
+                name="legacy-invalid-endpoint",
+                endpoint="https://broken:abc",
+                bucket="models",
+                access_key_encrypted=cipher.encrypt("AK"),
+                secret_key_encrypted=cipher.encrypt("SK"),
+                encryption_key_version="v1",
+                lifecycle_state="maintenance",
+            )
+            session.add(profile)
+            await session.commit()
+            await session.refresh(profile)
+            return profile.id
+
+    profile_id = asyncio.run(seed_invalid_profile())
+
+    detail = client.get(f"{API_PREFIX}/{profile_id}")
+    listing = client.get(API_PREFIX)
+    repaired = client.patch(
+        f"{API_PREFIX}/{profile_id}",
+        json={"endpoint": "https://repaired.example.com"},
+    )
+
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["endpoint"] == "https://broken:abc"
+    assert listing.status_code == 200, listing.text
+    assert listing.json()["items"][0]["endpoint"] == "https://broken:abc"
+    assert repaired.status_code == 200, repaired.text
+    assert repaired.json()["endpoint"] == "https://repaired.example.com"
+    assert repaired.json()["lifecycle_state"] == "maintenance"
 
 
 def test_profile_delete_returns_conflict_when_schedule_references_it(app, client):
@@ -474,7 +581,7 @@ def test_create_returns_public_profile_and_never_exposes_plain_credentials(clien
     created = create_profile(client, default_slot="global")
 
     assert created["name"] == "center-cache"
-    assert created["prefix"] == "datamodel/team-a"
+    assert created["prefix"] == ""
     assert created["credential_configured"] is True
     assert created["tls_verify"] is True
     assert created["config_version"] == 1
@@ -554,7 +661,19 @@ def test_prefix_rejects_unsafe_paths(client, prefix):
     assert response.status_code == 422
 
 
-@pytest.mark.parametrize("endpoint", ["ftp://s3.example.com", "s3.example.com"])
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "ftp://s3.example.com",
+        "s3.example.com",
+        "https://s3.example.com:abc",
+        "https://s3.example.com:99999",
+        "https://user@s3.example.com",
+        "https://s3.example.com/path",
+        "https://s3.example.com?query=1",
+        "https://s3.example.com#fragment",
+    ],
+)
 def test_endpoint_allows_only_http_or_https(client, endpoint):
     response = client.post(API_PREFIX, json=profile_payload(endpoint=endpoint))
 
@@ -563,7 +682,9 @@ def test_endpoint_allows_only_http_or_https(client, endpoint):
 
 def test_setting_default_profile_unsets_other_defaults(client):
     first = create_profile(client, name="first", default_slot="global")
-    second = create_profile(client, name="second", default_slot="global")
+    second = create_profile(
+        client, name="second", bucket="other-models", default_slot="global"
+    )
 
     first_response = client.get(f"{API_PREFIX}/{first['id']}")
     second_response = client.get(f"{API_PREFIX}/{second['id']}")
@@ -584,7 +705,9 @@ def test_failed_default_create_does_not_clear_existing_default(
 
     response = client.post(
         API_PREFIX,
-        json=profile_payload(name="second", default_slot="global"),
+        json=profile_payload(
+            name="second", bucket="other-models", default_slot="global"
+        ),
     )
 
     assert response.status_code == 500
@@ -600,13 +723,13 @@ def test_update_without_credentials_preserves_encrypted_values_and_config_versio
 
     response = client.patch(
         f"{API_PREFIX}/{created['id']}",
-        json={"description": "updated", "prefix": "datamodel/updated"},
+        json={"description": "updated"},
     )
 
     assert response.status_code == 200, response.text
     updated = response.json()
     after = asyncio.run(_stored_profile(app, created["id"]))
-    assert updated["config_version"] == 2
+    assert updated["config_version"] == 1
     assert updated["connectivity_state"] == "no_workers"
     assert after.last_connectivity_check_id is None
     assert after.last_connectivity_checked_at is None
@@ -653,7 +776,6 @@ def test_update_connection_config_increments_version_and_resets_connectivity(
         f"{API_PREFIX}/{created['id']}",
         json={
             "endpoint": "https://s3-new.example.com",
-            "prefix": "datamodel/team-b",
             "tls_enabled": False,
         },
     )
@@ -723,6 +845,78 @@ def test_concurrent_connection_config_updates_use_database_cas(app, monkeypatch)
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "competing_update",
+    [
+        {"description": "stale-description"},
+        {"default_slot": "global"},
+        {"endpoint": "https://stale.example.com"},
+    ],
+    ids=["description", "default", "connection"],
+)
+def test_maintenance_wins_concurrent_patch_without_invariant_drift(
+    app, monkeypatch, competing_update
+):
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as async_client:
+            created = await async_client.post(API_PREFIX, json=profile_payload())
+            assert created.status_code == 200
+            profile_id = created.json()["id"]
+
+            original_get_profile = model_preheat_s3_profiles._get_profile
+            original_update = model_preheat_s3_profiles._update_profile_with_cas
+            loaded = 0
+            loaded_lock = asyncio.Lock()
+            both_loaded = asyncio.Event()
+            maintenance_committed = asyncio.Event()
+
+            async def get_profile_with_barrier(*args, **kwargs):
+                nonlocal loaded
+                profile = await original_get_profile(*args, **kwargs)
+                async with loaded_lock:
+                    loaded += 1
+                    if loaded == 2:
+                        both_loaded.set()
+                await asyncio.wait_for(both_loaded.wait(), timeout=5)
+                return profile
+
+            async def ordered_update(session, profile, update_data, **kwargs):
+                if update_data.get("lifecycle_state") == "maintenance":
+                    await original_update(session, profile, update_data, **kwargs)
+                    maintenance_committed.set()
+                    return
+                await asyncio.wait_for(maintenance_committed.wait(), timeout=5)
+                await original_update(session, profile, update_data, **kwargs)
+
+            monkeypatch.setattr(
+                model_preheat_s3_profiles, "_get_profile", get_profile_with_barrier
+            )
+            monkeypatch.setattr(
+                model_preheat_s3_profiles, "_update_profile_with_cas", ordered_update
+            )
+            maintenance, competing = await asyncio.gather(
+                async_client.patch(
+                    f"{API_PREFIX}/{profile_id}",
+                    json={"lifecycle_state": "maintenance"},
+                ),
+                async_client.patch(f"{API_PREFIX}/{profile_id}", json=competing_update),
+            )
+
+        stored = await _stored_profile(app, profile_id)
+        return maintenance, competing, stored
+
+    maintenance, competing, stored = asyncio.run(run())
+    assert maintenance.status_code == 200, maintenance.text
+    assert competing.status_code == 409, competing.text
+    assert competing.json()["message"] == "profile_config_conflict"
+    assert stored.lifecycle_state == "maintenance"
+    assert stored.default_slot is None
+    assert stored.active_storage_key is None
+
+
 def test_default_profile_changes_roll_back_when_config_cas_loses(app, monkeypatch):
     async def run():
         transport = httpx.ASGITransport(app=app)
@@ -735,7 +929,9 @@ def test_default_profile_changes_roll_back_when_config_cas_loses(app, monkeypatc
             )
             target_response = await async_client.post(
                 API_PREFIX,
-                json=profile_payload(name="target", default_slot=None),
+                json=profile_payload(
+                    name="target", bucket="other-models", default_slot=None
+                ),
             )
             default_id = default_response.json()["id"]
             target_id = target_response.json()["id"]
@@ -889,6 +1085,23 @@ def test_delete_system_managed_profile_is_allowed(client, app):
     assert client.get(f"{API_PREFIX}/{created['id']}").status_code == 404
 
 
+def test_delete_system_managed_profile_declared_by_startup_config_is_rejected(
+    client, app
+):
+    created = create_profile(client)
+    asyncio.run(_update_stored_profile(app, created["id"], {"system_managed": True}))
+    config = app.state.server_config
+    config.worker_local_s3_host = "s3.example.com"
+    config.worker_local_s3_access_key = "startup-access"
+    config.worker_local_s3_secret_key = "startup-secret"
+    config.worker_local_s3_modelscope_prefix = "s3://models/model-storage"
+
+    response = client.delete(f"{API_PREFIX}/{created['id']}")
+
+    assert response.status_code == 409
+    assert response.json()["message"] == "system_profile_declared_by_startup_config"
+
+
 def test_delete_system_managed_current_default_profile_is_allowed(client, app):
     created = create_profile(client, default_slot=DEFAULT_SLOT_GLOBAL)
     asyncio.run(_update_stored_profile(app, created["id"], {"system_managed": True}))
@@ -907,7 +1120,7 @@ def test_update_system_managed_profile_allows_only_default_slot_reselect(client,
             app, system["id"], {"system_managed": True, "default_slot": None}
         )
     )
-    other = create_profile(client, name="other")
+    other = create_profile(client, name="other", bucket="other-models")
 
     response = client.patch(
         f"{API_PREFIX}/{other['id']}", json={"default_slot": "global"}
@@ -967,7 +1180,7 @@ def test_update_system_managed_profile_allows_runtime_s3_options(client, app):
     stored = asyncio.run(_stored_profile(app, created["id"]))
     assert stored.endpoint == "https://s3.example.com"
     assert stored.bucket == "models"
-    assert stored.prefix == "datamodel/team-a"
+    assert stored.prefix == ""
     assert stored.last_connectivity_check_id is None
     assert stored.last_connectivity_checked_at is None
 

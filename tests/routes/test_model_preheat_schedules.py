@@ -22,7 +22,10 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from gpustack.api import exceptions
 from gpustack.api.auth import get_admin_user
 from gpustack.config.config import Config
-from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_preheat_s3_profiles import (
+    ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
+)
 from gpustack.schemas.model_preheats import ModelPreheatCreate, ModelPreheatTask
 from gpustack.schemas.users import User
 from gpustack.server.db import get_session
@@ -1022,6 +1025,28 @@ def _payload(profile_id, **overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def test_schedule_create_rejects_maintenance_profile(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id = asyncio.run(_seed_profile(engine))
+
+    async def maintain():
+        async with AsyncSession(engine) as session:
+            profile = await session.get(ModelPreheatS3Profile, profile_id)
+            profile.lifecycle_state = (
+                ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+            )
+            session.add(profile)
+            await session.commit()
+
+    asyncio.run(maintain())
+    with TestClient(app) as client:
+        response = client.post("/v1/model-preheat-schedules", json=_payload(profile_id))
+
+    assert response.status_code == 409
+    assert response.json()["message"] == "model_preheat_s3_profile_in_maintenance"
+    asyncio.run(engine.dispose())
 
 
 def test_schedule_admin_crud_validates_profile_and_hides_internal_keys(tmp_path):

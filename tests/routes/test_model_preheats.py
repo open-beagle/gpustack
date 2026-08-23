@@ -22,6 +22,7 @@ from gpustack.routes import model_preheats
 from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ConnectivityStateEnum,
     ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
 )
 from gpustack.schemas.model_preheats import (
     ModelPreheatConnectivityCheckStateEnum,
@@ -46,6 +47,9 @@ from gpustack.schemas.workers import (
 )
 from gpustack.server.db import get_session
 from gpustack.server.model_preheat_connectivity import aggregate_connectivity_check
+from gpustack.server.model_preheat_s3_profile_lifecycle import (
+    ModelPreheatS3ProfileNotActive,
+)
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
@@ -196,6 +200,63 @@ def payload(profile_id, worker_ids, **overrides):
     }
     result.update(overrides)
     return result
+
+
+def test_create_rejects_maintenance_profile(tmp_path):
+    app, engine = _test_app(tmp_path)
+
+    async def seed():
+        async with AsyncSession(engine) as session:
+            profile, workers = await _seed(session)
+            profile_id = profile.id
+            worker_id = workers[0].id
+            profile.lifecycle_state = (
+                ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+            )
+            session.add(profile)
+            await session.commit()
+            return profile_id, worker_id
+
+    profile_id, worker_id = asyncio.run(seed())
+    with TestClient(app) as client:
+        response = client.post(API_PREFIX, json=payload(profile_id, [worker_id]))
+
+    assert response.status_code == 422
+    assert response.json()["message"] == "model_preheat_s3_profile_in_maintenance"
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+
+def test_create_rejects_profile_maintained_before_final_lock(tmp_path, monkeypatch):
+    app, engine = _test_app(tmp_path)
+
+    async def seed():
+        async with AsyncSession(engine) as session:
+            profile, workers = await _seed(session)
+            return profile.id, workers[0].id
+
+    async def reject_stale_active_profile(*args, **kwargs):
+        del args, kwargs
+        raise ModelPreheatS3ProfileNotActive
+
+    profile_id, worker_id = asyncio.run(seed())
+    monkeypatch.setattr(
+        model_preheats,
+        "lock_active_profile_for_new_work",
+        reject_stale_active_profile,
+    )
+    with TestClient(app) as client:
+        response = client.post(API_PREFIX, json=payload(profile_id, [worker_id]))
+
+    async def task_count():
+        async with AsyncSession(engine) as session:
+            return len((await session.exec(select(ModelPreheatTask))).all())
+
+    assert response.status_code == 422
+    assert response.json()["message"] == "model_preheat_s3_profile_in_maintenance"
+    assert asyncio.run(task_count()) == 0
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
 
 
 def test_operation_lock_deduplicates_without_idempotency_key_and_snapshots_sorted_targets(

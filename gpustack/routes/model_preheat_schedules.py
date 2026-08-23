@@ -8,7 +8,10 @@ from sqlmodel import select
 
 from gpustack.api.exceptions import HTTPException, InvalidException, NotFoundException
 from gpustack.schemas.common import PaginatedList, Pagination
-from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_preheat_s3_profiles import (
+    ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
+)
 from gpustack.schemas.model_preheat_schedules import (
     ModelPreheatSchedule,
     ModelPreheatScheduleCreate,
@@ -264,6 +267,8 @@ async def _profile_or_404(session, profile_id):
     profile = await session.get(ModelPreheatS3Profile, profile_id)
     if profile is None:
         raise NotFoundException(message="model_preheat_s3_profile_not_found")
+    if profile.lifecycle_state != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE:
+        raise HTTPException(409, "Conflict", "model_preheat_s3_profile_in_maintenance")
     return profile
 
 

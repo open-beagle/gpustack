@@ -45,6 +45,7 @@ async def create_or_reuse_connectivity_check(
     idempotency_scope_key: str | None = None,
     request_hash: str | None = None,
     scope_discriminator: str | None = None,
+    update_profile_pointer: bool = True,
 ):
     profile_identity = inspect(profile).identity
     if profile_identity is None:
@@ -76,23 +77,27 @@ async def create_or_reuse_connectivity_check(
     if not ready_workers:
         if all_ready_workers:
             return None
-        pointer_condition = _profile_pointer_matches(profile.last_connectivity_check_id)
-        result = await session.exec(
-            update(ModelPreheatS3Profile)
-            .where(
-                ModelPreheatS3Profile.id == profile.id,
-                ModelPreheatS3Profile.config_version == profile.config_version,
-                pointer_condition,
+        values = {
+            "connectivity_state": (
+                ModelPreheatS3ConnectivityStateEnum.PARTIAL
+                if all_registered_workers
+                else ModelPreheatS3ConnectivityStateEnum.NO_WORKERS
+            ),
+        }
+        conditions = [
+            ModelPreheatS3Profile.id == profile.id,
+            ModelPreheatS3Profile.config_version == profile.config_version,
+        ]
+        if update_profile_pointer:
+            conditions.append(
+                _profile_pointer_matches(profile.last_connectivity_check_id)
             )
-            .values(
-                connectivity_state=(
-                    ModelPreheatS3ConnectivityStateEnum.PARTIAL
-                    if all_registered_workers
-                    else ModelPreheatS3ConnectivityStateEnum.NO_WORKERS
-                ),
+            values.update(
                 last_connectivity_check_id=None,
                 last_connectivity_checked_at=None,
             )
+        result = await session.exec(
+            update(ModelPreheatS3Profile).where(*conditions).values(**values)
         )
         _expire_profile_after_failed_cas(session, profile, result.rowcount)
         await session.commit()
@@ -123,8 +128,16 @@ async def create_or_reuse_connectivity_check(
                     .execution_options(synchronize_session=False)
                 )
                 changed = result.rowcount == 1
-            if profile.last_connectivity_check_id != existing.id:
-                result = await _point_profile_to_check(session, profile, existing.id)
+            if (
+                update_profile_pointer
+                and profile.last_connectivity_check_id != existing.id
+            ):
+                result = await _mark_profile_checking(
+                    session,
+                    profile,
+                    existing.id,
+                    update_profile_pointer=True,
+                )
                 _expire_profile_after_failed_cas(session, profile, result.rowcount)
                 changed = changed or result.rowcount == 1
                 if result.rowcount == 0:
@@ -169,7 +182,12 @@ async def create_or_reuse_connectivity_check(
                     role=ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK,
                 )
             )
-        result = await _point_profile_to_check(session, profile, check.id)
+        result = await _mark_profile_checking(
+            session,
+            profile,
+            check.id,
+            update_profile_pointer=update_profile_pointer,
+        )
         _expire_profile_after_failed_cas(session, profile, result.rowcount)
         await session.commit()
     except IntegrityError:
@@ -340,6 +358,24 @@ async def _point_profile_to_check(session, profile, check_id: int):
         .values(
             connectivity_state=ModelPreheatS3ConnectivityStateEnum.CHECKING,
             last_connectivity_check_id=check_id,
+            last_connectivity_checked_at=None,
+        )
+    )
+
+
+async def _mark_profile_checking(
+    session, profile, check_id: int, *, update_profile_pointer: bool
+):
+    if update_profile_pointer:
+        return await _point_profile_to_check(session, profile, check_id)
+    return await session.exec(
+        update(ModelPreheatS3Profile)
+        .where(
+            ModelPreheatS3Profile.id == profile.id,
+            ModelPreheatS3Profile.config_version == profile.config_version,
+        )
+        .values(
+            connectivity_state=ModelPreheatS3ConnectivityStateEnum.CHECKING,
             last_connectivity_checked_at=None,
         )
     )

@@ -6,8 +6,8 @@ from gpustack.migrations.validate import validate_revision_graph
 
 
 def test_alembic_revision_graph_has_one_resolvable_head():
-    # 任务 4 固定 Profile 引用保护后，唯一 head 前移到引用保护 revision。
-    assert validate_revision_graph() == "a5b6c7d8e9f0"
+    # Profile 生命周期与安全删除 migration 后，唯一 head 必须可解析。
+    assert validate_revision_graph() == "c7d8e9f0a1b2"
 
 
 def test_alembic_upgrades_existing_model_cache_head_to_schedule_head(tmp_path):

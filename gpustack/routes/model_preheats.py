@@ -21,6 +21,7 @@ from gpustack.model_preheat_credentials import (
 from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ConnectivityStateEnum,
     ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
 )
 from gpustack.schemas.model_preheats import (
     ModelPreheatCreate,
@@ -45,6 +46,10 @@ from gpustack.server.model_preheat_idempotency import (
     canonical_request_hash,
     get_idempotency_record,
     new_idempotency_record,
+)
+from gpustack.server.model_preheat_s3_profile_lifecycle import (
+    ModelPreheatS3ProfileNotActive,
+    lock_active_profile_for_new_work,
 )
 from gpustack.server.model_preheat_revision import resolve_model_preheat_revision
 from gpustack.server.model_preheat_connectivity import (
@@ -233,6 +238,8 @@ async def create_model_preheat(
     profile = await ModelPreheatS3Profile.one_by_id(session, task_in.s3_profile_id)
     if profile is None:
         raise NotFoundException(message="model_preheat_s3_profile_not_found")
+    if profile.lifecycle_state != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE:
+        raise InvalidException(message="model_preheat_s3_profile_in_maintenance")
     workers, seed_worker, target_gpu_names = await _resolve_target_workers(
         session, task_in
     )
@@ -299,6 +306,14 @@ async def create_model_preheat(
         )
 
     matched_artifact = await _exact_artifact_match(session, profile, identity)
+    try:
+        await lock_active_profile_for_new_work(
+            session, profile.id, profile.config_version
+        )
+    except ModelPreheatS3ProfileNotActive:
+        raise InvalidException(
+            message="model_preheat_s3_profile_in_maintenance"
+        ) from None
     task = ModelPreheatTask(
         source=task_in.source,
         model_id=task_in.model_id,

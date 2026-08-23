@@ -13,7 +13,10 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatWorkerObservation,
     distribution_operation_key,
 )
-from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_preheat_s3_profiles import (
+    ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
     ModelPreheatExecutionStateEnum,
@@ -286,6 +289,56 @@ def test_new_worker_gets_incremental_connectivity_then_idempotent_distribution(
     assert tasks[0].worker_uuid == "new-uuid"
     assert targets == ["old-uuid"]
     assert probe_calls == 0
+
+
+def test_maintenance_profile_does_not_create_distribution_for_existing_policy(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        _, profile_id = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(
+            engine, ready_probe=FakeReadyProbe(_ready_result())
+        )
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine) as session:
+            worker = await _new_worker(session)
+            worker_uuid = worker.worker_uuid
+            profile = await session.get(ModelPreheatS3Profile, profile_id)
+            profile.lifecycle_state = (
+                ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+            )
+            session.add(profile)
+            check = ModelPreheatS3ConnectivityCheck(
+                profile_id=profile.id,
+                profile_config_version=profile.config_version,
+                state="available",
+                target_worker_uuids=[worker.worker_uuid],
+            )
+            session.add(check)
+            await session.flush()
+            session.add(
+                ModelPreheatWorkerTask(
+                    connectivity_check_id=check.id,
+                    worker_uuid=worker.worker_uuid,
+                    worker_id=worker.id,
+                    role=ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK,
+                    state=ModelPreheatWorkerTaskStateEnum.READY,
+                )
+            )
+            await session.commit()
+        await reconciler.reconcile_worker(worker_uuid)
+        async with AsyncSession(engine) as session:
+            tasks = (
+                await session.exec(
+                    select(ModelPreheatWorkerTask).where(
+                        ModelPreheatWorkerTask.role
+                        == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE
+                    )
+                )
+            ).all()
+        await engine.dispose()
+        return tasks
+
+    assert asyncio.run(run()) == []
 
 
 def test_heartbeat_and_temporary_offline_do_not_create_or_skip_work(tmp_path):

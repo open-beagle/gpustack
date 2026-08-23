@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -19,6 +20,8 @@ from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatBackfillPolicyEnum,
+    ModelPreheatConnectivityCheckStateEnum,
+    ModelPreheatS3ConnectivityCheck,
     ModelPreheatTargetScopeEnum,
     ModelPreheatTask,
     ModelPreheatWorkerTask,
@@ -53,7 +56,7 @@ def _test_app(tmp_path):
     )
 
     async def session_override():
-        async with AsyncSession(engine) as session:
+        async with AsyncSession(engine, expire_on_commit=True) as session:
             yield session
 
     async def admin_override():
@@ -186,9 +189,84 @@ def _ready_result(request_digest, artifact_id="c" * 64):
     }
 
 
+async def _seed_connectivity_task(engine, key):
+    cipher = ModelPreheatCredentialCipher(key, "v1")
+    async with AsyncSession(engine) as session:
+        worker = Worker(
+            id=1,
+            name="worker-a",
+            hostname="worker-a",
+            ip="127.0.0.1",
+            port=10150,
+            worker_uuid="worker-uuid",
+            state=WorkerStateEnum.READY,
+            model_storage_protocol_version=1,
+        )
+        profile = ModelPreheatS3Profile(
+            name="storage",
+            endpoint="https://s3.example.com",
+            bucket="models",
+            access_key_encrypted=cipher.encrypt("access-plain"),
+            secret_key_encrypted=cipher.encrypt("secret-plain"),
+            encryption_key_version="v1",
+        )
+        session.add_all([worker, profile])
+        await session.flush()
+        check = ModelPreheatS3ConnectivityCheck(
+            profile_id=profile.id,
+            profile_config_version=profile.config_version,
+            scope_key="connectivity-scope",
+            active_key="connectivity-active-scope",
+            state=ModelPreheatConnectivityCheckStateEnum.RUNNING,
+            target_worker_uuids=[worker.worker_uuid],
+        )
+        session.add(check)
+        await session.flush()
+        worker_task = ModelPreheatWorkerTask(
+            connectivity_check_id=check.id,
+            worker_uuid=worker.worker_uuid,
+            worker_id=worker.id,
+            role=ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK,
+        )
+        session.add(worker_task)
+        await session.flush()
+        worker_task_id = worker_task.id
+        await session.commit()
+        return worker_task_id
+
+
+def _connectivity_ready_result():
+    return {
+        "state": "ready",
+        "readable": True,
+        "writable": True,
+        "deletable": True,
+        "cleanup_failed": False,
+        "latency_ms": 1,
+    }
+
+
+def _connectivity_error_result():
+    return {
+        "state": "error",
+        "error_code": "network_timeout",
+        "failed_stage": "tcp",
+    }
+
+
 def test_claim_and_payload_keep_credentials_private(tmp_path):
     app, engine, key = _test_app(tmp_path)
-    child_id, _, _ = asyncio.run(_seed(engine, key))
+    child_id, task_id, _ = asyncio.run(_seed(engine, key))
+
+    async def maintain_after_task_was_frozen():
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+            profile = await session.get(ModelPreheatS3Profile, parent.s3_profile_id)
+            profile.lifecycle_state = "maintenance"
+            session.add(profile)
+            await session.commit()
+
+    asyncio.run(maintain_after_task_was_frozen())
     with TestClient(app) as client:
         claim = _claim(client, child_id)
         payload = client.get(
@@ -207,6 +285,14 @@ def test_claim_and_payload_keep_credentials_private(tmp_path):
     assert payload.json()["profile"]["access_key"] == "access-plain"
     assert "access-plain" not in public.text
     assert claim["lease_token"] not in public.text
+
+    async def used_at():
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+            profile = await session.get(ModelPreheatS3Profile, parent.s3_profile_id)
+            return profile.ever_used_at
+
+    assert asyncio.run(used_at()) is not None
     asyncio.run(engine.dispose())
 
 
@@ -289,4 +375,41 @@ def test_seed_complete_rejects_wrong_request_digest(tmp_path):
 
     assert completed.status_code == 409
     assert asyncio.run(artifact_id()) is None
+    asyncio.run(engine.dispose())
+
+
+@pytest.mark.parametrize("operation", ["complete", "fail"])
+def test_connectivity_terminal_updates_remain_serializable_after_aggregation(
+    tmp_path, operation
+):
+    app, engine, key = _test_app(tmp_path)
+    worker_task_id = asyncio.run(_seed_connectivity_task(engine, key))
+    with TestClient(app) as client:
+        claim = _claim(client, worker_task_id)
+        payload = {
+            "worker_uuid": "worker-uuid",
+            "worker_id": 1,
+            "attempt": claim["attempt"],
+            "lease_token": claim["lease_token"],
+        }
+        if operation == "complete":
+            payload["result"] = _connectivity_ready_result()
+        else:
+            payload["error_code"] = "network_timeout"
+            payload["result"] = _connectivity_error_result()
+        first = client.post(f"{API_PREFIX}/{worker_task_id}/{operation}", json=payload)
+        second = client.post(f"{API_PREFIX}/{worker_task_id}/{operation}", json=payload)
+
+    expected_state = "ready" if operation == "complete" else "error"
+    for response in (first, second):
+        assert response.status_code == 200, response.text
+        assert response.json()["state"] == expected_state
+        assert "access-plain" not in response.text
+
+    async def connectivity_did_not_use_storage():
+        async with AsyncSession(engine) as session:
+            profile = (await session.exec(select(ModelPreheatS3Profile))).one()
+            return profile.ever_used_at
+
+    assert asyncio.run(connectivity_did_not_use_storage()) is None
     asyncio.run(engine.dispose())

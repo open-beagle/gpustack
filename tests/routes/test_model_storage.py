@@ -38,7 +38,10 @@ from gpustack.schemas.model_files import (
     ModelFile,
     ModelFileStateEnum,
 )
-from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_preheat_s3_profiles import (
+    ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatInventoryManifestStateEnum,
@@ -56,6 +59,9 @@ from gpustack.server.db import get_engine, get_session
 from gpustack.server.model_preheat_worker_identity import (
     ModelPreheatWorkerPrincipal,
     get_model_preheat_worker_identity,
+)
+from gpustack.server.model_preheat_s3_profile_lifecycle import (
+    ModelPreheatS3ProfileNotActive,
 )
 
 API = "/v1/model-storage-sync-tasks"
@@ -522,6 +528,56 @@ def _create_task(app, profile_id, model_file_id):
     return response.json()
 
 
+def test_create_sync_task_rejects_maintenance_profile(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+
+    async def maintain():
+        async with AsyncSession(app.state.test_engine) as session:
+            profile = await session.get(ModelPreheatS3Profile, profile_id)
+            profile.lifecycle_state = (
+                ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+            )
+            session.add(profile)
+            await session.commit()
+
+    _run(app, maintain())
+    with TestClient(app) as client:
+        response = client.post(
+            API, json={"model_file_id": model_file_id, "profile_id": profile_id}
+        )
+
+    assert response.status_code == 409
+    assert response.json()["message"] == "s3_profile_in_maintenance"
+
+
+def test_create_sync_task_rejects_profile_maintained_before_final_lock(
+    app, monkeypatch
+):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+
+    async def reject_stale_active_profile(*args, **kwargs):
+        del args, kwargs
+        raise ModelPreheatS3ProfileNotActive
+
+    monkeypatch.setattr(
+        model_storage,
+        "lock_active_profile_for_new_work",
+        reject_stale_active_profile,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            API, json={"model_file_id": model_file_id, "profile_id": profile_id}
+        )
+
+    async def task_count():
+        async with AsyncSession(_engine(app)) as session:
+            return len((await session.exec(select(ModelStorageSyncTask))).all())
+
+    assert response.status_code == 409
+    assert response.json()["message"] == "s3_profile_in_maintenance"
+    assert _run(app, task_count()) == 0
+
+
 def test_worker_complete_cas_binds_artifact_from_null(app):
     profile_id, model_file_id = _run(app, _seed_ids(app))
     created = _create_task(app, profile_id, model_file_id)
@@ -655,6 +711,13 @@ def test_worker_execution_payload_returns_credentials_only_for_authorized(app):
             }
             assert "/models/" not in json.dumps(body["request_identity"])
             assert response.headers.get("cache-control") == "no-store"
+
+        async def used_at():
+            async with AsyncSession(app.state.test_engine) as session:
+                profile = await session.get(ModelPreheatS3Profile, profile_id)
+                return profile.ever_used_at
+
+        assert _run(app, used_at()) is not None
     finally:
         app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
 

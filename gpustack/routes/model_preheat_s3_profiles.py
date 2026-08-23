@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Header, Request
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import select
+from sqlmodel import delete, select
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
@@ -22,12 +22,16 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ConnectivityStateEnum,
     ModelPreheatS3Profile,
     ModelPreheatS3ProfileCreate,
+    ModelPreheatS3ProfileLifecycleStateEnum,
     ModelPreheatS3ProfilePublic,
     ModelPreheatS3ProfilesPublic,
     ModelPreheatS3ProfileUpdate,
+    model_preheat_s3_storage_key,
 )
 from gpustack.schemas.model_file_download_executions import (
+    ModelFileDownloadExecution,
     ModelFileDownloadExecutionProfilePin,
+    ModelFileDownloadExecutionStateEnum,
 )
 from gpustack.schemas.model_preheat_schedules import ModelPreheatSchedule
 from gpustack.schemas.model_preheat_distribution_policies import (
@@ -36,6 +40,7 @@ from gpustack.schemas.model_preheat_distribution_policies import (
 from gpustack.schemas.model_preheats import (
     ModelPreheatConnectivityCheckPublic,
     ModelPreheatConnectivityWorkerPublic,
+    ModelPreheatArtifact,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatTask,
     ModelPreheatWorkerTask,
@@ -56,6 +61,7 @@ from gpustack.server.model_preheat_idempotency import (
     get_idempotency_record,
     new_idempotency_record,
 )
+from gpustack.server.model_storage_bootstrap import parse_local_s3_target
 
 router = APIRouter()
 CONNECTIVITY_CHECK_OPERATION = "model_preheat_s3_profile.connectivity_check"
@@ -76,6 +82,7 @@ SYSTEM_MANAGED_EDITABLE_FIELDS = {
     "tls_verify",
     "use_virtual_hosted_style",
     "source_fallback_enabled",
+    "lifecycle_state",
 }
 
 
@@ -123,6 +130,8 @@ async def create_profile(
     session: SessionDep,
     profile_in: ModelPreheatS3ProfileCreate,
 ):
+    if profile_in.prefix:
+        raise HTTPException(422, "Invalid", "manual_profile_prefix_forbidden")
     existing = await ModelPreheatS3Profile.one_by_field(
         session, "name", profile_in.name
     )
@@ -130,6 +139,16 @@ async def create_profile(
         raise AlreadyExistsException(
             message=f"Model preheat S3 profile {profile_in.name} already exists"
         )
+    same_storage = (
+        await session.exec(
+            select(ModelPreheatS3Profile.id).where(
+                ModelPreheatS3Profile.active_storage_key
+                == model_preheat_s3_storage_key(profile_in.endpoint, profile_in.bucket)
+            )
+        )
+    ).first()
+    if same_storage is not None:
+        raise HTTPException(409, "Conflict", "profile_storage_conflict")
 
     cipher = _cipher_from_request(request)
     try:
@@ -138,6 +157,9 @@ async def create_profile(
             access_key_encrypted=cipher.encrypt(profile_in.access_key),
             secret_key_encrypted=cipher.encrypt(profile_in.secret_key),
             encryption_key_version=cipher.current_key_version,
+            active_storage_key=model_preheat_s3_storage_key(
+                profile_in.endpoint, profile_in.bucket
+            ),
         )
         # 显式使用 default_slot 占用默认槽位；Public API 的 is_default 由槽位派生。
         if profile.default_slot == DEFAULT_SLOT_GLOBAL:
@@ -147,10 +169,10 @@ async def create_profile(
         raise ServiceUnavailableException(
             message=f"credential_encryption_unavailable: {exc}"
         )
+    except HTTPException:
+        raise
     except IntegrityError:
-        raise AlreadyExistsException(
-            message=f"Model preheat S3 profile {profile_in.name} already exists"
-        )
+        raise HTTPException(409, "Conflict", "profile_storage_conflict")
     except Exception as exc:
         raise InternalServerErrorException(
             message=f"Failed to create model preheat S3 profile: {type(exc).__name__}"
@@ -181,6 +203,19 @@ async def update_profile(
             "system_profile_read_only",
         )
 
+    if not profile.system_managed and "prefix" in update_data and update_data["prefix"]:
+        raise HTTPException(422, "Invalid", "manual_profile_prefix_forbidden")
+    lifecycle_state = update_data.get("lifecycle_state", profile.lifecycle_state)
+    if (
+        lifecycle_state == ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+        and update_data.get("default_slot") == DEFAULT_SLOT_GLOBAL
+    ):
+        raise HTTPException(
+            409,
+            "maintenance_profile_not_defaultable",
+            "maintenance_profile_not_defaultable",
+        )
+
     if "name" in update_data:
         existing = await ModelPreheatS3Profile.one_by_field(
             session, "name", update_data["name"]
@@ -200,6 +235,16 @@ async def update_profile(
         for field in CONNECTION_CONFIG_FIELDS
         if field not in {"access_key", "secret_key"}
     )
+
+    endpoint = update_data.get("endpoint", profile.endpoint)
+    bucket = update_data.get("bucket", profile.bucket)
+    if lifecycle_state == ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE:
+        update_data["default_slot"] = None
+        update_data["active_storage_key"] = None
+    elif lifecycle_state == ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE:
+        update_data["active_storage_key"] = model_preheat_s3_storage_key(
+            endpoint, bucket
+        )
 
     try:
         _ensure_current_key_configured(cipher)
@@ -236,10 +281,12 @@ async def update_profile(
         if update_data.get("default_slot") == DEFAULT_SLOT_GLOBAL:
             await _unset_other_defaults(session, profile.id)
             await session.flush()
-        if connection_config_changed:
-            await _update_connection_config_with_cas(session, profile, update_data)
-        else:
-            await profile.update(session, update_data)
+        await _update_profile_with_cas(
+            session,
+            profile,
+            update_data,
+            increment_config_version=connection_config_changed,
+        )
     except CredentialEncryptionUnavailable as exc:
         raise ServiceUnavailableException(
             message=f"credential_encryption_unavailable: {exc}"
@@ -251,10 +298,11 @@ async def update_profile(
     except IntegrityError:
         # 唯一约束冲突：可能是重名，也可能是并发默认槽位抢占（default_slot 唯一）。
         # 后者返回稳定错误允许用户重试。
+        await session.rollback()
         raise HTTPException(
             409,
-            "default_slot_conflict",
-            "default_slot_conflict",
+            "profile_storage_or_default_conflict",
+            "profile_storage_or_default_conflict",
         )
     except ProfileConfigConflict:
         raise HTTPException(409, "profile_config_conflict", "profile_config_conflict")
@@ -376,6 +424,23 @@ async def delete_profile(request: Request, session: SessionDep, id: int):
             message=f"credential_encryption_unavailable: {exc}"
         )
     profile = await _get_profile(session, id)
+    if profile.system_managed and parse_local_s3_target(
+        request.app.state.server_config
+    ):
+        raise HTTPException(
+            409, "Conflict", "system_profile_declared_by_startup_config"
+        )
+    if profile.ever_used_at is not None:
+        raise HTTPException(409, "Conflict", "profile_has_been_used")
+    artifact = (
+        await session.exec(
+            select(ModelPreheatArtifact.id).where(
+                ModelPreheatArtifact.profile_id == profile.id
+            )
+        )
+    ).first()
+    if artifact is not None:
+        raise HTTPException(409, "Conflict", "model_preheat_artifact_uses_profile")
     policy = (
         await session.exec(
             select(ModelPreheatDistributionPolicy).where(
@@ -385,14 +450,25 @@ async def delete_profile(request: Request, session: SessionDep, id: int):
     ).first()
     if policy is not None:
         raise HTTPException(409, "Conflict", "distribution_policy_uses_profile")
-    download_execution = (
+    download_executions = (
         await session.exec(
-            select(ModelFileDownloadExecutionProfilePin.execution_id).where(
-                ModelFileDownloadExecutionProfilePin.profile_id == profile.id
+            select(ModelFileDownloadExecution)
+            .join(
+                ModelFileDownloadExecutionProfilePin,
+                ModelFileDownloadExecutionProfilePin.execution_id
+                == ModelFileDownloadExecution.id,
             )
+            .where(ModelFileDownloadExecutionProfilePin.profile_id == profile.id)
         )
-    ).first()
-    if download_execution is not None:
+    ).all()
+    removable_execution_ids = []
+    for execution in download_executions:
+        if (
+            execution.state == ModelFileDownloadExecutionStateEnum.PENDING
+            and execution.claimed_by_worker_uuid is None
+        ):
+            removable_execution_ids.append(execution.id)
+            continue
         raise HTTPException(
             409,
             "model_file_download_execution_uses_profile",
@@ -438,14 +514,60 @@ async def delete_profile(request: Request, session: SessionDep, id: int):
             "model_storage_sync_task_uses_profile",
         )
     try:
+        if removable_execution_ids:
+            detached = await _detach_unclaimed_download_executions(
+                session, profile.id, removable_execution_ids
+            )
+            if not detached:
+                raise HTTPException(
+                    409,
+                    "model_file_download_execution_uses_profile",
+                    "model_file_download_execution_uses_profile",
+                )
+            await session.exec(
+                delete(ModelFileDownloadExecutionProfilePin).where(
+                    ModelFileDownloadExecutionProfilePin.execution_id.in_(
+                        removable_execution_ids
+                    )
+                )
+            )
         await profile.delete(session)
     except IntegrityError:
         await session.rollback()
         raise HTTPException(409, "profile_is_in_use", "profile_is_in_use")
+    except HTTPException:
+        raise
     except Exception as exc:
         raise InternalServerErrorException(
             message=f"Failed to delete model preheat S3 profile: {type(exc).__name__}"
         )
+
+
+async def _detach_unclaimed_download_executions(
+    session, profile_id: int, execution_ids: list[int]
+) -> bool:
+    result = await session.exec(
+        update(ModelFileDownloadExecution)
+        .where(
+            ModelFileDownloadExecution.id.in_(execution_ids),
+            ModelFileDownloadExecution.state
+            == ModelFileDownloadExecutionStateEnum.PENDING,
+            ModelFileDownloadExecution.claimed_by_worker_uuid.is_(None),
+            ModelFileDownloadExecution.claimed_at.is_(None),
+            ModelFileDownloadExecution.default_profile_id == profile_id,
+        )
+        .values(
+            default_profile_id=None,
+            default_profile_config_version=None,
+            credential_snapshot_encrypted=None,
+            encryption_key_version=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == len(execution_ids):
+        return True
+    await session.rollback()
+    return False
 
 
 async def _get_profile(session, id: int) -> ModelPreheatS3Profile:
@@ -467,15 +589,24 @@ async def _unset_other_defaults(session, profile_id: int | None = None):
         session.add(profile)
 
 
-async def _update_connection_config_with_cas(session, profile, update_data):
+async def _update_profile_with_cas(
+    session, profile, update_data, *, increment_config_version: bool
+):
     expected_config_version = profile.config_version
+    expected_lifecycle_state = profile.lifecycle_state
+    expected_default_slot = profile.default_slot
+    expected_active_storage_key = profile.active_storage_key
     values = dict(update_data)
-    values["config_version"] = ModelPreheatS3Profile.config_version + 1
+    if increment_config_version:
+        values["config_version"] = ModelPreheatS3Profile.config_version + 1
     result = await session.exec(
         update(ModelPreheatS3Profile)
         .where(
             ModelPreheatS3Profile.id == profile.id,
             ModelPreheatS3Profile.config_version == expected_config_version,
+            ModelPreheatS3Profile.lifecycle_state == expected_lifecycle_state,
+            ModelPreheatS3Profile.default_slot == expected_default_slot,
+            ModelPreheatS3Profile.active_storage_key == expected_active_storage_key,
         )
         .values(**values)
         .execution_options(synchronize_session=False)
@@ -542,6 +673,8 @@ def _to_public(profile: ModelPreheatS3Profile) -> ModelPreheatS3ProfilePublic:
         provisioning_source=profile.provisioning_source,
         provisioning_key=profile.provisioning_key,
         system_managed=profile.system_managed,
+        lifecycle_state=profile.lifecycle_state,
+        ever_used_at=profile.ever_used_at,
         source_fallback_enabled=profile.source_fallback_enabled,
         config_version=profile.config_version,
         connectivity_state=profile.connectivity_state,

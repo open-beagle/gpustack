@@ -18,10 +18,15 @@ from gpustack.schemas.model_files import ModelFile
 from gpustack.schemas.model_preheat_s3_profiles import (
     DEFAULT_SLOT_GLOBAL,
     ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
 )
 from gpustack.schemas.models import SourceEnum, get_mmproj_filename
 from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
 from gpustack.server.bus import EventType
+from gpustack.server.model_preheat_s3_profile_lifecycle import (
+    ModelPreheatS3ProfileNotActive,
+    lock_active_profile_for_new_work,
+)
 from gpustack.worker.model_preheat.identity import encode_path, normalize_source
 from gpustack.worker.model_preheat.manifest import compute_request_digest
 
@@ -48,6 +53,19 @@ async def create_model_file_with_download_execution(session, model_file, config)
                 message="credential_encryption_unavailable"
             ) from exc
         key_version = cipher.current_key_version
+        try:
+            profile = await lock_active_profile_for_new_work(
+                session,
+                profile.id,
+                profile.config_version,
+                require_default=True,
+            )
+        except ModelPreheatS3ProfileNotActive:
+            # 默认 Profile 在创建期间进入维护或被替换，本次普通下载明确
+            # 降级为无 S3 固定配置。
+            profile = None
+            snapshot = None
+            key_version = None
 
     session.add(model_file)
     await session.flush()
@@ -103,7 +121,9 @@ async def _default_profile(session) -> Optional[ModelPreheatS3Profile]:
     return (
         await session.exec(
             select(ModelPreheatS3Profile).where(
-                ModelPreheatS3Profile.default_slot == DEFAULT_SLOT_GLOBAL
+                ModelPreheatS3Profile.default_slot == DEFAULT_SLOT_GLOBAL,
+                ModelPreheatS3Profile.lifecycle_state
+                == ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE,
             )
         )
     ).first()

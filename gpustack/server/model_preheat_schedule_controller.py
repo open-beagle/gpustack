@@ -14,7 +14,10 @@ from gpustack.model_preheat_credentials import (
     CredentialEncryptionUnavailable,
     ModelPreheatCredentialCipher,
 )
-from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_preheat_s3_profiles import (
+    ModelPreheatS3Profile,
+    ModelPreheatS3ProfileLifecycleStateEnum,
+)
 from gpustack.schemas.models import ModelInstance, ModelInstanceStateEnum
 from gpustack.schemas.model_preheat_schedules import (
     ModelPreheatSchedule,
@@ -38,6 +41,10 @@ from gpustack.schemas.model_preheats import (
 )
 from gpustack.server.model_preheat_connectivity import current_ready_workers
 from gpustack.server.model_preheat_revision import resolve_model_preheat_revision
+from gpustack.server.model_preheat_s3_profile_lifecycle import (
+    ModelPreheatS3ProfileNotActive,
+    lock_active_profile_for_new_work,
+)
 from gpustack.server.bus import EventType
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
@@ -981,6 +988,8 @@ async def create_scheduled_model_preheat_task(
     profile = await session.get(ModelPreheatS3Profile, schedule.s3_profile_id)
     if profile is None:
         raise RuntimeError("model_preheat_s3_profile_not_found")
+    if profile.lifecycle_state != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE:
+        raise RuntimeError("model_preheat_s3_profile_in_maintenance")
     workers, seed_worker, target_gpu_names = await _resolve_target_workers(
         session, task_in
     )
@@ -1029,6 +1038,12 @@ async def create_scheduled_model_preheat_task(
     except CredentialEncryptionUnavailable as exc:
         raise RuntimeError("credential_encryption_unavailable") from exc
     matched_artifact = await _exact_artifact_match(session, profile, identity)
+    try:
+        await lock_active_profile_for_new_work(
+            session, profile.id, profile.config_version
+        )
+    except ModelPreheatS3ProfileNotActive:
+        raise RuntimeError("model_preheat_s3_profile_in_maintenance") from None
     task = ModelPreheatTask(
         source=task_in.source,
         model_id=task_in.model_id,

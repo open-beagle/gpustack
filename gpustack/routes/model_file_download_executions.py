@@ -30,6 +30,7 @@ from gpustack.schemas.model_file_download_executions import (
     ModelFileDownloadExecutionStateEnum,
 )
 from gpustack.schemas.model_files import ModelFile
+from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatInventoryManifestStateEnum,
@@ -195,6 +196,15 @@ async def _claim_pending_execution(request, session, execution, model_file, iden
         )
     )
     if result.rowcount == 1:
+        if execution.default_profile_id is not None:
+            await session.exec(
+                update(ModelPreheatS3Profile)
+                .where(
+                    ModelPreheatS3Profile.id == execution.default_profile_id,
+                    ModelPreheatS3Profile.ever_used_at.is_(None),
+                )
+                .values(ever_used_at=claimed_at)
+            )
         if source in {"huggingface", "modelscope"}:
             model_file.requested_revision = requested_revision
             model_file.resolved_revision = resolved_revision
