@@ -177,9 +177,59 @@ class ModelStorageSyncTaskCreate(SQLModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-
     model_file_id: int
     profile_id: int
+
+
+class ModelStorageSyncScopeEnum(str, Enum):
+    SINGLE_MODEL = "single_model"
+    SELECTED_WORKERS = "selected_workers"
+    ALL_READY_WORKERS = "all_ready_workers"
+
+
+class ModelStorageSyncBatchCreate(SQLModel):
+    profile_id: int
+    scope: ModelStorageSyncScopeEnum = ModelStorageSyncScopeEnum.SINGLE_MODEL
+    model_file_id: Optional[int] = None
+    worker_ids: list[int] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ModelStorageSyncBatchItem(SQLModel):
+    model_file_id: Optional[int] = None
+    worker_id: Optional[int] = None
+    task_id: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class ModelStorageSyncBatchPublic(SQLModel):
+    scope: ModelStorageSyncScopeEnum
+    planned: int
+    created: list[ModelStorageSyncBatchItem] = Field(default_factory=list)
+    skipped: list[ModelStorageSyncBatchItem] = Field(default_factory=list)
+    failed: list[ModelStorageSyncBatchItem] = Field(default_factory=list)
+
+
+class ModelStorageSyncBatchResult(SQLModel, table=True):
+    """顶层 Idempotency-Key 对应的完整批量同步响应快照。"""
+
+    __tablename__ = "model_storage_sync_batch_results"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_record_id",
+            name="uix_model_storage_sync_batch_result_idempotency",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    idempotency_record_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_idempotency_records.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    response_payload: dict = Field(sa_column=Column(JSON, nullable=False))
 
 
 class ModelStorageSyncTaskProfilePublic(SQLModel):

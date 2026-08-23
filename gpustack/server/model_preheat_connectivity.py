@@ -78,11 +78,7 @@ async def create_or_reuse_connectivity_check(
         if all_ready_workers:
             return None
         values = {
-            "connectivity_state": (
-                ModelPreheatS3ConnectivityStateEnum.PARTIAL
-                if all_registered_workers
-                else ModelPreheatS3ConnectivityStateEnum.NO_WORKERS
-            ),
+            "connectivity_state": ModelPreheatS3ConnectivityStateEnum.NO_WORKERS,
         }
         conditions = [
             ModelPreheatS3Profile.id == profile.id,
@@ -429,7 +425,12 @@ async def _aggregate_profile_connectivity_state(
     profile_config_version: int,
     current_registered_by_uuid: dict[str, Worker],
 ):
-    if not current_registered_by_uuid:
+    ready_workers_by_uuid = {
+        worker_uuid: worker
+        for worker_uuid, worker in current_registered_by_uuid.items()
+        if worker.state == WorkerStateEnum.READY
+    }
+    if not ready_workers_by_uuid:
         return {
             "connectivity_state": ModelPreheatS3ConnectivityStateEnum.NO_WORKERS,
             "last_connectivity_checked_at": None,
@@ -439,16 +440,10 @@ async def _aggregate_profile_connectivity_state(
         session,
         profile_id,
         profile_config_version,
-        list(current_registered_by_uuid.values()),
+        list(ready_workers_by_uuid.values()),
     )
 
-    current_uuids = set(current_registered_by_uuid)
-    ready_worker_uuids = {
-        worker_uuid
-        for worker_uuid, worker in current_registered_by_uuid.items()
-        if worker.state == WorkerStateEnum.READY
-    }
-    offline_count = len(current_uuids - ready_worker_uuids)
+    ready_worker_uuids = set(ready_workers_by_uuid)
     missing_uuids = ready_worker_uuids - set(latest_results)
     ready_count = sum(
         worker_uuid in ready_worker_uuids
@@ -467,15 +462,15 @@ async def _aggregate_profile_connectivity_state(
         for worker_uuid, (task, _) in latest_results.items()
     )
 
-    if ready_count == len(current_uuids):
+    if ready_count == len(ready_worker_uuids):
         state = ModelPreheatS3ConnectivityStateEnum.AVAILABLE
     elif active_count:
         state = ModelPreheatS3ConnectivityStateEnum.CHECKING
     elif ready_count:
         state = ModelPreheatS3ConnectivityStateEnum.PARTIAL
-    elif failed_count and not missing_uuids and not offline_count:
+    elif failed_count and not missing_uuids:
         state = ModelPreheatS3ConnectivityStateEnum.UNAVAILABLE
-    elif failed_count or offline_count:
+    elif failed_count:
         state = ModelPreheatS3ConnectivityStateEnum.PARTIAL
     else:
         state = ModelPreheatS3ConnectivityStateEnum.STALE
@@ -603,7 +598,6 @@ async def mark_profile_stale_if_expired(
     if (
         profile.connectivity_state
         not in {
-            ModelPreheatS3ConnectivityStateEnum.AVAILABLE,
             ModelPreheatS3ConnectivityStateEnum.PARTIAL,
             ModelPreheatS3ConnectivityStateEnum.UNAVAILABLE,
         }

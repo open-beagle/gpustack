@@ -6,6 +6,9 @@ from sqlmodel import JSON, BigInteger, Column, Field, Relationship, SQLModel, Te
 from gpustack.mixins import BaseModelMixin
 from gpustack.schemas.common import PaginatedList
 from gpustack.schemas.links import ModelInstanceModelFileLink
+from gpustack.schemas.model_file_download_executions import (
+    ModelFileTransferSourceEnum,
+)
 from gpustack.schemas.models import ModelSource, ModelInstance
 
 
@@ -59,6 +62,11 @@ class ModelFilePublic(
     ModelFileBase,
 ):
     id: int
+    transfer_source: Optional[ModelFileTransferSourceEnum] = None
+    transfer_profile_id: Optional[int] = None
+    transfer_profile_name: Optional[str] = None
+    source_worker_id: Optional[int] = None
+    source_worker_name: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

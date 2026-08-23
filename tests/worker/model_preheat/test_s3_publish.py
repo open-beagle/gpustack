@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from minio import Minio
+import urllib3
 
 from gpustack.worker.model_preheat.identity import (
     ModelPreheatIdentity,
@@ -649,6 +650,14 @@ def test_minio_tls_verify_false_uses_unverified_transport(monkeypatch):
 
     assert captured["secure"] is True
     assert captured["http_client"].connection_pool_kw["cert_reqs"] == ssl.CERT_NONE
+    assert (
+        captured["http_client"].pool_classes_by_scheme["https"].__name__
+        == "_QuietUnverifiedHTTPSConnectionPool"
+    )
+    assert (
+        urllib3.PoolManager().pool_classes_by_scheme["https"]
+        is urllib3.HTTPSConnectionPool
+    )
     assert captured["virtual"] is True
 
 
@@ -659,9 +668,7 @@ def test_minio_tls_verify_false_uses_unverified_transport(monkeypatch):
         ("https://s3.example.invalid", False),
     ],
 )
-def test_minio_explicit_secure_overrides_endpoint_scheme(
-    monkeypatch, endpoint, secure
-):
+def test_minio_explicit_secure_overrides_endpoint_scheme(monkeypatch, endpoint, secure):
     captured = {}
 
     class FakeMinio:

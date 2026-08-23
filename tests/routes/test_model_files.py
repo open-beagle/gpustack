@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -7,6 +8,7 @@ from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.routes.model_files import (
+    _stream_model_files,
     create_model_file,
     delete_model_file,
     get_model_file,
@@ -112,6 +114,39 @@ async def _run_model_file_crud(tmp_path):
             encryption_key_version="v1",
         )
         profile = await ModelPreheatS3Profile.create(session, profile)
+        download_execution = await ModelFileDownloadExecution.one_by_field(
+            session, "model_file_id", created.id
+        )
+        download_execution.transfer_source = ModelFileTransferSourceEnum.S3
+        download_execution.transfer_profile_id = profile.id
+        download_execution.source_worker_id = worker.id
+        session.add(download_execution)
+        await session.commit()
+
+        transferred = await get_model_file(session, created.id)
+        assert transferred.source == SourceEnum.LOCAL_PATH
+        assert transferred.transfer_source == ModelFileTransferSourceEnum.S3
+        assert transferred.transfer_profile_id == profile.id
+        assert transferred.transfer_profile_name == "center-cache"
+        assert transferred.source_worker_id == worker.id
+        assert transferred.source_worker_name == "worker-a"
+
+        stream = _stream_model_files(engine)
+        initial_event = json.loads(await anext(stream))
+        assert initial_event["data"]["transfer_profile_name"] == "center-cache"
+        assert initial_event["data"]["source_worker_name"] == "worker-a"
+
+        next_event = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0.05)
+        model_file = await ModelFile.one_by_id(session, created.id)
+        model_file.state_message = "ordinary-update"
+        await model_file.update(session)
+        updated_event = json.loads(await asyncio.wait_for(next_event, timeout=2))
+        assert updated_event["data"]["state_message"] == "ordinary-update"
+        assert updated_event["data"]["transfer_profile_name"] == "center-cache"
+        assert updated_event["data"]["source_worker_name"] == "worker-a"
+        await stream.aclose()
+
         sync_task = ModelStorageSyncTask(
             model_file_id=created.id,
             worker_id=worker.id,

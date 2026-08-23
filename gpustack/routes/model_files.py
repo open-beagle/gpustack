@@ -2,6 +2,7 @@ from typing import Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import String, cast, func, or_, select
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
@@ -23,9 +24,12 @@ from gpustack.schemas.model_file_download_executions import (
     ModelFileDownloadExecution,
     ModelFileDownloadExecutionStateEnum,
 )
+from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.workers import Worker
 from gpustack.server.model_file_download_execution_service import (
     create_model_file_with_download_execution,
 )
+from gpustack.server.bus import EventType
 
 router = APIRouter()
 
@@ -50,7 +54,7 @@ async def get_model_files(
 
     if params.watch:
         return StreamingResponse(
-            ModelFile.streaming(
+            _stream_model_files(
                 engine,
                 fields=fields,
                 filter_func=get_filter_func(search),
@@ -85,13 +89,32 @@ async def get_model_files(
             )
         )
 
-    return await ModelFile.paginated_by_query(
+    result = await ModelFile.paginated_by_query(
         session=session,
         fields=fields,
         extra_conditions=extra_conditions,
         page=params.page,
         per_page=params.perPage,
     )
+    return ModelFilesPublic(
+        items=await _model_files_public(session, result.items),
+        pagination=result.pagination,
+    )
+
+
+async def _stream_model_files(engine, fields=None, filter_func=None):
+    """输出带传输来源名称的 ModelFile SSE，初始与增量事件使用同一序列化。"""
+    async for event in ModelFile.subscribe(engine):
+        if event.type == EventType.HEARTBEAT:
+            yield "\n\n"
+            continue
+        if not ModelFile._match_fields(event, fields):
+            continue
+        if filter_func and not ModelFile._safe_filter(filter_func, event.data):
+            continue
+        async with AsyncSession(engine) as session:
+            event.data = (await _model_files_public(session, [event.data]))[0]
+        yield ModelFile._format_event(event)
 
 
 def search_model_file_filter(data: ModelFile, search: str) -> bool:
@@ -129,7 +152,75 @@ async def get_model_file(session: SessionDep, id: int):
     model_file = await ModelFile.one_by_id(session, id)
     if not model_file:
         raise NotFoundException(message=f"Model file {id} not found")
-    return model_file
+    return (await _model_files_public(session, [model_file]))[0]
+
+
+async def _model_files_public(session, model_files):
+    model_file_ids = [item.id for item in model_files if item.id is not None]
+    executions = {}
+    if model_file_ids:
+        rows = (
+            await session.exec(
+                select(ModelFileDownloadExecution).where(
+                    ModelFileDownloadExecution.model_file_id.in_(model_file_ids)
+                )
+            )
+        ).all()
+        executions = {row.model_file_id: row for row in rows}
+
+    profile_ids = {
+        row.transfer_profile_id
+        for row in executions.values()
+        if row.transfer_profile_id is not None
+    }
+    worker_ids = {
+        row.source_worker_id
+        for row in executions.values()
+        if row.source_worker_id is not None
+    }
+    profiles = {}
+    if profile_ids:
+        profile_rows = (
+            await session.exec(
+                select(ModelPreheatS3Profile).where(
+                    ModelPreheatS3Profile.id.in_(profile_ids)
+                )
+            )
+        ).all()
+        profiles = {row.id: row.name for row in profile_rows}
+    workers = {}
+    if worker_ids:
+        worker_rows = (
+            await session.exec(select(Worker).where(Worker.id.in_(worker_ids)))
+        ).all()
+        workers = {row.id: row.name for row in worker_rows}
+
+    result = []
+    for model_file in model_files:
+        execution = executions.get(model_file.id)
+        result.append(
+            ModelFilePublic.model_validate(
+                model_file,
+                update={
+                    "transfer_source": execution.transfer_source if execution else None,
+                    "transfer_profile_id": (
+                        execution.transfer_profile_id if execution else None
+                    ),
+                    "transfer_profile_name": (
+                        profiles.get(execution.transfer_profile_id)
+                        if execution
+                        else None
+                    ),
+                    "source_worker_id": (
+                        execution.source_worker_id if execution else None
+                    ),
+                    "source_worker_name": (
+                        workers.get(execution.source_worker_id) if execution else None
+                    ),
+                },
+            )
+        )
+    return result
 
 
 @router.post("", response_model=ModelFilePublic)

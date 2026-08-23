@@ -889,7 +889,7 @@ def test_connectivity_aggregation_does_not_overwrite_newer_profile_version_or_av
                 assert check.state == ModelPreheatConnectivityCheckStateEnum.PARTIAL
                 assert (
                     profile.connectivity_state
-                    == ModelPreheatS3ConnectivityStateEnum.PARTIAL
+                    == ModelPreheatS3ConnectivityStateEnum.NO_WORKERS
                 )
         finally:
             await _tables(engine, SQLModel.metadata.drop_all)
@@ -937,7 +937,7 @@ def test_profile_aggregation_tracks_offline_registered_workers_and_removes_delet
                 await aggregate_connectivity_check(session, check_id)
                 assert (
                     profile.connectivity_state
-                    == ModelPreheatS3ConnectivityStateEnum.PARTIAL
+                    == ModelPreheatS3ConnectivityStateEnum.AVAILABLE
                 )
 
                 await session.delete(offline_worker)
@@ -1260,7 +1260,7 @@ def test_old_session_ttl_mark_cannot_make_new_profile_check_stale(tmp_path):
     asyncio.run(run())
 
 
-def test_zero_workers_and_ttl_stale_are_not_available(tmp_path):
+def test_zero_workers_and_successful_connectivity_does_not_expire(tmp_path):
     async def run():
         engine = create_async_engine(
             f"sqlite+aiosqlite:///{tmp_path / 'ttl.db'}", poolclass=NullPool
@@ -1289,10 +1289,10 @@ def test_zero_workers_and_ttl_stale_are_not_available(tmp_path):
                 )
                 session.add(profile)
                 await session.commit()
-                assert await mark_profile_stale_if_expired(session, profile)
+                assert not await mark_profile_stale_if_expired(session, profile)
                 assert (
                     profile.connectivity_state
-                    == ModelPreheatS3ConnectivityStateEnum.STALE
+                    == ModelPreheatS3ConnectivityStateEnum.AVAILABLE
                 )
 
                 profile.connectivity_state = ModelPreheatS3ConnectivityStateEnum.PARTIAL
@@ -1315,7 +1315,7 @@ def test_zero_workers_and_ttl_stale_are_not_available(tmp_path):
     asyncio.run(run())
 
 
-def test_registered_offline_worker_is_partial_instead_of_no_workers(tmp_path):
+def test_registered_not_ready_worker_is_no_workers(tmp_path):
     async def run():
         engine = create_async_engine(
             f"sqlite+aiosqlite:///{tmp_path / 'offline-only.db'}",
@@ -1338,7 +1338,7 @@ def test_registered_offline_worker_is_partial_instead_of_no_workers(tmp_path):
                 )
                 assert (
                     profile.connectivity_state
-                    == ModelPreheatS3ConnectivityStateEnum.PARTIAL
+                    == ModelPreheatS3ConnectivityStateEnum.NO_WORKERS
                 )
         finally:
             await _tables(engine, SQLModel.metadata.drop_all)

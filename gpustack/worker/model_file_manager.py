@@ -26,7 +26,7 @@ from urllib3.exceptions import (
     ReadTimeoutError,
 )
 
-from gpustack.api.exceptions import NotFoundException
+from gpustack.api.exceptions import HTTPException, NotFoundException
 from gpustack.config.config import Config
 from gpustack.logginglocal import setup_logging
 from gpustack.schemas.model_files import ModelFile, ModelFileUpdate, ModelFileStateEnum
@@ -469,7 +469,8 @@ class ModelFileManager:
                         model_file.id, result["error_code"]
                     )
                 else:
-                    self._clientset.model_files.complete_download_execution(
+                    acknowledged = _complete_download_execution_with_retries(
+                        self._clientset,
                         model_file.id,
                         ModelFileDownloadExecutionComplete(
                             transfer_source=result["transfer_source"],
@@ -477,6 +478,20 @@ class ModelFileManager:
                             source_worker_id=result.get("source_worker_id"),
                         ),
                     )
+                    if not acknowledged:
+                        asyncio.create_task(
+                            _retry_download_completion_ack(
+                                self._clientset,
+                                model_file.id,
+                                ModelFileDownloadExecutionComplete(
+                                    transfer_source=result["transfer_source"],
+                                    transfer_profile_id=result.get(
+                                        "transfer_profile_id"
+                                    ),
+                                    source_worker_id=result.get("source_worker_id"),
+                                ),
+                            )
+                        )
             except NotFoundException:
                 logger.info(
                     f"Model file {model_file.readable_source} not found. Maybe it was cancelled."
@@ -519,6 +534,48 @@ class ModelFileManager:
             logger.debug(f"Download completed for {model_file.readable_source}")
 
         asyncio.create_task(_check_completion())
+
+
+def _complete_download_execution_with_retries(
+    clientset, model_file_id, completion, attempts=3
+):
+    last_error = None
+    for _ in range(attempts):
+        try:
+            clientset.model_files.complete_download_execution(model_file_id, completion)
+            return True
+        except Exception as exc:
+            last_error = exc
+    logger.warning(
+        "Model file %s is locally complete but completion acknowledgement failed: %s",
+        model_file_id,
+        type(last_error).__name__,
+    )
+    return False
+
+
+async def _retry_download_completion_ack(
+    clientset, model_file_id, completion, max_attempts=10
+):
+    delay = 1
+    for _ in range(max_attempts):
+        await asyncio.sleep(delay)
+        try:
+            clientset.model_files.complete_download_execution(model_file_id, completion)
+            return
+        except NotFoundException:
+            return
+        except HTTPException as exc:
+            if exc.status_code < 500:
+                return
+        except Exception:
+            pass
+        delay = min(delay * 2, 30)
+    logger.error(
+        "Stopping completion acknowledgement retries for model file %s after %s attempts",
+        model_file_id,
+        max_attempts,
+    )
 
 
 class ModelFileDownloadTask:

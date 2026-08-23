@@ -154,6 +154,15 @@ class PublishResult:
     generation_prefix: str
 
 
+class _QuietUnverifiedHTTPSConnectionPool(urllib3.HTTPSConnectionPool):
+    """仅供显式 tls_verify=False 的 S3 client 使用，不改全局 warning 过滤器。"""
+
+    def _validate_conn(self, conn):
+        urllib3.HTTPConnectionPool._validate_conn(self, conn)
+        if conn.is_closed:
+            conn.connect()
+
+
 class ModelPreheatS3Client:
     def __init__(
         self,
@@ -192,6 +201,10 @@ class ModelPreheatS3Client:
                 cert_reqs=ssl.CERT_NONE,
                 assert_hostname=False,
             )
+            http_client.pool_classes_by_scheme = {
+                **http_client.pool_classes_by_scheme,
+                "https": _QuietUnverifiedHTTPSConnectionPool,
+            }
         minio_client = Minio(
             endpoint,
             access_key=access_key,

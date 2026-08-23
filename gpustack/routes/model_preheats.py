@@ -520,25 +520,21 @@ async def _ensure_profile_available_on_workers(
         worker.worker_uuid: current_results.get(worker.worker_uuid)
         for worker in target_workers
     }
-    now = datetime.now(timezone.utc)
-    target_results_are_fresh = all(
-        result is not None
-        and result[0].state == ModelPreheatWorkerTaskStateEnum.READY
-        and result[1].finished_at is not None
-        and result[1].finished_at + ttl >= now
+    target_results_are_available = all(
+        result is not None and result[0].state == ModelPreheatWorkerTaskStateEnum.READY
         for result in target_results.values()
     )
     current_worker_results_complete = set(current_results) == {
         worker.worker_uuid for worker in current_workers
     }
     if (
-        target_results_are_fresh
+        target_results_are_available
         and current_worker_results_complete
         and profile.last_connectivity_check_id is not None
     ):
         return
 
-    if not target_results_are_fresh:
+    if not target_results_are_available:
         quick_check = None
         if became_stale or profile.connectivity_state in {
             ModelPreheatS3ConnectivityStateEnum.STALE,

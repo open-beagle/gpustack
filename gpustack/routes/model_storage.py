@@ -18,6 +18,7 @@
 不进入 Public schema、SSE 或日志。
 """
 
+import asyncio
 import json
 import hmac
 import secrets
@@ -54,12 +55,18 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatInventoryManifestStateEnum,
 )
 from gpustack.schemas.model_file_download_executions import (
+    ModelFileDownloadExecution,
     ModelFileTransferSourceEnum,
 )
 from gpustack.schemas.model_storage_sync import (
     ModelStorageConnectionTestPublic,
     ModelStorageConnectionTestRequest,
     ModelStorageSyncCapabilitiesPublic,
+    ModelStorageSyncBatchCreate,
+    ModelStorageSyncBatchItem,
+    ModelStorageSyncBatchPublic,
+    ModelStorageSyncBatchResult,
+    ModelStorageSyncScopeEnum,
     ModelStorageSyncExecutionPayload,
     ModelStorageSyncExecutionProfile,
     ModelStorageSyncTaskComplete,
@@ -90,6 +97,7 @@ from gpustack.server.model_preheat_s3_profile_lifecycle import (
     ModelPreheatS3ProfileNotActive,
     lock_active_profile_for_new_work,
 )
+from gpustack.server.model_preheat_connectivity import current_ready_workers
 from gpustack.server.bus import EventType
 from gpustack.server.model_storage_connection_test import (
     VerifiedEndpoint,
@@ -116,6 +124,10 @@ WorkerIdentityDep = Annotated[
 ]
 
 SYNC_CREATE_OPERATION = "model_storage_sync_task.create"
+SYNC_BATCH_CREATE_OPERATION = "model_storage_sync_batch.create"
+SYNC_BATCH_IN_PROGRESS = -1
+SYNC_BATCH_REPLAY_WAIT_ATTEMPTS = 40
+SYNC_BATCH_REPLAY_WAIT_SECONDS = 0.05
 # Idempotency-Key 记录的 resource_type：统一为同步任务资源类型。
 SYNC_TASK_RESOURCE_TYPE = "model_storage_sync_task"
 # 活动任务：未达终态，同 (model_file_id, profile_id) 只允许一个。
@@ -444,6 +456,318 @@ async def create_model_storage_sync_task(
     await session.refresh(task)
     await ModelStorageSyncTask._publish_event(EventType.CREATED, task)
     return _to_public(task)
+
+
+@router.post(
+    "/model-storage-sync-batches",
+    response_model=ModelStorageSyncBatchPublic,
+)
+async def create_model_storage_sync_batch(
+    request: Request,
+    session: SessionDep,
+    current_user: CurrentAdminUserDep,
+    batch_in: ModelStorageSyncBatchCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    batch_request_hash = canonical_request_hash(
+        {
+            "profile_id": batch_in.profile_id,
+            "scope": batch_in.scope.value,
+            "model_file_id": batch_in.model_file_id,
+            "worker_ids": sorted(set(batch_in.worker_ids)),
+        }
+    )
+    batch_record = await get_idempotency_record(
+        session,
+        current_user.id,
+        SYNC_BATCH_CREATE_OPERATION,
+        idempotency_key,
+    )
+    replaying_batch = batch_record is not None
+    if batch_record is not None and batch_record.request_hash != batch_request_hash:
+        raise HTTPException(409, "idempotency_key_reused", "idempotency_key_reused")
+    if batch_record is not None:
+        batch_record = await _wait_for_finalized_sync_batch(
+            session,
+            current_user.id,
+            idempotency_key,
+            batch_request_hash,
+        )
+        return await _load_sync_batch_result(session, batch_record)
+    ready_workers = await current_ready_workers(session)
+    ready_worker_ids = {worker.id for worker in ready_workers}
+    skipped = []
+
+    if batch_in.scope == ModelStorageSyncScopeEnum.SINGLE_MODEL:
+        if batch_in.model_file_id is None:
+            raise HTTPException(422, "model_file_id_required", "model_file_id_required")
+        model_files = [await session.get(ModelFile, batch_in.model_file_id)]
+        if model_files[0] is None:
+            raise NotFoundException(message="model_file_not_found")
+    else:
+        if (
+            batch_in.scope == ModelStorageSyncScopeEnum.SELECTED_WORKERS
+            and not batch_in.worker_ids
+        ):
+            raise HTTPException(422, "worker_ids_required", "worker_ids_required")
+        selected_worker_ids = (
+            set(batch_in.worker_ids)
+            if batch_in.scope == ModelStorageSyncScopeEnum.SELECTED_WORKERS
+            else ready_worker_ids
+        )
+        for worker_id in sorted(selected_worker_ids - ready_worker_ids):
+            skipped.append(
+                ModelStorageSyncBatchItem(
+                    worker_id=worker_id, reason="worker_not_ready"
+                )
+            )
+        eligible_worker_ids = selected_worker_ids & ready_worker_ids
+        model_files = (
+            (
+                await session.exec(
+                    select(ModelFile)
+                    .where(ModelFile.worker_id.in_(eligible_worker_ids))
+                    .order_by(ModelFile.id)
+                )
+            ).all()
+            if eligible_worker_ids
+            else []
+        )
+
+    profile = await session.get(ModelPreheatS3Profile, batch_in.profile_id)
+    if profile is None:
+        raise NotFoundException(message="s3_profile_not_found")
+    if profile.lifecycle_state != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE:
+        raise HTTPException(409, "Conflict", "s3_profile_in_maintenance")
+
+    model_file_ids = [item.id for item in model_files if item is not None]
+    executions = {}
+    if model_file_ids:
+        execution_rows = (
+            await session.exec(
+                select(ModelFileDownloadExecution).where(
+                    ModelFileDownloadExecution.model_file_id.in_(model_file_ids)
+                )
+            )
+        ).all()
+        executions = {row.model_file_id: row for row in execution_rows}
+
+    planned_candidates = []
+    seen_identities = set()
+    failed = []
+    for model_file in model_files:
+        if model_file.state != ModelFileStateEnum.READY:
+            skipped.append(
+                ModelStorageSyncBatchItem(
+                    model_file_id=model_file.id,
+                    worker_id=model_file.worker_id,
+                    reason="model_file_not_ready",
+                )
+            )
+            continue
+        try:
+            identity, _, _ = _derive_task_identity(model_file)
+        except Exception:
+            failed.append(
+                ModelStorageSyncBatchItem(
+                    model_file_id=model_file.id,
+                    worker_id=model_file.worker_id,
+                    reason="model_identity_invalid",
+                )
+            )
+            continue
+        execution = executions.get(model_file.id)
+        identity_key = (
+            f"artifact:{execution.artifact_id}"
+            if execution is not None and execution.artifact_id
+            else f"request:{identity.request_digest}"
+        )
+        if identity_key in seen_identities:
+            skipped.append(
+                ModelStorageSyncBatchItem(
+                    model_file_id=model_file.id,
+                    worker_id=model_file.worker_id,
+                    reason="duplicate_artifact_identity",
+                )
+            )
+            continue
+        seen_identities.add(identity_key)
+        planned_candidates.append((model_file.id, model_file.worker_id))
+
+    owns_batch_record = False
+    if idempotency_key and batch_record is None:
+        try:
+            session.add(
+                new_idempotency_record(
+                    current_user.id,
+                    SYNC_BATCH_CREATE_OPERATION,
+                    idempotency_key,
+                    batch_request_hash,
+                    SYNC_BATCH_IN_PROGRESS,
+                    resource_type="model_storage_sync_batch",
+                )
+            )
+            await session.commit()
+            owns_batch_record = True
+        except IntegrityError:
+            await session.rollback()
+            batch_record = await get_idempotency_record(
+                session,
+                current_user.id,
+                SYNC_BATCH_CREATE_OPERATION,
+                idempotency_key,
+            )
+            if batch_record is None or batch_record.request_hash != batch_request_hash:
+                raise HTTPException(
+                    409, "idempotency_key_reused", "idempotency_key_reused"
+                ) from None
+            replaying_batch = True
+            batch_record = await _wait_for_finalized_sync_batch(
+                session,
+                current_user.id,
+                idempotency_key,
+                batch_request_hash,
+            )
+            return await _load_sync_batch_result(session, batch_record)
+
+    created = []
+    try:
+        for model_file_id, worker_id in planned_candidates:
+            child_key = (
+                f"{idempotency_key}:{model_file_id}" if idempotency_key else None
+            )
+            if replaying_batch and child_key:
+                child_record = await get_idempotency_record(
+                    session,
+                    current_user.id,
+                    SYNC_CREATE_OPERATION,
+                    child_key,
+                )
+                if child_record is None:
+                    skipped.append(
+                        ModelStorageSyncBatchItem(
+                            model_file_id=model_file_id,
+                            worker_id=worker_id,
+                            reason="not_in_original_batch_result",
+                        )
+                    )
+                    continue
+            if idempotency_key is None and await _active_sync_task(
+                session, _dedupe_key(model_file_id, batch_in.profile_id)
+            ):
+                skipped.append(
+                    ModelStorageSyncBatchItem(
+                        model_file_id=model_file_id,
+                        worker_id=worker_id,
+                        reason="active_task_exists",
+                    )
+                )
+                continue
+            try:
+                task = await create_model_storage_sync_task(
+                    request,
+                    session,
+                    current_user,
+                    ModelStorageSyncTaskCreate(
+                        model_file_id=model_file_id,
+                        profile_id=batch_in.profile_id,
+                    ),
+                    child_key,
+                )
+                created.append(
+                    ModelStorageSyncBatchItem(
+                        model_file_id=model_file_id,
+                        worker_id=worker_id,
+                        task_id=task.id,
+                    )
+                )
+            except HTTPException as exc:
+                failed.append(
+                    ModelStorageSyncBatchItem(
+                        model_file_id=model_file_id,
+                        worker_id=worker_id,
+                        reason=str(exc.message),
+                    )
+                )
+        result = ModelStorageSyncBatchPublic(
+            scope=batch_in.scope,
+            planned=len(model_files),
+            created=created,
+            skipped=skipped,
+            failed=failed,
+        )
+        if owns_batch_record:
+            batch_record = await get_idempotency_record(
+                session,
+                current_user.id,
+                SYNC_BATCH_CREATE_OPERATION,
+                idempotency_key,
+            )
+            if batch_record is None or batch_record.request_hash != batch_request_hash:
+                raise HTTPException(
+                    409, "idempotency_key_reused", "idempotency_key_reused"
+                )
+            persisted_result = ModelStorageSyncBatchResult(
+                idempotency_record_id=batch_record.id,
+                response_payload=result.model_dump(mode="json"),
+            )
+            session.add(persisted_result)
+            await session.flush()
+            batch_record.resource_id = persisted_result.id
+            session.add(batch_record)
+            await session.commit()
+    except Exception:
+        if owns_batch_record:
+            await session.rollback()
+            batch_record = await get_idempotency_record(
+                session,
+                current_user.id,
+                SYNC_BATCH_CREATE_OPERATION,
+                idempotency_key,
+            )
+            if (
+                batch_record is not None
+                and batch_record.request_hash == batch_request_hash
+                and batch_record.resource_id == SYNC_BATCH_IN_PROGRESS
+            ):
+                await session.delete(batch_record)
+                await session.commit()
+        raise
+
+    return result
+
+
+async def _wait_for_finalized_sync_batch(
+    session,
+    user_id: int,
+    idempotency_key: str,
+    request_hash: str,
+):
+    """等待批次拥有者发布完整子任务集合，避免重放观察到中间态。"""
+    for attempt in range(SYNC_BATCH_REPLAY_WAIT_ATTEMPTS):
+        await session.rollback()
+        record = await get_idempotency_record(
+            session,
+            user_id,
+            SYNC_BATCH_CREATE_OPERATION,
+            idempotency_key,
+        )
+        if record is None or record.request_hash != request_hash:
+            raise HTTPException(409, "idempotency_key_reused", "idempotency_key_reused")
+        if record.resource_id != SYNC_BATCH_IN_PROGRESS:
+            return record
+        if attempt + 1 < SYNC_BATCH_REPLAY_WAIT_ATTEMPTS:
+            await asyncio.sleep(SYNC_BATCH_REPLAY_WAIT_SECONDS)
+    raise ServiceUnavailableException(message="model_storage_sync_batch_in_progress")
+
+
+async def _load_sync_batch_result(session, batch_record):
+    result = await session.get(ModelStorageSyncBatchResult, batch_record.resource_id)
+    if result is None or result.idempotency_record_id != batch_record.id:
+        raise HTTPException(
+            409, "idempotency_resource_not_found", "idempotency_resource_not_found"
+        )
+    return ModelStorageSyncBatchPublic.model_validate(result.response_payload)
 
 
 async def _bind_idempotency_key_to_existing_task(

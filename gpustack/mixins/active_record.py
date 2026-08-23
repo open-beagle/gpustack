@@ -213,7 +213,9 @@ class ActiveRecordMixin:
         if isinstance(source, SQLModel):
             return cls.model_validate(source, update=update)
         if isinstance(source, BaseModel):
-            return cls.model_validate(source.model_dump(exclude_unset=True), update=update)
+            return cls.model_validate(
+                source.model_dump(exclude_unset=True), update=update
+            )
         if isinstance(source, dict):
             return cls.parse_obj(source, update=update)
         return None
@@ -314,9 +316,17 @@ class ActiveRecordMixin:
                 await self.save(session)
             await self._handle_cascade_delete(session)
 
+        event_snapshot = self.__class__.model_validate(
+            self.model_dump(),
+            update={
+                key: value
+                for key, value in getattr(self, "__dict__", {}).items()
+                if not key.startswith("_")
+            },
+        )
         await session.delete(self)
         await session.commit()
-        await self._publish_event(EventType.DELETED, self)
+        await self._publish_event(EventType.DELETED, event_snapshot)
 
     async def _handle_cascade_delete(self, session: AsyncSession):
         """Handle cascading deletes for all defined relationships."""
@@ -355,8 +365,6 @@ class ActiveRecordMixin:
     @classmethod
     async def _publish_event(cls, event_type: str, data: Any):
         try:
-            if hasattr(data, "model_copy") and not cls._is_orm_instance(data):
-                data = data.model_copy(deep=True)
             await event_bus.publish(
                 cls.__name__.lower(), Event(type=event_type, data=data)
             )
@@ -364,13 +372,24 @@ class ActiveRecordMixin:
             logger.error(f"Failed to publish event: {e}")
 
     @classmethod
-    async def subscribe(cls, engine: AsyncEngine) -> AsyncGenerator[Event, None]:
+    async def subscribe(
+        cls, engine: AsyncEngine, public_snapshot: bool = False
+    ) -> AsyncGenerator[Event, None]:
         async with AsyncSession(engine) as session:
             items = await cls.all(session)
             for item in items:
-                yield Event(type=EventType.CREATED, data=item)
+                if public_snapshot:
+                    snapshot = cls._convert_to_public_class(item)
+                    if isinstance(snapshot, dict):
+                        logger.error("Skipping invalid initial %s event", cls.__name__)
+                        continue
+                    yield Event(type=EventType.CREATED, data=snapshot)
+                else:
+                    yield Event(type=EventType.CREATED, data=item)
 
-        subscriber = event_bus.subscribe(cls.__name__.lower())
+        subscriber = event_bus.subscribe(
+            cls.__name__.lower(), public_snapshot=public_snapshot
+        )
         heartbeat_interval = timedelta(seconds=15)
         last_event_time = datetime.now(timezone.utc)
 
@@ -401,7 +420,7 @@ class ActiveRecordMixin:
     ) -> AsyncGenerator[str, None]:
         """Stream events matching the given criteria as JSON strings."""
         try:
-            async for event in cls.subscribe(engine):
+            async for event in cls.subscribe(engine, public_snapshot=True):
                 if event.type == EventType.HEARTBEAT:
                     yield "\n\n"
                     continue

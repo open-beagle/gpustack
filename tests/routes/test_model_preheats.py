@@ -1213,71 +1213,7 @@ def test_creation_rejects_profile_that_is_not_available_on_all_workers(tmp_path)
     assert response.json()["message"] == "s3_unavailable_on_workers"
 
 
-def test_creation_starts_and_reuses_targeted_check_for_expired_profile(tmp_path):
-    app, engine = _test_app(tmp_path)
-    app.state.server_config.model_preheat_connectivity_ttl_seconds = 30
-
-    async def seed():
-        async with AsyncSession(engine) as session:
-            profile, workers = await _seed(session)
-            expired_at = datetime.now(timezone.utc) - timedelta(minutes=2)
-            check = await session.get(
-                ModelPreheatS3ConnectivityCheck,
-                profile.last_connectivity_check_id,
-            )
-            check.finished_at = expired_at
-            profile.last_connectivity_checked_at = expired_at
-            profile_id = profile.id
-            worker_id = workers[0].id
-            worker_uuid = workers[0].worker_uuid
-            session.add_all([check, profile])
-            await session.commit()
-            return profile_id, worker_id, worker_uuid
-
-    profile_id, worker_id, worker_uuid = asyncio.run(seed())
-    request_payload = payload(profile_id, [worker_id])
-    with TestClient(app) as client:
-        first = client.post(API_PREFIX, json=request_payload)
-        second = client.post(API_PREFIX, json=request_payload)
-
-    async def stored_checks_and_tasks():
-        async with AsyncSession(engine) as session:
-            checks = (
-                await session.exec(
-                    select(ModelPreheatS3ConnectivityCheck).order_by(
-                        ModelPreheatS3ConnectivityCheck.id
-                    )
-                )
-            ).all()
-            tasks = (
-                await session.exec(
-                    select(ModelPreheatWorkerTask).where(
-                        ModelPreheatWorkerTask.connectivity_check_id == checks[-1].id
-                    )
-                )
-            ).all()
-            return checks, tasks
-
-    checks, tasks = asyncio.run(stored_checks_and_tasks())
-    asyncio.run(_drop_tables(engine))
-    asyncio.run(engine.dispose())
-
-    assert first.status_code == 422, first.text
-    assert second.status_code == 422, second.text
-    assert first.json()["message"] == second.json()["message"]
-    assert first.json()["message"].startswith(
-        "s3_unavailable_on_workers: connectivity_check_id="
-    )
-    quick_check_id = int(first.json()["message"].rsplit("=", 1)[1])
-    assert len(checks) == 2
-    assert checks[-1].id == quick_check_id
-    assert checks[-1].target_worker_uuids == [worker_uuid]
-    assert [(task.worker_uuid, task.worker_id) for task in tasks] == [
-        (worker_uuid, worker_id)
-    ]
-
-
-def test_creation_reuses_fresh_target_result_after_ttl_quick_check(tmp_path):
+def test_creation_reuses_successful_connectivity_after_ttl(tmp_path):
     app, engine = _test_app(tmp_path)
     app.state.server_config.model_preheat_connectivity_ttl_seconds = 30
 
@@ -1300,32 +1236,27 @@ def test_creation_reuses_fresh_target_result_after_ttl_quick_check(tmp_path):
     profile_id, worker_id = asyncio.run(seed())
     request_payload = payload(profile_id, [worker_id])
     with TestClient(app) as client:
-        blocked = client.post(API_PREFIX, json=request_payload)
-        quick_check_id = int(blocked.json()["message"].rsplit("=", 1)[1])
+        first = client.post(API_PREFIX, json=request_payload)
+        second = client.post(API_PREFIX, json=request_payload)
 
-        async def finish_quick_check():
-            async with AsyncSession(engine) as session:
-                task = (
-                    await session.exec(
-                        select(ModelPreheatWorkerTask).where(
-                            ModelPreheatWorkerTask.connectivity_check_id
-                            == quick_check_id
-                        )
+    async def stored_checks():
+        async with AsyncSession(engine) as session:
+            return (
+                await session.exec(
+                    select(ModelPreheatS3ConnectivityCheck).order_by(
+                        ModelPreheatS3ConnectivityCheck.id
                     )
-                ).one()
-                task.state = ModelPreheatWorkerTaskStateEnum.READY
-                session.add(task)
-                await session.commit()
-                await aggregate_connectivity_check(session, quick_check_id)
+                )
+            ).all()
 
-        asyncio.run(finish_quick_check())
-        retried = client.post(API_PREFIX, json=request_payload)
-
+    checks = asyncio.run(stored_checks())
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 
-    assert blocked.status_code == 422, blocked.text
-    assert retried.status_code == 200, retried.text
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["id"] == second.json()["id"]
+    assert len(checks) == 1
 
 
 def test_creation_uses_latest_results_across_incremental_checks(tmp_path):

@@ -39,6 +39,10 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatInventoryManifestStateEnum,
 )
+from gpustack.schemas.model_storage_sync import (
+    ModelStorageSyncTask,
+    ModelStorageSyncTaskStateEnum,
+)
 from gpustack.schemas.models import SourceEnum
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import get_session
@@ -79,7 +83,7 @@ def _app(tmp_path):
     )
 
     async def session_override():
-        async with AsyncSession(engine, expire_on_commit=False) as session:
+        async with AsyncSession(engine) as session:
             yield session
 
     async def identity_override():
@@ -288,6 +292,119 @@ def test_immutable_revision_claims_exact_artifact_without_hub_metadata(tmp_path)
     assert response.status_code == 200
     assert response.json()["artifact_id"] == "f" * 64
     assert metadata_calls == []
+
+
+def test_s3_completion_uses_provenance_and_publishes_transfer_snapshot(
+    tmp_path, monkeypatch
+):
+    app, engine, key = _app(tmp_path)
+    worker_id, model_file_id, _ = asyncio.run(
+        _seed(engine, key, filename="model.bin", requested_revision=SHA)
+    )
+
+    async def seed_artifact_and_provenance():
+        async with AsyncSession(engine) as session:
+            execution = (
+                await session.exec(
+                    select(ModelFileDownloadExecution).where(
+                        ModelFileDownloadExecution.model_file_id == model_file_id
+                    )
+                )
+            ).one()
+            profile_id = execution.default_profile_id
+            profile_config_version = execution.default_profile_config_version
+            artifact_id = "f" * 64
+            session.add(
+                ModelPreheatArtifact(
+                    profile_id=profile_id,
+                    profile_config_version=profile_config_version,
+                    artifact_id=artifact_id,
+                    source="huggingface",
+                    model_id="org/model",
+                    resolved_revision=SHA,
+                    include_patterns=["model.bin", "model.bin/**"],
+                    exclude_patterns=[],
+                    manifest_path=f"storage/huggingface/org/model/{artifact_id}/manifest.json",
+                    manifest_digest="e" * 64,
+                    file_count=1,
+                    total_size=12,
+                    manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                    last_verified_at=datetime.now(timezone.utc),
+                )
+            )
+            session.add(
+                ModelStorageSyncTask(
+                    model_file_id=model_file_id,
+                    worker_id=worker_id,
+                    worker_uuid="worker-uuid",
+                    profile_id=profile_id,
+                    profile_config_version=profile_config_version,
+                    request_identity={},
+                    request_digest="d" * 64,
+                    source="huggingface",
+                    model_id="org/model",
+                    resolved_revision=SHA,
+                    credential_snapshot_encrypted={},
+                    encryption_key_version="v1",
+                    artifact_id=artifact_id,
+                    state=ModelStorageSyncTaskStateEnum.READY,
+                    finished_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.commit()
+            return profile_id
+
+    profile_id = asyncio.run(seed_artifact_and_provenance())
+    claimed = TestClient(app).post(
+        f"/v1/model-files/{model_file_id}/download-executions/claim"
+    )
+    assert claimed.status_code == 200, claimed.text
+    published = []
+
+    async def capture(cls, event_type, data):
+        del cls, event_type
+        published.append(data)
+
+    monkeypatch.setattr(ModelFile, "_publish_event", classmethod(capture))
+    completed = TestClient(app).post(
+        f"/v1/model-files/{model_file_id}/download-executions/complete",
+        json={"transfer_source": "s3", "transfer_profile_id": profile_id},
+    )
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            return (
+                await session.exec(
+                    select(ModelFileDownloadExecution).where(
+                        ModelFileDownloadExecution.model_file_id == model_file_id
+                    )
+                )
+            ).one()
+
+    execution = asyncio.run(inspect())
+
+    async def reject_provenance_reselection(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("READY replay must use the fixed transfer result")
+
+    monkeypatch.setattr(
+        model_file_download_executions,
+        "_normalized_transfer_result",
+        reject_provenance_reselection,
+    )
+    replayed = TestClient(app).post(
+        f"/v1/model-files/{model_file_id}/download-executions/complete",
+        json={"transfer_source": "s3", "transfer_profile_id": profile_id},
+    )
+    assert completed.status_code == 200, completed.text
+    assert replayed.status_code == 200, replayed.text
+    assert execution.transfer_source.value == "peer_via_s3"
+    assert execution.source_worker_id == worker_id
+    assert published[-1].source == SourceEnum.HUGGING_FACE
+    assert published[-1].transfer_source.value == "peer_via_s3"
+    assert published[-1].transfer_profile_id == profile_id
+    assert published[-1].source_worker_id == worker_id
+    asyncio.run(engine.dispose())
     asyncio.run(engine.dispose())
 
 

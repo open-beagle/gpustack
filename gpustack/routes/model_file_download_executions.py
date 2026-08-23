@@ -28,14 +28,20 @@ from gpustack.schemas.model_file_download_executions import (
     ModelFileDownloadExecutionFail,
     ModelFileDownloadExecutionProfile,
     ModelFileDownloadExecutionStateEnum,
+    ModelFileTransferSourceEnum,
 )
-from gpustack.schemas.model_files import ModelFile
+from gpustack.schemas.model_files import ModelFile, ModelFilePublic
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatInventoryManifestStateEnum,
 )
 from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
+from gpustack.schemas.model_storage_sync import (
+    ModelStorageSyncTask,
+    ModelStorageSyncTaskStateEnum,
+)
+from gpustack.server.bus import EventType
 from gpustack.server.deps import SessionDep
 from gpustack.server.model_preheat_revision import (
     modelscope_upstream_revision,
@@ -466,17 +472,31 @@ async def complete_model_file_download_execution(
     execution, model_file = await _execution_and_model_file(session, model_file_id)
     await _authorize_execution(session, execution, model_file, identity)
     if execution.state == ModelFileDownloadExecutionStateEnum.READY:
-        if (
+        s3_replay = (
+            complete.transfer_source == ModelFileTransferSourceEnum.S3
+            and execution.transfer_source
+            in {
+                ModelFileTransferSourceEnum.S3,
+                ModelFileTransferSourceEnum.PEER_VIA_S3,
+            }
+            and execution.transfer_profile_id == complete.transfer_profile_id
+            and complete.source_worker_id is None
+        )
+        exact_replay = (
             execution.transfer_source == complete.transfer_source
             and execution.transfer_profile_id == complete.transfer_profile_id
             and execution.source_worker_id == complete.source_worker_id
-        ):
+        )
+        if s3_replay or exact_replay:
             return {"state": execution.state}
         raise HTTPException(
             409, "execution_already_completed", "execution_already_completed"
         )
     if execution.state != ModelFileDownloadExecutionStateEnum.RUNNING:
         raise HTTPException(409, "execution_not_running", "execution_not_running")
+    transfer_source, source_worker_id = await _normalized_transfer_result(
+        session, execution, complete
+    )
     if complete.transfer_profile_id not in {None, execution.default_profile_id}:
         raise HTTPException(422, "invalid_transfer_profile", "invalid_transfer_profile")
     if complete.source_worker_id not in {None, identity.worker_id}:
@@ -492,15 +512,35 @@ async def complete_model_file_download_execution(
     elif complete.transfer_profile_id is not None:
         raise HTTPException(422, "invalid_transfer_source", "invalid_transfer_source")
     execution.state = ModelFileDownloadExecutionStateEnum.READY
-    execution.transfer_source = complete.transfer_source
+    execution.transfer_source = transfer_source
     execution.transfer_profile_id = complete.transfer_profile_id
-    execution.source_worker_id = complete.source_worker_id
+    execution.source_worker_id = source_worker_id
     execution.error_code = None
     execution.state_message = None
     execution.finished_at = datetime.now(timezone.utc)
     session.add(execution)
+    response_state = execution.state
+    profile_name = None
+    if complete.transfer_profile_id is not None:
+        profile = await session.get(ModelPreheatS3Profile, complete.transfer_profile_id)
+        profile_name = profile.name if profile is not None else None
+    source_worker_name = None
+    if source_worker_id is not None:
+        source_worker = await session.get(Worker, source_worker_id)
+        source_worker_name = source_worker.name if source_worker is not None else None
+    model_file_event = ModelFilePublic.model_validate(
+        model_file,
+        update={
+            "transfer_source": transfer_source,
+            "transfer_profile_id": complete.transfer_profile_id,
+            "transfer_profile_name": profile_name,
+            "source_worker_id": source_worker_id,
+            "source_worker_name": source_worker_name,
+        },
+    )
     await session.commit()
-    return {"state": execution.state}
+    await ModelFile._publish_event(EventType.UPDATED, model_file_event)
+    return {"state": response_state}
 
 
 @router.post("/{model_file_id}/download-executions/fail")
@@ -538,8 +578,9 @@ async def fail_model_file_download_execution(
     execution.state_message = execution.error_code
     execution.finished_at = datetime.now(timezone.utc)
     session.add(execution)
+    response_state = execution.state
     await session.commit()
-    return {"state": execution.state}
+    return {"state": response_state}
 
 
 async def _execution_and_model_file(session, model_file_id):
@@ -554,3 +595,24 @@ async def _execution_and_model_file(session, model_file_id):
     if execution is None or model_file is None:
         raise NotFoundException(message="model_file_download_execution_not_found")
     return execution, model_file
+
+
+async def _normalized_transfer_result(session, execution, complete):
+    if complete.transfer_source != ModelFileTransferSourceEnum.S3:
+        return complete.transfer_source, complete.source_worker_id
+    provenance = (
+        await session.exec(
+            select(ModelStorageSyncTask)
+            .where(
+                ModelStorageSyncTask.profile_id == execution.default_profile_id,
+                ModelStorageSyncTask.artifact_id == execution.artifact_id,
+                ModelStorageSyncTask.state == ModelStorageSyncTaskStateEnum.READY,
+            )
+            .order_by(
+                ModelStorageSyncTask.finished_at.desc(), ModelStorageSyncTask.id.desc()
+            )
+        )
+    ).first()
+    if provenance is None:
+        return ModelFileTransferSourceEnum.S3, None
+    return ModelFileTransferSourceEnum.PEER_VIA_S3, provenance.worker_id
