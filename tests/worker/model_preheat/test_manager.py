@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -149,6 +150,51 @@ def test_sse_reconnect_and_duplicate_events_start_only_one_execution():
     assert calls == 1
     assert worker_tasks.list_params
     assert worker_tasks.list_params[0]["state"] == ["pending", "running", "paused"]
+
+
+def test_connectivity_payload_failure_writes_terminal_result_and_role_log(caplog):
+    class ConnectivityFailureClient(FakeWorkerTasksClient):
+        def __init__(self):
+            super().__init__()
+            self.failures = []
+
+        async def aclaim(self, id, claim):
+            claimed = await super().aclaim(id, claim)
+            claimed.role = ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK
+            return claimed
+
+        async def aget_execution_payload(self, **kwargs):
+            raise RuntimeError("payload unavailable")
+
+        async def afail(self, id, failure):
+            self.failures.append(failure)
+
+    async def run():
+        client = ConnectivityFailureClient()
+        manager = ModelPreheatManager(
+            worker_id=11,
+            worker_uuid="worker-uuid",
+            clientset=SimpleNamespace(model_preheat_worker_tasks=client),
+        )
+        task = _public_task().model_copy(
+            update={"role": ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK}
+        )
+        manager.handle_event(Event(EventType.CREATED, task.model_dump(mode="json")))
+        await asyncio.gather(*manager._active_tasks.values())
+        return client
+
+    with caplog.at_level(logging.ERROR):
+        client = asyncio.run(run())
+
+    assert len(client.failures) == 1
+    assert client.failures[0].error_code == "execution_payload_unavailable"
+    assert client.failures[0].result == {
+        "state": "error",
+        "error_code": "execution_payload_unavailable",
+        "failed_stage": "client",
+    }
+    assert "模型存储连通性检测执行参数获取失败" in caplog.text
+    assert "模型预热执行参数获取失败" not in caplog.text
 
 
 def test_periodic_reconciliation_claims_task_after_existing_lease_expires():

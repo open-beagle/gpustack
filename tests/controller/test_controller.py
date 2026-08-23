@@ -2,6 +2,9 @@ import asyncio
 from datetime import datetime
 from typing import List
 import pytest
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlmodel import SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
 from gpustack.policies.base import ModelInstanceScore
 
 from gpustack.schemas.links import ModelInstanceModelFileLink
@@ -14,7 +17,7 @@ from gpustack.schemas.models import (
     ModelInstanceStateEnum,
     SourceEnum,
 )
-from gpustack.schemas.workers import WorkerStateEnum
+from gpustack.schemas.workers import Worker, WorkerStateEnum
 from gpustack.server.controllers import (
     ModelInstanceController,
     WorkerController,
@@ -146,6 +149,63 @@ def test_worker_reconcile_skips_expired_event_data_without_implicit_io():
         )
 
     list_mock.assert_not_awaited()
+
+
+def test_worker_reconcile_reloads_attached_expired_event_by_identity(tmp_path):
+    async def run():
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'worker.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                SQLModel.metadata.create_all, tables=[Worker.__table__]
+            )
+        async with AsyncSession(engine, expire_on_commit=True) as real_session:
+            expired = Worker(
+                name="worker-a",
+                hostname="worker-a",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="worker-a-uuid",
+                state=WorkerStateEnum.READY,
+            )
+            real_session.add(expired)
+            await real_session.commit()
+            assert expired.model_dump() == {}
+
+            controller = WorkerController.__new__(WorkerController)
+            controller._engine = object()
+            fake_session = AsyncMock()
+            current = Worker(
+                id=1,
+                name="worker-a",
+                hostname="worker-a",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="worker-a-uuid",
+                state=WorkerStateEnum.READY,
+            )
+            reload_mock = AsyncMock(return_value=current)
+            list_mock = AsyncMock(return_value=[])
+            with (
+                patch(
+                    "gpustack.server.controllers.AsyncSession",
+                    return_value=FakeAsyncSessionContext(fake_session),
+                ),
+                patch(
+                    "gpustack.server.controllers.Worker.one_by_id",
+                    new=reload_mock,
+                ),
+                patch(
+                    "gpustack.server.controllers.ModelInstance.all_by_field",
+                    new=list_mock,
+                ),
+            ):
+                await controller._reconcile(Event(type=EventType.UPDATED, data=expired))
+
+            reload_mock.assert_awaited_once_with(fake_session, 1)
+            list_mock.assert_awaited_once_with(fake_session, "worker_name", "worker-a")
+        await engine.dispose()
+
+    asyncio.run(run())
 
 
 def test_ensure_model_instance_file_links_adds_missing_links():

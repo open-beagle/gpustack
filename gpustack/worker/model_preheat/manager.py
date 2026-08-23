@@ -199,7 +199,9 @@ class ModelPreheatManager:
             or len(self._active_tasks) >= self._max_concurrent_tasks
         ):
             return
-        task = asyncio.create_task(self._claim_and_execute(worker_task.id))
+        task = asyncio.create_task(
+            self._claim_and_execute(worker_task.id, worker_task.role)
+        )
         self._active_tasks[worker_task.id] = task
         task.add_done_callback(
             lambda completed, task_id=worker_task.id: self._remove_active_task(
@@ -256,7 +258,7 @@ class ModelPreheatManager:
             return True
         return role in self._role_handlers
 
-    async def _claim_and_execute(self, worker_task_id: int):
+    async def _claim_and_execute(self, worker_task_id: int, role=None):
         claim_request = ModelPreheatWorkerTaskClaim(
             worker_uuid=self._worker_uuid,
             worker_id=self._worker_id,
@@ -270,18 +272,22 @@ class ModelPreheatManager:
             if exc.status_code == 409:
                 return
             logger.error(
-                "模型预热任务领取失败。worker_task_id=%s error_type=%s",
+                "%s领取失败。worker_task_id=%s error_type=%s",
+                self._role_name(role),
                 worker_task_id,
                 type(exc).__name__,
             )
             return
         except Exception as exc:
             logger.error(
-                "模型预热任务领取失败。worker_task_id=%s error_type=%s",
+                "%s领取失败。worker_task_id=%s error_type=%s",
+                self._role_name(role),
                 worker_task_id,
                 type(exc).__name__,
             )
             return
+
+        role = claim.role
 
         lease = _LeaseIdentity(
             worker_task_id=worker_task_id,
@@ -306,11 +312,16 @@ class ModelPreheatManager:
             raise
         except Exception as exc:
             logger.error(
-                "模型预热执行参数获取失败。worker_task_id=%s error_type=%s",
+                "%s执行参数获取失败。worker_task_id=%s error_type=%s",
+                self._role_name(role),
                 worker_task_id,
                 type(exc).__name__,
             )
-            await self._fail(lease, "execution_payload_unavailable")
+            await self._fail(
+                lease,
+                "execution_payload_unavailable",
+                role=role,
+            )
             return
 
         execution = asyncio.create_task(self._execution_handler(payload, context))
@@ -337,11 +348,12 @@ class ModelPreheatManager:
             raise
         except Exception as exc:
             logger.error(
-                "模型预热任务执行失败。worker_task_id=%s error_type=%s",
+                "%s执行失败。worker_task_id=%s error_type=%s",
+                self._role_name(role),
                 worker_task_id,
                 type(exc).__name__,
             )
-            await self._fail(lease, "worker_execution_failed")
+            await self._fail(lease, "worker_execution_failed", role=role)
             return
         finally:
             heartbeat.cancel()
@@ -352,6 +364,7 @@ class ModelPreheatManager:
                 lease,
                 result.get("error_code") or "worker_execution_failed",
                 result,
+                role=role,
             )
             return
         try:
@@ -365,13 +378,15 @@ class ModelPreheatManager:
         except HTTPException as exc:
             if exc.status_code != 409:
                 logger.error(
-                    "模型预热任务完成回写失败。worker_task_id=%s error_type=%s",
+                    "%s完成回写失败。worker_task_id=%s error_type=%s",
+                    self._role_name(role),
                     worker_task_id,
                     type(exc).__name__,
                 )
         except Exception as exc:
             logger.error(
-                "模型预热任务完成回写失败。worker_task_id=%s error_type=%s",
+                "%s完成回写失败。worker_task_id=%s error_type=%s",
+                self._role_name(role),
                 worker_task_id,
                 type(exc).__name__,
             )
@@ -404,7 +419,9 @@ class ModelPreheatManager:
         except Exception:
             return False
 
-    async def _fail(self, lease, error_code, result=None):
+    async def _fail(self, lease, error_code, result=None, *, role=None):
+        if result is None:
+            result = self._failure_result(role, error_code)
         try:
             await self._client.afail(
                 id=lease.worker_task_id,
@@ -412,22 +429,45 @@ class ModelPreheatManager:
                     **lease.request().model_dump(),
                     error_code=error_code,
                     state_message=error_code,
-                    result=result or {},
+                    result=result,
                 ),
             )
         except HTTPException as exc:
             if exc.status_code != 409:
                 logger.error(
-                    "模型预热任务失败回写失败。worker_task_id=%s error_type=%s",
+                    "%s失败回写失败。worker_task_id=%s error_type=%s",
+                    self._role_name(role),
                     lease.worker_task_id,
                     type(exc).__name__,
                 )
         except Exception as exc:
             logger.error(
-                "模型预热任务失败回写失败。worker_task_id=%s error_type=%s",
+                "%s失败回写失败。worker_task_id=%s error_type=%s",
+                self._role_name(role),
                 lease.worker_task_id,
                 type(exc).__name__,
             )
+
+    @staticmethod
+    def _role_name(role):
+        if role == ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK:
+            return "模型存储连通性检测"
+        return "模型预热"
+
+    @staticmethod
+    def _failure_result(role, error_code):
+        if role == ModelPreheatWorkerTaskRoleEnum.CONNECTIVITY_CHECK:
+            return {
+                "state": "error",
+                "error_code": error_code,
+                "failed_stage": "client",
+            }
+        if role in {
+            ModelPreheatWorkerTaskRoleEnum.SEED,
+            ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+        }:
+            return {"state": "error", "error_code": error_code}
+        return {}
 
     async def _execute_registered_task(self, payload, context):
         handler = self._role_handlers.get(payload.role)

@@ -6,7 +6,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from gpustack.server.bus import Event, EventType, event_bus
+from gpustack.server import bus as bus_module
+from gpustack.server.bus import Event, EventBus, EventType, event_bus
 from gpustack.server.controllers import set_default_worker_selector
 from gpustack.schemas.models import (
     Model,
@@ -120,6 +121,147 @@ async def test_worker_initial_event_survives_subscription_session_end(tmp_path):
     assert event.data.name == "worker-a"
     assert event.data.state == WorkerStateEnum.READY
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_public_snapshot_refreshes_attached_expired_worker(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'expired-event.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            SQLModel.metadata.create_all, tables=[Worker.__table__]
+        )
+
+    topic = "test-expired-worker-public-event"
+    subscriber = event_bus.subscribe(topic, public_snapshot=True)
+    try:
+        async with AsyncSession(engine, expire_on_commit=True) as session:
+            worker = Worker(
+                name="worker-expired",
+                hostname="worker-expired",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="worker-expired-uuid",
+                state=WorkerStateEnum.READY,
+            )
+            session.add(worker)
+            await session.commit()
+            assert worker.model_dump() == {}
+
+            await event_bus.publish(topic, Event(type=EventType.UPDATED, data=worker))
+            event = await asyncio.wait_for(subscriber.receive(), timeout=0.1)
+
+        assert isinstance(event.data, WorkerPublic)
+        assert event.data.name == "worker-expired"
+        assert event.data.worker_uuid == "worker-expired-uuid"
+    finally:
+        event_bus.unsubscribe(topic, subscriber)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_public_snapshot_refreshes_partially_expired_required_field(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'partial.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            SQLModel.metadata.create_all, tables=[Worker.__table__]
+        )
+
+    topic = "test-partially-expired-worker-public-event"
+    subscriber = event_bus.subscribe(topic, public_snapshot=True)
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            worker = Worker(
+                name="worker-partial",
+                hostname="worker-partial",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="worker-partial-uuid",
+                state=WorkerStateEnum.READY,
+            )
+            session.add(worker)
+            await session.commit()
+            session.expire(worker, ["name"])
+            assert worker.model_dump()
+            assert "name" not in worker.model_dump()
+
+            await event_bus.publish(topic, Event(type=EventType.UPDATED, data=worker))
+            event = await asyncio.wait_for(subscriber.receive(), timeout=0.1)
+
+        assert isinstance(event.data, WorkerPublic)
+        assert event.data.name == "worker-partial"
+    finally:
+        event_bus.unsubscribe(topic, subscriber)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_publish_preserves_topic_order_for_all_subscribers(
+    monkeypatch,
+):
+    bus = EventBus()
+    topic = "test-concurrent-topic-order"
+    internal = bus.subscribe(topic)
+    public = bus.subscribe(topic, public_snapshot=True)
+    snapshot_a_started = asyncio.Event()
+    release_snapshot_a = asyncio.Event()
+    original_snapshot = bus_module._snapshot_event
+
+    async def delayed_snapshot(event):
+        if event.data["sequence"] == "A":
+            snapshot_a_started.set()
+            await release_snapshot_a.wait()
+        return await original_snapshot(event)
+
+    monkeypatch.setattr(bus_module, "_snapshot_event", delayed_snapshot)
+    publish_a = asyncio.create_task(
+        bus.publish(topic, Event(EventType.UPDATED, {"sequence": "A"}))
+    )
+    await asyncio.wait_for(snapshot_a_started.wait(), timeout=1)
+    publish_b = asyncio.create_task(
+        bus.publish(topic, Event(EventType.UPDATED, {"sequence": "B"}))
+    )
+    await asyncio.sleep(0)
+    release_snapshot_a.set()
+    await asyncio.gather(publish_a, publish_b)
+
+    internal_order = [(await internal.receive()).data["sequence"] for _ in range(2)]
+    public_order = [(await public.receive()).data["sequence"] for _ in range(2)]
+
+    assert internal_order == ["A", "B"]
+    assert public_order == ["A", "B"]
+
+    bus.unsubscribe(topic, internal)
+    bus.unsubscribe(topic, public)
+    assert topic not in bus._topic_publish_states
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_wakes_publish_blocked_by_full_queue():
+    bus = EventBus()
+    topic = "test-full-queue-unsubscribe"
+    blocked = bus.subscribe(topic)
+    blocked.queue = asyncio.Queue(maxsize=1)
+    await blocked.queue.put(Event(EventType.CREATED, {"sequence": "preloaded"}))
+    survivor = bus.subscribe(topic)
+
+    publishing = asyncio.create_task(
+        bus.publish(topic, Event(EventType.UPDATED, {"sequence": "A"}))
+    )
+    await asyncio.sleep(0)
+    assert not publishing.done()
+
+    bus.unsubscribe(topic, blocked)
+    await asyncio.wait_for(publishing, timeout=1)
+    assert (await survivor.receive()).data["sequence"] == "A"
+
+    bus.unsubscribe(topic, survivor)
+    replacement = bus.subscribe(topic)
+    await asyncio.wait_for(
+        bus.publish(topic, Event(EventType.UPDATED, {"sequence": "B"})),
+        timeout=1,
+    )
+    assert (await replacement.receive()).data["sequence"] == "B"
+    bus.unsubscribe(topic, replacement)
 
 
 @pytest.mark.asyncio

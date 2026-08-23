@@ -659,10 +659,10 @@ def _decrypt_profile(cipher, encrypted_profile):
     return ModelPreheatExecutionProfile(
         endpoint=encrypted_profile["endpoint"],
         bucket=encrypted_profile["bucket"],
-        prefix=encrypted_profile.get("prefix", ""),
+        prefix=encrypted_profile.get("prefix") or "",
         tls_enabled=encrypted_profile.get("tls_enabled", True),
         tls_verify=encrypted_profile.get("tls_verify", True),
-        region=encrypted_profile.get("region", ""),
+        region=encrypted_profile.get("region") or "",
         use_virtual_hosted_style=encrypted_profile.get(
             "use_virtual_hosted_style", True
         ),

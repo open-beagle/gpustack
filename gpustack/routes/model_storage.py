@@ -1218,9 +1218,23 @@ async def _stream_sync_tasks(engine, fields=None, cipher=None):
         if event.type == EventType.HEARTBEAT:
             yield "\n\n"
             continue
-        if not ModelStorageSyncTask._match_fields(event, fields):
-            continue
         async with AsyncSession(engine) as session:
+            if (
+                ModelStorageSyncTask._safe_event_value(event.data, "created_at", None)
+                is None
+                or ModelStorageSyncTask._safe_event_value(
+                    event.data, "updated_at", None
+                )
+                is None
+            ):
+                task_id = ModelStorageSyncTask._safe_event_value(event.data, "id", None)
+                if task_id is None:
+                    continue
+                event.data = await session.get(ModelStorageSyncTask, task_id)
+                if event.data is None:
+                    continue
+            if not ModelStorageSyncTask._match_fields(event, fields):
+                continue
             event.data = (await _sync_tasks_public(session, [event.data], cipher))[0]
         yield ModelStorageSyncTask._format_event(event)
 

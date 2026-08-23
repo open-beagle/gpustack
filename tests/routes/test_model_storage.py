@@ -63,6 +63,7 @@ from gpustack.server.model_preheat_worker_identity import (
 from gpustack.server.model_preheat_s3_profile_lifecycle import (
     ModelPreheatS3ProfileNotActive,
 )
+from gpustack.server.bus import Event, EventType
 
 API = "/v1/model-storage-sync-tasks"
 DETAIL = "/v1/model-storage-sync-tasks/{id}"
@@ -775,6 +776,40 @@ def test_sync_history_decryption_unavailable_degrades_without_credentials(app, c
             assert forbidden not in serialized
     finally:
         app.state.server_config.model_preheat_credential_key = original_key
+
+
+def test_sync_stream_reloads_event_missing_timestamps_by_id(app, client, monkeypatch):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = client.post(
+        API, json={"model_file_id": model_file_id, "profile_id": profile_id}
+    ).json()
+
+    async def subscribe(cls, engine):
+        del cls, engine
+        yield Event(
+            type=EventType.UPDATED,
+            data=ModelStorageSyncTask(id=created["id"]),
+        )
+
+    monkeypatch.setattr(
+        ModelStorageSyncTask,
+        "subscribe",
+        classmethod(subscribe),
+    )
+
+    async def read_event():
+        stream = model_storage._stream_sync_tasks(
+            _engine(app), cipher=_cipher_from_app(app)
+        )
+        try:
+            return json.loads(await anext(stream))["data"]
+        finally:
+            await stream.aclose()
+
+    event = _run(app, read_event())
+    assert event["id"] == created["id"]
+    assert event["created_at"] is not None
+    assert event["updated_at"] is not None
 
 
 def test_cancel_active_task_marks_canceled(app, client):

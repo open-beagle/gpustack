@@ -296,6 +296,35 @@ def test_claim_and_payload_keep_credentials_private(tmp_path):
     asyncio.run(engine.dispose())
 
 
+def test_connectivity_payload_normalizes_nullable_profile_region(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    worker_task_id = asyncio.run(_seed_connectivity_task(engine, key))
+
+    async def clear_region():
+        async with AsyncSession(engine) as session:
+            profile = (await session.exec(select(ModelPreheatS3Profile))).one()
+            profile.region = None
+            session.add(profile)
+            await session.commit()
+
+    asyncio.run(clear_region())
+    with TestClient(app) as client:
+        claim = _claim(client, worker_task_id)
+        payload = client.get(
+            f"{API_PREFIX}/{worker_task_id}/execution-payload",
+            headers={
+                "X-Worker-UUID": "worker-uuid",
+                "X-Worker-ID": "1",
+                "X-Task-Attempt": str(claim["attempt"]),
+                "X-Lease-Token": claim["lease_token"],
+            },
+        )
+
+    assert payload.status_code == 200, payload.text
+    assert payload.json()["profile"]["region"] == ""
+    asyncio.run(engine.dispose())
+
+
 def test_claim_rejects_worker_without_storage_protocol(tmp_path):
     app, engine, key = _test_app(tmp_path)
     child_id, _, _ = asyncio.run(_seed(engine, key))

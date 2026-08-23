@@ -4,6 +4,8 @@ import random
 import string
 from typing import Any, Dict, List
 import httpx
+from sqlalchemy import inspect
+from sqlalchemy.exc import NoInspectionAvailable
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -49,6 +51,17 @@ def safe_event_attr(obj: Any, attr: str, default: str = "<unknown>"):
     except Exception:
         return default
     return value if value is not None else default
+
+
+def event_model_id(obj: Any):
+    data = getattr(obj, "__dict__", {})
+    if isinstance(data, dict) and data.get("id") is not None:
+        return data["id"]
+    try:
+        identity = inspect(obj).identity
+    except NoInspectionAvailable:
+        return None
+    return identity[0] if identity else None
 
 
 class ModelController:
@@ -109,6 +122,7 @@ class ModelInstanceController:
 
         model_instance: ModelInstance = event.data
         model_instance_name = safe_event_attr(model_instance, "name")
+        model_instance_id = event_model_id(model_instance)
         try:
             async with AsyncSession(self._engine) as session:
                 if event.type == EventType.DELETED:
@@ -120,8 +134,10 @@ class ModelInstanceController:
                     await sync_ready_replicas(session, model)
                     return
 
+                if model_instance_id is None:
+                    return
                 model_instance = await ModelInstance.one_by_id(
-                    session, model_instance.id
+                    session, model_instance_id
                 )
                 if not model_instance:
                     return
@@ -584,7 +600,7 @@ class WorkerController:
         if not event_worker:
             return
 
-        worker_id = safe_event_attr(event_worker, "id", None)
+        worker_id = event_model_id(event_worker)
         worker_name = safe_event_attr(event_worker, "name", None)
         worker_state = safe_event_attr(event_worker, "state", None)
 
