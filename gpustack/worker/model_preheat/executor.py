@@ -282,6 +282,7 @@ def execute_target_preheat(
         target = Path(request.target_dir)
         target.mkdir(parents=True, exist_ok=True)
         if request.identity.source == "ollama_library":
+            transfer_result = []
             install_ollama_artifact(
                 s3_client,
                 manifest,
@@ -291,7 +292,9 @@ def execute_target_preheat(
                 model_id=decode_path(request.identity.model_path),
                 cancel_check=cancel_check,
                 progress_callback=progress_callback,
+                transfer_callback=transfer_result.append,
             )
+            downloaded = transfer_result[0]
             _write_local_artifact_marker(request.cache_dir, manifest)
             return _ready_result(
                 request,
@@ -299,8 +302,8 @@ def execute_target_preheat(
                 manifest,
                 transfer_source="s3",
                 uploaded=0,
-                skipped=0,
-                downloaded=1,
+                skipped=0 if downloaded else 1,
+                downloaded=1 if downloaded else 0,
             )
         downloaded = 0
         completed = []

@@ -19,6 +19,7 @@ from gpustack.schemas.model_preheat_s3_profiles import (
 )
 from gpustack.schemas.model_preheats import (
     ModelPreheatConnectivityCheckStateEnum,
+    ModelPreheatCreate,
     ModelPreheatIdempotencyRecord,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatWorkerTask,
@@ -26,7 +27,11 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTaskStateEnum,
 )
 from gpustack.schemas.users import User
-from gpustack.schemas.workers import Worker, WorkerStateEnum
+from gpustack.schemas.workers import (
+    MODEL_STORAGE_PROTOCOL_VERSION,
+    Worker,
+    WorkerStateEnum,
+)
 from gpustack.server.db import get_session
 from gpustack.server.model_preheat_idempotency import canonical_request_hash
 
@@ -61,6 +66,7 @@ async def _seed(session):
         port=10150,
         worker_uuid="worker-a-uuid",
         state=WorkerStateEnum.READY,
+        model_storage_protocol_version=MODEL_STORAGE_PROTOCOL_VERSION,
     )
     session.add(profile)
     session.add(worker)
@@ -261,7 +267,9 @@ def test_operation_lock_collision_persists_idempotency_replay_record(
     assert record.operation == model_preheats.CREATE_OPERATION
     assert record.idempotency_key == "race-key"
     assert record.request_hash == canonical_request_hash(
-        payload(profile.id, worker.id, keep_new_workers_in_sync=True)
+        ModelPreheatCreate.model_validate(
+            payload(profile.id, worker.id, keep_new_workers_in_sync=True)
+        ).model_dump(mode="json", exclude_none=True)
     )
     assert record.resource_id == initial.json()["id"]
     assert conflicting_replay.status_code == 409

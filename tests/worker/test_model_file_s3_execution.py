@@ -600,6 +600,56 @@ def test_ollama_distribution_installs_single_file_atomically(tmp_path):
     assert progress == [(["qwen2_5_7b"], len(content), len(content))]
 
 
+def test_ollama_distribution_skips_matching_file_without_download(tmp_path):
+    content = b"ollama-model"
+    manifest = _ollama_distribution_manifest(["qwen2_5_7b"])
+    request = _ollama_distribution_request(tmp_path, manifest)
+    target = request.target_dir / "qwen2_5_7b"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(content)
+    downloads = []
+
+    result = execute_target_preheat(
+        request,
+        _ollama_distribution_client(
+            request,
+            manifest,
+            lambda *args: downloads.append(args),
+        ),
+    )
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 0
+    assert result["skipped"] == 1
+    assert downloads == []
+    assert target.read_bytes() == content
+
+
+def test_ollama_distribution_matching_file_hash_honors_cancellation(tmp_path):
+    content = b"ollama-model"
+    manifest = _ollama_distribution_manifest(["qwen2_5_7b"])
+    request = _ollama_distribution_request(tmp_path, manifest)
+    target = request.target_dir / "qwen2_5_7b"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(content)
+    checks = iter((False, True))
+    downloads = []
+
+    result = execute_target_preheat(
+        request,
+        _ollama_distribution_client(
+            request,
+            manifest,
+            lambda *args: downloads.append(args),
+        ),
+        cancel_check=lambda: next(checks),
+    )
+
+    assert result == {"state": "error", "error_code": "canceled"}
+    assert downloads == []
+    assert target.read_bytes() == content
+
+
 @pytest.mark.parametrize(
     "paths",
     [["wrong_name"], ["qwen2_5_7b", "extra_file"]],

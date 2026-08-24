@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -13,16 +15,43 @@ from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatInventoryManifestStateEnum,
+    ModelPreheatTargetScopeEnum,
 )
+from gpustack.schemas.model_preheat_distribution_policies import (
+    ModelPreheatDistributionPolicy,
+    ModelPreheatDistributionPolicyCreate,
+)
+from gpustack.schemas.model_storage_sync import (
+    ModelStorageSyncExecutionPayload,
+    ModelStorageSyncExecutionProfile,
+    ModelStorageSyncTaskStateEnum,
+)
+from gpustack.schemas.users import User
 from gpustack.model_preheat_credentials import ModelPreheatCredentialError
+from gpustack.routes.model_preheat_distribution_policies import (
+    create_distribution_policy,
+)
 from gpustack.server import model_preheat_s3_inventory as inventory_module
 from gpustack.server.model_preheat_s3_inventory import (
     InventoryRefreshError,
     ModelPreheatS3Inventory,
 )
-from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
+from gpustack.worker.model_preheat.executor import (
+    SeedExecutionRequest,
+    TargetExecutionRequest,
+    execute_seed_preheat,
+    execute_target_preheat,
+)
+from gpustack.worker.model_preheat.identity import (
+    ModelPreheatIdentity,
+    decode_path,
+    ollama_model_filename,
+)
 from gpustack.worker.model_preheat.manifest import build_model_preheat_manifest
+from gpustack.worker.model_preheat.s3_client import ModelPreheatS3Client
 from gpustack.worker.model_preheat.s3_client import ModelPreheatS3ManifestError
+from gpustack.worker.model_storage_sync_manager import ModelStorageSyncManager
+from tests.worker.model_preheat.test_seed_executor import InMemoryMinio
 
 
 def _identity():
@@ -211,6 +240,7 @@ def test_refresh_discovers_three_sources_from_shared_s3_in_independent_database(
                 tables=[
                     ModelPreheatS3Profile.__table__,
                     ModelPreheatArtifact.__table__,
+                    ModelPreheatDistributionPolicy.__table__,
                 ],
             )
         async with AsyncSession(engine) as session:
@@ -230,45 +260,8 @@ def test_refresh_discovers_three_sources_from_shared_s3_in_independent_database(
             await session.commit()
             return profile_id
 
-    class SharedFakeS3:
-        def __init__(self):
-            self._client = self
-            self.manifests = {}
-
-        def publish(self, manifest):
-            path = f"shared/{manifest.artifact_prefix('')}/manifest.json"
-            self.manifests[path] = manifest
-
-        def list_objects(self, bucket, prefix, recursive):
-            assert (bucket, prefix, recursive) == ("models", "shared/", True)
-            return [SimpleNamespace(object_name=path) for path in self.manifests]
-
-        def read_artifact_manifest_path(self, bucket, path):
-            return self.manifests[path]
-
-        def artifact_manifest_object(self, prefix, manifest):
-            return f"{prefix}/{manifest.artifact_prefix('')}/manifest.json"
-
-    shared_s3 = SharedFakeS3()
-    for source, model_id in (
-        ("modelscope", "modelscope/model"),
-        ("huggingface", "huggingface/model"),
-        ("ollama_library", "ollama/model:latest"),
-    ):
-        source_dir = tmp_path / source
-        source_dir.mkdir()
-        (source_dir / "model.bin").write_text(source, encoding="utf-8")
-        shared_s3.publish(
-            build_model_preheat_manifest(
-                source_dir,
-                ModelPreheatIdentity(
-                    source=source,
-                    model_id=model_id,
-                    revision="revision-1",
-                    file_patterns=("model.bin",),
-                ),
-            )
-        )
+    shared_minio = InMemoryMinio()
+    shared_s3 = ModelPreheatS3Client(shared_minio)
 
     monkeypatch.setattr(
         inventory_module.ModelPreheatS3Client,
@@ -276,25 +269,155 @@ def test_refresh_discovers_three_sources_from_shared_s3_in_independent_database(
         lambda **kwargs: shared_s3,
     )
 
+    profile = ModelStorageSyncExecutionProfile(
+        endpoint="https://s3.example.com",
+        bucket="models",
+        prefix="shared",
+        access_key="stack-a-access",
+        secret_key="stack-a-secret",
+    )
+    sync_root = tmp_path / "stack-a-modelscope"
+    sync_root.mkdir()
+    (sync_root / "model.bin").write_bytes(b"modelscope")
+    sync_identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="modelscope/model",
+        revision="revision-1",
+        file_patterns=("model.bin",),
+    )
+    sync_result = ModelStorageSyncManager(
+        worker_id=1, clientset=SimpleNamespace(), cfg=SimpleNamespace()
+    )._publish(
+        ModelStorageSyncExecutionPayload(
+            task_id=1,
+            state=ModelStorageSyncTaskStateEnum.PUBLISHING,
+            source="modelscope",
+            model_id="modelscope/model",
+            resolved_revision="revision-1",
+            request_identity={
+                "source": "modelscope",
+                "model_id": "modelscope/model",
+                "requested_revision": None,
+                "include_patterns": ["model.bin"],
+                "exclude_patterns": [],
+            },
+            request_digest=sync_identity.request_digest,
+            source_paths=[str(sync_root / "model.bin")],
+            scan_spec={"root": str(sync_root), "include_patterns": ["model.bin"]},
+            lease_token="stack-a-sync-lease",
+            profile=profile,
+        ),
+        threading.Event(),
+    )
+
+    def seed(source, model_id, revision, task_id, content):
+        identity = ModelPreheatIdentity(
+            source=source,
+            model_id=model_id,
+            revision=revision,
+            file_patterns=() if source == "ollama_library" else ("model.bin",),
+        )
+        filename = (
+            ollama_model_filename(model_id)
+            if source == "ollama_library"
+            else "model.bin"
+        )
+
+        def download(_identity, staging, **_kwargs):
+            (staging / filename).write_bytes(content)
+
+        result = execute_seed_preheat(
+            SeedExecutionRequest(
+                cache_dir=tmp_path / f"stack-a-{source}-cache",
+                target_dir=tmp_path / f"stack-a-{source}-target",
+                task_id=task_id,
+                attempt=1,
+                request_digest=identity.request_digest,
+                identity=identity,
+                exclude_patterns=(),
+                bucket="models",
+                prefix="shared",
+                source_fallback_enabled=True,
+                install_local=False,
+            ),
+            shared_s3,
+            download_to_staging=download,
+        )
+        assert result["state"] == "ready"
+        return result
+
+    huggingface_result = seed(
+        "huggingface", "huggingface/model", "revision-1", 2, b"huggingface"
+    )
+    ollama_result = seed(
+        "ollama_library",
+        "ollama/model:latest",
+        "ollama-pending",
+        3,
+        b"ollama",
+    )
+    assert re.fullmatch(
+        r"local-snapshot-[0-9a-f]{64}", ollama_result["resolved_revision"]
+    )
+
     async def run():
         stack_a = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'a.db'}")
         stack_b = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'b.db'}")
-        await create_profile(stack_a, "stack-a")
+        stack_a_profile_id = await create_profile(stack_a, "stack-a")
         profile_id = await create_profile(stack_b, "stack-b")
 
-        service = ModelPreheatS3Inventory(stack_b)
-        service._cipher = lambda: SimpleNamespace(decrypt=lambda value: "secret")
-        async with AsyncSession(stack_b) as session:
-            counts = await service.refresh_profile(session, profile_id, 1)
-        async with AsyncSession(stack_b) as session:
+        stack_a_service = ModelPreheatS3Inventory(stack_a)
+        stack_b_service = ModelPreheatS3Inventory(stack_b)
+        for service in (stack_a_service, stack_b_service):
+            service._cipher = lambda: SimpleNamespace(decrypt=lambda value: "secret")
+        async with AsyncSession(stack_a) as session:
+            stack_a_counts = await stack_a_service.refresh_profile(
+                session, stack_a_profile_id, 1
+            )
+        async with AsyncSession(stack_b, expire_on_commit=False) as session:
+            counts = await stack_b_service.refresh_profile(session, profile_id, 1)
+        async with AsyncSession(stack_b, expire_on_commit=False) as session:
             rows = (await session.exec(select(ModelPreheatArtifact))).all()
             profile = await session.get(ModelPreheatS3Profile, profile_id)
+            huggingface_artifact = next(
+                row for row in rows if row.source == "huggingface"
+            )
+            ollama_artifact = next(
+                row for row in rows if row.source == "ollama_library"
+            )
+            stack_b_ollama = {
+                "artifact_id": ollama_artifact.artifact_id,
+                "source": ollama_artifact.source,
+                "model_id": ollama_artifact.model_id,
+                "resolved_revision": ollama_artifact.resolved_revision,
+                "include_patterns": list(ollama_artifact.include_patterns),
+                "exclude_patterns": list(ollama_artifact.exclude_patterns),
+                "manifest_path": ollama_artifact.manifest_path,
+                "file_count": ollama_artifact.file_count,
+                "total_size": ollama_artifact.total_size,
+                "bucket": profile.bucket,
+                "prefix": profile.prefix,
+            }
+            policy = await create_distribution_policy(
+                session,
+                User(id=1, username="admin", is_admin=True, hashed_password=""),
+                ModelPreheatDistributionPolicyCreate(
+                    name="shared-huggingface",
+                    profile_id=profile_id,
+                    artifact_id=huggingface_artifact.artifact_id,
+                    target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
+                    worker_selector={"worker_uuids": ["stack-b-worker"]},
+                    gpu_selector={},
+                ),
+            )
         await stack_a.dispose()
         await stack_b.dispose()
-        return counts, rows, profile
+        return stack_a_counts, counts, rows, profile, policy, stack_b_ollama
 
-    counts, rows, profile = asyncio.run(run())
+    stack_a_counts, counts, rows, profile, policy, stack_b_ollama = asyncio.run(run())
 
+    assert sync_result["artifact_id"] in {row.artifact_id for row in rows}
+    assert stack_a_counts["valid"] == 3
     assert counts["valid"] == 3
     assert {row.source for row in rows} == {
         "modelscope",
@@ -303,10 +426,100 @@ def test_refresh_discovers_three_sources_from_shared_s3_in_independent_database(
     }
     assert all(row.created_by_task_id is None for row in rows)
     assert profile.inventory_last_success_at is not None
-    assert profile.inventory_last_scan_count == 3
+    assert profile.inventory_last_scan_count == len(shared_minio.objects)
+    assert policy.source_artifact == huggingface_result["artifact_id"]
+    assert policy.request_identity["source"] == "huggingface"
+
+    assert stack_b_ollama["source"] == "ollama_library"
+    assert re.fullmatch(
+        r"local-snapshot-[0-9a-f]{64}", stack_b_ollama["resolved_revision"]
+    )
+    assert stack_b_ollama["include_patterns"] == []
+    assert stack_b_ollama["exclude_patterns"] == []
+    assert stack_b_ollama["file_count"] == 1
+    assert stack_b_ollama["total_size"] == len(b"ollama")
+    stack_b_ollama_manifest = shared_s3.read_artifact_manifest_path(
+        stack_b_ollama["bucket"], stack_b_ollama["manifest_path"]
+    )
+    assert stack_b_ollama_manifest.identity.source == stack_b_ollama["source"]
+    assert (
+        decode_path(stack_b_ollama_manifest.identity.revision_path)
+        == stack_b_ollama["resolved_revision"]
+    )
+    assert [decode_path(file.path) for file in stack_b_ollama_manifest.files] == [
+        ollama_model_filename(decode_path(stack_b_ollama["model_id"]))
+    ]
+    assert stack_b_ollama_manifest.files[0].size == len(b"ollama")
+    assert (
+        stack_b_ollama_manifest.files[0].sha256 == hashlib.sha256(b"ollama").hexdigest()
+    )
+    stack_b_ollama_identity = ModelPreheatIdentity(
+        source=stack_b_ollama["source"],
+        model_id=decode_path(stack_b_ollama["model_id"]),
+        revision=stack_b_ollama["resolved_revision"],
+        file_patterns=tuple(
+            decode_path(pattern) for pattern in stack_b_ollama["include_patterns"]
+        ),
+        exclude_patterns=tuple(
+            decode_path(pattern) for pattern in stack_b_ollama["exclude_patterns"]
+        ),
+    )
+    target_request = TargetExecutionRequest(
+        cache_dir=tmp_path / "stack-b-cache",
+        target_dir=tmp_path / "stack-b-ollama",
+        task_id=4,
+        attempt=1,
+        request_digest=stack_b_ollama_identity.request_digest,
+        identity=stack_b_ollama_identity,
+        exclude_patterns=stack_b_ollama["exclude_patterns"],
+        bucket=stack_b_ollama["bucket"],
+        prefix=stack_b_ollama["prefix"],
+        artifact_id=stack_b_ollama["artifact_id"],
+        manifest_path=stack_b_ollama["manifest_path"],
+    )
+    file_downloads_before = len(
+        [path for path in shared_minio.downloads if not path.endswith("/manifest.json")]
+    )
+    first_distribution = execute_target_preheat(target_request, shared_s3)
+    file_downloads_after_first = len(
+        [path for path in shared_minio.downloads if not path.endswith("/manifest.json")]
+    )
+    second_distribution = execute_target_preheat(target_request, shared_s3)
+    assert first_distribution["state"] == "ready"
+    assert first_distribution["downloaded"] == 1
+    assert first_distribution["skipped"] == 0
+    assert second_distribution["state"] == "ready"
+    assert second_distribution["downloaded"] == 0
+    assert second_distribution["skipped"] == 1
+    assert file_downloads_after_first == file_downloads_before + 1
+    assert (
+        len(
+            [
+                path
+                for path in shared_minio.downloads
+                if not path.endswith("/manifest.json")
+            ]
+        )
+        == file_downloads_after_first
+    )
+    assert (
+        target_request.target_dir
+        / ollama_model_filename(decode_path(stack_b_ollama_identity.model_path))
+    ).read_bytes() == b"ollama"
+
+    manifest_payloads = [
+        stored.data
+        for (bucket, path), stored in shared_minio.objects.items()
+        if bucket == "models" and path.endswith("/manifest.json")
+    ]
+    assert len(manifest_payloads) == 3
+    assert all(b"stack-a-access" not in payload for payload in manifest_payloads)
+    assert all(b"stack-a-secret" not in payload for payload in manifest_payloads)
 
 
-def test_refresh_keeps_existing_artifact_when_manifest_is_invalid(monkeypatch, tmp_path):
+def test_refresh_keeps_existing_artifact_when_manifest_is_invalid(
+    monkeypatch, tmp_path
+):
     async def run():
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'invalid.db'}")
         async with engine.begin() as connection:
@@ -348,11 +561,16 @@ def test_refresh_keeps_existing_artifact_when_manifest_is_invalid(monkeypatch, t
 
 def test_refresh_records_credential_failure_without_leaking_ciphertext(tmp_path):
     async def run():
-        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'credential.db'}")
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'credential.db'}"
+        )
         async with engine.begin() as connection:
             await connection.run_sync(
                 SQLModel.metadata.create_all,
-                tables=[ModelPreheatS3Profile.__table__, ModelPreheatArtifact.__table__],
+                tables=[
+                    ModelPreheatS3Profile.__table__,
+                    ModelPreheatArtifact.__table__,
+                ],
             )
         async with AsyncSession(engine, expire_on_commit=False) as session:
             profile = _profile()
@@ -382,9 +600,63 @@ def test_refresh_records_credential_failure_without_leaking_ciphertext(tmp_path)
     assert profile.inventory_refresh_owner is None
 
 
-def test_refresh_preserves_artifacts_referenced_by_tasks_and_policy(monkeypatch, tmp_path):
+def test_refresh_failure_preserves_previous_valid_inventory(monkeypatch, tmp_path):
+    previous_success = datetime(2026, 8, 24, tzinfo=timezone.utc)
+
     async def run():
-        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'references.db'}")
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'failure.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                SQLModel.metadata.create_all,
+                tables=[
+                    ModelPreheatS3Profile.__table__,
+                    ModelPreheatArtifact.__table__,
+                ],
+            )
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            profile = _profile()
+            profile.inventory_last_success_at = previous_success
+            session.add(profile)
+            await session.flush()
+            artifact = _artifact(profile.id, profile.config_version, "e" * 64)
+            session.add(artifact)
+            await session.commit()
+            profile_id = profile.id
+            artifact_id = artifact.id
+
+        def fail_scan(_snapshot):
+            raise OSError("network unavailable")
+
+        monkeypatch.setattr(inventory_module, "_scan_profile", fail_scan)
+        service = ModelPreheatS3Inventory(engine)
+        service._cipher = lambda: SimpleNamespace(decrypt=lambda value: "secret")
+        async with AsyncSession(engine) as session:
+            with pytest.raises(InventoryRefreshError) as exc_info:
+                await service.refresh_profile(session, profile_id, 1)
+        async with AsyncSession(engine) as session:
+            saved_artifact = await session.get(ModelPreheatArtifact, artifact_id)
+            saved_profile = await session.get(ModelPreheatS3Profile, profile_id)
+        await engine.dispose()
+        return exc_info.value.code, saved_artifact, saved_profile
+
+    error_code, artifact, profile = asyncio.run(run())
+
+    assert error_code == "inventory_scan_failed"
+    assert artifact is not None
+    assert artifact.manifest_state == ModelPreheatInventoryManifestStateEnum.VALID
+    assert profile.inventory_last_success_at == previous_success
+    assert profile.inventory_last_attempt_at is not None
+    assert profile.inventory_last_error_code == "inventory_scan_failed"
+    assert profile.inventory_refresh_owner is None
+
+
+def test_refresh_preserves_artifacts_referenced_by_tasks_and_policy(
+    monkeypatch, tmp_path
+):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'references.db'}"
+        )
         async with engine.begin() as connection:
             await connection.run_sync(
                 SQLModel.metadata.create_all,
@@ -427,7 +699,9 @@ def test_refresh_preserves_artifacts_referenced_by_tasks_and_policy(monkeypatch,
             )
             await session.commit()
             profile_id = profile.id
-        monkeypatch.setattr(inventory_module, "_scan_profile", lambda snapshot: ([], 0, 0, set()))
+        monkeypatch.setattr(
+            inventory_module, "_scan_profile", lambda snapshot: ([], 0, 0, set())
+        )
         service = ModelPreheatS3Inventory(engine)
         service._cipher = lambda: SimpleNamespace(decrypt=lambda value: "secret")
         async with AsyncSession(engine) as session:
@@ -445,7 +719,9 @@ def test_refresh_preserves_artifacts_referenced_by_tasks_and_policy(monkeypatch,
     }
 
 
-def test_refresh_rolls_back_when_profile_config_changes_during_scan(monkeypatch, tmp_path):
+def test_refresh_rolls_back_when_profile_config_changes_during_scan(
+    monkeypatch, tmp_path
+):
     async def run():
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'lease.db'}")
         async with engine.begin() as connection:
@@ -478,7 +754,9 @@ def test_refresh_rolls_back_when_profile_config_changes_during_scan(monkeypatch,
         service = ModelPreheatS3Inventory(engine)
         service._cipher = lambda: SimpleNamespace(decrypt=lambda value: "secret")
         async with AsyncSession(engine) as old_session:
-            refresh = asyncio.create_task(service.refresh_profile(old_session, profile_id, 1))
+            refresh = asyncio.create_task(
+                service.refresh_profile(old_session, profile_id, 1)
+            )
             await asyncio.to_thread(started.wait)
             async with AsyncSession(engine, expire_on_commit=False) as new_session:
                 profile = await new_session.get(ModelPreheatS3Profile, profile_id)
