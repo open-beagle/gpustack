@@ -31,6 +31,9 @@ from gpustack.server.model_preheat_controller import (
 from gpustack.server.model_preheat_schedule_controller import (
     ModelPreheatScheduleController,
 )
+from gpustack.server.model_storage_sync_policy_controller import (
+    ModelStorageSyncPolicyController,
+)
 from gpustack.server.model_preheat_worker_reconciler import (
     ModelPreheatWorkerReconciler,
 )
@@ -68,6 +71,7 @@ class Server:
         self._model_preheat_worker_reconciler = None
         self._model_preheat_s3_inventory = None
         self._model_preheat_schedule_controller = None
+        self._model_storage_sync_policy_controller = None
 
     @property
     def all_processes(self):
@@ -143,6 +147,9 @@ class Server:
         app.state.model_preheat_s3_inventory = self._model_preheat_s3_inventory
         app.state.model_preheat_schedule_controller = (
             self._model_preheat_schedule_controller
+        )
+        app.state.model_storage_sync_policy_controller = (
+            self._model_storage_sync_policy_controller
         )
         if self._config.enable_cors:
             app.add_middleware(
@@ -292,6 +299,7 @@ class Server:
                 "Issued one-time bootstrap credential for embedded worker "
                 "(upgraded database, no local credential file)"
             )
+
     def _start_scheduler(self):
         scheduler = Scheduler(self._config)
         self._create_async_task(scheduler.start())
@@ -336,6 +344,14 @@ class Server:
         self._create_restartable_async_task(
             self._model_preheat_schedule_controller.start,
             "model preheat schedule controller",
+        )
+
+        self._model_storage_sync_policy_controller = ModelStorageSyncPolicyController(
+            get_engine(), config=self._config
+        )
+        self._create_restartable_async_task(
+            self._model_storage_sync_policy_controller.start,
+            "model storage sync policy controller",
         )
 
         self._model_preheat_worker_reconciler = ModelPreheatWorkerReconciler(

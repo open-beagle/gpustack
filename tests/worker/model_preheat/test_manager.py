@@ -251,6 +251,36 @@ def test_periodic_reconciliation_claims_task_after_existing_lease_expires():
     assert worker_tasks.complete_count == 1
 
 
+def test_periodic_connect_timeout_uses_neutral_rate_limited_log(caplog):
+    class TimeoutClient(FakeWorkerTasksClient):
+        def list(self, params):
+            raise httpx.ConnectTimeout("server unavailable")
+
+    async def run():
+        manager = ModelPreheatManager(
+            worker_id=11,
+            worker_uuid="worker-uuid",
+            clientset=SimpleNamespace(model_preheat_worker_tasks=TimeoutClient()),
+            reconcile_interval=0.001,
+        )
+        reconcile = asyncio.create_task(manager._reconcile_loop())
+        await asyncio.sleep(0.02)
+        reconcile.cancel()
+        await asyncio.gather(reconcile, return_exceptions=True)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(run())
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "服务连接超时" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "模型存储任务" in messages[0]
+    assert "模型预热任务租约核对" not in caplog.text
+
+
 class RestartProtocolClient:
     def __init__(self, generated_client, engine, worker_id):
         self._generated_client = generated_client

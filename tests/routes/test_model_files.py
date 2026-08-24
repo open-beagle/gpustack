@@ -33,7 +33,7 @@ from gpustack.schemas.model_files import (
 )
 from gpustack.schemas.models import Model, ModelInstance, SourceEnum
 from gpustack.schemas.users import User
-from gpustack.schemas.workers import Worker
+from gpustack.schemas.workers import Worker, WorkerStateEnum
 
 
 def test_model_storage_sync_task_is_owned_by_model_file():
@@ -83,6 +83,7 @@ async def _run_model_file_crud(tmp_path):
             ip="127.0.0.1",
             port=10150,
             worker_uuid="worker-a-uuid",
+            state=WorkerStateEnum.READY,
             model_storage_protocol_version=1,
         )
         worker = await Worker.create(session, worker)
@@ -95,7 +96,24 @@ async def _run_model_file_crud(tmp_path):
                 worker_id=worker.id,
             ),
         )
+        assert created.worker_uuid_snapshot == "worker-a-uuid"
+        assert created.worker_name_snapshot == "worker-a"
         fetched = await get_model_file(session, created.id)
+        assert fetched.worker_name == "worker-a"
+        assert fetched.worker_available is True
+
+        worker.state = WorkerStateEnum.NOT_READY
+        session.add(worker)
+        await session.commit()
+        assert (await get_model_file(session, created.id)).worker_available is False
+        worker.state = WorkerStateEnum.READY
+        worker.model_storage_protocol_version = 0
+        session.add(worker)
+        await session.commit()
+        assert (await get_model_file(session, created.id)).worker_available is False
+        worker.model_storage_protocol_version = 1
+        session.add(worker)
+        await session.commit()
         assert fetched.local_path == "/models/original.gguf"
         assert fetched.state == ModelFileStateEnum.DOWNLOADING
 
@@ -160,6 +178,22 @@ async def _run_model_file_crud(tmp_path):
         reloaded_event = json.loads(await asyncio.wait_for(next_event, timeout=2))
         assert reloaded_event["data"]["created_at"] is not None
         assert reloaded_event["data"]["updated_at"] is not None
+
+        next_event = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0.05)
+        incomplete_created_event = ModelFile(
+            id=created.id,
+            source=SourceEnum.LOCAL_PATH,
+            local_path="/models/original.gguf",
+            worker_id=worker.id,
+            state=ModelFileStateEnum.READY,
+        )
+        await ModelFile._publish_event(EventType.CREATED, incomplete_created_event)
+        reloaded_created_event = json.loads(
+            await asyncio.wait_for(next_event, timeout=2)
+        )
+        assert reloaded_created_event["data"]["created_at"] is not None
+        assert reloaded_created_event["data"]["updated_at"] is not None
         await stream.aclose()
 
         sync_task = ModelStorageSyncTask(

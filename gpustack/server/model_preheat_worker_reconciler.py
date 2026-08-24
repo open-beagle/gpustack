@@ -20,6 +20,7 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ProfileLifecycleStateEnum,
 )
 from gpustack.schemas.model_preheats import (
+    ModelPreheatArtifact,
     ModelPreheatExecutionStateEnum,
     ModelPreheatTargetScopeEnum,
     ModelPreheatTask,
@@ -37,6 +38,10 @@ from gpustack.server.model_preheat_connectivity import (
     create_or_reuse_connectivity_check,
     current_registered_workers,
     latest_connectivity_results_for_workers,
+)
+from gpustack.server.model_preheat_distribution_source import (
+    DistributionSourceUnavailable,
+    resolve_distribution_source,
 )
 from gpustack.utils.gpu import normalize_gpu_names
 
@@ -252,23 +257,11 @@ class ModelPreheatWorkerReconciler:
             for policy in policies:
                 if not _policy_matches_worker(policy, worker):
                     continue
-                source_task = await session.get(
-                    ModelPreheatTask, policy.created_by_task_id
-                )
-                profile = await session.get(ModelPreheatS3Profile, policy.profile_id)
-                if (
-                    source_task is None
-                    or profile is None
-                    or profile.lifecycle_state
-                    != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
-                    or not policy.enabled
-                    or policy.profile_config_version != profile.config_version
-                    or source_task.s3_profile_config_version
-                    != policy.profile_config_version
-                    or source_task.execution_state
-                    != ModelPreheatExecutionStateEnum.READY
-                ):
+                try:
+                    source = await resolve_distribution_source(session, policy)
+                except DistributionSourceUnavailable:
                     continue
+                profile = source.profile
                 connectivity = await latest_connectivity_results_for_workers(
                     session,
                     policy.profile_id,
@@ -281,30 +274,26 @@ class ModelPreheatWorkerReconciler:
                     or result[0].state != ModelPreheatWorkerTaskStateEnum.READY
                 ):
                     continue
-                await session.refresh(source_task)
                 await session.refresh(policy)
                 await session.refresh(profile)
                 current_worker = await _latest_worker(session, worker.worker_uuid)
+                try:
+                    source = await resolve_distribution_source(session, policy)
+                except DistributionSourceUnavailable:
+                    continue
                 if (
-                    not source_task.artifact_id
-                    or not source_task.s3_manifest_path
-                    or not source_task.manifest_digest
-                    or profile.lifecycle_state
+                    profile.lifecycle_state
                     != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
                     or not policy.enabled
                     or policy.profile_config_version != profile.config_version
-                    or source_task.s3_profile_config_version
-                    != policy.profile_config_version
                     or current_worker is None
                     or current_worker.id != worker.id
                     or current_worker.model_storage_protocol_version
                     != MODEL_STORAGE_PROTOCOL_VERSION
-                    or source_task.execution_state
-                    != ModelPreheatExecutionStateEnum.READY
                 ):
                     continue
                 await _create_or_rebind_distribution_task(
-                    session, policy, source_task, current_worker
+                    session, policy, source, current_worker
                 )
                 policy.last_reconciled_at = datetime.now(timezone.utc)
                 session.add(policy)
@@ -372,6 +361,16 @@ async def _ensure_policy(session, task):
         or task.s3_profile_config_version != profile.config_version
     ):
         return None
+    source_artifact = (
+        await session.exec(
+            select(ModelPreheatArtifact).where(
+                ModelPreheatArtifact.profile_id == task.s3_profile_id,
+                ModelPreheatArtifact.profile_config_version
+                == task.s3_profile_config_version,
+                ModelPreheatArtifact.artifact_id == task.artifact_id,
+            )
+        )
+    ).first()
     worker_selector, gpu_selector = _selectors_for_task(task)
     selector_digest = distribution_selector_digest(worker_selector, gpu_selector)
     existing = (
@@ -385,6 +384,12 @@ async def _ensure_policy(session, task):
         )
     ).first()
     if existing is not None:
+        manually_sourced = existing.source_sync_task_id is not None or (
+            existing.source_artifact_id is not None
+            and existing.created_by_task_id is None
+        )
+        if manually_sourced:
+            return existing
         expected_version = existing.profile_config_version
         expected_task_id = existing.created_by_task_id
         expected_enabled = existing.enabled
@@ -412,6 +417,10 @@ async def _ensure_policy(session, task):
                 .values(
                     profile_config_version=profile.config_version,
                     created_by_task_id=task.id,
+                    source_artifact_id=(
+                        source_artifact.id if source_artifact is not None else None
+                    ),
+                    source_sync_task_id=None,
                     enabled=enable_current_version,
                     profile_version_stale=False,
                 )
@@ -432,6 +441,9 @@ async def _ensure_policy(session, task):
         gpu_selector=gpu_selector,
         selector_digest=selector_digest,
         created_by_task_id=task.id,
+        source_artifact_id=(
+            source_artifact.id if source_artifact is not None else None
+        ),
     )
     session.add(policy)
     return policy
@@ -519,7 +531,7 @@ async def _reset_policy_tasks(session, policy_id, parent_attempt):
     )
 
 
-async def _create_or_rebind_distribution_task(session, policy, source_task, worker):
+async def _create_or_rebind_distribution_task(session, policy, source, worker):
     operation_key = distribution_operation_key(
         policy.id, worker.worker_uuid, policy.request_digest
     )
@@ -534,7 +546,7 @@ async def _create_or_rebind_distribution_task(session, policy, source_task, work
         task = ModelPreheatWorkerTask(
             distribution_policy_id=policy.id,
             operation_key=operation_key,
-            parent_attempt=source_task.attempt,
+            parent_attempt=source.attempt,
             worker_uuid=worker.worker_uuid,
             worker_id=worker.id,
             role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
@@ -543,7 +555,7 @@ async def _create_or_rebind_distribution_task(session, policy, source_task, work
         return task
     if task.worker_id != worker.id:
         task.worker_id = worker.id
-        task.parent_attempt = source_task.attempt
+        task.parent_attempt = source.attempt
         task.state = ModelPreheatWorkerTaskStateEnum.PENDING
         task.lease_owner = None
         task.lease_token_hash = None
@@ -553,11 +565,11 @@ async def _create_or_rebind_distribution_task(session, policy, source_task, work
         task.finished_at = None
         session.add(task)
     elif task.state == ModelPreheatWorkerTaskStateEnum.ERROR:
-        await _retry_distribution_error(session, task, source_task, worker)
+        await _retry_distribution_error(session, task, source, worker)
     return task
 
 
-async def _retry_distribution_error(session, task, source_task, worker):
+async def _retry_distribution_error(session, task, source, worker):
     if (
         task.error_code not in RETRYABLE_DISTRIBUTION_ERRORS
         or task.attempt >= MAX_DISTRIBUTION_ATTEMPTS
@@ -575,7 +587,7 @@ async def _retry_distribution_error(session, task, source_task, worker):
         .where(
             ModelPreheatWorkerTask.id == task.id,
             ModelPreheatWorkerTask.worker_id == worker.id,
-            ModelPreheatWorkerTask.parent_attempt == source_task.attempt,
+            ModelPreheatWorkerTask.parent_attempt == source.attempt,
             ModelPreheatWorkerTask.state == ModelPreheatWorkerTaskStateEnum.ERROR,
             ModelPreheatWorkerTask.error_code == task.error_code,
             ModelPreheatWorkerTask.finished_at == task.finished_at,

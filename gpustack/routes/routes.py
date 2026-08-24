@@ -10,6 +10,7 @@ from gpustack.routes import (
     model_files,
     model_file_download_executions,
     model_storage,
+    model_storage_sync_policies,
     model_instances,
     model_preheats,
     model_preheat_schedules,
@@ -65,6 +66,11 @@ v1_admin_router.include_router(
 # 模型存储：路由内已带完整 /model-storage* 前缀（capabilities/connection-tests
 # /sync-tasks/artifacts），挂载在 /v1 管理员作用域下，不再叠加额外前缀。
 v1_admin_router.include_router(model_storage.router, tags=["Model Storage"])
+v1_admin_router.include_router(
+    model_storage_sync_policies.router,
+    prefix="/model-storage-sync-policies",
+    tags=["Model Storage Sync Policies"],
+)
 v1_admin_router.include_router(
     model_evaluations.router, prefix="/model-evaluations", tags=["Model Evaluations"]
 )

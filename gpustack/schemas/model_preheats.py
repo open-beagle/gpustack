@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Optional
 
 from pydantic import field_validator, model_validator
-from sqlalchemy import Column, ForeignKey, Index, UniqueConstraint
+from sqlalchemy import Column, ForeignKey, Index, String, UniqueConstraint
 from sqlmodel import Field, SQLModel, Text
 
 from gpustack.mixins import BaseModelMixin
@@ -439,6 +439,12 @@ class ModelPreheatIdempotencyRecord(SQLModel, BaseModelMixin, table=True):
     request_hash: str
     resource_type: str
     resource_id: int
+    batch_lease_token: Optional[str] = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    batch_lease_expires_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
     response_status: int = 200
     expires_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
 

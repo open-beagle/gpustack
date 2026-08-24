@@ -37,6 +37,14 @@ from gpustack.server.bus import Event, EventType
 logger = logging.getLogger(__name__)
 
 
+# 自动重启只保护连续失败。实例一旦成功进入 RUNNING，计数会清零。
+MAX_CONSECUTIVE_AUTO_RESTARTS = 5
+AUTO_RESTART_LIMIT_MESSAGE = (
+    f"连续自动重启已达到上限（{MAX_CONSECUTIVE_AUTO_RESTARTS} 次），"
+    "已停止自动重启。请检查服务日志后手动重新部署。"
+)
+
+
 class ServeManager:
     def __init__(
         self,
@@ -51,6 +59,8 @@ class ServeManager:
         self._serving_model_instance_ports: Dict[int, Set[int]] = {}
         self._starting_model_instances: Dict[int, ModelInstance] = {}
         self._error_model_instances: Dict[int, ModelInstance] = {}
+        self._restart_limit_reported_model_instances: Set[int] = set()
+        self._restart_limit_write_failed_model_instances: Set[int] = set()
         self._model_cache_by_instance: Dict[int, Model] = {}
         self._clientset = clientset
         self._cache_dir = cfg.cache_dir
@@ -165,13 +175,45 @@ class ServeManager:
                     )
                     return
 
+        if mi.state != ModelInstanceStateEnum.ERROR:
+            self._restart_limit_reported_model_instances.discard(mi.id)
+            self._restart_limit_write_failed_model_instances.discard(mi.id)
+
+        if (
+            is_main_worker
+            and event.type != EventType.DELETED
+            and mi.state == ModelInstanceStateEnum.RUNNING
+            and ((mi.restart_count or 0) > 0 or mi.last_restart_time is not None)
+        ):
+            # 兼容升级前已经处于运行态但保留了失败计数的实例。
+            self._update_model_instance(
+                mi.id,
+                restart_count=0,
+                last_restart_time=None,
+            )
+
         if mi.state == ModelInstanceStateEnum.ERROR and event.type == EventType.DELETED:
             self._error_model_instances.pop(mi.id, None)
+            self._restart_limit_reported_model_instances.discard(mi.id)
+            self._restart_limit_write_failed_model_instances.discard(mi.id)
             return
         elif mi.state == ModelInstanceStateEnum.ERROR:
-            m = self._get_model_with_cache(mi)
+            m = self._get_model_with_cache(mi, refresh=True)
             if m.restart_on_error:
-                self._error_model_instances[mi.id] = mi
+                if (
+                    (mi.restart_count or 0) >= MAX_CONSECUTIVE_AUTO_RESTARTS
+                    and mi.state_message == AUTO_RESTART_LIMIT_MESSAGE
+                ):
+                    # 终止态会随着 watch 重连再次收到，但不应重复写库或打日志。
+                    self._error_model_instances.pop(mi.id, None)
+                    self._restart_limit_reported_model_instances.add(mi.id)
+                    self._restart_limit_write_failed_model_instances.discard(mi.id)
+                else:
+                    self._error_model_instances[mi.id] = mi
+            else:
+                self._error_model_instances.pop(mi.id, None)
+                self._restart_limit_reported_model_instances.discard(mi.id)
+                self._restart_limit_write_failed_model_instances.discard(mi.id)
             return
         elif mi.id in self._serving_model_instances and event.type == EventType.DELETED:
             self._stop_model_instance(mi)
@@ -360,9 +402,9 @@ class ServeManager:
 
         self._clientset.model_instances.internal_update(id=id, model_update=mi)
 
-    def _get_model_with_cache(self, mi: ModelInstance) -> Model:
-        """Get model from cache or fetch from clientset."""
-        if mi.id in self._model_cache_by_instance:
+    def _get_model_with_cache(self, mi: ModelInstance, refresh: bool = False) -> Model:
+        """从缓存获取模型；错误实例检查时强制刷新配置。"""
+        if not refresh and mi.id in self._model_cache_by_instance:
             return self._model_cache_by_instance[mi.id]
 
         model = self._clientset.models.get(mi.model_id)
@@ -397,7 +439,48 @@ class ServeManager:
             )
             return
 
+        model = self._get_model_with_cache(mi, refresh=True)
+        if not model.restart_on_error:
+            self._error_model_instances.pop(mi.id, None)
+            self._restart_limit_reported_model_instances.discard(mi.id)
+            self._restart_limit_write_failed_model_instances.discard(mi.id)
+            return
+
         restart_count = mi.restart_count or 0
+        if restart_count >= MAX_CONSECUTIVE_AUTO_RESTARTS:
+            if mi.id in self._restart_limit_reported_model_instances:
+                self._error_model_instances.pop(mi.id, None)
+                return
+
+            if mi.state_message == AUTO_RESTART_LIMIT_MESSAGE:
+                self._error_model_instances.pop(mi.id, None)
+                self._restart_limit_reported_model_instances.add(mi.id)
+                self._restart_limit_write_failed_model_instances.discard(mi.id)
+                return
+
+            try:
+                self._update_model_instance(
+                    mi.id,
+                    state=ModelInstanceStateEnum.ERROR,
+                    state_message=AUTO_RESTART_LIMIT_MESSAGE,
+                )
+            except Exception as e:
+                if mi.id not in self._restart_limit_write_failed_model_instances:
+                    logger.error(
+                        f"无法写入模型实例 {mi.name} 的自动重启终止状态，将重试：{e}"
+                    )
+                    self._restart_limit_write_failed_model_instances.add(mi.id)
+                return
+
+            self._error_model_instances.pop(mi.id, None)
+            self._restart_limit_reported_model_instances.add(mi.id)
+            self._restart_limit_write_failed_model_instances.discard(mi.id)
+            logger.error(
+                f"模型实例 {mi.name} 连续自动重启已达到上限 "
+                f"({MAX_CONSECUTIVE_AUTO_RESTARTS} 次)，停止自动重启。"
+            )
+            return
+
         last_restart_time = mi.last_restart_time or mi.updated_at
 
         current_time = datetime.now(timezone.utc)
@@ -512,6 +595,9 @@ class ServeManager:
                             # for manual scale-up. Once the instance is running,
                             # future restarts should use model-level placement.
                             "placement_override": None,
+                            # 成功运行后，后续故障是新的连续失败周期。
+                            "restart_count": 0,
+                            "last_restart_time": None,
                         }
                     # Otherwise, update the main worker state to ERROR.
                     else:

@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from typing import Optional
 
-from pydantic import ConfigDict, field_validator
+from pydantic import ConfigDict, field_validator, model_validator
 from sqlalchemy import Column, ForeignKey, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
@@ -49,6 +49,20 @@ class ModelPreheatDistributionPolicy(SQLModel, BaseModelMixin, table=True):
             ForeignKey("model_preheat_tasks.id", ondelete="RESTRICT"), nullable=True
         ),
     )
+    source_artifact_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            ForeignKey("model_preheat_artifacts.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+    )
+    source_sync_task_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            ForeignKey("model_storage_sync_tasks.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
     last_reconciled_at: Optional[datetime] = Field(
         default=None, sa_column=Column(UTCDateTime, nullable=True)
     )
@@ -75,6 +89,9 @@ class ModelPreheatDistributionPolicyPublic(SQLModel):
     worker_selector: dict
     gpu_selector: dict
     created_by_task_id: Optional[int] = None
+    source_artifact_id: Optional[int] = None
+    source_artifact: Optional[str] = None
+    source_sync_task_id: Optional[int] = None
     last_reconciled_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
@@ -97,6 +114,41 @@ class ModelPreheatDistributionPolicyUpdate(SQLModel):
 ModelPreheatDistributionPoliciesPublic = PaginatedList[
     ModelPreheatDistributionPolicyPublic
 ]
+
+
+class ModelPreheatDistributionPolicyCreate(SQLModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    profile_id: Optional[int] = None
+    artifact_id: Optional[str] = None
+    sync_task_id: Optional[int] = None
+    target_scope: ModelPreheatTargetScopeEnum
+    worker_selector: dict = Field(default_factory=dict)
+    gpu_selector: dict = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def validate_create_name(cls, value):
+        value = value.strip()
+        if not value or len(value) > 255:
+            raise ValueError("invalid_policy_name")
+        return value
+
+    @model_validator(mode="after")
+    def validate_source_and_selector(self):
+        if (self.artifact_id is None) == (self.sync_task_id is None):
+            raise ValueError("distribution_source_required")
+        if self.artifact_id is not None and self.profile_id is None:
+            raise ValueError("profile_id_required")
+        worker_uuids = self.worker_selector.get("worker_uuids", [])
+        gpu_names = self.gpu_selector.get("gpu_names", [])
+        if self.target_scope == ModelPreheatTargetScopeEnum.SAME_GPU_MODEL:
+            if not gpu_names or worker_uuids:
+                raise ValueError("invalid_gpu_selector")
+        elif not worker_uuids or gpu_names:
+            raise ValueError("invalid_worker_selector")
+        return self
 
 
 def distribution_selector_digest(worker_selector: dict, gpu_selector: dict) -> str:

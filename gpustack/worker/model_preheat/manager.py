@@ -1,6 +1,8 @@
 import asyncio
 from concurrent.futures import ProcessPoolExecutor
+import httpx
 import logging
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional, Protocol
 
@@ -134,6 +136,7 @@ class ModelPreheatManager:
         self._idle_check = idle_check or (lambda: True)
         self._active_tasks: dict[int, asyncio.Task] = {}
         self._pause_requested: set[int] = set()
+        self._connect_timeout_log_times: dict[str, float] = {}
 
     async def watch_model_preheat_tasks(self):
         reconciliation = asyncio.create_task(self._reconcile_loop())
@@ -148,9 +151,12 @@ class ModelPreheatManager:
                     )
                 except asyncio.CancelledError:
                     raise
+                except httpx.ConnectTimeout as exc:
+                    self._log_connect_timeout("watch", exc)
+                    await asyncio.sleep(self._reconnect_delay)
                 except Exception as exc:
                     logger.warning(
-                        "模型预热任务 watch 中断，准备重连。error_type=%s",
+                        "模型存储任务 watch 中断，准备重连。error_type=%s",
                         type(exc).__name__,
                     )
                     await asyncio.sleep(self._reconnect_delay)
@@ -224,9 +230,11 @@ class ModelPreheatManager:
                     self.handle_event(Event(EventType.UPDATED, worker_task))
             except asyncio.CancelledError:
                 raise
+            except httpx.ConnectTimeout as exc:
+                self._log_connect_timeout("lease_reconcile", exc)
             except Exception as exc:
                 logger.warning(
-                    "模型预热任务租约核对失败。error_type=%s",
+                    "模型存储任务租约核对失败。error_type=%s",
                     type(exc).__name__,
                 )
             await asyncio.sleep(self._reconcile_interval)
@@ -257,6 +265,23 @@ class ModelPreheatManager:
         if not self._uses_default_handler:
             return True
         return role in self._role_handlers
+
+    def _log_connect_timeout(self, scope, exc):
+        now = time.monotonic()
+        last_logged = self._connect_timeout_log_times.get(scope)
+        if last_logged is None or now - last_logged >= 60:
+            logger.warning(
+                "模型存储任务服务连接超时，稍后重试。scope=%s error_type=%s",
+                scope,
+                type(exc).__name__,
+            )
+            self._connect_timeout_log_times[scope] = now
+        else:
+            logger.debug(
+                "模型存储任务服务连接仍超时。scope=%s error_type=%s",
+                scope,
+                type(exc).__name__,
+            )
 
     async def _claim_and_execute(self, worker_task_id: int, role=None):
         claim_request = ModelPreheatWorkerTaskClaim(

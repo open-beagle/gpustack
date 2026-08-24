@@ -1,6 +1,7 @@
 from datetime import datetime
 from enum import Enum
 from typing import List, Optional
+from pydantic import model_validator
 from sqlmodel import JSON, BigInteger, Column, Field, Relationship, SQLModel, Text
 
 from gpustack.mixins import BaseModelMixin
@@ -42,6 +43,8 @@ class ModelFile(ModelFileBase, BaseModelMixin, table=True):
 
     # Unique index of the model source
     source_index: Optional[str] = Field(index=True, unique=True, default=None)
+    worker_uuid_snapshot: Optional[str] = None
+    worker_name_snapshot: Optional[str] = None
 
     instances: list[ModelInstance] = Relationship(
         sa_relationship_kwargs={"lazy": "selectin"},
@@ -67,8 +70,26 @@ class ModelFilePublic(
     transfer_profile_name: Optional[str] = None
     source_worker_id: Optional[int] = None
     source_worker_name: Optional[str] = None
+    worker_uuid_snapshot: Optional[str] = None
+    worker_name_snapshot: Optional[str] = None
+    worker_name: Optional[str] = None
+    worker_available: bool = False
+    revision_kind: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def infer_revision_kind(self):
+        if self.revision_kind is None:
+            if self.resolved_revision:
+                self.revision_kind = (
+                    "local_snapshot"
+                    if self.resolved_revision.startswith("local-snapshot-")
+                    else "upstream"
+                )
+            elif self.state == ModelFileStateEnum.READY and self.resolved_paths:
+                self.revision_kind = "local_snapshot"
+        return self
 
 
 ModelFilesPublic = PaginatedList[ModelFilePublic]

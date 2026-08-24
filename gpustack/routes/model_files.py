@@ -1,6 +1,8 @@
 from typing import Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy import inspect
+from sqlalchemy.exc import NoInspectionAvailable
 from sqlmodel import String, cast, func, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -25,7 +27,11 @@ from gpustack.schemas.model_file_download_executions import (
     ModelFileDownloadExecutionStateEnum,
 )
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
-from gpustack.schemas.workers import Worker
+from gpustack.schemas.workers import (
+    MODEL_STORAGE_PROTOCOL_VERSION,
+    Worker,
+    WorkerStateEnum,
+)
 from gpustack.server.model_file_download_execution_service import (
     create_model_file_with_download_execution,
 )
@@ -110,14 +116,11 @@ async def _stream_model_files(engine, fields=None, filter_func=None):
             continue
         async with AsyncSession(engine) as session:
             if (
-                event.type != EventType.CREATED
-                and getattr(event.data, "id", None) is not None
-                and (
-                    getattr(event.data, "created_at", None) is None
-                    or getattr(event.data, "updated_at", None) is None
-                )
+                event.type != EventType.DELETED
+                and _event_model_id(event.data) is not None
+                and _event_timestamps_missing(event.data)
             ):
-                persisted = await session.get(ModelFile, event.data.id)
+                persisted = await session.get(ModelFile, _event_model_id(event.data))
                 if persisted is not None:
                     event.data = persisted
             if not ModelFile._match_fields(event, fields):
@@ -126,6 +129,24 @@ async def _stream_model_files(engine, fields=None, filter_func=None):
                 continue
             event.data = (await _model_files_public(session, [event.data]))[0]
         yield ModelFile._format_event(event)
+
+
+def _event_model_id(data):
+    values = getattr(data, "__dict__", {})
+    if isinstance(values, dict) and values.get("id") is not None:
+        return values["id"]
+    try:
+        identity = inspect(data).identity
+    except NoInspectionAvailable:
+        return None
+    return identity[0] if identity else None
+
+
+def _event_timestamps_missing(data):
+    values = getattr(data, "__dict__", {})
+    return not isinstance(values, dict) or any(
+        values.get(field) is None for field in ("created_at", "updated_at")
+    )
 
 
 def search_model_file_filter(data: ModelFile, search: str) -> bool:
@@ -184,7 +205,7 @@ async def _model_files_public(session, model_files):
         for row in executions.values()
         if row.transfer_profile_id is not None
     }
-    worker_ids = {
+    source_worker_ids = {
         row.source_worker_id
         for row in executions.values()
         if row.source_worker_id is not None
@@ -199,16 +220,46 @@ async def _model_files_public(session, model_files):
             )
         ).all()
         profiles = {row.id: row.name for row in profile_rows}
-    workers = {}
-    if worker_ids:
+    source_workers = {}
+    if source_worker_ids:
         worker_rows = (
-            await session.exec(select(Worker).where(Worker.id.in_(worker_ids)))
+            await session.exec(select(Worker).where(Worker.id.in_(source_worker_ids)))
         ).all()
-        workers = {row.id: row.name for row in worker_rows}
+        source_workers = {row.id: row.name for row in worker_rows}
+
+    owner_worker_ids = {
+        row.worker_id for row in model_files if row.worker_id is not None
+    }
+    owner_workers = {}
+    latest_worker_ids_by_uuid = {}
+    if owner_worker_ids:
+        owner_rows = (
+            await session.exec(select(Worker).where(Worker.id.in_(owner_worker_ids)))
+        ).all()
+        owner_workers = {row.id: row for row in owner_rows}
+        owner_uuids = {row.worker_uuid for row in owner_rows}
+        current_rows = (
+            await session.exec(
+                select(Worker)
+                .where(Worker.worker_uuid.in_(owner_uuids))
+                .order_by(Worker.id.desc())
+            )
+        ).all()
+        for row in current_rows:
+            latest_worker_ids_by_uuid.setdefault(row.worker_uuid, row.id)
 
     result = []
     for model_file in model_files:
         execution = executions.get(model_file.id)
+        owner_worker = owner_workers.get(model_file.worker_id)
+        worker_available = bool(
+            owner_worker is not None
+            and latest_worker_ids_by_uuid.get(owner_worker.worker_uuid)
+            == owner_worker.id
+            and owner_worker.state == WorkerStateEnum.READY
+            and owner_worker.model_storage_protocol_version
+            == MODEL_STORAGE_PROTOCOL_VERSION
+        )
         result.append(
             ModelFilePublic.model_validate(
                 model_file,
@@ -226,8 +277,16 @@ async def _model_files_public(session, model_files):
                         execution.source_worker_id if execution else None
                     ),
                     "source_worker_name": (
-                        workers.get(execution.source_worker_id) if execution else None
+                        source_workers.get(execution.source_worker_id)
+                        if execution
+                        else None
                     ),
+                    "worker_name": (
+                        owner_worker.name
+                        if owner_worker is not None
+                        else model_file.worker_name_snapshot
+                    ),
+                    "worker_available": worker_available,
                 },
             )
         )

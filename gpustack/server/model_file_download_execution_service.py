@@ -34,6 +34,8 @@ from gpustack.worker.model_preheat.manifest import compute_request_digest
 async def create_model_file_with_download_execution(session, model_file, config):
     """在同一事务中创建 ModelFile 及其唯一私有下载执行记录。"""
     worker = await _current_protocol_worker(session, model_file.worker_id)
+    model_file.worker_uuid_snapshot = worker.worker_uuid
+    model_file.worker_name_snapshot = worker.name
     request_identity = _request_identity(model_file)
     profile = await _default_profile(session)
     snapshot = None

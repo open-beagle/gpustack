@@ -21,6 +21,10 @@ from gpustack.schemas.model_preheat_distribution_policies import (
 )
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
 from gpustack.schemas.model_preheats import ModelPreheatTargetScopeEnum
+from gpustack.schemas.model_preheats import (
+    ModelPreheatArtifact,
+    ModelPreheatInventoryManifestStateEnum,
+)
 from gpustack.schemas.users import User
 from gpustack.server.db import get_session
 
@@ -102,6 +106,39 @@ async def _seed(engine):
         return policy.id
 
 
+async def _seed_artifact(engine):
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        profile = ModelPreheatS3Profile(
+            name="artifact-profile",
+            endpoint="https://s3.example.com",
+            bucket="models",
+            access_key_encrypted={"ciphertext": "access-secret"},
+            secret_key_encrypted={"ciphertext": "secret-secret"},
+            encryption_key_version="v1",
+        )
+        session.add(profile)
+        await session.flush()
+        artifact = ModelPreheatArtifact(
+            profile_id=profile.id,
+            profile_config_version=profile.config_version,
+            artifact_id="a" * 64,
+            source="huggingface",
+            model_id="org/model",
+            resolved_revision="commit-1",
+            include_patterns=[],
+            exclude_patterns=[],
+            manifest_path="models/huggingface/org/model/manifest.json",
+            manifest_digest="b" * 64,
+            file_count=1,
+            total_size=10,
+            manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+            last_verified_at=datetime.now(timezone.utc),
+        )
+        session.add(artifact)
+        await session.commit()
+        return profile.id, artifact.artifact_id
+
+
 def test_policy_routes_list_get_disable_and_reconcile_without_credentials(tmp_path):
     app, engine = _test_app(tmp_path)
     policy_id = asyncio.run(_seed(engine))
@@ -145,6 +182,30 @@ def test_policy_patch_rejects_selector_or_credential_mutation(tmp_path):
 
     assert selector.status_code == 422
     assert credential.status_code == 422
+
+
+def test_policy_can_be_created_from_existing_s3_artifact(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id, artifact_id = asyncio.run(_seed_artifact(engine))
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/model-preheat-distribution-policies",
+            json={
+                "name": "artifact-distribution",
+                "profile_id": profile_id,
+                "artifact_id": artifact_id,
+                "target_scope": "selected_workers",
+                "worker_selector": {"worker_uuids": ["worker-a"]},
+                "gpu_selector": {},
+            },
+        )
+    asyncio.run(engine.dispose())
+
+    assert created.status_code == 200, created.text
+    assert created.json()["source_artifact"] == artifact_id
+    assert created.json()["source_artifact_id"] is not None
+    assert created.json()["source_sync_task_id"] is None
+    assert created.json()["request_identity"]["source"] == "huggingface"
 
 
 def test_policy_schema_and_successor_migration_are_portable():

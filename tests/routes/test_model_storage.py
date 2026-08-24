@@ -10,7 +10,7 @@ source、本次 transfer_source、S3 Profile 与来源 Worker，不混用字段�
 import asyncio
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -34,6 +34,8 @@ from gpustack.client.generated_model_storage_sync_task_client import (
     ModelStorageSyncTaskClient,
 )
 from gpustack.routes import model_storage
+from gpustack.routes import model_storage_sync_policies
+from gpustack.routes import model_preheat_distribution_policies
 from gpustack.schemas.model_files import (
     ModelFile,
     ModelFileStateEnum,
@@ -41,6 +43,9 @@ from gpustack.schemas.model_files import (
 from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3Profile,
     ModelPreheatS3ProfileLifecycleStateEnum,
+)
+from gpustack.schemas.model_preheat_distribution_policies import (
+    ModelPreheatDistributionPolicy,
 )
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
@@ -54,7 +59,11 @@ from gpustack.schemas.model_storage_sync import (
 )
 from gpustack.schemas.models import SourceEnum
 from gpustack.schemas.users import User
-from gpustack.schemas.workers import Worker, WorkerStateEnum
+from gpustack.schemas.workers import (
+    MODEL_STORAGE_PROTOCOL_VERSION,
+    Worker,
+    WorkerStateEnum,
+)
 from gpustack.server.db import get_engine, get_session
 from gpustack.server.model_preheat_worker_identity import (
     ModelPreheatWorkerPrincipal,
@@ -62,6 +71,13 @@ from gpustack.server.model_preheat_worker_identity import (
 )
 from gpustack.server.model_preheat_s3_profile_lifecycle import (
     ModelPreheatS3ProfileNotActive,
+)
+from gpustack.server.model_storage_sync_policy_controller import (
+    ModelStorageSyncPolicyController,
+)
+from gpustack.server.model_preheat_distribution_source import (
+    DistributionSourceUnavailable,
+    resolve_distribution_source,
 )
 from gpustack.server.bus import Event, EventType
 
@@ -159,7 +175,21 @@ def app(tmp_path):
     test_app.dependency_overrides[get_current_user] = admin_user_override
     admin_router = APIRouter(dependencies=[Depends(get_admin_user)])
     admin_router.include_router(model_storage.router)
+    admin_router.include_router(
+        model_storage_sync_policies.router,
+        prefix="/model-storage-sync-policies",
+    )
+    admin_router.include_router(
+        model_preheat_distribution_policies.router,
+        prefix="/model-preheat-distribution-policies",
+    )
     test_app.include_router(admin_router, prefix="/v1")
+    test_app.state.model_storage_sync_policy_controller = (
+        ModelStorageSyncPolicyController(engine, config=test_app.state.server_config)
+    )
+    test_app.state.model_preheat_worker_reconciler = SimpleNamespace(
+        reconcile_policy=lambda _policy_id: asyncio.sleep(0)
+    )
     # Worker 侧端点（受 Worker 身份约束），挂载在 api 级（非管理员作用域）。
     test_app.include_router(
         model_storage.worker_router,
@@ -224,6 +254,7 @@ async def _seed(
         port=10150,
         worker_uuid="worker-a-uuid",
         state=worker_state,
+        model_storage_protocol_version=MODEL_STORAGE_PROTOCOL_VERSION,
     )
     session.add(worker)
     await session.flush()
@@ -292,6 +323,625 @@ def test_create_sync_task_only_accepts_model_file_and_profile_id(app, client):
     assert "access_key" not in body
 
 
+def test_sync_policy_run_now_creates_existing_sync_task_and_replays(app, client):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = client.post(
+        "/v1/model-storage-sync-policies",
+        json={
+            "name": "nightly-model-sync",
+            "trigger_mode": "manual",
+            "profile_id": profile_id,
+            "scope": "single_model",
+            "model_file_id": model_file_id,
+        },
+    )
+    assert created.status_code == 200, created.text
+    policy_id = created.json()["id"]
+
+    missing_key = client.post(f"/v1/model-storage-sync-policies/{policy_id}/run-now")
+    first = client.post(
+        f"/v1/model-storage-sync-policies/{policy_id}/run-now",
+        headers={"Idempotency-Key": "policy-run-1"},
+    )
+    disabled = client.patch(
+        f"/v1/model-storage-sync-policies/{policy_id}",
+        json={"enabled": False},
+    )
+    replay = client.post(
+        f"/v1/model-storage-sync-policies/{policy_id}/run-now",
+        headers={"Idempotency-Key": "policy-run-1"},
+    )
+
+    assert missing_key.status_code == 422
+    assert first.status_code == 200, first.text
+    assert disabled.status_code == 200, disabled.text
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first.json()
+    assert first.json()["state"] == "ready"
+    task_id = first.json()["response_payload"]["created"][0]["task_id"]
+    assert task_id is not None
+    detail = client.get(f"{API}/{task_id}")
+    assert detail.status_code == 200
+    assert detail.json()["model_file_id"] == model_file_id
+
+
+def test_sync_policy_same_key_for_different_policy_conflicts(app, client):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    policy_ids = []
+    for name in ("sync-a", "sync-b"):
+        response = client.post(
+            "/v1/model-storage-sync-policies",
+            json={
+                "name": name,
+                "trigger_mode": "manual",
+                "profile_id": profile_id,
+                "scope": "single_model",
+                "model_file_id": model_file_id,
+            },
+        )
+        assert response.status_code == 200, response.text
+        policy_ids.append(response.json()["id"])
+
+    first = client.post(
+        f"/v1/model-storage-sync-policies/{policy_ids[0]}/run-now",
+        headers={"Idempotency-Key": "shared-policy-key"},
+    )
+    conflict = client.post(
+        f"/v1/model-storage-sync-policies/{policy_ids[1]}/run-now",
+        headers={"Idempotency-Key": "shared-policy-key"},
+    )
+
+    assert first.status_code == 200, first.text
+    assert conflict.status_code == 409
+    assert conflict.json()["message"] == "idempotency_key_reused"
+
+
+def test_sync_policy_can_be_disabled_when_profile_is_in_maintenance(app, client):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = client.post(
+        "/v1/model-storage-sync-policies",
+        json={
+            "name": "disable-me",
+            "trigger_mode": "manual",
+            "profile_id": profile_id,
+            "scope": "single_model",
+            "model_file_id": model_file_id,
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    async def maintain_profile():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            profile = await session.get(ModelPreheatS3Profile, profile_id)
+            profile.lifecycle_state = (
+                ModelPreheatS3ProfileLifecycleStateEnum.MAINTENANCE
+            )
+            session.add(profile)
+            await session.commit()
+
+    _run(app, maintain_profile())
+    disabled = client.patch(
+        f"/v1/model-storage-sync-policies/{created.json()['id']}",
+        json={"enabled": False},
+    )
+
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["enabled"] is False
+
+
+def test_scheduled_sync_policy_claims_one_window_and_creates_sync_task(app, client):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = client.post(
+        "/v1/model-storage-sync-policies",
+        json={
+            "name": "scheduled-sync",
+            "trigger_mode": "scheduled",
+            "cron_expression": "* * * * *",
+            "timezone": "UTC",
+            "profile_id": profile_id,
+            "scope": "single_model",
+            "model_file_id": model_file_id,
+        },
+    )
+    assert created.status_code == 200, created.text
+    policy_id = created.json()["id"]
+    due = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+    async def make_due_and_tick_twice():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            from gpustack.schemas.model_storage_sync_policies import (
+                ModelStorageSyncPolicy,
+                ModelStorageSyncPolicyRun,
+            )
+
+            policy = await session.get(ModelStorageSyncPolicy, policy_id)
+            policy.next_run_at = due
+            session.add(policy)
+            await session.commit()
+        controller = app.state.model_storage_sync_policy_controller
+        await controller.tick(due)
+        await controller.tick(due)
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            runs = (
+                await session.exec(
+                    select(ModelStorageSyncPolicyRun).where(
+                        ModelStorageSyncPolicyRun.policy_id == policy_id
+                    )
+                )
+            ).all()
+            tasks = (await session.exec(select(ModelStorageSyncTask))).all()
+            return runs, tasks
+
+    runs, tasks = _run(app, make_due_and_tick_twice())
+
+    assert len(runs) == 1
+    assert runs[0].state.value == "ready"
+    assert len(tasks) == 1
+    assert tasks[0].model_file_id == model_file_id
+
+
+def test_sync_policy_run_lease_recovers_and_rejects_stale_terminal_write(app):
+    async def run():
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicy,
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunStateEnum,
+            ModelStorageSyncPolicyRunTriggerEnum,
+            ModelStorageSyncScopeEnum,
+            ModelStorageSyncPolicyTriggerModeEnum,
+        )
+
+        profile_id, model_file_id = await _seed_ids(app)
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            policy = ModelStorageSyncPolicy(
+                name="lease-policy",
+                trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
+                timezone="UTC",
+                profile_id=profile_id,
+                scope=ModelStorageSyncScopeEnum.SINGLE_MODEL,
+                model_file_id=model_file_id,
+            )
+            session.add(policy)
+            await session.flush()
+            record = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="lease-policy-operation",
+                request_hash="0" * 64,
+                created_by_user_id=1,
+            )
+            session.add(record)
+            await session.commit()
+            run_id = record.id
+
+        first = ModelStorageSyncPolicyController(_engine(app))
+        second = ModelStorageSyncPolicyController(_engine(app))
+        first_token, second_token = await asyncio.gather(
+            first._claim_run(run_id), second._claim_run(run_id)
+        )
+        assert bool(first_token) != bool(second_token)
+        winner = first if first_token else second
+        winner_token = first_token or second_token
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            record = await session.get(ModelStorageSyncPolicyRun, run_id)
+            assert record.attempt == 1
+            assert record.lease_owner == winner._lease_owner
+            assert record.lease_token == winner_token
+            assert record.started_at is not None
+            record.lease_expires_at = datetime.now(timezone.utc).replace(year=2020)
+            session.add(record)
+            await session.commit()
+
+        same_server_token = await winner._claim_run(run_id)
+        assert same_server_token != winner_token
+        stale = await winner._finish_run(
+            run_id,
+            ModelStorageSyncPolicyRunStateEnum.ERROR,
+            winner_token,
+            error_code="stale_owner",
+        )
+        assert stale.state == ModelStorageSyncPolicyRunStateEnum.PENDING
+        ready = await winner._finish_run(
+            run_id,
+            ModelStorageSyncPolicyRunStateEnum.READY,
+            same_server_token,
+            response_payload={"planned": 0},
+        )
+        assert ready.state == ModelStorageSyncPolicyRunStateEnum.READY
+        assert ready.error_code is None
+        assert ready.attempt == 2
+        assert ready.lease_owner is None
+        assert ready.lease_token is None
+        assert ready.lease_expires_at is None
+
+    _run(app, run())
+
+
+def test_sync_policy_lost_lease_cancels_batch_without_terminal_write(app):
+    async def run():
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicy,
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunStateEnum,
+            ModelStorageSyncPolicyRunTriggerEnum,
+            ModelStorageSyncScopeEnum,
+            ModelStorageSyncPolicyTriggerModeEnum,
+        )
+
+        profile_id, model_file_id = await _seed_ids(app)
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            session.add(User(id=1, username="admin", is_admin=True, hashed_password=""))
+            policy = ModelStorageSyncPolicy(
+                name="lease-heartbeat-policy",
+                trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
+                timezone="UTC",
+                profile_id=profile_id,
+                scope=ModelStorageSyncScopeEnum.SINGLE_MODEL,
+                model_file_id=model_file_id,
+            )
+            session.add(policy)
+            await session.flush()
+            record = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="lease-heartbeat-operation",
+                request_hash="2" * 64,
+            )
+            session.add(record)
+            await session.commit()
+            run_id = record.id
+
+        batch_started = asyncio.Event()
+        batch_cancelled = asyncio.Event()
+
+        async def blocked_batch(*_args):
+            batch_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                batch_cancelled.set()
+                raise
+
+        controller = ModelStorageSyncPolicyController(
+            _engine(app), batch_executor=blocked_batch
+        )
+        controller._lease_ttl = timedelta(milliseconds=120)
+        renew_calls = 0
+
+        async def lose_after_initial_renew(*_args):
+            nonlocal renew_calls
+            renew_calls += 1
+            return renew_calls == 1
+
+        controller._renew_lease = lose_after_initial_renew
+        completed = await asyncio.wait_for(
+            controller._claim_and_execute(run_id, controller._internal_request()),
+            timeout=2,
+        )
+        assert batch_started.is_set()
+        assert batch_cancelled.is_set()
+        assert completed.state == ModelStorageSyncPolicyRunStateEnum.PENDING
+        assert completed.finished_at is None
+
+    _run(app, run())
+
+
+def test_scheduled_sync_policy_without_creator_uses_stable_admin_or_errors(app):
+    async def create_run(name, profile_id, model_file_id):
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicy,
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunTriggerEnum,
+            ModelStorageSyncScopeEnum,
+            ModelStorageSyncPolicyTriggerModeEnum,
+        )
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            policy = ModelStorageSyncPolicy(
+                name=name,
+                trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.SCHEDULED,
+                cron_expression="* * * * *",
+                timezone="UTC",
+                profile_id=profile_id,
+                scope=ModelStorageSyncScopeEnum.SINGLE_MODEL,
+                model_file_id=model_file_id,
+            )
+            session.add(policy)
+            await session.flush()
+            record = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.SCHEDULED,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key=f"{name}-operation",
+                request_hash="1" * 64,
+            )
+            session.add(record)
+            await session.commit()
+            return record.id
+
+    async def run():
+        from gpustack.schemas.model_storage_sync import ModelStorageSyncBatchPublic
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunStateEnum,
+        )
+
+        profile_id, model_file_id = await _seed_ids(app)
+        no_user_run_id = await create_run(
+            "scheduled-without-user", profile_id, model_file_id
+        )
+        controller = ModelStorageSyncPolicyController(_engine(app))
+        no_user_run = await controller._claim_and_execute(
+            no_user_run_id, controller._internal_request()
+        )
+        assert no_user_run.state == ModelStorageSyncPolicyRunStateEnum.ERROR
+        assert (
+            no_user_run.error_code
+            == "model_storage_sync_policy_system_user_unavailable"
+        )
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            later_admin = User(
+                id=20, username="later-admin", is_admin=True, hashed_password=""
+            )
+            first_admin = User(
+                id=10, username="first-admin", is_admin=True, hashed_password=""
+            )
+            non_admin = User(
+                id=1, username="member", is_admin=False, hashed_password=""
+            )
+            deleted_admin = User(
+                id=2,
+                username="deleted-admin",
+                is_admin=True,
+                hashed_password="",
+                deleted_at=datetime.now(timezone.utc),
+            )
+            session.add(later_admin)
+            session.add(first_admin)
+            session.add(non_admin)
+            session.add(deleted_admin)
+            await session.commit()
+            first_admin_id = first_admin.id
+
+        selected_user_ids = []
+
+        async def batch_executor(_request, _session, user_id, batch, _key):
+            selected_user_ids.append(user_id)
+            return ModelStorageSyncBatchPublic(scope=batch.scope, planned=0)
+
+        ready_run_id = await create_run(
+            "scheduled-system-user", profile_id, model_file_id
+        )
+        controller = ModelStorageSyncPolicyController(
+            _engine(app), batch_executor=batch_executor
+        )
+        ready_run = await controller._claim_and_execute(
+            ready_run_id, controller._internal_request()
+        )
+        assert ready_run.state == ModelStorageSyncPolicyRunStateEnum.READY
+        assert selected_user_ids == [first_admin_id]
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            persisted = await session.get(ModelStorageSyncPolicyRun, ready_run_id)
+            assert persisted.created_by_user_id is None
+            assert persisted.execution_user_id == first_admin_id
+
+    _run(app, run())
+
+
+def test_stale_batch_placeholder_recovers_existing_child_idempotently(app, client):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    key = "stale-batch-placeholder"
+    child = client.post(
+        API,
+        headers={"Idempotency-Key": f"{key}:{model_file_id}"},
+        json={"model_file_id": model_file_id, "profile_id": profile_id},
+    )
+    assert child.status_code == 200, child.text
+
+    async def create_stale_placeholder():
+        from gpustack.schemas.model_preheats import ModelPreheatIdempotencyRecord
+        from gpustack.server.model_preheat_idempotency import canonical_request_hash
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            session.add(
+                ModelPreheatIdempotencyRecord(
+                    user_id=1,
+                    operation="model_storage_sync_batch.create",
+                    idempotency_key=key,
+                    request_hash=canonical_request_hash(
+                        {
+                            "profile_id": profile_id,
+                            "scope": "single_model",
+                            "model_file_id": model_file_id,
+                            "worker_ids": [],
+                        }
+                    ),
+                    resource_type="model_storage_sync_batch",
+                    resource_id=-1,
+                    batch_lease_token="abandoned",
+                    batch_lease_expires_at=datetime.now(timezone.utc).replace(
+                        year=2020
+                    ),
+                    expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                )
+            )
+            await session.commit()
+
+    _run(app, create_stale_placeholder())
+    recovered = client.post(
+        "/v1/model-storage-sync-batches",
+        headers={"Idempotency-Key": key},
+        json={
+            "profile_id": profile_id,
+            "scope": "single_model",
+            "model_file_id": model_file_id,
+        },
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["created"][0]["task_id"] == child.json()["id"]
+
+    async def verify_finalized_once():
+        from gpustack.schemas.model_preheats import ModelPreheatIdempotencyRecord
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            record = (
+                await session.exec(
+                    select(ModelPreheatIdempotencyRecord).where(
+                        ModelPreheatIdempotencyRecord.operation
+                        == "model_storage_sync_batch.create",
+                        ModelPreheatIdempotencyRecord.idempotency_key == key,
+                    )
+                )
+            ).one()
+            tasks = (await session.exec(select(ModelStorageSyncTask))).all()
+            assert record.resource_id != -1
+            assert record.batch_lease_token is None
+            assert record.batch_lease_expires_at is None
+            assert len(tasks) == 1
+
+    _run(app, verify_finalized_once())
+
+
+def test_selected_worker_policy_resolves_latest_registration_by_uuid(app, client):
+    profile_id, _model_file_id = _run(app, _seed_ids(app))
+    created = client.post(
+        "/v1/model-storage-sync-policies",
+        json={
+            "name": "selected-worker-sync",
+            "trigger_mode": "manual",
+            "profile_id": profile_id,
+            "scope": "selected_workers",
+            "worker_uuids": ["worker-a-uuid"],
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    async def reregister_without_protocol():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            session.add(
+                Worker(
+                    name="worker-a-new",
+                    hostname="worker-a-new",
+                    ip="127.0.0.2",
+                    port=10150,
+                    worker_uuid="worker-a-uuid",
+                    state=WorkerStateEnum.READY,
+                    model_storage_protocol_version=0,
+                )
+            )
+            await session.commit()
+
+    _run(app, reregister_without_protocol())
+    run = client.post(
+        f"/v1/model-storage-sync-policies/{created.json()['id']}/run-now",
+        headers={"Idempotency-Key": "selected-latest-worker"},
+    )
+
+    assert run.status_code == 200, run.text
+    assert run.json()["response_payload"]["created"] == []
+    assert run.json()["response_payload"]["skipped"] == [
+        {
+            "model_file_id": None,
+            "worker_id": None,
+            "worker_uuid": "worker-a-uuid",
+            "task_id": None,
+            "reason": "worker_protocol_unsupported",
+        }
+    ]
+
+
+def test_distribution_policy_can_reference_successful_sync_task(app, client):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    sync = client.post(
+        API,
+        json={"model_file_id": model_file_id, "profile_id": profile_id},
+    )
+    assert sync.status_code == 200, sync.text
+    artifact_id = "9" * 64
+
+    async def complete_sync_inventory():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            task = await session.get(ModelStorageSyncTask, sync.json()["id"])
+            task.state = ModelStorageSyncTaskStateEnum.READY
+            task.artifact_id = artifact_id
+            task.manifest_path = "models/modelscope/Qwen/Test/manifest.json"
+            task.manifest_digest = "8" * 64
+            session.add(task)
+            session.add(
+                ModelPreheatArtifact(
+                    profile_id=profile_id,
+                    profile_config_version=task.profile_config_version,
+                    artifact_id=artifact_id,
+                    source=task.source,
+                    model_id=task.model_id,
+                    resolved_revision=task.resolved_revision,
+                    include_patterns=[],
+                    exclude_patterns=[],
+                    manifest_path=task.manifest_path,
+                    manifest_digest=task.manifest_digest,
+                    file_count=1,
+                    total_size=10,
+                    manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                    last_verified_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.commit()
+
+    _run(app, complete_sync_inventory())
+    policy = client.post(
+        "/v1/model-preheat-distribution-policies",
+        json={
+            "name": "sync-task-distribution",
+            "sync_task_id": sync.json()["id"],
+            "target_scope": "selected_workers",
+            "worker_selector": {"worker_uuids": ["worker-a-uuid"]},
+            "gpu_selector": {},
+        },
+    )
+
+    assert policy.status_code == 200, policy.text
+    assert policy.json()["source_sync_task_id"] == sync.json()["id"]
+    assert policy.json()["source_artifact"] == artifact_id
+
+    async def verify_priority_and_identity_guard():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            row = await session.get(ModelPreheatDistributionPolicy, policy.json()["id"])
+            source = await resolve_distribution_source(session, row)
+            sync_task = await session.get(ModelStorageSyncTask, sync.json()["id"])
+            assert source.encrypted_profile == sync_task.credential_snapshot_encrypted
+            assert source.preheat_task is None
+            mismatched = ModelPreheatArtifact(
+                profile_id=profile_id,
+                profile_config_version=sync_task.profile_config_version,
+                artifact_id="7" * 64,
+                source=sync_task.source,
+                model_id=sync_task.model_id,
+                resolved_revision=sync_task.resolved_revision,
+                include_patterns=[],
+                exclude_patterns=[],
+                manifest_path="models/modelscope/Qwen/Other/manifest.json",
+                manifest_digest="6" * 64,
+                file_count=1,
+                total_size=10,
+                manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                last_verified_at=datetime.now(timezone.utc),
+            )
+            session.add(mismatched)
+            await session.flush()
+            row.source_artifact_id = mismatched.id
+            session.add(row)
+            await session.commit()
+            with pytest.raises(DistributionSourceUnavailable):
+                await resolve_distribution_source(session, row)
+
+    _run(app, verify_priority_and_identity_guard())
+
+
 def test_batch_sync_selected_workers_plans_ready_models_and_replays(app, client):
     profile_id, first_model_file_id = _run(app, _seed_ids(app))
 
@@ -306,6 +956,7 @@ def test_batch_sync_selected_workers_plans_ready_models_and_replays(app, client)
                 port=10150,
                 worker_uuid="worker-b-uuid",
                 state=WorkerStateEnum.READY,
+                model_storage_protocol_version=MODEL_STORAGE_PROTOCOL_VERSION,
             )
             not_ready_worker = Worker(
                 name="worker-c",
@@ -2243,22 +2894,60 @@ def test_complete_uses_task_profile_config_version_not_current(app):
     )
 
 
-def test_create_rejects_missing_resolved_revision_for_dev_branch(app):
-    """requested_revision=dev 不能在 resolved_revision 缺失时冒充解析结果。"""
+def test_create_uses_stable_local_snapshot_when_resolved_revision_is_missing(app):
+    """历史 Ready 记录缺 revision 时使用本地快照，不冒充上游 commit。"""
     profile_id, model_file_id = _run(
         app, _seed_ids(app, resolved_revision=None, requested_revision="dev")
     )
-    response = client_post(app, model_file_id, profile_id)
-    assert response.status_code == 409
+    first = client_post(app, model_file_id, profile_id)
+    batch = TestClient(app).post(
+        "/v1/model-storage-sync-batches",
+        json={
+            "profile_id": profile_id,
+            "scope": "single_model",
+            "model_file_id": model_file_id,
+        },
+    )
+
+    assert first.status_code == 200, first.text
+    assert first.json()["resolved_revision"].startswith("local-snapshot-")
+    assert first.json()["revision_kind"] == "local_snapshot"
+    assert batch.status_code == 200, batch.text
+    assert batch.json()["created"] == []
+    assert batch.json()["skipped"][0]["reason"] == "active_task_exists"
 
 
-def test_create_rejects_missing_resolved_revision_for_release_branch(app):
-    """requested_revision=release 同样不能通过有限别名表逃逸。"""
+def test_local_snapshot_revision_is_stable_for_same_model_file(app):
     profile_id, model_file_id = _run(
         app, _seed_ids(app, resolved_revision=None, requested_revision="release")
     )
+    first = client_post(app, model_file_id, profile_id)
+    assert first.status_code == 200, first.text
+
+    async def derive_again():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            model_file = await session.get(ModelFile, model_file_id)
+            return model_storage._derive_task_identity(model_file)[1]
+
+    assert _run(app, derive_again()) == first.json()["resolved_revision"]
+
+
+def test_create_rejects_worker_without_model_storage_protocol(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+
+    async def disable_protocol():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            model_file = await session.get(ModelFile, model_file_id)
+            worker = await session.get(Worker, model_file.worker_id)
+            worker.model_storage_protocol_version = 0
+            session.add(worker)
+            await session.commit()
+
+    _run(app, disable_protocol())
     response = client_post(app, model_file_id, profile_id)
+
     assert response.status_code == 409
+    assert response.json()["message"] == "model_file_worker_protocol_unsupported"
 
 
 def test_create_accepts_concrete_resolved_revision(app):

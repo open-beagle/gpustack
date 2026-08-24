@@ -50,6 +50,10 @@ from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
 from gpustack.server.bus import EventType
 from gpustack.server.deps import EngineDep, ListParamsDep, SessionDep
 from gpustack.server.model_preheat_connectivity import aggregate_connectivity_check
+from gpustack.server.model_preheat_distribution_source import (
+    DistributionSourceUnavailable,
+    resolve_distribution_source,
+)
 from gpustack.server.model_preheat_worker_identity import (
     ModelPreheatWorkerPrincipal,
     get_model_preheat_worker_identity,
@@ -620,13 +624,10 @@ async def _execution_source(session, worker_task: ModelPreheatWorkerTask):
         return payload, task.s3_profile_snapshot_encrypted, task
 
     if worker_task.distribution_policy_id is not None:
-        _, task = await _active_distribution_source(
+        _, source = await _active_distribution_source(
             session, worker_task.distribution_policy_id
         )
-        payload = task.model_dump(
-            exclude={"s3_profile_snapshot_encrypted", "encryption_key_version"}
-        )
-        return payload, task.s3_profile_snapshot_encrypted, task
+        return source.payload, source.encrypted_profile, source.preheat_task
 
     check = await session.get(
         ModelPreheatS3ConnectivityCheck, worker_task.connectivity_check_id
@@ -750,20 +751,13 @@ def _validate_task_identity(task, identity):
 
 async def _active_distribution_source(session, policy_id):
     policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
-    if policy is None or policy.created_by_task_id is None or not policy.enabled:
+    if policy is None or not policy.enabled:
         _conflict("distribution_policy_not_active")
-    source_task = await session.get(ModelPreheatTask, policy.created_by_task_id)
-    profile = await session.get(ModelPreheatS3Profile, policy.profile_id)
-    if (
-        source_task is None
-        or profile is None
-        or profile.config_version != policy.profile_config_version
-        or source_task.s3_profile_config_version != policy.profile_config_version
-        or source_task.execution_state != ModelPreheatExecutionStateEnum.READY
-        or source_task.request_digest != policy.request_digest
-    ):
+    try:
+        source = await resolve_distribution_source(session, policy)
+    except DistributionSourceUnavailable:
         _conflict("distribution_source_not_ready")
-    return policy, source_task
+    return policy, source
 
 
 async def _validate_current_registration(session, worker_uuid: str, worker_id: int):

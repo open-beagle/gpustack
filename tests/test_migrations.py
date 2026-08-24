@@ -7,7 +7,7 @@ from gpustack.migrations.validate import validate_revision_graph
 
 def test_alembic_revision_graph_has_one_resolvable_head():
     # Profile 生命周期与安全删除 migration 后，唯一 head 必须可解析。
-    assert validate_revision_graph() == "e9f0a1b2c3d4"
+    assert validate_revision_graph() == "2a3b4c5d6e7f"
 
 
 def test_alembic_upgrades_existing_model_cache_head_to_schedule_head(tmp_path):

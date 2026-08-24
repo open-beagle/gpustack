@@ -19,11 +19,13 @@
 """
 
 import asyncio
+import hashlib
 import json
 import hmac
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Callable, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, Request, Response
 from fastapi.responses import StreamingResponse
@@ -54,6 +56,7 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatArtifactPublic,
     ModelPreheatInventoryManifestStateEnum,
+    ModelPreheatIdempotencyRecord,
 )
 from gpustack.schemas.model_file_download_executions import (
     ModelFileDownloadExecution,
@@ -82,7 +85,11 @@ from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncTaskDedupeSlot,
 )
 from gpustack.schemas.models import SourceEnum
-from gpustack.schemas.workers import Worker, WorkerStateEnum
+from gpustack.schemas.workers import (
+    MODEL_STORAGE_PROTOCOL_VERSION,
+    Worker,
+    WorkerStateEnum,
+)
 from gpustack.server.deps import (
     CurrentAdminUserDep,
     EngineDep,
@@ -129,6 +136,7 @@ SYNC_BATCH_CREATE_OPERATION = "model_storage_sync_batch.create"
 SYNC_BATCH_IN_PROGRESS = -1
 SYNC_BATCH_REPLAY_WAIT_ATTEMPTS = 40
 SYNC_BATCH_REPLAY_WAIT_SECONDS = 0.05
+SYNC_BATCH_LEASE_TTL = timedelta(seconds=45)
 # Idempotency-Key 记录的 resource_type：统一为同步任务资源类型。
 SYNC_TASK_RESOURCE_TYPE = "model_storage_sync_task"
 # 活动任务：未达终态，同 (model_file_id, profile_id) 只允许一个。
@@ -484,17 +492,37 @@ async def create_model_storage_sync_batch(
         SYNC_BATCH_CREATE_OPERATION,
         idempotency_key,
     )
-    replaying_batch = batch_record is not None
+    batch_record_id = batch_record.id if batch_record is not None else None
+    batch_lease_token = None
     if batch_record is not None and batch_record.request_hash != batch_request_hash:
         raise HTTPException(409, "idempotency_key_reused", "idempotency_key_reused")
     if batch_record is not None:
-        batch_record = await _wait_for_finalized_sync_batch(
-            session,
-            current_user.id,
-            idempotency_key,
-            batch_request_hash,
+        batch_lease_token = await _claim_sync_batch_placeholder(
+            session, batch_record_id
         )
-        return await _load_sync_batch_result(session, batch_record)
+        if batch_lease_token is None:
+            batch_record = await _wait_for_finalized_sync_batch(
+                session,
+                current_user.id,
+                idempotency_key,
+                batch_request_hash,
+            )
+            if batch_record is not None:
+                return await _load_sync_batch_result(session, batch_record)
+            batch_record = await get_idempotency_record(
+                session,
+                current_user.id,
+                SYNC_BATCH_CREATE_OPERATION,
+                idempotency_key,
+            )
+            batch_record_id = batch_record.id if batch_record is not None else None
+            batch_lease_token = await _claim_sync_batch_placeholder(
+                session, batch_record_id
+            )
+            if batch_lease_token is None:
+                raise ServiceUnavailableException(
+                    message="model_storage_sync_batch_in_progress"
+                )
     ready_workers = await current_ready_workers(session)
     ready_worker_ids = {worker.id for worker in ready_workers}
     skipped = []
@@ -595,19 +623,25 @@ async def create_model_storage_sync_batch(
         seen_identities.add(identity_key)
         planned_candidates.append((model_file.id, model_file.worker_id))
 
-    owns_batch_record = False
+    owns_batch_record = batch_lease_token is not None
     if idempotency_key and batch_record is None:
         try:
-            session.add(
-                new_idempotency_record(
-                    current_user.id,
-                    SYNC_BATCH_CREATE_OPERATION,
-                    idempotency_key,
-                    batch_request_hash,
-                    SYNC_BATCH_IN_PROGRESS,
-                    resource_type="model_storage_sync_batch",
-                )
+            batch_lease_token = uuid4().hex
+            batch_record = new_idempotency_record(
+                current_user.id,
+                SYNC_BATCH_CREATE_OPERATION,
+                idempotency_key,
+                batch_request_hash,
+                SYNC_BATCH_IN_PROGRESS,
+                resource_type="model_storage_sync_batch",
             )
+            batch_record.batch_lease_token = batch_lease_token
+            batch_record.batch_lease_expires_at = (
+                datetime.now(timezone.utc) + SYNC_BATCH_LEASE_TTL
+            )
+            session.add(batch_record)
+            await session.flush()
+            batch_record_id = batch_record.id
             await session.commit()
             owns_batch_record = True
         except IntegrityError:
@@ -622,37 +656,36 @@ async def create_model_storage_sync_batch(
                 raise HTTPException(
                     409, "idempotency_key_reused", "idempotency_key_reused"
                 ) from None
-            replaying_batch = True
-            batch_record = await _wait_for_finalized_sync_batch(
-                session,
-                current_user.id,
-                idempotency_key,
-                batch_request_hash,
+            batch_lease_token = await _claim_sync_batch_placeholder(
+                session, batch_record_id
             )
-            return await _load_sync_batch_result(session, batch_record)
+            if batch_lease_token is not None:
+                owns_batch_record = True
+            else:
+                batch_record = await _wait_for_finalized_sync_batch(
+                    session,
+                    current_user.id,
+                    idempotency_key,
+                    batch_request_hash,
+                )
+                if batch_record is None:
+                    raise ServiceUnavailableException(
+                        message="model_storage_sync_batch_in_progress"
+                    )
+                return await _load_sync_batch_result(session, batch_record)
 
     created = []
     try:
         for model_file_id, worker_id in planned_candidates:
+            if owns_batch_record and not await _renew_sync_batch_placeholder(
+                session, batch_record_id, batch_lease_token
+            ):
+                raise ServiceUnavailableException(
+                    message="model_storage_sync_batch_in_progress"
+                )
             child_key = (
                 f"{idempotency_key}:{model_file_id}" if idempotency_key else None
             )
-            if replaying_batch and child_key:
-                child_record = await get_idempotency_record(
-                    session,
-                    current_user.id,
-                    SYNC_CREATE_OPERATION,
-                    child_key,
-                )
-                if child_record is None:
-                    skipped.append(
-                        ModelStorageSyncBatchItem(
-                            model_file_id=model_file_id,
-                            worker_id=worker_id,
-                            reason="not_in_original_batch_result",
-                        )
-                    )
-                    continue
             if idempotency_key is None and await _active_sync_task(
                 session, _dedupe_key(model_file_id, batch_in.profile_id)
             ):
@@ -690,6 +723,12 @@ async def create_model_storage_sync_batch(
                         reason=str(exc.message),
                     )
                 )
+            if owns_batch_record and not await _renew_sync_batch_placeholder(
+                session, batch_record_id, batch_lease_token
+            ):
+                raise ServiceUnavailableException(
+                    message="model_storage_sync_batch_in_progress"
+                )
         result = ModelStorageSyncBatchPublic(
             scope=batch_in.scope,
             planned=len(model_files),
@@ -698,44 +737,100 @@ async def create_model_storage_sync_batch(
             failed=failed,
         )
         if owns_batch_record:
-            batch_record = await get_idempotency_record(
-                session,
-                current_user.id,
-                SYNC_BATCH_CREATE_OPERATION,
-                idempotency_key,
-            )
-            if batch_record is None or batch_record.request_hash != batch_request_hash:
-                raise HTTPException(
-                    409, "idempotency_key_reused", "idempotency_key_reused"
-                )
             persisted_result = ModelStorageSyncBatchResult(
-                idempotency_record_id=batch_record.id,
+                idempotency_record_id=batch_record_id,
                 response_payload=result.model_dump(mode="json"),
             )
             session.add(persisted_result)
             await session.flush()
-            batch_record.resource_id = persisted_result.id
-            session.add(batch_record)
+            finalized = await session.exec(
+                update(ModelPreheatIdempotencyRecord)
+                .where(
+                    ModelPreheatIdempotencyRecord.id == batch_record_id,
+                    ModelPreheatIdempotencyRecord.resource_id == SYNC_BATCH_IN_PROGRESS,
+                    ModelPreheatIdempotencyRecord.batch_lease_token
+                    == batch_lease_token,
+                )
+                .values(
+                    resource_id=persisted_result.id,
+                    batch_lease_token=None,
+                    batch_lease_expires_at=None,
+                )
+            )
+            if finalized.rowcount != 1:
+                raise ServiceUnavailableException(
+                    message="model_storage_sync_batch_in_progress"
+                )
             await session.commit()
+    except asyncio.CancelledError:
+        if owns_batch_record:
+            await session.rollback()
+            await _release_sync_batch_placeholder(
+                session, batch_record_id, batch_lease_token
+            )
+        raise
     except Exception:
         if owns_batch_record:
             await session.rollback()
-            batch_record = await get_idempotency_record(
-                session,
-                current_user.id,
-                SYNC_BATCH_CREATE_OPERATION,
-                idempotency_key,
+            await _release_sync_batch_placeholder(
+                session, batch_record_id, batch_lease_token
             )
-            if (
-                batch_record is not None
-                and batch_record.request_hash == batch_request_hash
-                and batch_record.resource_id == SYNC_BATCH_IN_PROGRESS
-            ):
-                await session.delete(batch_record)
-                await session.commit()
         raise
 
     return result
+
+
+async def _claim_sync_batch_placeholder(session, record_id):
+    now = datetime.now(timezone.utc)
+    lease_token = uuid4().hex
+    claimed = await session.exec(
+        update(ModelPreheatIdempotencyRecord)
+        .where(
+            ModelPreheatIdempotencyRecord.id == record_id,
+            ModelPreheatIdempotencyRecord.resource_id == SYNC_BATCH_IN_PROGRESS,
+            or_(
+                ModelPreheatIdempotencyRecord.batch_lease_token.is_(None),
+                ModelPreheatIdempotencyRecord.batch_lease_expires_at.is_(None),
+                ModelPreheatIdempotencyRecord.batch_lease_expires_at <= now,
+            ),
+        )
+        .values(
+            batch_lease_token=lease_token,
+            batch_lease_expires_at=now + SYNC_BATCH_LEASE_TTL,
+        )
+    )
+    await session.commit()
+    return lease_token if claimed.rowcount == 1 else None
+
+
+async def _renew_sync_batch_placeholder(session, record_id, lease_token):
+    now = datetime.now(timezone.utc)
+    renewed = await session.exec(
+        update(ModelPreheatIdempotencyRecord)
+        .where(
+            ModelPreheatIdempotencyRecord.id == record_id,
+            ModelPreheatIdempotencyRecord.resource_id == SYNC_BATCH_IN_PROGRESS,
+            ModelPreheatIdempotencyRecord.batch_lease_token == lease_token,
+            ModelPreheatIdempotencyRecord.batch_lease_expires_at > now,
+        )
+        .values(batch_lease_expires_at=now + SYNC_BATCH_LEASE_TTL)
+    )
+    await session.commit()
+    return renewed.rowcount == 1
+
+
+async def _release_sync_batch_placeholder(session, record_id, lease_token):
+    released = await session.exec(
+        update(ModelPreheatIdempotencyRecord)
+        .where(
+            ModelPreheatIdempotencyRecord.id == record_id,
+            ModelPreheatIdempotencyRecord.resource_id == SYNC_BATCH_IN_PROGRESS,
+            ModelPreheatIdempotencyRecord.batch_lease_token == lease_token,
+        )
+        .values(batch_lease_token=None, batch_lease_expires_at=None)
+    )
+    await session.commit()
+    return released.rowcount == 1
 
 
 async def _wait_for_finalized_sync_batch(
@@ -759,7 +854,7 @@ async def _wait_for_finalized_sync_batch(
             return record
         if attempt + 1 < SYNC_BATCH_REPLAY_WAIT_ATTEMPTS:
             await asyncio.sleep(SYNC_BATCH_REPLAY_WAIT_SECONDS)
-    raise ServiceUnavailableException(message="model_storage_sync_batch_in_progress")
+    return None
 
 
 async def _load_sync_batch_result(session, batch_record):
@@ -888,6 +983,8 @@ async def _latest_ready_worker_for_model_file(session, model_file: ModelFile) ->
     ).first()
     if latest is None or latest.id != worker.id:
         raise ConflictException(message="model_file_worker_stale_registration")
+    if worker.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
+        raise ConflictException(message="model_file_worker_protocol_unsupported")
     return worker
 
 
@@ -1033,8 +1130,9 @@ def _derive_task_identity(model_file: ModelFile):
     ``scan_spec.root`` 供 Worker 扫描，不进入 request digest、Artifact 身份
     或 Manifest 相对路径。
 
-    ``resolved_revision`` 只读取下载阶段写入的可信字段；缺失时直接拒绝，
-    不回退到 ``requested_revision``，也不在这里猜测分支或标签名称。
+    ``resolved_revision`` 优先读取下载阶段写入的可信字段；历史 Ready 记录
+    缺失时生成稳定的 ``local-snapshot`` revision，不回退到
+    ``requested_revision``，也不猜测分支或标签名称。
     返回 ``(ModelPreheatIdentity, resolved_revision)``。identity 附带
     ``scan_spec``（冻结扫描规约）与 ``raw_patterns``（未编码规约，与库存
     存储形态一致）。
@@ -1060,14 +1158,9 @@ def _derive_task_identity(model_file: ModelFile):
         or not model_file.resolved_paths
     ):
         raise ConflictException(message="model_file_not_ready")
-    # resolved_revision 必须只接受**真实** resolved_revision：缺失直接稳定拒绝。
-    # 完全删除 ``requested_revision`` 回退与 moving-alias denylist（不猜分支名）：
-    # dev/release 等请求分支缺失真实 resolved_revision 时一律拒绝，不得用
-    # requested_revision 或别名冒充不可变 revision（任务身份与库存精确匹配
-    # 依赖不可变 revision）。
-    resolved_revision = model_file.resolved_revision
-    if not resolved_revision:
-        raise ConflictException(message="model_file_missing_resolved_revision")
+    resolved_revision = model_file.resolved_revision or _local_snapshot_revision(
+        model_file
+    )
     try:
         repository_complete = (
             model_file.huggingface_filename is None
@@ -1102,6 +1195,23 @@ def _derive_task_identity(model_file: ModelFile):
         "exclude_patterns": [],
     }
     return identity, resolved_revision, scan_spec
+
+
+def _local_snapshot_revision(model_file: ModelFile) -> str:
+    source_index = model_file.source_index or model_file.model_source_index
+    if source_index:
+        seed = f"source-index:{source_index}"
+    else:
+        seed = json.dumps(
+            {
+                "source": str(model_file.source),
+                "resolved_paths": sorted(model_file.resolved_paths),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    return f"local-snapshot-{hashlib.sha256(seed.encode('utf-8')).hexdigest()}"
 
 
 async def _exact_artifact_match(session, profile, identity) -> Optional[str]:
@@ -1156,6 +1266,11 @@ def _to_public(task: ModelStorageSyncTask) -> ModelStorageSyncTaskPublic:
         source=task.source,
         model_id=task.model_id,
         resolved_revision=task.resolved_revision,
+        revision_kind=(
+            "local_snapshot"
+            if task.resolved_revision.startswith("local-snapshot-")
+            else "upstream"
+        ),
         artifact_id=task.artifact_id,
         state=task.state,
         state_message=task.state_message,

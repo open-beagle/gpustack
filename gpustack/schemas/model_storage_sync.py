@@ -146,6 +146,7 @@ class ModelStorageSyncTaskPublic(SQLModel):
     source: str
     model_id: str
     resolved_revision: str
+    revision_kind: str
     artifact_id: Optional[str] = None
     state: ModelStorageSyncTaskStateEnum
     state_message: Optional[str] = None
@@ -204,6 +205,7 @@ class ModelStorageSyncBatchCreate(SQLModel):
 class ModelStorageSyncBatchItem(SQLModel):
     model_file_id: Optional[int] = None
     worker_id: Optional[int] = None
+    worker_uuid: Optional[str] = None
     task_id: Optional[int] = None
     reason: Optional[str] = None
 

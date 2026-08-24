@@ -18,8 +18,10 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ProfileLifecycleStateEnum,
 )
 from gpustack.schemas.model_preheats import (
+    ModelPreheatArtifact,
     ModelPreheatBackfillPolicyEnum,
     ModelPreheatExecutionStateEnum,
+    ModelPreheatInventoryManifestStateEnum,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatTargetScopeEnum,
     ModelPreheatTask,
@@ -32,6 +34,9 @@ from gpustack.server.bus import Event, EventType
 from gpustack.server.model_preheat_worker_reconciler import (
     ModelPreheatWorkerReconciler,
     _create_or_rebind_distribution_task,
+)
+from gpustack.server.model_preheat_distribution_source import (
+    resolve_distribution_source,
 )
 
 
@@ -180,6 +185,76 @@ def test_ready_task_materializes_policy_once_and_non_ready_task_does_not(tmp_pat
     assert policies[0].created_by_task_id == ready_id
     assert policies[0].created_by_task_id != pending_id
     assert policies[0].enabled is True
+
+
+def test_preheat_source_keeps_frozen_credentials_and_trusted_local_task(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(
+            engine, ready_probe=FakeReadyProbe(_ready_result())
+        )
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine) as session:
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            source = await resolve_distribution_source(session, policy)
+        await engine.dispose()
+        return task_id, source
+
+    task_id, source = asyncio.run(run())
+    assert source.encrypted_profile == {"ciphertext": "encrypted-snapshot"}
+    assert source.preheat_task.id == task_id
+    assert source.payload["artifact_id"] == ARTIFACT_ID
+
+
+def test_materialization_never_rewrites_manually_sourced_artifact_policy(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, profile_id = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(
+            engine, ready_probe=FakeReadyProbe(_ready_result())
+        )
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            artifact = ModelPreheatArtifact(
+                profile_id=profile_id,
+                profile_config_version=1,
+                artifact_id=ARTIFACT_ID,
+                source="huggingface",
+                model_id="org/model",
+                resolved_revision="a" * 40,
+                include_patterns=[],
+                exclude_patterns=[],
+                manifest_path=(
+                    f"model-storage/huggingface/org/model/{ARTIFACT_ID}/manifest.json"
+                ),
+                manifest_digest="d" * 64,
+                file_count=1,
+                total_size=10,
+                manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                last_verified_at=datetime.now(timezone.utc),
+            )
+            session.add(artifact)
+            await session.flush()
+            policy.name = "人工 Artifact 分发"
+            policy.created_by_task_id = None
+            policy.source_artifact_id = artifact.id
+            session.add(policy)
+            await session.commit()
+            policy_id = policy.id
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine) as session:
+            policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
+        await engine.dispose()
+        return task_id, policy
+
+    task_id, policy = asyncio.run(run())
+    assert policy.name == "人工 Artifact 分发"
+    assert policy.created_by_task_id is None
+    assert policy.source_artifact_id is not None
+    assert policy.source_sync_task_id is None
+    assert policy.created_by_task_id != task_id
 
 
 def test_manually_disabled_policy_is_not_reenabled_by_materialization(tmp_path):
