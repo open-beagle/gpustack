@@ -27,3 +27,9 @@ def test_restartable_background_task_backs_off_after_normal_return():
     source = Path("gpustack/server/server.py").read_text()
 
     assert "await task_factory()\n                await asyncio.sleep(5)" in source
+
+
+def test_inventory_refresh_service_is_registered_once():
+    source = Path("gpustack/server/server.py").read_text()
+
+    assert source.count("self._model_preheat_s3_inventory.start") == 1

@@ -680,6 +680,11 @@ def _to_public(profile: ModelPreheatS3Profile) -> ModelPreheatS3ProfilePublic:
         connectivity_state=profile.connectivity_state,
         last_connectivity_check_id=profile.last_connectivity_check_id,
         last_connectivity_checked_at=profile.last_connectivity_checked_at,
+        inventory_refresh_interval_seconds=profile.inventory_refresh_interval_seconds,
+        inventory_last_attempt_at=profile.inventory_last_attempt_at,
+        inventory_last_success_at=profile.inventory_last_success_at,
+        inventory_last_scan_count=profile.inventory_last_scan_count,
+        inventory_last_error_code=profile.inventory_last_error_code,
         created_at=profile.created_at,
         updated_at=profile.updated_at,
     )

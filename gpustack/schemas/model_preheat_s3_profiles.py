@@ -114,6 +114,7 @@ class ModelPreheatS3ProfileBase(SQLModel):
     tls_verify: bool = True
     region: Optional[str] = ""
     use_virtual_hosted_style: bool = True
+    inventory_refresh_interval_seconds: Optional[int] = Field(default=None, ge=60)
 
     @field_validator("prefix")
     @classmethod
@@ -180,6 +181,24 @@ class ModelPreheatS3Profile(ModelPreheatS3ProfileBase, BaseModelMixin, table=Tru
     last_connectivity_checked_at: Optional[datetime] = Field(
         default=None, sa_column=Column(UTCDateTime, nullable=True)
     )
+    inventory_last_attempt_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+    inventory_last_success_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+    inventory_last_scan_count: int = 0
+    inventory_last_error_code: Optional[str] = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    # 刷新租约只用于跨 Server 的库存互斥，不进入 Public API。
+    inventory_refresh_owner: Optional[str] = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    inventory_refresh_config_version: Optional[int] = None
+    inventory_refresh_lease_expires_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
 
 
 class ModelPreheatS3ProfileCreate(ModelPreheatS3ProfileBase):
@@ -211,6 +230,7 @@ class ModelPreheatS3ProfileUpdate(SQLModel):
     source_fallback_enabled: Optional[bool] = None
     default_slot: Optional[str] = None
     lifecycle_state: Optional[ModelPreheatS3ProfileLifecycleStateEnum] = None
+    inventory_refresh_interval_seconds: Optional[int] = Field(default=None, ge=60)
 
     @field_validator("endpoint")
     @classmethod
@@ -241,6 +261,11 @@ class ModelPreheatS3ProfilePublic(ModelPreheatS3ProfileBase):
     connectivity_state: ModelPreheatS3ConnectivityStateEnum
     last_connectivity_check_id: Optional[int] = None
     last_connectivity_checked_at: Optional[datetime] = None
+    inventory_refresh_interval_seconds: Optional[int] = None
+    inventory_last_attempt_at: Optional[datetime] = None
+    inventory_last_success_at: Optional[datetime] = None
+    inventory_last_scan_count: int = 0
+    inventory_last_error_code: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

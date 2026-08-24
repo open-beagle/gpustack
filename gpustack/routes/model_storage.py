@@ -29,7 +29,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, Request, Response
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, update
+from sqlalchemy import and_, func, update
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
@@ -54,10 +54,12 @@ from gpustack.schemas.model_preheat_s3_profiles import (
 )
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
+    ModelPreheatArtifactsPage,
     ModelPreheatArtifactPublic,
     ModelPreheatInventoryManifestStateEnum,
     ModelPreheatIdempotencyRecord,
 )
+from gpustack.schemas.common import Pagination
 from gpustack.schemas.model_file_download_executions import (
     ModelFileDownloadExecution,
     ModelFileTransferSourceEnum,
@@ -1071,29 +1073,57 @@ async def cancel_model_storage_sync_task(session: SessionDep, id: int):
 
 @router.get(
     "/model-storage-profiles/{profile_id}/artifacts",
-    response_model=list[ModelPreheatArtifactPublic],
+    response_model=ModelPreheatArtifactsPage,
 )
 async def list_profile_artifacts(
     session: SessionDep,
+    params: ListParamsDep,
     profile_id: int,
     manifest_state: Optional[ModelPreheatInventoryManifestStateEnum] = None,
+    source: Optional[str] = None,
+    search: Optional[str] = None,
 ):
     """Artifact 库存列表：必须精确匹配 profile + 当前 config version。"""
     profile = await ModelPreheatS3Profile.one_by_id(session, profile_id)
     if profile is None:
         raise NotFoundException(message="s3_profile_not_found")
-    statement = select(ModelPreheatArtifact).where(
-        and_(
-            ModelPreheatArtifact.profile_id == profile.id,
-            ModelPreheatArtifact.profile_config_version == profile.config_version,
-        )
-    )
+    filters = [
+        ModelPreheatArtifact.profile_id == profile.id,
+        ModelPreheatArtifact.profile_config_version == profile.config_version,
+    ]
     if manifest_state is not None:
-        statement = statement.where(
-            ModelPreheatArtifact.manifest_state == manifest_state
+        filters.append(ModelPreheatArtifact.manifest_state == manifest_state)
+    if source is not None:
+        filters.append(ModelPreheatArtifact.source == source)
+    if search:
+        filters.append(
+            func.lower(ModelPreheatArtifact.model_id).like(f"%{search.lower()}%")
         )
-    rows = (await session.exec(statement)).all()
-    return [ModelPreheatArtifactPublic.model_validate(row) for row in rows]
+    total = await session.scalar(
+        select(func.count()).select_from(ModelPreheatArtifact).where(*filters)
+    )
+    rows = (
+        await session.exec(
+            select(ModelPreheatArtifact)
+            .where(*filters)
+            .order_by(
+            ModelPreheatArtifact.model_id,
+            ModelPreheatArtifact.source,
+            ModelPreheatArtifact.artifact_id,
+        )
+            .offset((params.page - 1) * params.perPage)
+            .limit(params.perPage)
+        )
+    ).all()
+    return ModelPreheatArtifactsPage(
+        items=[ModelPreheatArtifactPublic.model_validate(row) for row in rows],
+        pagination=Pagination(
+            page=params.page,
+            perPage=params.perPage,
+            total=total,
+            totalPage=(total + params.perPage - 1) // params.perPage,
+        ),
+    )
 
 
 @router.post(
@@ -1118,8 +1148,9 @@ async def refresh_profile_artifacts(
         job = await service.create_refresh_job(
             session, profile.id, profile.config_version
         )
-    except Exception:
-        raise ServiceUnavailableException(message="inventory_service_unavailable")
+    except Exception as exc:
+        error_code = getattr(exc, "code", "inventory_refresh_failed")
+        raise ServiceUnavailableException(message=error_code)
     return {"job_id": getattr(job, "id", None)}
 
 

@@ -141,6 +141,38 @@ def test_manual_profile_prefix_is_system_controlled(client):
     assert response.json()["message"] == "manual_profile_prefix_forbidden"
 
 
+def test_profile_public_includes_inventory_refresh_status(client, app):
+    created = create_profile(client, inventory_refresh_interval_seconds=120)
+    attempted_at = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    succeeded_at = datetime(2026, 8, 24, 12, 1, tzinfo=timezone.utc)
+    asyncio.run(
+        _update_stored_profile(
+            app,
+            created["id"],
+            {
+                "inventory_last_attempt_at": attempted_at,
+                "inventory_last_success_at": succeeded_at,
+                "inventory_last_scan_count": 12,
+                "inventory_last_error_code": "inventory_scan_failed",
+            },
+        )
+    )
+
+    detail = client.get(f"{API_PREFIX}/{created['id']}")
+    listing = client.get(API_PREFIX)
+
+    for body in (detail.json(), listing.json()["items"][0]):
+        assert body["inventory_refresh_interval_seconds"] == 120
+        assert body["inventory_last_attempt_at"] == attempted_at.isoformat().replace(
+            "+00:00", "Z"
+        )
+        assert body["inventory_last_success_at"] == succeeded_at.isoformat().replace(
+            "+00:00", "Z"
+        )
+        assert body["inventory_last_scan_count"] == 12
+        assert body["inventory_last_error_code"] == "inventory_scan_failed"
+
+
 def test_maintenance_clears_default_and_reactivation_requires_explicit_default(client):
     created = create_profile(client, default_slot="global")
 

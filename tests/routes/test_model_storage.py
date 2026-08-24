@@ -1517,8 +1517,75 @@ def test_artifacts_list_matches_profile_and_config_version(app, client):
     _run(app, seed_artifacts())
     response = client.get(f"/v1/model-storage-profiles/{profile_id}/artifacts")
     assert response.status_code == 200
-    items = response.json()
+    page = response.json()
+    items = page["items"]
     assert [item["artifact_id"] for item in items] == ["b" * 64]
+    assert page["pagination"] == {
+        "page": 1,
+        "perPage": 100,
+        "total": 1,
+        "totalPage": 1,
+    }
+
+
+def test_artifacts_list_filters_searches_and_pages_stably(app, client):
+    profile_id, _ = _run(app, _seed_ids(app))
+
+    async def seed_artifacts():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            now = datetime.now(timezone.utc)
+            for source, model_id, artifact_id in [
+                ("huggingface", "alpha/model", "a" * 64),
+                ("modelscope", "Qwen/One", "b" * 64),
+                ("modelscope", "Qwen/Two", "c" * 64),
+            ]:
+                session.add(
+                    ModelPreheatArtifact(
+                        profile_id=profile_id,
+                        profile_config_version=3,
+                        artifact_id=artifact_id,
+                        source=source,
+                        model_id=model_id,
+                        resolved_revision="8f73c6a91b",
+                        include_patterns=[],
+                        exclude_patterns=[],
+                        manifest_path=f"models/{artifact_id}/manifest.json",
+                        manifest_digest="c" * 64,
+                        file_count=1,
+                        total_size=10,
+                        manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                        last_verified_at=now,
+                    )
+                )
+            await session.commit()
+
+    _run(app, seed_artifacts())
+    base = f"/v1/model-storage-profiles/{profile_id}/artifacts"
+    first = client.get(f"{base}?page=1&perPage=2")
+    second = client.get(f"{base}?page=2&perPage=2")
+    filtered = client.get(f"{base}?source=modelscope&search=qWeN")
+
+    assert [item["artifact_id"] for item in first.json()["items"]] == [
+        "b" * 64,
+        "c" * 64,
+    ]
+    assert first.json()["pagination"] == {
+        "page": 1,
+        "perPage": 2,
+        "total": 3,
+        "totalPage": 2,
+    }
+    assert [item["artifact_id"] for item in second.json()["items"]] == ["a" * 64]
+    assert second.json()["pagination"] == {
+        "page": 2,
+        "perPage": 2,
+        "total": 3,
+        "totalPage": 2,
+    }
+    assert [item["artifact_id"] for item in filtered.json()["items"]] == [
+        "b" * 64,
+        "c" * 64,
+    ]
 
 
 def test_artifacts_list_404_for_missing_profile(app, client):

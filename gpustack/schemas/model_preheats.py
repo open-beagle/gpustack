@@ -537,9 +537,7 @@ class ModelPreheatArtifactPublic(SQLModel):
     updated_at: datetime
 
 
-class ModelPreheatArtifactsPage(SQLModel):
-    items: list[ModelPreheatArtifactPublic]
-    next_cursor: Optional[str] = None
+ModelPreheatArtifactsPage = PaginatedList[ModelPreheatArtifactPublic]
 
 
 class ModelPreheatCreate(SQLModel):
