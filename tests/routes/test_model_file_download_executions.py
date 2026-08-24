@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -44,7 +45,7 @@ from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncTaskStateEnum,
 )
 from gpustack.schemas.models import SourceEnum
-from gpustack.schemas.workers import Worker
+from gpustack.schemas.workers import Worker, WorkerStateEnum
 from gpustack.server.db import get_session
 from gpustack.server import model_file_download_execution_service
 from gpustack.server.model_file_download_execution_service import (
@@ -102,7 +103,15 @@ async def _create_tables(engine):
 
 
 async def _seed(
-    engine, key, *, with_profile=True, filename=None, requested_revision="main"
+    engine,
+    key,
+    *,
+    with_profile=True,
+    filename=None,
+    requested_revision="main",
+    source=SourceEnum.HUGGING_FACE,
+    model_id="org/model",
+    worker_state=WorkerStateEnum.READY,
 ):
     async with AsyncSession(engine, expire_on_commit=False) as session:
         worker = Worker(
@@ -112,6 +121,7 @@ async def _seed(
             port=10150,
             worker_uuid="worker-uuid",
             model_storage_protocol_version=1,
+            state=worker_state,
         )
         session.add(worker)
         await session.commit()
@@ -132,12 +142,21 @@ async def _seed(
             session.add(profile)
             await session.commit()
         model_file = ModelFile(
-            source=SourceEnum.HUGGING_FACE,
-            huggingface_repo_id="org/model",
+            source=source,
+            huggingface_repo_id=(
+                model_id if source == SourceEnum.HUGGING_FACE else None
+            ),
             huggingface_filename=filename,
+            ollama_library_model_name=(
+                model_id if source == SourceEnum.OLLAMA_LIBRARY else None
+            ),
             requested_revision=requested_revision,
             worker_id=worker.id,
-            source_index="hf:org/model",
+            source_index=(
+                hashlib.sha256(model_id.encode()).hexdigest()
+                if source == SourceEnum.OLLAMA_LIBRARY
+                else "hf:org/model"
+            ),
         )
         config = SimpleNamespace(
             model_preheat_credential_key=key,
@@ -196,6 +215,42 @@ def test_claim_is_private_fixed_and_retryable(tmp_path):
     asyncio.run(engine.dispose())
 
 
+def test_create_download_execution_rejects_not_ready_worker(tmp_path):
+    app, engine, key = _app(tmp_path)
+
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(
+            _seed(
+                engine,
+                key,
+                worker_state=WorkerStateEnum.NOT_READY,
+            )
+        )
+    assert raised.value.message == "model_file_worker_not_ready"
+    asyncio.run(engine.dispose())
+
+
+def test_claim_download_execution_rejects_worker_that_became_not_ready(tmp_path):
+    app, engine, key = _app(tmp_path)
+    worker_id, model_file_id, _ = asyncio.run(_seed(engine, key))
+
+    async def mark_not_ready():
+        async with AsyncSession(engine) as session:
+            worker = await session.get(Worker, worker_id)
+            worker.state = WorkerStateEnum.NOT_READY
+            session.add(worker)
+            await session.commit()
+
+    asyncio.run(mark_not_ready())
+    response = TestClient(app).post(
+        f"/v1/model-files/{model_file_id}/download-executions/claim"
+    )
+
+    assert response.status_code == 409
+    assert response.json()["message"] == "model_file_worker_not_ready"
+    asyncio.run(engine.dispose())
+
+
 def test_claim_matches_task3_concrete_file_selection(tmp_path):
     app, engine, key = _app(tmp_path)
     _, model_file_id, _ = asyncio.run(_seed(engine, key, filename="model.gguf"))
@@ -237,6 +292,73 @@ def test_claim_matches_task3_concrete_file_selection(tmp_path):
     )
     assert response.status_code == 200
     assert response.json()["artifact_id"] == "b" * 64
+    asyncio.run(engine.dispose())
+
+
+def test_ollama_claim_matches_local_snapshot_artifact_without_registry_metadata(
+    tmp_path,
+):
+    app, engine, key = _app(tmp_path)
+    _, model_file_id, _ = asyncio.run(
+        _seed(
+            engine,
+            key,
+            source=SourceEnum.OLLAMA_LIBRARY,
+            model_id="qwen2.5:7b",
+            requested_revision=None,
+        )
+    )
+
+    async def seed_artifact():
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            execution = (
+                await session.exec(
+                    select(ModelFileDownloadExecution).where(
+                        ModelFileDownloadExecution.model_file_id == model_file_id
+                    )
+                )
+            ).one()
+            source_index = hashlib.sha256("qwen2.5:7b".encode()).hexdigest()
+            resolved_revision = (
+                "local-snapshot-"
+                + hashlib.sha256(f"source-index:{source_index}".encode()).hexdigest()
+            )
+            session.add(
+                ModelPreheatArtifact(
+                    profile_id=execution.default_profile_id,
+                    profile_config_version=execution.default_profile_config_version,
+                    artifact_id="d" * 64,
+                    source="ollama_library",
+                    model_id="qwen2.5:7b",
+                    resolved_revision=resolved_revision,
+                    include_patterns=["qwen2_5_7b", "qwen2_5_7b/**"],
+                    exclude_patterns=[],
+                    manifest_path=(
+                        "storage/ollama_library/qwen2.5:7b/"
+                        + "d" * 64
+                        + "/manifest.json"
+                    ),
+                    manifest_digest="e" * 64,
+                    file_count=1,
+                    total_size=12,
+                    manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                    last_verified_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.commit()
+            return resolved_revision
+
+    seeded_revision = asyncio.run(seed_artifact())
+    response = TestClient(app).post(
+        f"/v1/model-files/{model_file_id}/download-executions/claim"
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["source"] == "ollama_library"
+    assert payload["model_id"] == "qwen2.5:7b"
+    assert payload["resolved_revision"] == seeded_revision
+    assert payload["artifact_id"] == "d" * 64
     asyncio.run(engine.dispose())
 
 

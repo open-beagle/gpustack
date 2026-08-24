@@ -6,7 +6,9 @@ import re
 import fnmatch
 import shutil
 from filelock import SoftFileLock
+from minio.error import S3Error
 import requests
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
 from typing import List, Optional, Tuple, Union
 from pathlib import Path
 from tqdm import tqdm
@@ -39,10 +41,15 @@ from gpustack.worker.downloader_s3 import S3Downloader
 from gpustack.config.config import Config
 from gpustack.worker.model_preheat.identity import (
     ModelPreheatIdentity,
+    ModelPreheatIdentityError,
     decode_path,
+    ollama_model_filename,
 )
+from gpustack.worker.model_preheat.ollama_artifact import install_ollama_artifact
 from gpustack.worker.model_preheat.s3_client import (
+    ModelPreheatCanceled,
     ModelPreheatS3Client,
+    ModelPreheatS3Conflict,
     ModelPreheatS3ManifestError,
 )
 from gpustack.server.model_preheat_revision import (
@@ -152,6 +159,7 @@ def download_model(
     if execution is not None and execution.source in {
         "huggingface",
         "modelscope",
+        "ollama_library",
     }:
         return download_model_with_execution(
             model,
@@ -159,6 +167,7 @@ def download_model(
             local_dir=local_dir,
             cache_dir=cache_dir,
             huggingface_token=huggingface_token,
+            ollama_library_base_url=ollama_library_base_url,
             cfg=cfg,
         )
     if model.source == SourceEnum.HUGGING_FACE:
@@ -205,13 +214,28 @@ def download_model_with_execution(
     local_dir: Optional[str],
     cache_dir: str,
     huggingface_token: Optional[str],
+    ollama_library_base_url: Optional[str],
     cfg: Config,
 ) -> List[str]:
     """严格执行领取时固定的 S3 命中或公共源回源决策。"""
     if execution.artifact_id:
         if execution.profile is None or not execution.manifest_path:
             raise ValueError("s3_execution_profile_missing")
-        return _download_execution_artifact(execution, local_dir, cache_dir)
+        try:
+            return _download_execution_artifact(execution, local_dir, cache_dir)
+        except Exception as exc:
+            if not (
+                execution.source == "ollama_library"
+                and execution.source_fallback_enabled
+                and _ollama_s3_failure_allows_fallback(exc)
+            ):
+                raise
+            return _download_ollama_from_registry(
+                model,
+                local_dir=local_dir,
+                cache_dir=cache_dir,
+                ollama_library_base_url=ollama_library_base_url,
+            )
     if not execution.source_fallback_enabled:
         raise ValueError("model_artifact_not_found")
 
@@ -224,6 +248,13 @@ def download_model_with_execution(
             local_dir=local_dir,
             cache_dir=os.path.join(cache_dir, "huggingface"),
             revision=execution.resolved_revision,
+        )
+    if execution.source == "ollama_library":
+        return _download_ollama_from_registry(
+            model,
+            local_dir=local_dir,
+            cache_dir=cache_dir,
+            ollama_library_base_url=ollama_library_base_url,
         )
     expected_revision = execution.resolved_revision
     upstream_revision = modelscope_upstream_revision(
@@ -277,6 +308,11 @@ def _download_execution_artifact(execution, local_dir, cache_dir) -> List[str]:
     ):
         raise ModelPreheatS3ManifestError("s3_manifest_invalid")
 
+    if execution.source == "ollama_library":
+        return _download_ollama_execution_artifact(
+            client, manifest, execution, local_dir, cache_dir
+        )
+
     group, name = model_id_to_group_owner_name(execution.model_id)
     source_cache = "huggingface" if execution.source == "huggingface" else "model_scope"
     target_root = Path(local_dir or Path(cache_dir) / source_cache / group / name)
@@ -299,6 +335,84 @@ def _download_execution_artifact(execution, local_dir, cache_dir) -> List[str]:
             )
             downloaded_paths.append(str(target))
     return [str(target_root)] if not execution.include_patterns else downloaded_paths
+
+
+_S3_AUTH_ERROR_MARKERS = {
+    "accessdenied",
+    "auth",
+    "credential",
+    "forbidden",
+    "invalidaccesskey",
+    "invalidkey",
+    "security",
+    "signature",
+    "token",
+    "unauthorized",
+}
+
+
+def _ollama_s3_failure_allows_fallback(exc: Exception) -> bool:
+    if isinstance(exc, (ModelPreheatCanceled, ModelPreheatIdentityError)):
+        return False
+    if _http_error_status(exc) in {401, 403}:
+        return False
+    if isinstance(exc, S3Error):
+        normalized_code = re.sub(r"[^a-z0-9]", "", (exc.code or "").lower())
+        if any(marker in normalized_code for marker in _S3_AUTH_ERROR_MARKERS):
+            return False
+        return True
+    return isinstance(
+        exc,
+        (
+            ModelPreheatS3ManifestError,
+            ModelPreheatS3Conflict,
+            requests.RequestException,
+            Urllib3HTTPError,
+            TimeoutError,
+        ),
+    )
+
+
+def _http_error_status(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    for candidate in (exc, response):
+        if candidate is None:
+            continue
+        status = getattr(candidate, "status_code", None)
+        if status is None:
+            status = getattr(candidate, "status", None)
+        if isinstance(status, int):
+            return status
+    return None
+
+
+def _download_ollama_from_registry(
+    model,
+    *,
+    local_dir,
+    cache_dir,
+    ollama_library_base_url,
+) -> List[str]:
+    return OllamaLibraryDownloader(registry_url=ollama_library_base_url).download(
+        model_name=model.ollama_library_model_name,
+        local_dir=local_dir,
+        cache_dir=os.path.join(cache_dir, "ollama"),
+    )
+
+
+def _download_ollama_execution_artifact(
+    client, manifest, execution, local_dir, cache_dir
+) -> List[str]:
+    target_root = Path(local_dir or Path(cache_dir) / "ollama")
+    target = install_ollama_artifact(
+        client,
+        manifest,
+        bucket=execution.profile.bucket,
+        prefix=execution.profile.prefix,
+        target_root=target_root,
+        model_id=execution.model_id,
+    )
+    return [str(target)]
 
 
 def download_resolved_revision_to_staging(
@@ -457,11 +571,15 @@ def _download_preheat_files(files, download_file, cancel_check, progress_callbac
 def preheat_model_target_dir(
     cache_dir: str | os.PathLike[str], identity: ModelPreheatIdentity
 ) -> Path:
-    source_dir = {"huggingface": "huggingface", "modelscope": "model_scope"}.get(
-        identity.source
-    )
+    source_dir = {
+        "huggingface": "huggingface",
+        "modelscope": "model_scope",
+        "ollama_library": "ollama",
+    }.get(identity.source)
     if source_dir is None:
         raise ValueError("unsupported_preheat_source")
+    if identity.source == "ollama_library":
+        return Path(cache_dir) / source_dir
     group_or_owner, name = model_id_to_group_owner_name(
         decode_path(identity.model_path)
     )
@@ -742,7 +860,7 @@ class OllamaLibraryDownloader:
         local_dir: Optional[str] = None,
         cache_dir: Optional[str] = None,
     ) -> List[str]:
-        sanitized_filename = re.sub(r"[^a-zA-Z0-9]", "_", model_name)
+        sanitized_filename = ollama_model_filename(model_name)
 
         if cache_dir is None:
             cache_dir = self._default_cache_dir

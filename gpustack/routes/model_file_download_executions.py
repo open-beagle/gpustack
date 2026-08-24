@@ -36,7 +36,11 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatInventoryManifestStateEnum,
 )
-from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
+from gpustack.schemas.workers import (
+    MODEL_STORAGE_PROTOCOL_VERSION,
+    Worker,
+    WorkerStateEnum,
+)
 from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncTask,
     ModelStorageSyncTaskStateEnum,
@@ -55,6 +59,7 @@ from gpustack.server.model_preheat_worker_identity import (
 from gpustack.worker.model_preheat.identity import (
     ModelPreheatIdentityError,
     encode_path,
+    local_snapshot_revision,
 )
 
 
@@ -178,6 +183,27 @@ async def _claim_pending_execution(request, session, execution, model_file, iden
             artifact_id = artifact.artifact_id if artifact is not None else None
             manifest_path = artifact.manifest_path if artifact is not None else None
             artifact_total_size = artifact.total_size if artifact is not None else None
+        elif source == "ollama_library":
+            resolved_revision = local_snapshot_revision(
+                source_index=model_file.source_index or model_file.model_source_index,
+                source=source,
+                resolved_paths=list(model_file.resolved_paths),
+            )
+            artifact = await _exact_artifact(
+                session,
+                execution,
+                source,
+                model_id,
+                resolved_revision,
+                sorted(
+                    encode_path(pattern)
+                    for pattern in request_identity.get("include_patterns") or []
+                ),
+                request_identity.get("exclude_patterns") or [],
+            )
+            artifact_id = artifact.artifact_id if artifact is not None else None
+            manifest_path = artifact.manifest_path if artifact is not None else None
+            artifact_total_size = artifact.total_size if artifact is not None else None
         else:
             resolved_revision = requested_revision or "not_applicable"
 
@@ -211,7 +237,7 @@ async def _claim_pending_execution(request, session, execution, model_file, iden
                 )
                 .values(ever_used_at=claimed_at)
             )
-        if source in {"huggingface", "modelscope"}:
+        if source in {"huggingface", "modelscope", "ollama_library"}:
             model_file.requested_revision = requested_revision
             model_file.resolved_revision = resolved_revision
             session.add(model_file)
@@ -257,6 +283,12 @@ async def _authorize_execution(session, execution, model_file, identity) -> Work
     ).first()
     if latest is None or latest.id != worker.id:
         raise HTTPException(403, "worker_not_current", "worker_not_current")
+    if worker.state != WorkerStateEnum.READY:
+        raise HTTPException(
+            409,
+            "model_file_worker_not_ready",
+            "model_file_worker_not_ready",
+        )
     if worker.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
         raise HTTPException(
             409, "model_storage_protocol_mismatch", "model_storage_protocol_mismatch"

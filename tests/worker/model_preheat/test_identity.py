@@ -76,10 +76,23 @@ def test_modelscope_source_aliases_share_canonical_identity_and_prefix():
     )
 
 
+def test_ollama_identity_preserves_source_and_does_not_duplicate_prefix():
+    identity = ModelPreheatIdentity(
+        source=SourceEnum.OLLAMA_LIBRARY,
+        model_id="qwen2.5:7b",
+        revision="local-snapshot-" + "a" * 64,
+        file_patterns=["qwen2_5_7b"],
+    )
+
+    assert identity.source == "ollama_library"
+    assert identity.model_path == "qwen2.5:7b"
+    assert identity.artifact_prefix("models") == "models/ollama_library/qwen2.5:7b"
+
+
 def test_identity_rejects_unknown_source():
     with pytest.raises(ModelPreheatIdentityError, match="invalid_source"):
         ModelPreheatIdentity(
-            source="ollama_library",
+            source="unknown_registry",
             model_id="org/model",
             revision="main",
             file_patterns=["config.json"],

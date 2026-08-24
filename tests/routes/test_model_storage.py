@@ -273,9 +273,18 @@ async def _seed(
         source=source,
         model_scope_model_id=model_id if source == SourceEnum.MODEL_SCOPE else None,
         huggingface_repo_id=model_id if source == SourceEnum.HUGGING_FACE else None,
+        ollama_library_model_name=(
+            model_id if source == SourceEnum.OLLAMA_LIBRARY else None
+        ),
         worker_id=worker.id,
         resolved_paths=(
-            ["/models/Qwen/Test"] if state == ModelFileStateEnum.READY else []
+            (
+                ["/models/ollama/qwen2_5_7b"]
+                if source == SourceEnum.OLLAMA_LIBRARY
+                else ["/models/Qwen/Test"]
+            )
+            if state == ModelFileStateEnum.READY
+            else []
         ),
         state=state,
         requested_revision=requested_revision,
@@ -2930,6 +2939,91 @@ def test_local_snapshot_revision_is_stable_for_same_model_file(app):
             return model_storage._derive_task_identity(model_file)[1]
 
     assert _run(app, derive_again()) == first.json()["resolved_revision"]
+
+
+def test_ollama_ready_model_can_sync_and_distribute_from_s3(app, client):
+    profile_id, model_file_id = _run(
+        app,
+        _seed_ids(
+            app,
+            source=SourceEnum.OLLAMA_LIBRARY,
+            model_id="qwen2.5:7b",
+            requested_revision=None,
+            resolved_revision=None,
+        ),
+    )
+
+    sync = client.post(
+        API,
+        json={"model_file_id": model_file_id, "profile_id": profile_id},
+    )
+    assert sync.status_code == 200, sync.text
+    sync_payload = sync.json()
+    assert sync_payload["source"] == "ollama_library"
+    assert sync_payload["model_id"] == "qwen2.5:7b"
+    assert sync_payload["resolved_revision"].startswith("local-snapshot-")
+
+    artifact_id = "a" * 64
+
+    async def complete_inventory_and_read_identity():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            task = await session.get(ModelStorageSyncTask, sync_payload["id"])
+            task.state = ModelStorageSyncTaskStateEnum.READY
+            task.artifact_id = artifact_id
+            task.manifest_path = (
+                f"models/ollama_library/qwen2.5:7b/{artifact_id}/manifest.json"
+            )
+            task.manifest_digest = "b" * 64
+            session.add(task)
+            artifact = ModelPreheatArtifact(
+                profile_id=profile_id,
+                profile_config_version=task.profile_config_version,
+                artifact_id=artifact_id,
+                source=task.source,
+                model_id=task.model_id,
+                resolved_revision=task.resolved_revision,
+                include_patterns=list(task.request_identity["include_patterns"]),
+                exclude_patterns=[],
+                manifest_path=task.manifest_path,
+                manifest_digest=task.manifest_digest,
+                file_count=1,
+                total_size=10,
+                manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                last_verified_at=datetime.now(timezone.utc),
+            )
+            session.add(artifact)
+            await session.commit()
+            return dict(task.request_identity)
+
+    request_identity = _run(app, complete_inventory_and_read_identity())
+    assert request_identity["source"] == "ollama_library"
+    assert request_identity["model_id"] == "qwen2.5:7b"
+    assert request_identity["include_patterns"] == [
+        "qwen2_5_7b",
+        "qwen2_5_7b/**",
+    ]
+
+    policy = client.post(
+        "/v1/model-preheat-distribution-policies",
+        json={
+            "name": "ollama-from-s3",
+            "sync_task_id": sync_payload["id"],
+            "target_scope": "selected_workers",
+            "worker_selector": {"worker_uuids": ["worker-a-uuid"]},
+            "gpu_selector": {},
+        },
+    )
+    assert policy.status_code == 200, policy.text
+
+    async def resolve_source():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            row = await session.get(ModelPreheatDistributionPolicy, policy.json()["id"])
+            return await resolve_distribution_source(session, row)
+
+    source = _run(app, resolve_source())
+    assert source.payload["source"] == "ollama_library"
+    assert source.payload["model_id"] == "qwen2.5:7b"
+    assert source.payload["artifact_id"] == artifact_id
 
 
 def test_create_rejects_worker_without_model_storage_protocol(app):

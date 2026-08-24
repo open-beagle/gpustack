@@ -25,6 +25,7 @@ from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncTaskStateEnum,
 )
 from gpustack.worker import model_storage_sync_manager as msm
+from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 from gpustack.worker.model_preheat.s3_client import PublishResult
 
 
@@ -127,6 +128,44 @@ def test_publish_scans_local_and_reports_artifact(tmp_path, monkeypatch):
     assert result["total_size"] == len('{"a": 1}') + 128
     # 发布器拿到的是解密后明文凭据对应的连接参数。
     assert payload.profile.bucket == "models"
+
+
+def test_publish_ollama_file_uses_single_source_segment(tmp_path, monkeypatch):
+    model_file = tmp_path / "ollama" / "qwen2_5_7b"
+    model_file.parent.mkdir(parents=True)
+    model_file.write_bytes(b"ollama-model")
+
+    monkeypatch.setattr(msm, "ModelPreheatS3Client", _FakeS3Client)
+    manager = _make_manager(tmp_path)
+    payload = _payload(tmp_path, [str(model_file)])
+    payload.scan_spec = {
+        "root": str(model_file.parent),
+        "include_patterns": ["qwen2_5_7b", "qwen2_5_7b/**"],
+        "exclude_patterns": [],
+    }
+    payload.source = "ollama_library"
+    payload.model_id = "qwen2.5:7b"
+    payload.resolved_revision = "local-snapshot-" + "a" * 64
+    payload.request_identity = {
+        "source": "ollama_library",
+        "model_id": "qwen2.5:7b",
+        "requested_revision": None,
+        "include_patterns": ["qwen2_5_7b", "qwen2_5_7b/**"],
+        "exclude_patterns": [],
+    }
+    payload.request_digest = ModelPreheatIdentity(
+        source=payload.source,
+        model_id=payload.model_id,
+        revision=payload.resolved_revision,
+        requested_revision=None,
+        file_patterns=payload.request_identity["include_patterns"],
+    ).request_digest
+
+    result = manager._publish(payload, threading.Event())
+
+    assert result["file_count"] == 1
+    assert result["manifest_path"].startswith("datamodel/ollama_library/qwen2.5:7b/")
+    assert "/ollama_library/ollama_library/" not in result["manifest_path"]
 
 
 def test_publish_cancel_does_not_write_manifest(tmp_path, monkeypatch):

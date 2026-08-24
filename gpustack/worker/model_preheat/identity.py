@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 from urllib.parse import quote, unquote
@@ -17,6 +18,8 @@ _SOURCE_ALIASES = {
     "huggingface": "huggingface",
     "model_scope": "modelscope",
     "modelscope": "modelscope",
+    "ollama": "ollama_library",
+    "ollama_library": "ollama_library",
 }
 
 
@@ -56,6 +59,32 @@ def normalize_source(source: str | Enum) -> str:
     if canonical is None:
         raise ModelPreheatIdentityError("invalid_source")
     return canonical
+
+
+def ollama_model_filename(model_name: str) -> str:
+    """返回 Ollama 下载器使用的稳定本地文件名。"""
+    if not isinstance(model_name, str) or not model_name:
+        raise ModelPreheatIdentityError("empty_path")
+    filename = re.sub(r"[^a-zA-Z0-9]", "_", model_name)
+    if not filename:
+        raise ModelPreheatIdentityError("empty_path")
+    return filename
+
+
+def local_snapshot_revision(
+    *, source_index: str | None, source: str, resolved_paths: list[str]
+) -> str:
+    """为没有上游不可变 revision 的本地模型生成稳定快照身份。"""
+    if source_index:
+        seed = f"source-index:{source_index}"
+    else:
+        seed = json.dumps(
+            {"source": source, "resolved_paths": sorted(resolved_paths)},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    return f"local-snapshot-{hashlib.sha256(seed.encode('utf-8')).hexdigest()}"
 
 
 def _validate_glob_pattern(pattern: str):

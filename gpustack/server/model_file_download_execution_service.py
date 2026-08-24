@@ -21,13 +21,21 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ProfileLifecycleStateEnum,
 )
 from gpustack.schemas.models import SourceEnum, get_mmproj_filename
-from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
+from gpustack.schemas.workers import (
+    MODEL_STORAGE_PROTOCOL_VERSION,
+    Worker,
+    WorkerStateEnum,
+)
 from gpustack.server.bus import EventType
 from gpustack.server.model_preheat_s3_profile_lifecycle import (
     ModelPreheatS3ProfileNotActive,
     lock_active_profile_for_new_work,
 )
-from gpustack.worker.model_preheat.identity import encode_path, normalize_source
+from gpustack.worker.model_preheat.identity import (
+    encode_path,
+    normalize_source,
+    ollama_model_filename,
+)
 from gpustack.worker.model_preheat.manifest import compute_request_digest
 
 
@@ -114,6 +122,8 @@ async def _current_protocol_worker(session, worker_id: Optional[int]) -> Worker:
     ).first()
     if latest is None or latest.id != worker.id:
         raise ConflictException(message="model_file_worker_stale_registration")
+    if worker.state != WorkerStateEnum.READY:
+        raise ConflictException(message="model_file_worker_not_ready")
     if worker.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
         raise ConflictException(message="model_storage_protocol_mismatch")
     return worker
@@ -140,8 +150,9 @@ def _request_identity(model_file: ModelFile) -> dict:
     if source_value not in {
         SourceEnum.HUGGING_FACE.value,
         SourceEnum.MODEL_SCOPE.value,
+        SourceEnum.OLLAMA_LIBRARY.value,
     }:
-        # 普通 S3 模型库只服务 Hub 来源，其他来源仍需执行记录以保持协议门禁。
+        # 统一模型存储只服务受支持来源；其他来源仍创建执行记录保持协议门禁。
         return {
             "source": source_value,
             "model_id": model_file.model_source_index,
@@ -156,9 +167,17 @@ def _request_identity(model_file: ModelFile) -> dict:
     elif source == "modelscope":
         model_id = model_file.model_scope_model_id
         patterns = [model_file.model_scope_file_path]
+    elif source == SourceEnum.OLLAMA_LIBRARY.value:
+        model_id = model_file.ollama_library_model_name
+        filename = ollama_model_filename(model_id) if model_id else None
+        patterns = [filename, f"{filename}/**"] if filename else []
     if not model_id:
         raise ConflictException(message="model_file_missing_model_id")
-    extra = get_mmproj_filename(model_file)
+    extra = (
+        get_mmproj_filename(model_file)
+        if source in {"huggingface", "modelscope"}
+        else None
+    )
     if extra:
         patterns.append(extra)
     return {
@@ -171,16 +190,8 @@ def _request_identity(model_file: ModelFile) -> dict:
 
 
 def _request_digest(identity: dict) -> str:
-    source = identity["source"]
-    if source not in {"huggingface", "modelscope"}:
-        # 非 Hub 来源不参与 S3 查询，但仍需要稳定的请求摘要。
-        import hashlib
-
-        return hashlib.sha256(
-            json.dumps(identity, separators=(",", ":"), sort_keys=True).encode()
-        ).hexdigest()
     return compute_request_digest(
-        source=source,
+        source=identity["source"],
         model_id=encode_path(identity["model_id"]),
         requested_revision=(
             encode_path(identity["requested_revision"])

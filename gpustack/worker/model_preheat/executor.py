@@ -18,6 +18,7 @@ from gpustack.worker.model_preheat.identity import (
     encode_path,
 )
 from gpustack.worker.model_preheat.local_cache import create_staging_dir
+from gpustack.worker.model_preheat.ollama_artifact import install_ollama_artifact
 from gpustack.worker.model_preheat.manifest import (
     ModelPreheatManifestError,
     build_model_preheat_manifest,
@@ -241,6 +242,27 @@ def execute_target_preheat(
             return _error_result("s3_manifest_invalid")
         target = Path(request.target_dir)
         target.mkdir(parents=True, exist_ok=True)
+        if request.identity.source == "ollama_library":
+            install_ollama_artifact(
+                s3_client,
+                manifest,
+                bucket=request.bucket,
+                prefix=request.prefix,
+                target_root=target,
+                model_id=decode_path(request.identity.model_path),
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
+            _write_local_artifact_marker(request.cache_dir, manifest)
+            return _ready_result(
+                request,
+                s3_client,
+                manifest,
+                transfer_source="s3",
+                uploaded=0,
+                skipped=0,
+                downloaded=1,
+            )
         downloaded = 0
         completed = []
         completed_size = 0

@@ -119,6 +119,7 @@ from gpustack.server.model_preheat_worker_identity import (
     get_model_preheat_worker_identity,
 )
 from gpustack.worker.model_preheat.identity import (
+    local_snapshot_revision,
     ModelPreheatIdentity,
     ModelPreheatIdentityError,
 )
@@ -1125,7 +1126,7 @@ async def refresh_profile_artifacts(
 def _derive_task_identity(model_file: ModelFile):
     """从 ModelFile 推导运行时请求身份（source/model_id/实际文件选择）。
 
-    只支持 ModelScope / Hugging Face 来源；其他来源或字段缺失时拒绝。
+    支持 ModelScope / Hugging Face / Ollama Library 来源；其他来源拒绝。
     ``file_patterns`` 描述模型仓库内的逻辑文件选择，物理绝对路径仅保存在
     ``scan_spec.root`` 供 Worker 扫描，不进入 request digest、Artifact 身份
     或 Manifest 相对路径。
@@ -1150,6 +1151,10 @@ def _derive_task_identity(model_file: ModelFile):
         if not model_file.huggingface_repo_id:
             raise ConflictException(message="model_file_missing_model_id")
         model_id = model_file.huggingface_repo_id
+    elif source == SourceEnum.OLLAMA_LIBRARY.value:
+        if not model_file.ollama_library_model_name:
+            raise ConflictException(message="model_file_missing_model_id")
+        model_id = model_file.ollama_library_model_name
     else:
         raise ConflictException(message="model_sync_source_unsupported")
     if (
@@ -1163,7 +1168,8 @@ def _derive_task_identity(model_file: ModelFile):
     )
     try:
         repository_complete = (
-            model_file.huggingface_filename is None
+            source != SourceEnum.OLLAMA_LIBRARY.value
+            and model_file.huggingface_filename is None
             and model_file.model_scope_file_path is None
         )
         scan_root, raw_patterns = compute_scan_spec(
@@ -1198,20 +1204,16 @@ def _derive_task_identity(model_file: ModelFile):
 
 
 def _local_snapshot_revision(model_file: ModelFile) -> str:
-    source_index = model_file.source_index or model_file.model_source_index
-    if source_index:
-        seed = f"source-index:{source_index}"
-    else:
-        seed = json.dumps(
-            {
-                "source": str(model_file.source),
-                "resolved_paths": sorted(model_file.resolved_paths),
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-    return f"local-snapshot-{hashlib.sha256(seed.encode('utf-8')).hexdigest()}"
+    source = (
+        model_file.source.value
+        if hasattr(model_file.source, "value")
+        else str(model_file.source)
+    )
+    return local_snapshot_revision(
+        source_index=model_file.source_index or model_file.model_source_index,
+        source=source,
+        resolved_paths=list(model_file.resolved_paths),
+    )
 
 
 async def _exact_artifact_match(session, profile, identity) -> Optional[str]:
