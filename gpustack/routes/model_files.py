@@ -3,7 +3,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import inspect
 from sqlalchemy.exc import NoInspectionAvailable
-from sqlmodel import String, cast, func, or_, select
+from sqlmodel import String, cast, func, or_, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import (
@@ -22,11 +22,16 @@ from gpustack.schemas.model_files import (
     ModelFileUpdate,
     ModelFilesPublic,
 )
+from gpustack.schemas.models import SourceEnum
 from gpustack.schemas.model_file_download_executions import (
     ModelFileDownloadExecution,
     ModelFileDownloadExecutionStateEnum,
 )
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_storage_sync import (
+    ModelStorageSyncTask,
+    ModelStorageSyncTaskStateEnum,
+)
 from gpustack.schemas.workers import (
     MODEL_STORAGE_PROTOCOL_VERSION,
     Worker,
@@ -40,6 +45,29 @@ from gpustack.server.bus import EventType
 router = APIRouter()
 
 
+async def lock_model_file_for_sync_or_delete(session, model_file_id: int):
+    """串行化 ModelFile 删除与同步任务创建，避免 CASCADE 吞掉活动任务。"""
+    dialect = session.bind.dialect.name
+    if dialect in {"postgresql", "mysql"}:
+        return (
+            await session.exec(
+                select(ModelFile)
+                .where(ModelFile.id == model_file_id)
+                .with_for_update()
+            )
+        ).first()
+
+    # SQLite 不支持行级 FOR UPDATE；无变化 UPDATE 在当前事务持有写锁。
+    result = await session.exec(
+        update(ModelFile)
+        .where(ModelFile.id == model_file_id)
+        .values(id=ModelFile.id)
+    )
+    if result.rowcount != 1:
+        return None
+    return await session.get(ModelFile, model_file_id)
+
+
 @router.get("", response_model=ModelFilesPublic)
 async def get_model_files(
     engine: EngineDep,
@@ -47,11 +75,17 @@ async def get_model_files(
     params: ListParamsDep,
     search: str = None,
     worker_id: int = None,
+    source: Optional[SourceEnum] = None,
+    state: Optional[ModelFileStateEnum] = None,
 ):
     fields = {}
 
-    if worker_id:
+    if worker_id is not None:
         fields["worker_id"] = worker_id
+    if source is not None:
+        fields["source"] = source
+    if state is not None:
+        fields["state"] = state
 
     def get_filter_func(search):
         if search:
@@ -123,9 +157,15 @@ async def _stream_model_files(engine, fields=None, filter_func=None):
                 persisted = await session.get(ModelFile, _event_model_id(event.data))
                 if persisted is not None:
                     event.data = persisted
-            if not ModelFile._match_fields(event, fields):
-                continue
-            if filter_func and not ModelFile._safe_filter(filter_func, event.data):
+            matches = ModelFile._match_fields(event, fields) and (
+                not filter_func or ModelFile._safe_filter(filter_func, event.data)
+            )
+            if not matches:
+                # UPDATE 离开当前筛选集合时通知客户端移除旧行；对从未进入
+                # 集合的记录发送 DELETE 是幂等的。CREATED 不匹配仍忽略。
+                if event.type == EventType.UPDATED:
+                    event.type = EventType.DELETED
+                    yield ModelFile._format_event(event)
                 continue
             event.data = (await _model_files_public(session, [event.data]))[0]
         yield ModelFile._format_event(event)
@@ -348,7 +388,7 @@ async def update_model_file(
 async def delete_model_file(
     session: SessionDep, id: int, cleanup: Optional[bool] = None
 ):
-    model_file = await ModelFile.one_by_id(session, id)
+    model_file = await lock_model_file_for_sync_or_delete(session, id)
     if not model_file:
         raise NotFoundException(message=f"Model file {id} not found")
 
@@ -360,14 +400,35 @@ async def delete_model_file(
             message=f"Cannot delete the model file. It's being used by model instances: {model_instance_names}.",
         )
 
+    active_sync_task = (
+        await session.exec(
+            select(ModelStorageSyncTask.id).where(
+                ModelStorageSyncTask.model_file_id == model_file.id,
+                ModelStorageSyncTask.state.in_(
+                    (
+                        ModelStorageSyncTaskStateEnum.PENDING,
+                        ModelStorageSyncTaskStateEnum.SCANNING,
+                        ModelStorageSyncTaskStateEnum.PUBLISHING,
+                    )
+                ),
+            )
+        )
+    ).first()
+    if active_sync_task is not None:
+        raise ConflictException(message="model_file_has_active_sync_task")
+
+    # cleanup、活动任务检查与 DELETE 必须留在同一个事务中。ActiveRecord 的
+    # update/delete helper 会分别提交，导致父记录锁在真正删除前被释放。
+    event_snapshot = ModelFile.model_validate(model_file.model_dump())
     try:
         if cleanup is not None and model_file.cleanup_on_delete != cleanup:
             model_file.cleanup_on_delete = cleanup
-            await model_file.update(session)
-
-        await model_file.delete(session)
+        await session.delete(model_file)
+        await session.commit()
     except Exception as e:
+        await session.rollback()
         raise InternalServerErrorException(message=f"Failed to delete model file: {e}")
+    await ModelFile._publish_event(EventType.DELETED, event_snapshot)
 
 
 @router.post("/{id}/reset", response_model=ModelFilePublic)

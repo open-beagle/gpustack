@@ -48,6 +48,7 @@ from gpustack.model_preheat_credentials import (
     ModelPreheatCredentialError,
 )
 from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
+from gpustack.routes.model_files import lock_model_file_for_sync_or_delete
 from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3Profile,
     ModelPreheatS3ProfileLifecycleStateEnum,
@@ -279,7 +280,7 @@ async def create_model_storage_sync_task(
             raise HTTPException(409, "idempotency_key_reused", "idempotency_key_reused")
 
     # 现在才读取/验证 ModelFile、Profile、revision/path/READY、Worker 与密钥。
-    model_file = await ModelFile.one_by_id(session, mf_id)
+    model_file = await lock_model_file_for_sync_or_delete(session, mf_id)
     if model_file is None:
         raise NotFoundException(message="model_file_not_found")
 
