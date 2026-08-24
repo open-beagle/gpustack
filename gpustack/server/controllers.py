@@ -637,7 +637,13 @@ class WorkerController:
                 or event.type == EventType.DELETED
             ):
                 instance_names = [instance.name for instance in instances]
-                for instance in instances:
+                instance_ids = [event_model_id(instance) for instance in instances]
+                for instance_id in instance_ids:
+                    if instance_id is None:
+                        continue
+                    instance = await ModelInstance.one_by_id(session, instance_id)
+                    if not instance:
+                        continue
                     await ModelInstanceService(session).delete(instance)
 
                 if instance_names:
@@ -650,6 +656,8 @@ class WorkerController:
                         f"Delete instance {', '.join(instance_names)} "
                         f"since worker {worker_name} is {state}"
                     )
+                if event.type == EventType.DELETED:
+                    return
 
             if worker_state == WorkerStateEnum.READY:
                 await self.update_instance_states(

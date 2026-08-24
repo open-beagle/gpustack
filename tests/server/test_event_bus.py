@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from gpustack.schemas.links import ModelInstanceModelFileLink
+from gpustack.schemas.model_files import ModelFile
 from gpustack.server import bus as bus_module
 from gpustack.server.bus import Event, EventBus, EventType, event_bus
 from gpustack.server.controllers import set_default_worker_selector
@@ -15,6 +17,7 @@ from gpustack.schemas.models import (
     ModelInstancePublic,
     SourceEnum,
 )
+from gpustack.schemas.users import User
 from gpustack.schemas.workers import Worker, WorkerPublic, WorkerStateEnum
 
 
@@ -43,6 +46,167 @@ async def test_publish_model_instance_event_uses_fixed_public_snapshot():
         assert event.data.name == "instance-7"
     finally:
         event_bus.unsubscribe(topic, subscriber)
+
+
+@pytest.mark.asyncio
+async def test_deleted_model_instance_event_uses_public_snapshot_with_timestamps(
+    tmp_path,
+):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'model-instance-event.db'}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            SQLModel.metadata.create_all,
+            tables=[
+                ModelInstance.__table__,
+                ModelFile.__table__,
+                ModelInstanceModelFileLink.__table__,
+            ],
+        )
+
+    subscriber = event_bus.subscribe("modelinstance", public_snapshot=True)
+    try:
+        async with AsyncSession(engine, expire_on_commit=True) as session:
+            instance = ModelInstance(
+                name="instance-7",
+                model_id=3,
+                model_name="model-a",
+                source=SourceEnum.LOCAL_PATH,
+                local_path="/models/a",
+            )
+            session.add(instance)
+            await session.commit()
+
+            await instance.delete(session)
+
+        event = await asyncio.wait_for(subscriber.receive(), timeout=1)
+        assert event.type == EventType.DELETED
+        assert isinstance(event.data, ModelInstancePublic)
+        assert event.data.id is not None
+        assert event.data.created_at is not None
+        assert event.data.updated_at is not None
+    finally:
+        event_bus.unsubscribe("modelinstance", subscriber)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_deleted_model_instance_snapshot_isolates_mutable_columns(tmp_path):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'model-instance-snapshot.db'}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            SQLModel.metadata.create_all,
+            tables=[
+                ModelInstance.__table__,
+                ModelFile.__table__,
+                ModelInstanceModelFileLink.__table__,
+            ],
+        )
+
+    subscriber = event_bus.subscribe("modelinstance")
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            instance = ModelInstance(
+                name="instance-8",
+                model_id=3,
+                model_name="model-a",
+                source=SourceEnum.LOCAL_PATH,
+                local_path="/models/a",
+                gpu_indexes=[0],
+                ports=[8000],
+            )
+            session.add(instance)
+            await session.commit()
+
+            await instance.delete(session)
+            instance.gpu_indexes.append(1)
+
+        event = await asyncio.wait_for(subscriber.receive(), timeout=1)
+        assert event.type == EventType.DELETED
+        assert event.data.gpu_indexes == [0]
+        assert event.data.gpu_indexes is not instance.gpu_indexes
+    finally:
+        event_bus.unsubscribe("modelinstance", subscriber)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_delete_detached_user_reloads_current_session_instance(tmp_path):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'user-delete.db'}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            SQLModel.metadata.create_all, tables=[User.__table__]
+        )
+
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            user = User(username="detached-user", hashed_password="hashed-password")
+            session.add(user)
+            await session.commit()
+
+            detached_user = await User.one_by_id(session, user.id)
+            session.expunge(detached_user)
+            await detached_user.delete(session)
+
+            assert await User.one_by_id(session, user.id) is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_delete_skips_model_instance_removed_by_another_session(tmp_path):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'model-instance-race.db'}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            SQLModel.metadata.create_all,
+            tables=[
+                Model.__table__,
+                ModelInstance.__table__,
+                ModelFile.__table__,
+                ModelInstanceModelFileLink.__table__,
+            ],
+        )
+
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            session.add(
+                Model(
+                    id=3,
+                    name="model-a",
+                    source=SourceEnum.LOCAL_PATH,
+                    local_path="/models/a",
+                )
+            )
+            instance = ModelInstance(
+                name="instance-race",
+                model_id=3,
+                model_name="model-a",
+                source=SourceEnum.LOCAL_PATH,
+                local_path="/models/a",
+            )
+            session.add(instance)
+            await session.commit()
+            instance_id = instance.id
+
+        async with AsyncSession(engine) as first_session:
+            stale_instance = await ModelInstance.one_by_id(first_session, instance_id)
+            async with AsyncSession(engine) as second_session:
+                current_instance = await ModelInstance.one_by_id(
+                    second_session, instance_id
+                )
+                await current_instance.delete(second_session)
+
+            await stale_instance.delete(first_session)
+            assert await ModelInstance.one_by_id(first_session, instance_id) is None
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

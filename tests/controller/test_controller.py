@@ -12,6 +12,8 @@ from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.models import (
     ComputedResourceClaim,
     GPUSelector,
+    Model,
+    ModelInstance,
     ModelPlacementOverride,
     PlacementOverrideReplicaGroup,
     ModelInstanceStateEnum,
@@ -149,6 +151,149 @@ def test_worker_reconcile_skips_expired_event_data_without_implicit_io():
         )
 
     list_mock.assert_not_awaited()
+
+
+def test_worker_reconcile_deletes_multiple_instances_after_each_commit(tmp_path):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'worker-instance-delete.db'}"
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                SQLModel.metadata.create_all,
+                tables=[
+                    Model.__table__,
+                    ModelInstance.__table__,
+                    ModelFile.__table__,
+                    ModelInstanceModelFileLink.__table__,
+                ],
+            )
+
+        async with AsyncSession(engine) as session:
+            session.add(
+                Model(
+                    id=3,
+                    name="model-a",
+                    source=SourceEnum.LOCAL_PATH,
+                    local_path="/models/a",
+                )
+            )
+            session.add_all(
+                [
+                    ModelInstance(
+                        name="instance-1",
+                        model_id=3,
+                        model_name="model-a",
+                        worker_name="worker-a",
+                        source=SourceEnum.LOCAL_PATH,
+                        local_path="/models/a",
+                    ),
+                    ModelInstance(
+                        name="instance-2",
+                        model_id=3,
+                        model_name="model-a",
+                        worker_name="worker-a",
+                        source=SourceEnum.LOCAL_PATH,
+                        local_path="/models/a",
+                    ),
+                ]
+            )
+            await session.commit()
+
+        controller = WorkerController.__new__(WorkerController)
+        controller._engine = engine
+        with patch(
+            "gpustack.server.services.delete_cache_by_key", new=AsyncMock()
+        ):
+            await controller._reconcile(
+                Event(
+                    type=EventType.DELETED,
+                    data=Worker(
+                        name="worker-a",
+                        hostname="worker-a",
+                        ip="127.0.0.1",
+                        port=10150,
+                        worker_uuid="worker-a-uuid",
+                        state=WorkerStateEnum.READY,
+                    ),
+                ),
+        )
+
+        async with AsyncSession(engine) as session:
+            instances = await ModelInstance.all_by_field(
+                session, "worker_name", "worker-a"
+            )
+            assert instances == []
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_worker_deleted_event_does_not_restore_unreachable_instances(tmp_path):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'worker-unreachable-delete.db'}"
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                SQLModel.metadata.create_all,
+                tables=[
+                    Model.__table__,
+                    ModelInstance.__table__,
+                    ModelFile.__table__,
+                    ModelInstanceModelFileLink.__table__,
+                ],
+            )
+
+        async with AsyncSession(engine) as session:
+            session.add(
+                Model(
+                    id=3,
+                    name="model-a",
+                    source=SourceEnum.LOCAL_PATH,
+                    local_path="/models/a",
+                )
+            )
+            session.add(
+                ModelInstance(
+                    name="instance-unreachable",
+                    model_id=3,
+                    model_name="model-a",
+                    worker_name="worker-a",
+                    source=SourceEnum.LOCAL_PATH,
+                    local_path="/models/a",
+                    state=ModelInstanceStateEnum.UNREACHABLE,
+                )
+            )
+            await session.commit()
+
+        controller = WorkerController.__new__(WorkerController)
+        controller._engine = engine
+        with patch(
+            "gpustack.server.services.delete_cache_by_key", new=AsyncMock()
+        ):
+            await controller._reconcile(
+                Event(
+                    type=EventType.DELETED,
+                    data=Worker(
+                        name="worker-a",
+                        hostname="worker-a",
+                        ip="127.0.0.1",
+                        port=10150,
+                        worker_uuid="worker-a-uuid",
+                        state=WorkerStateEnum.READY,
+                    ),
+                ),
+        )
+
+        async with AsyncSession(engine) as session:
+            instances = await ModelInstance.all_by_field(
+                session, "worker_name", "worker-a"
+            )
+            assert instances == []
+        await engine.dispose()
+
+    asyncio.run(run())
 
 
 def test_worker_reconcile_reloads_attached_expired_event_by_identity(tmp_path):

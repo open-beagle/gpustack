@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from datetime import datetime, timedelta, timezone
 import importlib
 import json
@@ -8,10 +9,10 @@ from typing import Any, AsyncGenerator, Callable, List, Optional, Union, Tuple
 
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, inspect as sa_inspect
 from sqlmodel import SQLModel, and_, asc, col, desc, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
 from sqlalchemy.orm.exc import FlushError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from gpustack.schemas.common import PaginatedList, Pagination
@@ -309,24 +310,46 @@ class ActiveRecordMixin:
     async def delete(self, session: AsyncSession):
         """Delete the object from the database."""
 
-        if self._has_cascade_delete():
-            if hasattr(self, "deleted_at"):
-                # timestamp is stored without timezone in db
-                self.deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                await self.save(session)
-            await self._handle_cascade_delete(session)
+        record = self
+        record_state = sa_inspect(record)
+        if record_state.detached:
+            if not record_state.identity:
+                return
+            record = await session.get(record.__class__, record_state.identity)
+            if record is None:
+                return
 
-        event_snapshot = self.__class__.model_validate(
-            self.model_dump(),
-            update={
-                key: value
-                for key, value in getattr(self, "__dict__", {}).items()
-                if not key.startswith("_")
-            },
-        )
-        await session.delete(self)
+        if record._has_cascade_delete():
+            if hasattr(record, "deleted_at"):
+                # timestamp is stored without timezone in db
+                record.deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                await record.save(session)
+            await record._handle_cascade_delete(session)
+
+        column_keys = [column.key for column in record.__mapper__.column_attrs]
+        try:
+            await session.refresh(record, attribute_names=column_keys)
+        except InvalidRequestError as exc:
+            if not str(exc).startswith("Could not refresh instance"):
+                raise
+            record_identity = sa_inspect(record).identity
+            if not record_identity:
+                raise
+            await session.rollback()
+            if sa_inspect(record).session is session:
+                session.expunge(record)
+            if await session.get(record.__class__, record_identity) is None:
+                return
+            raise
+        snapshot_values = {
+            column_key: copy.deepcopy(getattr(record, column_key))
+            for column_key in column_keys
+        }
+        event_snapshot = record.__class__.model_validate(snapshot_values)
+        event_snapshot.__dict__.update(snapshot_values)
+        await session.delete(record)
         await session.commit()
-        await self._publish_event(EventType.DELETED, event_snapshot)
+        await record._publish_event(EventType.DELETED, event_snapshot)
 
     async def _handle_cascade_delete(self, session: AsyncSession):
         """Handle cascading deletes for all defined relationships."""
