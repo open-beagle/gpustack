@@ -83,6 +83,11 @@ class ModelPreheatBackfillPolicyEnum(str, Enum):
     NEVER = "never"
 
 
+class ModelPreheatDeliveryModeEnum(str, Enum):
+    S3_ONLY = "s3_only"
+    S3_AND_WORKERS = "s3_and_workers"
+
+
 class ModelPreheatTargetScopeEnum(str, Enum):
     SEED_WORKER = "seed_worker"
     SAME_GPU_MODEL = "same_gpu_model"
@@ -142,9 +147,14 @@ class ModelPreheatTask(SQLModel, BaseModelMixin, table=True):
     s3_profile_snapshot_encrypted: dict = Field(sa_column=Column(JSON, nullable=False))
     encryption_key_version: str
     s3_backfill_policy: ModelPreheatBackfillPolicyEnum
+    delivery_mode: ModelPreheatDeliveryModeEnum = (
+        ModelPreheatDeliveryModeEnum.S3_AND_WORKERS
+    )
     s3_manifest_path: Optional[str] = None
     manifest_digest: Optional[str] = None
     keep_new_workers_in_sync: bool = False
+    # 最近一次连通性明确失败时，调用方必须显式确认继续执行；该值属于请求审计。
+    connectivity_failure_override: bool = False
     # 任务执行结果来源字段：模型身份（source/model_id/revision）保持不变，
     # 这些字段仅记录本次传输路径，不参与 Artifact ID 计算。
     transfer_source: Optional[str] = None
@@ -555,7 +565,11 @@ class ModelPreheatCreate(SQLModel):
     s3_backfill_policy: ModelPreheatBackfillPolicyEnum = (
         ModelPreheatBackfillPolicyEnum.WHEN_MISSING
     )
+    delivery_mode: ModelPreheatDeliveryModeEnum = (
+        ModelPreheatDeliveryModeEnum.S3_AND_WORKERS
+    )
     keep_new_workers_in_sync: bool = False
+    connectivity_failure_override: bool = False
 
     @field_validator("target_worker_ids")
     @classmethod
@@ -607,6 +621,17 @@ class ModelPreheatCreate(SQLModel):
 
     @model_validator(mode="after")
     def validate_target_scope(self):
+        if self.source == "ollama_library" and (
+            self.include_patterns or self.exclude_patterns
+        ):
+            raise ValueError("ollama_patterns_unsupported")
+        if (
+            self.keep_new_workers_in_sync
+            and self.delivery_mode != ModelPreheatDeliveryModeEnum.S3_AND_WORKERS
+        ):
+            raise ValueError("keep_new_workers_requires_s3_and_workers")
+        if self.delivery_mode == ModelPreheatDeliveryModeEnum.S3_ONLY:
+            return self
         if (
             self.target_scope == ModelPreheatTargetScopeEnum.SELECTED_WORKERS
             and not self.target_worker_ids
@@ -630,7 +655,7 @@ class ModelPreheatTaskPublic(SQLModel):
     source: str
     model_id: str
     requested_revision: Optional[str] = None
-    resolved_revision: str
+    resolved_revision: Optional[str] = None
     include_patterns: list[str]
     exclude_patterns: list[str]
     selection_digest: str
@@ -646,7 +671,9 @@ class ModelPreheatTaskPublic(SQLModel):
     s3_profile_id: int
     s3_profile_config_version: int
     s3_backfill_policy: ModelPreheatBackfillPolicyEnum
+    delivery_mode: ModelPreheatDeliveryModeEnum
     keep_new_workers_in_sync: bool
+    connectivity_failure_override: bool = False
     transfer_source: Optional[str] = None
     transfer_profile_id: Optional[int] = None
     source_worker_id: Optional[int] = None
@@ -683,10 +710,12 @@ def operation_key_for(
     request_digest: str,
     target_worker_uuids: list[str],
     backfill_policy: ModelPreheatBackfillPolicyEnum,
+    delivery_mode: ModelPreheatDeliveryModeEnum = ModelPreheatDeliveryModeEnum.S3_AND_WORKERS,
 ) -> str:
     payload = json.dumps(
         {
             "backfill_policy": backfill_policy.value,
+            "delivery_mode": delivery_mode.value,
             "request_digest": request_digest,
             "profile_id": profile_id,
             "target_worker_uuids": sorted(target_worker_uuids),
@@ -715,3 +744,6 @@ from gpustack.schemas import (
 from gpustack.schemas import (
     model_preheat_distribution_policies as _distribution_policies,
 )  # noqa: E402,F401
+
+# 分发策略也引用同步任务，确保仅导入预热 schema 的 SQLite 测试可建立完整元数据。
+from gpustack.schemas import model_storage_sync as _model_storage_sync  # noqa: E402,F401

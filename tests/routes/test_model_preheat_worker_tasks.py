@@ -34,6 +34,10 @@ from gpustack.server.model_preheat_worker_identity import (
     get_model_preheat_worker_identity,
 )
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
+from gpustack.worker.model_preheat.executor import (
+    SeedExecutionRequest,
+    execute_seed_preheat,
+)
 
 
 API_PREFIX = "/v1/model-preheat-worker-tasks"
@@ -75,12 +79,20 @@ def _test_app(tmp_path):
     return app, engine, key
 
 
-async def _seed(engine, key, *, artifact_id=None):
+async def _seed(
+    engine,
+    key,
+    *,
+    artifact_id=None,
+    source="modelscope",
+    model_id="Qwen/Test",
+    resolved_revision="a" * 40,
+):
     cipher = ModelPreheatCredentialCipher(key, "v1")
     identity = ModelPreheatIdentity(
-        source="modelscope",
-        model_id="Qwen/Test",
-        revision="a" * 40,
+        source=source,
+        model_id=model_id,
+        revision=resolved_revision,
         requested_revision="master",
         file_patterns=(),
     )
@@ -120,10 +132,10 @@ async def _seed(engine, key, *, artifact_id=None):
         session.add_all([worker, profile])
         await session.flush()
         task = ModelPreheatTask(
-            source="modelscope",
-            model_id="Qwen/Test",
+            source=source,
+            model_id=model_id,
             requested_revision="master",
-            resolved_revision="a" * 40,
+            resolved_revision=resolved_revision,
             include_patterns=[],
             exclude_patterns=[],
             selection_digest="b" * 64,
@@ -186,6 +198,7 @@ def _ready_result(request_digest, artifact_id="c" * 64):
         "uploaded": 2,
         "skipped": 0,
         "downloaded": 0,
+        "resolved_revision": "a" * 40,
     }
 
 
@@ -377,6 +390,211 @@ def test_seed_complete_cas_binds_artifact_and_inventory(tmp_path):
     assert parent.transfer_source == "modelscope"
     assert len(artifacts) == 1
     assert artifacts[0].profile_config_version == 3
+    asyncio.run(engine.dispose())
+
+
+@pytest.mark.parametrize(
+    ("source", "model_id", "revision", "filename"),
+    [
+        ("huggingface", "org/model", "b" * 40, "config.json"),
+        ("modelscope", "Qwen/Test", "a" * 40, "config.json"),
+        ("ollama_library", "llama3:latest", "sha256:" + "c" * 64, "llama3_latest"),
+    ],
+)
+def test_seed_complete_accepts_real_executor_ready_result(
+    tmp_path, source, model_id, revision, filename
+):
+    app, engine, key = _test_app(tmp_path)
+    child_id, task_id, request_digest = asyncio.run(
+        _seed(
+            engine,
+            key,
+            source=source,
+            model_id=model_id,
+            resolved_revision=revision,
+        )
+    )
+    identity = ModelPreheatIdentity(
+        source=source,
+        model_id=model_id,
+        revision=revision,
+        requested_revision="master",
+        file_patterns=(),
+    )
+
+    class FakeS3:
+        def publish_artifact(self, bucket, prefix, manifest, staging, **kwargs):
+            del bucket, prefix, staging, kwargs
+            self.manifest = manifest
+            return SimpleNamespace(uploaded=len(manifest.files) + 1, skipped=0)
+
+        def artifact_manifest_object(self, prefix, manifest):
+            return f"{prefix}/{manifest.artifact_id}/manifest.json"
+
+    request = SeedExecutionRequest(
+        cache_dir=tmp_path / "cache",
+        target_dir=tmp_path / "target",
+        task_id=task_id,
+        attempt=1,
+        request_digest=request_digest,
+        identity=identity,
+        exclude_patterns=(),
+        bucket="models",
+        prefix="model-storage",
+        source_fallback_enabled=True,
+    )
+    result = execute_seed_preheat(
+        request,
+        FakeS3(),
+        download_to_staging=lambda _identity, staging, **kwargs: (
+            staging / filename
+        ).write_bytes(b"config"),
+    )
+    assert result["state"] == "ready"
+    assert result["resolved_revision"] == revision
+
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+            artifact = (await session.exec(select(ModelPreheatArtifact))).one()
+            return parent, artifact
+
+    parent, artifact = asyncio.run(inspect())
+    assert completed.status_code == 200, completed.text
+    assert parent.resolved_revision == revision
+    assert artifact.resolved_revision == revision
+    asyncio.run(engine.dispose())
+
+
+def test_pending_ollama_complete_binds_only_actual_local_snapshot(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    child_id, task_id, request_digest = asyncio.run(
+        _seed(
+            engine,
+            key,
+            source="ollama_library",
+            model_id="llama3:latest",
+            resolved_revision="ollama-pending",
+        )
+    )
+    identity = ModelPreheatIdentity(
+        source="ollama_library",
+        model_id="llama3:latest",
+        revision="ollama-pending",
+        requested_revision="master",
+        file_patterns=(),
+    )
+
+    class FakeS3:
+        def publish_artifact(self, bucket, prefix, manifest, staging, **kwargs):
+            del bucket, prefix, staging, kwargs
+            return SimpleNamespace(uploaded=len(manifest.files) + 1, skipped=0)
+
+        def artifact_manifest_object(self, prefix, manifest):
+            return f"{prefix}/{manifest.artifact_id}/manifest.json"
+
+    request = SeedExecutionRequest(
+        cache_dir=tmp_path / "cache",
+        target_dir=tmp_path / "target",
+        task_id=task_id,
+        attempt=1,
+        request_digest=request_digest,
+        identity=identity,
+        exclude_patterns=(),
+        bucket="models",
+        prefix="model-storage",
+        source_fallback_enabled=True,
+    )
+    result = execute_seed_preheat(
+        request,
+        FakeS3(),
+        download_to_staging=lambda _identity, staging, **kwargs: (
+            staging / "llama3_latest"
+        ).write_bytes(b"ollama"),
+    )
+    assert result["resolved_revision"].startswith("local-snapshot-")
+
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+            artifact = (await session.exec(select(ModelPreheatArtifact))).one()
+            return parent, artifact
+    parent, artifact = asyncio.run(inspect())
+    assert completed.status_code == 200, completed.text
+    assert parent.resolved_revision == result["resolved_revision"]
+    assert artifact.resolved_revision == result["resolved_revision"]
+    asyncio.run(engine.dispose())
+
+
+@pytest.mark.parametrize(
+    "resolved_revision",
+    ["local-snapshot-x", "local-snapshot-" + "A" * 64, "local-snapshot-" + "a" * 63, 1, [], None],
+)
+def test_pending_ollama_complete_rejects_malformed_snapshot_without_binding(
+    tmp_path, resolved_revision
+):
+    app, engine, key = _test_app(tmp_path)
+    child_id, task_id, request_digest = asyncio.run(
+        _seed(
+            engine,
+            key,
+            source="ollama_library",
+            model_id="llama3:latest",
+            resolved_revision="ollama-pending",
+        )
+    )
+    result = _ready_result(request_digest)
+    result["transfer_source"] = "ollama_library"
+    result["resolved_revision"] = resolved_revision
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+            artifacts = (await session.exec(select(ModelPreheatArtifact))).all()
+            return parent.artifact_id, artifacts
+
+    artifact_id, artifacts = asyncio.run(inspect())
+    assert completed.status_code == 422, completed.text
+    assert completed.json()["message"] == "invalid_preheat_result"
+    assert artifact_id is None
+    assert artifacts == []
     asyncio.run(engine.dispose())
 
 

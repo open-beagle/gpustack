@@ -2,6 +2,8 @@ import hashlib
 import json
 import re
 
+import requests
+
 from huggingface_hub import HfApi
 from modelscope.hub.api import HubApi
 from modelscope_hub.api import HubApi as ModelScopeHubApi
@@ -15,6 +17,7 @@ class ModelPreheatRevisionResolutionError(ValueError):
 
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 MODELSCOPE_FILELIST_REVISION_PREFIX = "modelscope-filelist-v1-"
+_OLLAMA_DIGEST = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
 
 
 def resolve_model_preheat_revision(
@@ -26,9 +29,19 @@ def resolve_model_preheat_revision(
     hf_api_factory=HfApi,
     modelscope_api_factory=HubApi,
     modelscope_file_api_factory=ModelScopeHubApi,
-) -> str:
+    ollama_digest_resolver=None,
+) -> str | None:
     try:
         normalized_source = normalize_source(source)
+        if normalized_source == "ollama_library":
+            resolver = ollama_digest_resolver or _resolve_ollama_registry_digest
+            digest = resolver(model_id, requested_revision)
+            if digest is None:
+                # tag 是可变别名；由 Seed 下载后的实际单文件快照完成二阶段绑定。
+                return None
+            if not isinstance(digest, str) or not _OLLAMA_DIGEST.fullmatch(digest):
+                raise ValueError("invalid_ollama_digest")
+            return digest.lower()
         if isinstance(requested_revision, str) and _COMMIT_SHA.fullmatch(
             requested_revision
         ):
@@ -75,6 +88,20 @@ def resolve_model_preheat_revision(
         raise ModelPreheatRevisionResolutionError(
             "remote_revision_resolution_failed"
         ) from None
+
+
+def _resolve_ollama_registry_digest(model_id: str, requested_revision: str | None):
+    repo, tag = model_id.rsplit(":", 1) if ":" in model_id else (model_id, "latest")
+    if "/" not in repo:
+        repo = f"library/{repo}"
+    response = requests.get(
+        f"https://registry.ollama.ai/v2/{repo}/manifests/{requested_revision or tag}",
+        headers={"Accept": "application/vnd.docker.distribution.manifest.v2+json"},
+        timeout=10,
+    )
+    if response.status_code != 200:
+        return None
+    return response.headers.get("Docker-Content-Digest")
 
 
 def _is_safe_modelscope_revision(value: object) -> bool:

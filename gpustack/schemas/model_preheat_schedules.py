@@ -12,6 +12,7 @@ from gpustack.mixins import BaseModelMixin
 from gpustack.schemas.common import JSON, PaginatedList, UTCDateTime
 from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
+    ModelPreheatDeliveryModeEnum,
     ModelPreheatTargetScopeEnum,
 )
 from gpustack.worker.model_preheat.identity import (
@@ -86,7 +87,11 @@ class ModelPreheatSchedule(SQLModel, BaseModelMixin, table=True):
     s3_backfill_policy: ModelPreheatBackfillPolicyEnum = (
         ModelPreheatBackfillPolicyEnum.WHEN_MISSING
     )
+    delivery_mode: ModelPreheatDeliveryModeEnum = (
+        ModelPreheatDeliveryModeEnum.S3_AND_WORKERS
+    )
     keep_new_workers_in_sync: bool = False
+    connectivity_failure_override: bool = False
     created_by_user_id: Optional[int] = Field(
         default=None,
         sa_column=Column(
@@ -181,7 +186,11 @@ class ModelPreheatScheduleBase(SQLModel):
     s3_backfill_policy: ModelPreheatBackfillPolicyEnum = (
         ModelPreheatBackfillPolicyEnum.WHEN_MISSING
     )
+    delivery_mode: ModelPreheatDeliveryModeEnum = (
+        ModelPreheatDeliveryModeEnum.S3_AND_WORKERS
+    )
     keep_new_workers_in_sync: bool = False
+    connectivity_failure_override: bool = False
 
     @field_validator("name")
     @classmethod
@@ -254,11 +263,22 @@ class ModelPreheatScheduleBase(SQLModel):
 
     @model_validator(mode="after")
     def validate_target(self):
+        if self.source == "ollama_library" and (
+            self.include_patterns or self.exclude_patterns
+        ):
+            raise ValueError("ollama_patterns_unsupported")
         if self.trigger_mode == ModelPreheatScheduleTriggerModeEnum.SCHEDULED:
             if self.cron_expression is None:
                 raise ValueError("cron_expression_required")
         else:
             self.cron_expression = None
+        if (
+            self.keep_new_workers_in_sync
+            and self.delivery_mode != ModelPreheatDeliveryModeEnum.S3_AND_WORKERS
+        ):
+            raise ValueError("keep_new_workers_requires_s3_and_workers")
+        if self.delivery_mode == ModelPreheatDeliveryModeEnum.S3_ONLY:
+            return self
         if (
             self.target_scope == ModelPreheatTargetScopeEnum.SELECTED_WORKERS
             and not self.target_worker_uuids
@@ -308,7 +328,9 @@ class ModelPreheatScheduleUpdate(SQLModel):
     seed_worker_uuid: Optional[str] = None
     s3_profile_id: Optional[int] = None
     s3_backfill_policy: Optional[ModelPreheatBackfillPolicyEnum] = None
+    delivery_mode: Optional[ModelPreheatDeliveryModeEnum] = None
     keep_new_workers_in_sync: Optional[bool] = None
+    connectivity_failure_override: Optional[bool] = None
 
     @field_validator("enabled")
     @classmethod

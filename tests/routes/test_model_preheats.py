@@ -1195,7 +1195,7 @@ def test_task_target_snapshot_does_not_change_when_worker_is_deleted(tmp_path):
     ]
 
 
-def test_creation_rejects_profile_that_is_not_available_on_all_workers(tmp_path):
+def test_creation_allows_partial_connectivity_when_target_is_available(tmp_path):
     app, engine = _test_app(tmp_path)
 
     async def seed():
@@ -1209,8 +1209,7 @@ def test_creation_rejects_profile_that_is_not_available_on_all_workers(tmp_path)
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 
-    assert response.status_code == 422
-    assert response.json()["message"] == "s3_unavailable_on_workers"
+    assert response.status_code == 200, response.text
 
 
 def test_creation_reuses_successful_connectivity_after_ttl(tmp_path):
@@ -1396,7 +1395,7 @@ def test_creation_rejects_selected_worker_that_is_not_online(tmp_path):
     assert response.json()["message"] == "target_workers_not_online"
 
 
-def test_creation_rejects_check_that_does_not_cover_new_online_worker(tmp_path):
+def test_creation_allows_check_that_does_not_cover_new_online_worker(tmp_path):
     app, engine = _test_app(tmp_path)
 
     async def seed():
@@ -1423,11 +1422,10 @@ def test_creation_rejects_check_that_does_not_cover_new_online_worker(tmp_path):
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 
-    assert response.status_code == 422
-    assert response.json()["message"] == "s3_unavailable_on_workers"
+    assert response.status_code == 200, response.text
 
 
-def test_creation_rejects_check_worker_without_ready_result(tmp_path):
+def test_creation_requires_explicit_override_for_recent_connectivity_failure(tmp_path):
     app, engine = _test_app(tmp_path)
 
     async def seed():
@@ -1453,15 +1451,25 @@ def test_creation_rejects_check_worker_without_ready_result(tmp_path):
     profile_id, worker_id = asyncio.run(seed())
     with TestClient(app) as client:
         response = client.post(API_PREFIX, json=payload(profile_id, [worker_id]))
+        overridden = client.post(
+            API_PREFIX,
+            json=payload(
+                profile_id,
+                [worker_id],
+                connectivity_failure_override=True,
+            ),
+        )
 
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 
     assert response.status_code == 422
-    assert response.json()["message"] == "s3_unavailable_on_workers"
+    assert response.json()["message"] == "s3_unavailable_on_workers_confirmation_required"
+    assert overridden.status_code == 200, overridden.text
+    assert overridden.json()["connectivity_failure_override"] is True
 
 
-def test_creation_rejects_available_profile_without_connectivity_check(tmp_path):
+def test_creation_allows_available_profile_without_connectivity_check(tmp_path):
     app, engine = _test_app(tmp_path)
 
     async def seed():
@@ -1481,11 +1489,10 @@ def test_creation_rejects_available_profile_without_connectivity_check(tmp_path)
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 
-    assert response.status_code == 422
-    assert response.json()["message"] == "s3_unavailable_on_workers"
+    assert response.status_code == 200, response.text
 
 
-def test_creation_rejects_connectivity_check_for_old_profile_version(tmp_path):
+def test_creation_allows_connectivity_check_for_old_profile_version(tmp_path):
     app, engine = _test_app(tmp_path)
 
     async def seed():
@@ -1505,8 +1512,7 @@ def test_creation_rejects_connectivity_check_for_old_profile_version(tmp_path):
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 
-    assert response.status_code == 422
-    assert response.json()["message"] == "s3_unavailable_on_workers"
+    assert response.status_code == 200, response.text
 
 
 def test_get_and_list_return_public_tasks_without_profile_snapshot(tmp_path):

@@ -16,11 +16,14 @@ from gpustack.worker.model_preheat.identity import (
     ModelPreheatIdentity,
     decode_path,
     encode_path,
+    local_snapshot_revision,
+    ollama_model_filename,
 )
 from gpustack.worker.model_preheat.local_cache import create_staging_dir
 from gpustack.worker.model_preheat.ollama_artifact import install_ollama_artifact
 from gpustack.worker.model_preheat.manifest import (
     ModelPreheatManifestError,
+    _sha256_file,
     build_model_preheat_manifest,
 )
 from gpustack.worker.model_preheat.s3_client import (
@@ -70,6 +73,7 @@ class SeedExecutionRequest:
     bandwidth_limit_mbps: int | None = None
     resumable_cursor: dict | None = None
     trusted_local_candidate: TrustedLocalCandidate | None = None
+    install_local: bool = True
 
 
 @dataclass(frozen=True)
@@ -176,17 +180,46 @@ def execute_seed_preheat(
                 )
 
                 downloader = download_resolved_revision_to_staging
-            downloader(
-                request.identity,
-                staging,
-                token=source_token,
-                exclude_patterns=request.exclude_patterns,
-                cancel_check=cancel_check,
-                progress_callback=progress_callback,
+            download_kwargs = {
+                "token": source_token,
+                "exclude_patterns": request.exclude_patterns,
+                "cancel_check": cancel_check,
+                "progress_callback": progress_callback,
+            }
+            if request.identity.source == "ollama_library":
+                download_kwargs["private_cache_dir"] = request.cache_dir / ".ollama-auth"
+            downloader(request.identity, staging, **download_kwargs)
+        identity = request.identity
+        if identity.source == "ollama_library" and identity.revision == "ollama-pending":
+            filename = ollama_model_filename(decode_path(identity.model_path))
+            blob = staging / filename
+            if not blob.is_file():
+                return _error_result("ollama_artifact_invalid")
+            _validate_ollama_staging(staging, filename)
+            identity = ModelPreheatIdentity(
+                source=identity.source,
+                model_id=decode_path(identity.model_path),
+                revision=local_snapshot_revision(
+                    source_index=_sha256_file(
+                        blob,
+                        (lambda: _raise_if_cancelled(cancel_check))
+                        if cancel_check is not None
+                        else None,
+                    ),
+                    source=identity.source,
+                    resolved_paths=[filename],
+                ),
+                requested_revision=identity.requested_revision,
+                file_patterns=(),
+                exclude_patterns=(),
+            )
+        elif identity.source == "ollama_library":
+            _validate_ollama_staging(
+                staging, ollama_model_filename(decode_path(identity.model_path))
             )
         manifest = build_model_preheat_manifest(
             staging,
-            request.identity,
+            identity,
             exclude_patterns=request.exclude_patterns,
             cancel_callback=(
                 (lambda: _raise_if_cancelled(cancel_check))
@@ -202,8 +235,9 @@ def execute_seed_preheat(
             cancel_check=cancel_check,
             bandwidth_limit_mbps=request.bandwidth_limit_mbps,
         )
-        _install_staging(staging, request.target_dir, manifest)
-        _write_local_artifact_marker(request.cache_dir, manifest)
+        if request.install_local:
+            _install_staging(staging, request.target_dir, manifest)
+            _write_local_artifact_marker(request.cache_dir, manifest)
         return _ready_result(
             request,
             s3_client,
@@ -212,11 +246,16 @@ def execute_seed_preheat(
             uploaded=published.uploaded,
             skipped=published.skipped,
             downloaded=0,
+            resolved_revision=identity.revision,
         )
     except ModelPreheatCanceled:
         return _error_result("canceled")
-    except ModelPreheatManifestError:
-        return _error_result("local_manifest_invalid")
+    except ModelPreheatManifestError as exc:
+        return _error_result(
+            "ollama_artifact_invalid"
+            if str(exc) == "ollama_artifact_invalid"
+            else "local_manifest_invalid"
+        )
     except ModelPreheatS3ManifestError:
         return _error_result("s3_manifest_invalid")
     except ModelPreheatS3Conflict as exc:
@@ -324,8 +363,10 @@ def _ready_result(
     uploaded,
     skipped,
     downloaded,
+    resolved_revision=None,
 ):
     manifest_bytes = manifest.to_artifact_json_bytes()
+    resolved_revision = resolved_revision or decode_path(manifest.identity.revision_path)
     return {
         "state": "ready",
         "request_digest": request.request_digest,
@@ -339,11 +380,22 @@ def _ready_result(
         "uploaded": uploaded,
         "skipped": skipped,
         "downloaded": downloaded,
+        "resolved_revision": resolved_revision,
     }
 
 
 def _error_result(error_code, *args, **kwargs):
     return {"state": "error", "error_code": error_code}
+
+
+def _validate_ollama_staging(staging: Path, expected_filename: str) -> None:
+    files = sorted(
+        path.relative_to(staging).as_posix()
+        for path in staging.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    )
+    if files != [expected_filename]:
+        raise ModelPreheatManifestError("ollama_artifact_invalid")
 
 
 def _safe_s3_error(exc):
@@ -488,6 +540,7 @@ async def _execute_payload(
             if getattr(payload, "trusted_local_candidate", None) is not None
             else None
         ),
+        "install_local": task.get("delivery_mode") != "s3_only",
     }
     if seed:
         request_fields["source_fallback_enabled"] = bool(

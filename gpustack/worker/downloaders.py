@@ -423,6 +423,7 @@ def download_resolved_revision_to_staging(
     exclude_patterns: Optional[list[str] | tuple[str, ...]] = None,
     cancel_check=None,
     progress_callback=None,
+    private_cache_dir: str | os.PathLike[str] | None = None,
 ) -> str:
     """将固定 revision 下载到预热 staging，不读取 worker-local-S3 配置。"""
     destination = Path(staging_dir)
@@ -522,6 +523,16 @@ def download_resolved_revision_to_staging(
             model_id,
             revision,
             resolved_revision,
+        )
+        return str(destination)
+    if identity.source == "ollama_library":
+        # Ollama Registry 只产出一个模型 blob；文件名必须与原子安装器契约一致。
+        if patterns or ignored_patterns:
+            raise ValueError("ollama_patterns_unsupported")
+        OllamaLibraryDownloader().download(
+            model_name=model_id,
+            local_dir=str(destination),
+            cache_dir=str(private_cache_dir or destination.parent / ".ollama-auth"),
         )
         return str(destination)
     raise ValueError("unsupported_preheat_source")

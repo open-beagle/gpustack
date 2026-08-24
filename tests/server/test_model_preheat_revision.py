@@ -205,3 +205,27 @@ def test_default_revision_is_resolved_for_both_hubs():
         )
         == "d" * 40
     )
+
+
+def test_ollama_uses_trusted_registry_digest():
+    assert (
+        resolve_model_preheat_revision(
+            "ollama_library",
+            "llama3:latest",
+            "latest",
+            ollama_digest_resolver=lambda model_id, revision: "sha256:" + "a" * 64,
+        )
+        == "sha256:" + "a" * 64
+    )
+
+
+def test_ollama_untrusted_tag_requires_two_phase_snapshot():
+    assert (
+        resolve_model_preheat_revision(
+            "ollama_library",
+            "llama3:latest",
+            "latest",
+            ollama_digest_resolver=lambda model_id, revision: None,
+        )
+        is None
+    )

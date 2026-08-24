@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -73,6 +74,7 @@ WorkerIdentityDep = Annotated[
     ModelPreheatWorkerPrincipal, Depends(get_model_preheat_worker_identity)
 ]
 LEASE_TTL = timedelta(seconds=60)
+_LOCAL_SNAPSHOT_REVISION = re.compile(r"^local-snapshot-[0-9a-f]{64}$")
 CONNECTIVITY_RESULT_FIELDS = {
     "state",
     "readable",
@@ -144,6 +146,7 @@ SAFE_ERROR_CODES = {
     "artifact_manifest_conflict",
     "object_content_conflict",
     "local_file_content_mismatch",
+    "ollama_artifact_invalid",
 }
 PREHEAT_RESULT_FIELDS = {
     "state",
@@ -159,6 +162,7 @@ PREHEAT_RESULT_FIELDS = {
     "skipped",
     "downloaded",
     "total_size",
+    "resolved_revision",
     "cursor",
 }
 PREHEAT_RESULT_STATES = {"ready", "error"}
@@ -861,12 +865,30 @@ async def _bind_preheat_artifact(session, worker_task, result, now):
         raise HTTPException(422, "Invalid", "invalid_preheat_result")
     if parent.artifact_id is not None and parent.artifact_id != artifact_id:
         _conflict("artifact_binding_conflict")
+    if (
+        worker_task.role == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE
+        and result["resolved_revision"] != parent.resolved_revision
+    ):
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
     if worker_task.role == ModelPreheatWorkerTaskRoleEnum.SEED:
         values = {
             "artifact_id": artifact_id,
             "s3_manifest_path": result["manifest_path"],
             "manifest_digest": result["manifest_digest"],
         }
+        resolved_revision = result["resolved_revision"]
+        if parent.resolved_revision == "ollama-pending":
+            if (
+                not isinstance(resolved_revision, str)
+                or _LOCAL_SNAPSHOT_REVISION.fullmatch(resolved_revision) is None
+            ):
+                raise HTTPException(422, "Invalid", "invalid_preheat_result")
+        elif (
+            not isinstance(resolved_revision, str)
+            or resolved_revision != parent.resolved_revision
+        ):
+            raise HTTPException(422, "Invalid", "invalid_preheat_result")
+        values["resolved_revision"] = resolved_revision
         transfer_source = result["transfer_source"]
         if transfer_source == "current_node":
             transfer_source = (
@@ -920,7 +942,7 @@ async def _bind_preheat_artifact(session, worker_task, result, now):
                 artifact_id=artifact_id,
                 source=parent.source,
                 model_id=parent.request_identity["model_id"],
-                resolved_revision=parent.resolved_revision,
+                resolved_revision=resolved_revision or parent.resolved_revision,
                 include_patterns=parent.request_identity.get("include_patterns", []),
                 exclude_patterns=parent.request_identity.get("exclude_patterns", []),
                 manifest_path=result["manifest_path"],
@@ -1062,6 +1084,7 @@ def _validated_preheat_result(value):
             "skipped",
             "downloaded",
             "total_size",
+            "resolved_revision",
         }
         if not required <= set(value) or value.get("error_code") is not None:
             raise HTTPException(422, "Invalid", "invalid_preheat_result")
@@ -1077,6 +1100,7 @@ def _validated_preheat_result(value):
             "skipped",
             "downloaded",
             "total_size",
+            "resolved_revision",
         }
         if value.get("error_code") is None or ready_only & set(value):
             raise HTTPException(422, "Invalid", "invalid_preheat_result")
@@ -1091,6 +1115,7 @@ def _validated_preheat_result(value):
         "s3",
         "modelscope",
         "huggingface",
+        "ollama_library",
         None,
     }:
         raise HTTPException(422, "Invalid", "invalid_preheat_result")
@@ -1114,6 +1139,7 @@ def _validated_preheat_result(value):
                 "skipped",
                 "downloaded",
                 "total_size",
+                "resolved_revision",
             )
         }
     sanitized = {

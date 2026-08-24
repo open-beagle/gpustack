@@ -10,6 +10,7 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3Profile,
 )  # noqa: F401
 from gpustack.schemas.model_preheats import (
+    ModelPreheatDeliveryModeEnum,
     ModelPreheatDesiredStateEnum,
     ModelPreheatBackfillPolicyEnum,
     ModelPreheatExecutionStateEnum,
@@ -182,6 +183,29 @@ def test_bound_artifact_distributes_without_seed(tmp_path):
         ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE
     }
     assert {child.worker_uuid for child in children} == {"worker-a", "worker-b"}
+
+
+def test_s3_only_bound_artifact_completes_without_workers(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine, targets=("worker-a",), artifact_id="c" * 64)
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatTask, task_id)
+            task.delivery_mode = ModelPreheatDeliveryModeEnum.S3_ONLY
+            task.seed_worker_uuid = None
+            task.seed_worker_id = None
+            task.target_worker_uuids = []
+            session.add(task)
+            await session.commit()
+        await ModelPreheatController(engine).reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+        await engine.dispose()
+        return parent
+
+    parent = asyncio.run(run())
+    assert parent.execution_state == ModelPreheatExecutionStateEnum.READY
+    assert parent.transfer_source == "s3"
 
 
 def test_all_locations_missing_uses_requested_seed_for_public_fallback(tmp_path):

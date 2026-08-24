@@ -954,6 +954,7 @@ async def create_scheduled_model_preheat_task(
         _exact_artifact_match,
         _profile_snapshot,
         _request_identity,
+        _resolve_s3_only_seed_worker,
         _resolve_target_workers,
         _target_snapshot,
     )
@@ -965,7 +966,10 @@ async def create_scheduled_model_preheat_task(
         worker for worker in ready_workers if worker.id not in busy_worker_ids
     ]
     workers_by_uuid = {worker.worker_uuid: worker for worker in ready_workers}
-    if schedule.target_scope.value == "selected_workers":
+    if schedule.delivery_mode.value == "s3_only":
+        # 精确 Artifact 命中不需要任何 Worker；未命中时随后只解析一个 Seed。
+        target_worker_ids, seed_worker_id = [], None
+    elif schedule.target_scope.value == "selected_workers":
         missing = set(schedule.target_worker_uuids) - set(workers_by_uuid)
         if missing:
             if missing <= set(ready_workers_by_uuid):
@@ -999,25 +1003,15 @@ async def create_scheduled_model_preheat_task(
         seed_worker_id=seed_worker_id,
         s3_profile_id=schedule.s3_profile_id,
         s3_backfill_policy=schedule.s3_backfill_policy,
+        delivery_mode=schedule.delivery_mode,
         keep_new_workers_in_sync=schedule.keep_new_workers_in_sync,
+        connectivity_failure_override=schedule.connectivity_failure_override,
     )
     profile = await session.get(ModelPreheatS3Profile, schedule.s3_profile_id)
     if profile is None:
         raise RuntimeError("model_preheat_s3_profile_not_found")
     if profile.lifecycle_state != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE:
         raise RuntimeError("model_preheat_s3_profile_in_maintenance")
-    workers, seed_worker, target_gpu_names = await _resolve_target_workers(
-        session, task_in
-    )
-    workers = [worker for worker in workers if worker.id not in busy_worker_ids]
-    if not workers:
-        raise RuntimeError("target_workers_not_idle")
-    await _ensure_profile_available_on_workers(session, profile, config, workers)
-    target_snapshot = _target_snapshot(workers)
-    target_worker_uuids = [item["worker_uuid"] for item in target_snapshot]
-    pattern_digest = selection_digest(
-        task_in.include_patterns, task_in.exclude_patterns
-    )
     resolved_revision = await asyncio.to_thread(
         resolve_model_preheat_revision,
         task_in.source,
@@ -1025,6 +1019,7 @@ async def create_scheduled_model_preheat_task(
         task_in.revision,
         token=getattr(config, "huggingface_token", None),
     )
+    resolved_revision = resolved_revision or "ollama-pending"
     identity = ModelPreheatIdentity(
         source=task_in.source,
         model_id=task_in.model_id,
@@ -1033,11 +1028,46 @@ async def create_scheduled_model_preheat_task(
         file_patterns=task_in.include_patterns,
         exclude_patterns=task_in.exclude_patterns,
     )
+    matched_artifact = await _exact_artifact_match(session, profile, identity)
+    if task_in.delivery_mode.value == "s3_only" and matched_artifact is not None:
+        workers, seed_worker, target_gpu_names = [], None, []
+    elif task_in.delivery_mode.value == "s3_only":
+        seed_worker = await _resolve_s3_only_seed_worker(session, task_in)
+        if seed_worker.id in busy_worker_ids:
+            raise RuntimeError("seed_worker_not_idle")
+        workers, target_gpu_names = [], []
+        await _ensure_profile_available_on_workers(
+            session,
+            profile,
+            config,
+            [seed_worker],
+            allow_failure=task_in.connectivity_failure_override,
+        )
+    else:
+        workers, seed_worker, target_gpu_names = await _resolve_target_workers(
+            session, task_in
+        )
+        workers = [worker for worker in workers if worker.id not in busy_worker_ids]
+        if not workers:
+            raise RuntimeError("target_workers_not_idle")
+        await _ensure_profile_available_on_workers(
+            session,
+            profile,
+            config,
+            workers,
+            allow_failure=task_in.connectivity_failure_override,
+        )
+    target_snapshot = _target_snapshot(workers)
+    target_worker_uuids = [item["worker_uuid"] for item in target_snapshot]
+    pattern_digest = selection_digest(
+        task_in.include_patterns, task_in.exclude_patterns
+    )
     operation_key = operation_key_for(
         profile.id,
         identity.request_digest,
         target_worker_uuids,
         task_in.s3_backfill_policy,
+        task_in.delivery_mode,
     )
     existing = await _active_task_for_operation(session, operation_key)
     if existing is not None:
@@ -1053,7 +1083,6 @@ async def create_scheduled_model_preheat_task(
         profile_snapshot = _profile_snapshot(cipher, profile)
     except CredentialEncryptionUnavailable as exc:
         raise RuntimeError("credential_encryption_unavailable") from exc
-    matched_artifact = await _exact_artifact_match(session, profile, identity)
     try:
         await lock_active_profile_for_new_work(
             session, profile.id, profile.config_version
@@ -1071,8 +1100,8 @@ async def create_scheduled_model_preheat_task(
         request_identity=_request_identity(identity),
         request_digest=identity.request_digest,
         artifact_id=(matched_artifact.artifact_id if matched_artifact else None),
-        seed_worker_uuid=seed_worker.worker_uuid,
-        seed_worker_id=seed_worker.id,
+        seed_worker_uuid=(seed_worker.worker_uuid if seed_worker else None),
+        seed_worker_id=(seed_worker.id if seed_worker else None),
         target_scope=task_in.target_scope,
         target_gpu_names=target_gpu_names,
         target_worker_uuids=target_worker_uuids,
@@ -1082,11 +1111,13 @@ async def create_scheduled_model_preheat_task(
         s3_profile_snapshot_encrypted=profile_snapshot,
         encryption_key_version=cipher.current_key_version,
         s3_backfill_policy=task_in.s3_backfill_policy,
+        delivery_mode=task_in.delivery_mode,
         s3_manifest_path=(matched_artifact.manifest_path if matched_artifact else None),
         manifest_digest=(
             matched_artifact.manifest_digest if matched_artifact else None
         ),
         keep_new_workers_in_sync=task_in.keep_new_workers_in_sync,
+        connectivity_failure_override=task_in.connectivity_failure_override,
         bandwidth_limit_mbps=schedule.bandwidth_limit_mbps,
         schedule_id=schedule.id,
         created_by_user_id=created_by_user_id,

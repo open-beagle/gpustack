@@ -17,6 +17,7 @@ from gpustack.worker.downloaders import download_resolved_revision_to_staging
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 from gpustack.worker.model_preheat.manifest import build_model_preheat_manifest
 from gpustack.worker.model_preheat.s3_client import ModelPreheatS3Client
+from gpustack.routes.model_preheat_worker_tasks import _validated_preheat_result
 
 
 @dataclass
@@ -147,6 +148,54 @@ def _target_request(tmp_path, manifest, client):
         artifact_id=manifest.artifact_id,
         manifest_path=client.artifact_manifest_object("model-storage", manifest),
     )
+
+
+def test_ollama_pending_seed_keeps_auth_cache_outside_artifact_and_returns_revision(
+    tmp_path,
+):
+    identity = ModelPreheatIdentity(
+        source="ollama_library",
+        model_id="llama3:latest",
+        revision="ollama-pending",
+        requested_revision="latest",
+        file_patterns=(),
+    )
+    request = _seed_request(
+        tmp_path,
+        identity=identity,
+        request_digest=identity.request_digest,
+        exclude_patterns=(),
+        install_local=False,
+    )
+    private_cache = request.cache_dir / ".ollama-auth"
+
+    def download(_identity, staging, **kwargs):
+        assert kwargs["private_cache_dir"] == private_cache
+        private_cache.mkdir(parents=True)
+        (private_cache / "id_ed25519").write_bytes(b"private")
+        (private_cache / "id_ed25519.pub").write_bytes(b"public")
+        (staging / "llama3_latest").write_bytes(b"model")
+
+    minio = InMemoryMinio()
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(minio),
+        download_to_staging=download,
+    )
+
+    assert result["state"] == "ready"
+    assert result["resolved_revision"].startswith("local-snapshot-")
+    assert _validated_preheat_result(result)["resolved_revision"] == result[
+        "resolved_revision"
+    ]
+    manifest = next(
+        payload.data
+        for (bucket, name), payload in minio.objects.items()
+        if bucket == "models" and name.endswith("/manifest.json")
+    )
+    files = json.loads(manifest)["files"]
+    assert [item["path"] for item in files] == ["llama3_latest"]
+    assert all("id_ed25519" not in name for name in minio.uploads)
 
 
 def test_seed_reuses_trusted_local_and_publishes_unified_artifact(tmp_path):

@@ -11,6 +11,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.schemas.model_preheats import (
     ModelPreheatDesiredStateEnum,
+    ModelPreheatDeliveryModeEnum,
     ModelPreheatExecutionStateEnum,
     ModelPreheatTask,
     ModelPreheatTaskLock,
@@ -138,6 +139,9 @@ class ModelPreheatController:
             return
 
         all_workers = await _current_workers(session)
+        if task.delivery_mode == ModelPreheatDeliveryModeEnum.S3_ONLY:
+            await self._reconcile_s3_only(session, task, all_workers)
+            return
         targets = {
             worker_uuid: all_workers[worker_uuid]
             for worker_uuid in task.target_worker_uuids
@@ -321,6 +325,42 @@ class ModelPreheatController:
             task.finished_at = finished_at
             if finished_at is not None:
                 task.progress = 100
+
+    async def _reconcile_s3_only(self, session, task, workers):
+        if task.artifact_id and task.s3_manifest_path:
+            _finish(task, ModelPreheatExecutionStateEnum.READY)
+            task.transfer_source = "s3"
+            task.transfer_profile_id = task.s3_profile_id
+            return
+        children = (
+            await session.exec(
+                select(ModelPreheatWorkerTask)
+                .where(
+                    ModelPreheatWorkerTask.task_id == task.id,
+                    ModelPreheatWorkerTask.parent_attempt == task.attempt,
+                    ModelPreheatWorkerTask.role == ModelPreheatWorkerTaskRoleEnum.SEED,
+                )
+                .order_by(ModelPreheatWorkerTask.id)
+            )
+        ).all()
+        if not children:
+            worker = workers.get(task.seed_worker_uuid or "")
+            if worker is None:
+                _finish(task, ModelPreheatExecutionStateEnum.ERROR, "no_available_seed")
+                return
+            task.execution_state = ModelPreheatExecutionStateEnum.STAGING
+            task.started_at = task.started_at or datetime.now(timezone.utc)
+            task.seed_worker_id = worker.id
+            _add_seed_child(session, task, worker)
+            return
+        seed = children[-1]
+        if seed.state == ModelPreheatWorkerTaskStateEnum.READY:
+            if task.artifact_id and task.s3_manifest_path:
+                _finish(task, ModelPreheatExecutionStateEnum.READY)
+            else:
+                _finish(task, ModelPreheatExecutionStateEnum.ERROR, "artifact_binding_failed")
+        elif seed.state == ModelPreheatWorkerTaskStateEnum.ERROR:
+            _finish(task, ModelPreheatExecutionStateEnum.ERROR, seed.error_code)
 
 
 async def _current_workers(session):
