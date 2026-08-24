@@ -49,6 +49,17 @@ async def resolve_distribution_source(session, policy) -> DistributionSource:
     )
     if policy.source_artifact_id is not None and referenced_artifact is None:
         raise DistributionSourceUnavailable("distribution_artifact_not_ready")
+    if (
+        referenced_artifact is not None
+        and referenced_artifact.manifest_state
+        != ModelPreheatInventoryManifestStateEnum.VALID
+    ):
+        raise DistributionSourceUnavailable(
+            "distribution_artifact_stale"
+            if referenced_artifact.manifest_state
+            == ModelPreheatInventoryManifestStateEnum.STALE
+            else "distribution_artifact_not_ready"
+        )
 
     sync_task = await _ready_sync_task(session, policy)
     preheat_task = await _ready_preheat_task(session, policy)
@@ -105,9 +116,14 @@ async def resolve_distribution_source(session, policy) -> DistributionSource:
         artifact is None
         or artifact.profile_id != policy.profile_id
         or artifact.profile_config_version != policy.profile_config_version
-        or artifact.manifest_state != ModelPreheatInventoryManifestStateEnum.VALID
     ):
         raise DistributionSourceUnavailable("distribution_artifact_not_ready")
+    if artifact.manifest_state != ModelPreheatInventoryManifestStateEnum.VALID:
+        raise DistributionSourceUnavailable(
+            "distribution_artifact_stale"
+            if artifact.manifest_state == ModelPreheatInventoryManifestStateEnum.STALE
+            else "distribution_artifact_not_ready"
+        )
     if policy.request_digest != (
         sync_task.request_digest
         if sync_task is not None

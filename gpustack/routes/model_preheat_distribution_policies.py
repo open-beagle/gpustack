@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Request
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
@@ -10,8 +12,10 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicyCreate,
     ModelPreheatDistributionPolicyPublic,
     ModelPreheatDistributionPolicyUpdate,
+    ModelPreheatDistributionPolicyTriggerModeEnum,
     distribution_selector_digest,
 )
+from gpustack.schemas.model_preheat_schedules import next_window_start_utc
 from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3Profile,
     ModelPreheatS3ProfileLifecycleStateEnum,
@@ -101,11 +105,10 @@ async def create_distribution_policy(
                 "exclude_patterns": list(artifact.exclude_patterns),
             }
             request_digest = identity.request_digest
-    if (
-        artifact is None
-        or artifact.manifest_state != ModelPreheatInventoryManifestStateEnum.VALID
-    ):
+    if artifact is None:
         raise HTTPException(409, "Conflict", "artifact_not_ready")
+    if artifact.manifest_state != ModelPreheatInventoryManifestStateEnum.VALID:
+        raise HTTPException(409, "Conflict", _artifact_unavailable_code(artifact))
     profile = await session.get(ModelPreheatS3Profile, profile_id)
     if (
         profile is None
@@ -127,7 +130,11 @@ async def create_distribution_policy(
         ),
         source_artifact_id=artifact.id,
         source_sync_task_id=source_sync_task_id,
+        trigger_mode=policy_in.trigger_mode,
+        cron_expression=policy_in.cron_expression,
+        timezone=policy_in.timezone,
     )
+    _set_next_run(policy)
     session.add(policy)
     try:
         await session.commit()
@@ -151,10 +158,62 @@ async def update_distribution_policy(
 ):
     policy = await _policy_or_404(session, id)
     update_data = policy_in.model_dump(exclude_unset=True)
-    if "enabled" in update_data:
+    enabled = update_data.pop("enabled", policy.enabled)
+    candidate_data = {
+        "name": policy.name,
+        "trigger_mode": policy.trigger_mode,
+        "cron_expression": policy.cron_expression,
+        "timezone": policy.timezone,
+        "profile_id": policy.profile_id,
+        "artifact_id": "bound-artifact",
+        "target_scope": policy.target_scope,
+        "worker_selector": policy.worker_selector,
+        "gpu_selector": policy.gpu_selector,
+    }
+    candidate_data.update(update_data)
+    try:
+        candidate = ModelPreheatDistributionPolicyCreate.model_validate(candidate_data)
+    except ValueError as exc:
+        raise HTTPException(422, "Validation Error", str(exc)) from None
+    if enabled and not policy.enabled:
+        profile = await session.get(ModelPreheatS3Profile, candidate.profile_id)
+        if (
+            profile is None
+            or profile.lifecycle_state != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
+        ):
+            raise HTTPException(409, "Conflict", "s3_profile_in_maintenance")
+        if profile.config_version != policy.profile_config_version:
+            raise HTTPException(409, "Conflict", "distribution_profile_version_stale")
+        artifact = (
+            await session.get(ModelPreheatArtifact, policy.source_artifact_id)
+            if policy.source_artifact_id is not None
+            else None
+        )
+        if (
+            artifact is None
+            or artifact.profile_id != policy.profile_id
+            or artifact.profile_config_version != policy.profile_config_version
+        ):
+            raise HTTPException(409, "Conflict", "artifact_not_ready")
+        if artifact.manifest_state != ModelPreheatInventoryManifestStateEnum.VALID:
+            raise HTTPException(409, "Conflict", _artifact_unavailable_code(artifact))
+    timing_changed = bool(
+        {"trigger_mode", "cron_expression", "timezone"} & update_data.keys()
+    )
+    was_enabled = policy.enabled
+    if enabled and not was_enabled:
         policy.profile_version_stale = False
-    for field, value in update_data.items():
-        setattr(policy, field, value)
+    for field in ("name", "trigger_mode", "cron_expression", "timezone"):
+        setattr(policy, field, getattr(candidate, field))
+    policy.enabled = enabled
+    if (
+        not enabled
+        or policy.trigger_mode
+        != ModelPreheatDistributionPolicyTriggerModeEnum.SCHEDULED
+    ):
+        policy.next_run_at = None
+    elif not was_enabled or timing_changed:
+        policy.next_run_at = next_window_start_utc(policy, datetime.now(timezone.utc))
     session.add(policy)
     await session.commit()
     await session.refresh(policy)
@@ -179,7 +238,10 @@ async def reconcile_distribution_policy(request: Request, session: SessionDep, i
     reconciler = getattr(request.app.state, "model_preheat_worker_reconciler", None)
     if reconciler is None:
         raise HTTPException(503, "Unavailable", "distribution_reconciler_unavailable")
-    await reconciler.reconcile_policy(policy.id)
+    if hasattr(reconciler, "reconcile_manual_policy"):
+        await reconciler.reconcile_manual_policy(policy.id)
+    else:
+        await reconciler.reconcile_policy(policy.id)
     policy = await _policy_or_404(session, id, populate_existing=True)
     return await _public(session, policy)
 
@@ -219,3 +281,19 @@ async def _artifact_by_identity(session, profile_id, profile_version, artifact_i
             )
         )
     ).first()
+
+
+def _artifact_unavailable_code(artifact):
+    if artifact.manifest_state == ModelPreheatInventoryManifestStateEnum.STALE:
+        return "artifact_stale"
+    return "artifact_not_ready"
+
+
+def _set_next_run(policy):
+    policy.next_run_at = (
+        next_window_start_utc(policy, datetime.now(timezone.utc))
+        if policy.enabled
+        and policy.trigger_mode
+        == ModelPreheatDistributionPolicyTriggerModeEnum.SCHEDULED
+        else None
+    )

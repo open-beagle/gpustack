@@ -10,6 +10,10 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
+    ModelPreheatDistributionPolicyRun,
+    ModelPreheatDistributionPolicyRunTriggerEnum,
+    ModelPreheatDistributionPolicyTriggerModeEnum,
+    ModelPreheatDistributionWorkerSlot,
     ModelPreheatWorkerObservation,
     distribution_operation_key,
 )
@@ -278,6 +282,234 @@ def test_manually_disabled_policy_is_not_reenabled_by_materialization(tmp_path):
         return policy
 
     assert asyncio.run(run()).enabled is False
+
+
+def test_discovered_artifact_without_local_task_becomes_explicitly_blocked_when_stale(
+    tmp_path,
+):
+    async def run():
+        engine = await _database(tmp_path)
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            profile = ModelPreheatS3Profile(
+                name="discovered-profile",
+                endpoint="https://s3.example.com",
+                bucket="models",
+                access_key_encrypted={"ciphertext": "access"},
+                secret_key_encrypted={"ciphertext": "secret"},
+                encryption_key_version="v1",
+            )
+            session.add(profile)
+            await session.flush()
+            artifact = ModelPreheatArtifact(
+                profile_id=profile.id,
+                profile_config_version=profile.config_version,
+                artifact_id=ARTIFACT_ID,
+                source="huggingface",
+                model_id="org/model",
+                resolved_revision="a" * 40,
+                include_patterns=[],
+                exclude_patterns=[],
+                manifest_path=f"model-storage/huggingface/org/model/{ARTIFACT_ID}/manifest.json",
+                manifest_digest="d" * 64,
+                file_count=1,
+                total_size=10,
+                manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                last_verified_at=datetime.now(timezone.utc),
+            )
+            session.add(artifact)
+            await session.flush()
+            policy = ModelPreheatDistributionPolicy(
+                name="shared-artifact",
+                profile_id=profile.id,
+                profile_config_version=profile.config_version,
+                request_identity={"source": "huggingface", "model_id": "org/model"},
+                request_digest="c" * 64,
+                target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
+                worker_selector={"worker_uuids": ["worker-a"]},
+                gpu_selector={},
+                selector_digest="d" * 64,
+                source_artifact_id=artifact.id,
+                trigger_mode=ModelPreheatDistributionPolicyTriggerModeEnum.MANUAL,
+            )
+            session.add(policy)
+            await session.commit()
+            artifact.manifest_state = ModelPreheatInventoryManifestStateEnum.STALE
+            session.add(artifact)
+            await session.commit()
+            policy_id = policy.id
+        reconciler = ModelPreheatWorkerReconciler(engine)
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine) as session:
+            policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
+        await engine.dispose()
+        return policy
+
+    policy = asyncio.run(run())
+    assert policy.enabled is True
+    assert policy.blocked_reason == "distribution_artifact_stale"
+
+
+def test_manual_and_continuous_safety_runs_have_distinct_audit_identities(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        _, _profile_id = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(engine)
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine) as session:
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            policy_id = policy.id
+        await reconciler.reconcile_manual_policy(policy_id)
+        await reconciler.reconcile_manual_policy(policy_id)
+        now = datetime.now(timezone.utc)
+        await reconciler.reconcile_continuous_policy(policy_id, now)
+        await reconciler.reconcile_continuous_policy(policy_id, now)
+        async with AsyncSession(engine) as session:
+            runs = (
+                await session.exec(
+                    select(ModelPreheatDistributionPolicyRun).where(
+                        ModelPreheatDistributionPolicyRun.policy_id == policy_id
+                    )
+                )
+            ).all()
+        await engine.dispose()
+        return runs
+
+    runs = asyncio.run(run())
+    assert len(runs) == 3
+    assert [run.trigger for run in runs].count(
+        ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL
+    ) == 2
+    assert [run.trigger for run in runs].count(
+        ModelPreheatDistributionPolicyRunTriggerEnum.CONTINUOUS
+    ) == 1
+
+
+def test_scheduled_windows_reuse_existing_active_worker_task(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(engine)
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine) as session:
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            source = await session.get(ModelPreheatTask, task_id)
+            worker = (
+                await session.exec(
+                    select(Worker).where(Worker.worker_uuid == "old-uuid")
+                )
+            ).one()
+            policy_id = policy.id
+            worker_uuid = worker.worker_uuid
+            first = await _create_or_rebind_distribution_task(
+                session, policy, source, worker, run_key="scheduled-window-one"
+            )
+            second = await _create_or_rebind_distribution_task(
+                session, policy, source, worker, run_key="scheduled-window-two"
+            )
+            await session.commit()
+            tasks = (
+                await session.exec(
+                    select(ModelPreheatWorkerTask).where(
+                        ModelPreheatWorkerTask.distribution_policy_id == policy_id,
+                        ModelPreheatWorkerTask.worker_uuid == worker_uuid,
+                    )
+                )
+            ).all()
+        await engine.dispose()
+        return first.id, second.id, tasks
+
+    first_id, second_id, tasks = asyncio.run(run())
+    assert first_id == second_id
+    assert len(tasks) == 1
+    assert tasks[0].state == ModelPreheatWorkerTaskStateEnum.PENDING
+
+
+def test_distribution_worker_slot_cas_prevents_cross_session_active_tasks(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(engine)
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            source = await session.get(ModelPreheatTask, task_id)
+            worker = (
+                await session.exec(
+                    select(Worker).where(Worker.worker_uuid == "old-uuid")
+                )
+            ).one()
+            completed = ModelPreheatWorkerTask(
+                distribution_policy_id=policy.id,
+                operation_key=distribution_operation_key(
+                    policy.id,
+                    worker.worker_uuid,
+                    policy.request_digest,
+                    "completed-window",
+                ),
+                parent_attempt=source.attempt,
+                worker_uuid=worker.worker_uuid,
+                worker_id=worker.id,
+                role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                state=ModelPreheatWorkerTaskStateEnum.READY,
+            )
+            session.add(completed)
+            await session.flush()
+            session.add(
+                ModelPreheatDistributionWorkerSlot(
+                    policy_id=policy.id,
+                    worker_uuid=worker.worker_uuid,
+                    active_task_id=completed.id,
+                    active_operation_key=completed.operation_key,
+                )
+            )
+            await session.commit()
+            policy_id = policy.id
+            worker_id = worker.id
+            worker_uuid = worker.worker_uuid
+
+        start = asyncio.Event()
+
+        async def create_for_window(run_key):
+            await start.wait()
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
+                source = await session.get(ModelPreheatTask, task_id)
+                worker = await session.get(Worker, worker_id)
+                task = await _create_or_rebind_distribution_task(
+                    session, policy, source, worker, run_key=run_key
+                )
+                await session.commit()
+                return task.id if task is not None else None
+
+        first = asyncio.create_task(create_for_window("scheduled-window-one"))
+        second = asyncio.create_task(create_for_window("scheduled-window-two"))
+        await asyncio.sleep(0)
+        start.set()
+        result_ids = await asyncio.gather(first, second)
+        async with AsyncSession(engine) as session:
+            active_tasks = (
+                await session.exec(
+                    select(ModelPreheatWorkerTask).where(
+                        ModelPreheatWorkerTask.distribution_policy_id == policy_id,
+                        ModelPreheatWorkerTask.worker_uuid == worker_uuid,
+                        ModelPreheatWorkerTask.role
+                        == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                        ModelPreheatWorkerTask.state.in_(
+                            [
+                                ModelPreheatWorkerTaskStateEnum.PENDING,
+                                ModelPreheatWorkerTaskStateEnum.RUNNING,
+                                ModelPreheatWorkerTaskStateEnum.PAUSED,
+                            ]
+                        ),
+                    )
+                )
+            ).all()
+        await engine.dispose()
+        return result_ids, active_tasks
+
+    result_ids, active_tasks = asyncio.run(run())
+    assert len(active_tasks) == 1
+    assert set(result_ids) <= {None, active_tasks[0].id}
 
 
 def test_protocol_mismatch_worker_gets_no_connectivity_or_distribution(tmp_path):

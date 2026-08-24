@@ -37,6 +37,9 @@ from gpustack.server.model_storage_sync_policy_controller import (
 from gpustack.server.model_preheat_worker_reconciler import (
     ModelPreheatWorkerReconciler,
 )
+from gpustack.server.model_preheat_distribution_schedule_controller import (
+    ModelPreheatDistributionScheduleController,
+)
 from gpustack.server.model_preheat_s3_inventory import ModelPreheatS3Inventory
 from gpustack.server.model_preheat_trusted_local import ProductionLocalInventoryProbe
 from gpustack.server.usage_buffer import flush_usage_to_db
@@ -71,6 +74,7 @@ class Server:
         self._model_preheat_worker_reconciler = None
         self._model_preheat_s3_inventory = None
         self._model_preheat_schedule_controller = None
+        self._model_preheat_distribution_schedule_controller = None
         self._model_storage_sync_policy_controller = None
 
     @property
@@ -147,6 +151,9 @@ class Server:
         app.state.model_preheat_s3_inventory = self._model_preheat_s3_inventory
         app.state.model_preheat_schedule_controller = (
             self._model_preheat_schedule_controller
+        )
+        app.state.model_preheat_distribution_schedule_controller = (
+            self._model_preheat_distribution_schedule_controller
         )
         app.state.model_storage_sync_policy_controller = (
             self._model_storage_sync_policy_controller
@@ -361,6 +368,16 @@ class Server:
         self._create_restartable_async_task(
             self._model_preheat_worker_reconciler.start,
             "model preheat worker reconciler",
+        )
+
+        self._model_preheat_distribution_schedule_controller = (
+            ModelPreheatDistributionScheduleController(
+                get_engine(), reconciler=self._model_preheat_worker_reconciler
+            )
+        )
+        self._create_restartable_async_task(
+            self._model_preheat_distribution_schedule_controller.start,
+            "model preheat distribution schedule controller",
         )
 
         self._create_restartable_async_task(

@@ -9,7 +9,7 @@ from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api import exceptions
@@ -206,6 +206,167 @@ def test_policy_can_be_created_from_existing_s3_artifact(tmp_path):
     assert created.json()["source_artifact_id"] is not None
     assert created.json()["source_sync_task_id"] is None
     assert created.json()["request_identity"]["source"] == "huggingface"
+    assert created.json()["trigger_mode"] == "manual"
+
+
+def test_policy_exposes_blocked_reason_for_stale_fixed_artifact(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id, artifact_id = asyncio.run(_seed_artifact(engine))
+
+    async def mark_stale():
+        async with AsyncSession(engine) as session:
+            artifact = (
+                await session.exec(
+                    select(ModelPreheatArtifact).where(
+                        ModelPreheatArtifact.profile_id == profile_id,
+                        ModelPreheatArtifact.artifact_id == artifact_id,
+                    )
+                )
+            ).one()
+            artifact.manifest_state = ModelPreheatInventoryManifestStateEnum.STALE
+            session.add(artifact)
+            await session.commit()
+
+    asyncio.run(mark_stale())
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/model-preheat-distribution-policies",
+            json={
+                "name": "stale-artifact",
+                "profile_id": profile_id,
+                "artifact_id": artifact_id,
+                "target_scope": "selected_workers",
+                "worker_selector": {"worker_uuids": ["worker-a"]},
+                "gpu_selector": {},
+            },
+        )
+    asyncio.run(engine.dispose())
+
+    assert created.status_code == 409
+    assert created.json()["message"] == "artifact_stale"
+
+
+def test_reenable_rejects_stale_fixed_artifact(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id, artifact_id = asyncio.run(_seed_artifact(engine))
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/model-preheat-distribution-policies",
+            json={
+                "name": "fixed-artifact",
+                "profile_id": profile_id,
+                "artifact_id": artifact_id,
+                "target_scope": "selected_workers",
+                "worker_selector": {"worker_uuids": ["worker-a"]},
+                "gpu_selector": {},
+            },
+        )
+        policy_id = created.json()["id"]
+        assert (
+            client.patch(
+                f"/v1/model-preheat-distribution-policies/{policy_id}",
+                json={"enabled": False},
+            ).status_code
+            == 200
+        )
+
+    async def mark_stale():
+        async with AsyncSession(engine) as session:
+            artifact = (
+                await session.exec(
+                    select(ModelPreheatArtifact).where(
+                        ModelPreheatArtifact.profile_id == profile_id,
+                        ModelPreheatArtifact.artifact_id == artifact_id,
+                    )
+                )
+            ).one()
+            artifact.manifest_state = ModelPreheatInventoryManifestStateEnum.STALE
+            session.add(artifact)
+            await session.commit()
+
+    asyncio.run(mark_stale())
+    with TestClient(app) as client:
+        enabled = client.patch(
+            f"/v1/model-preheat-distribution-policies/{policy_id}",
+            json={"enabled": True},
+        )
+    asyncio.run(engine.dispose())
+
+    assert enabled.status_code == 409
+    assert enabled.json()["message"] == "artifact_stale"
+
+
+def test_reenable_rejects_profile_config_version_drift(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id, artifact_id = asyncio.run(_seed_artifact(engine))
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/model-preheat-distribution-policies",
+            json={
+                "name": "version-bound-artifact",
+                "profile_id": profile_id,
+                "artifact_id": artifact_id,
+                "target_scope": "selected_workers",
+                "worker_selector": {"worker_uuids": ["worker-a"]},
+                "gpu_selector": {},
+            },
+        )
+        policy_id = created.json()["id"]
+        assert (
+            client.patch(
+                f"/v1/model-preheat-distribution-policies/{policy_id}",
+                json={"enabled": False},
+            ).status_code
+            == 200
+        )
+
+    async def rotate_profile():
+        async with AsyncSession(engine) as session:
+            profile = await session.get(ModelPreheatS3Profile, profile_id)
+            profile.config_version += 1
+            session.add(profile)
+            await session.commit()
+
+    asyncio.run(rotate_profile())
+    with TestClient(app) as client:
+        enabled = client.patch(
+            f"/v1/model-preheat-distribution-policies/{policy_id}",
+            json={"enabled": True},
+        )
+    asyncio.run(engine.dispose())
+
+    assert enabled.status_code == 409
+    assert enabled.json()["message"] == "distribution_profile_version_stale"
+
+
+def test_repeated_disable_preserves_profile_version_stale(tmp_path):
+    app, engine = _test_app(tmp_path)
+    policy_id = asyncio.run(_seed(engine))
+
+    async def mark_stale():
+        async with AsyncSession(engine) as session:
+            policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
+            policy.enabled = False
+            policy.profile_version_stale = True
+            session.add(policy)
+            await session.commit()
+
+    asyncio.run(mark_stale())
+    with TestClient(app) as client:
+        disabled = client.patch(
+            f"/v1/model-preheat-distribution-policies/{policy_id}",
+            json={"enabled": False},
+        )
+
+    async def read_policy():
+        async with AsyncSession(engine) as session:
+            return await session.get(ModelPreheatDistributionPolicy, policy_id)
+
+    policy = asyncio.run(read_policy())
+    asyncio.run(engine.dispose())
+
+    assert disabled.status_code == 200
+    assert policy.profile_version_stale is True
 
 
 def test_policy_schema_and_successor_migration_are_portable():

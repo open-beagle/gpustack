@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -11,8 +12,14 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
+    ModelPreheatDistributionPolicyRun,
+    ModelPreheatDistributionPolicyRunStateEnum,
+    ModelPreheatDistributionPolicyRunTriggerEnum,
+    ModelPreheatDistributionPolicyTriggerModeEnum,
+    ModelPreheatDistributionWorkerSlot,
     ModelPreheatWorkerObservation,
     distribution_operation_key,
+    distribution_policy_run_operation_key,
     distribution_selector_digest,
 )
 from gpustack.schemas.model_preheat_s3_profiles import (
@@ -55,6 +62,11 @@ RETRYABLE_DISTRIBUTION_ERRORS = {
 }
 MAX_DISTRIBUTION_ATTEMPTS = 5
 MAX_DISTRIBUTION_RETRY_DELAY = 300
+ACTIVE_DISTRIBUTION_TASK_STATES = (
+    ModelPreheatWorkerTaskStateEnum.PENDING,
+    ModelPreheatWorkerTaskStateEnum.RUNNING,
+    ModelPreheatWorkerTaskStateEnum.PAUSED,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -73,6 +85,8 @@ class ModelPreheatWorkerReconciler:
         self._ready_probe = ready_probe
         self._connectivity_creator = connectivity_creator
         self._interval = interval
+        self._continuous_safety_interval = timedelta(minutes=5)
+        self._next_continuous_safety_at = None
 
     async def start(self):
         event_task = asyncio.create_task(self._watch_workers())
@@ -106,19 +120,38 @@ class ModelPreheatWorkerReconciler:
                 await self._reconcile_deleted(worker_uuid, worker_id)
             return
         if event.type in {EventType.CREATED, EventType.UPDATED}:
-            await self.reconcile_worker(worker_uuid)
+            await self.reconcile_worker(worker_uuid, event_driven=True)
 
     async def reconcile_all(self):
         await self.reconcile_policies()
         async with AsyncSession(self._engine) as session:
-            worker_uuids = [
-                worker.worker_uuid
-                for worker in await current_registered_workers(session)
-                if worker.model_storage_protocol_version
+            workers = await current_registered_workers(session)
+        for worker in workers:
+            if (
+                worker.state == WorkerStateEnum.READY
+                and worker.model_storage_protocol_version
                 == MODEL_STORAGE_PROTOCOL_VERSION
-            ]
-        for worker_uuid in worker_uuids:
-            await self.reconcile_worker(worker_uuid)
+            ):
+                await self.reconcile_worker(worker.worker_uuid, safety_check=True)
+        now = datetime.now(timezone.utc)
+        if (
+            self._next_continuous_safety_at is not None
+            and self._next_continuous_safety_at > now
+        ):
+            return
+        self._next_continuous_safety_at = now + self._continuous_safety_interval
+        async with AsyncSession(self._engine) as session:
+            policy_ids = (
+                await session.exec(
+                    select(ModelPreheatDistributionPolicy.id).where(
+                        ModelPreheatDistributionPolicy.enabled.is_(True),
+                        ModelPreheatDistributionPolicy.trigger_mode
+                        == ModelPreheatDistributionPolicyTriggerModeEnum.CONTINUOUS,
+                    )
+                )
+            ).all()
+        for policy_id in policy_ids:
+            await self.reconcile_continuous_policy(policy_id, now)
 
     async def reconcile_policies(self):
         async with AsyncSession(self._engine) as session:
@@ -155,23 +188,38 @@ class ModelPreheatWorkerReconciler:
                         or policy.profile_config_version != profile.config_version
                     ):
                         await _deactivate_policy(session, policy)
+                        policy.blocked_reason = "distribution_profile_not_active"
+                        session.add(policy)
+                    elif policy.enabled:
+                        try:
+                            await resolve_distribution_source(session, policy)
+                        except DistributionSourceUnavailable as exc:
+                            policy.blocked_reason = str(exc)
+                            session.add(policy)
+                        else:
+                            policy.blocked_reason = None
+                            session.add(policy)
                 await session.commit()
             except (IntegrityError, OperationalError):
                 await session.rollback()
 
-    async def reconcile_policy(self, policy_id):
+    async def reconcile_policy(self, policy_id, run_key=None, lease_check=None):
         async with AsyncSession(self._engine) as session:
             policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
             if policy is None:
                 return
             workers = await current_registered_workers(session)
         for worker in workers:
+            if lease_check is not None and not lease_check():
+                return
             if (
                 worker.state == WorkerStateEnum.READY
                 and worker.model_storage_protocol_version
                 == MODEL_STORAGE_PROTOCOL_VERSION
             ):
-                await self._evaluate_worker(worker, policy_ids=[policy_id])
+                await self._evaluate_worker(
+                    worker, policy_ids=[policy_id], run_key=run_key
+                )
         async with AsyncSession(self._engine) as session:
             policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
             if policy is not None:
@@ -179,7 +227,75 @@ class ModelPreheatWorkerReconciler:
                 session.add(policy)
                 await session.commit()
 
-    async def reconcile_worker(self, worker_uuid):
+    async def reconcile_manual_policy(self, policy_id):
+        return await self._run_policy(
+            policy_id,
+            ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+            datetime.now(timezone.utc),
+            unique_suffix=uuid4().hex,
+        )
+
+    async def reconcile_continuous_policy(self, policy_id, now):
+        window_seconds = int(self._continuous_safety_interval.total_seconds())
+        window = datetime.fromtimestamp(
+            int(now.timestamp() // window_seconds) * window_seconds,
+            tz=timezone.utc,
+        )
+        return await self._run_policy(
+            policy_id,
+            ModelPreheatDistributionPolicyRunTriggerEnum.CONTINUOUS,
+            window,
+        )
+
+    async def _run_policy(self, policy_id, trigger, window, unique_suffix=None):
+        operation_key = distribution_policy_run_operation_key(
+            policy_id, window, trigger.value, unique_suffix
+        )
+        async with AsyncSession(self._engine, expire_on_commit=False) as session:
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy_id,
+                trigger=trigger,
+                window_start_utc=window,
+                operation_key=operation_key,
+            )
+            session.add(run)
+            try:
+                await session.commit()
+                await session.refresh(run)
+            except (IntegrityError, OperationalError):
+                await session.rollback()
+                return None
+        error_code = None
+        try:
+            await self.reconcile_policy(policy_id, operation_key)
+        except Exception as exc:
+            error_code = type(exc).__name__
+            raise
+        finally:
+            async with AsyncSession(self._engine) as session:
+                await session.exec(
+                    update(ModelPreheatDistributionPolicyRun)
+                    .where(
+                        ModelPreheatDistributionPolicyRun.id == run.id,
+                        ModelPreheatDistributionPolicyRun.state
+                        == ModelPreheatDistributionPolicyRunStateEnum.PENDING,
+                    )
+                    .values(
+                        state=(
+                            ModelPreheatDistributionPolicyRunStateEnum.ERROR
+                            if error_code
+                            else ModelPreheatDistributionPolicyRunStateEnum.READY
+                        ),
+                        error_code=error_code,
+                        finished_at=datetime.now(timezone.utc),
+                    )
+                )
+                await session.commit()
+        return run
+
+    async def reconcile_worker(
+        self, worker_uuid, *, event_driven=False, safety_check=True
+    ):
         async with AsyncSession(self._engine) as session:
             worker = await _latest_worker(session, worker_uuid)
             if worker is None:
@@ -210,7 +326,13 @@ class ModelPreheatWorkerReconciler:
                 return
             await _record_worker_state(session, current)
             worker = await _latest_worker(session, worker_uuid)
-        await self._evaluate_worker(worker)
+        if event_driven or safety_check:
+            await self._evaluate_worker(
+                worker,
+                allowed_modes=[
+                    ModelPreheatDistributionPolicyTriggerModeEnum.CONTINUOUS
+                ],
+            )
 
     async def _ensure_connectivity_checks(self, worker):
         async with AsyncSession(self._engine) as session:
@@ -242,7 +364,9 @@ class ModelPreheatWorkerReconciler:
                     update_profile_pointer=False,
                 )
 
-    async def _evaluate_worker(self, worker, policy_ids=None):
+    async def _evaluate_worker(
+        self, worker, policy_ids=None, allowed_modes=None, run_key=None
+    ):
         if worker.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
             return
         async with AsyncSession(self._engine) as session:
@@ -253,13 +377,19 @@ class ModelPreheatWorkerReconciler:
                 statement = statement.where(
                     ModelPreheatDistributionPolicy.id.in_(policy_ids)
                 )
+            if allowed_modes is not None:
+                statement = statement.where(
+                    ModelPreheatDistributionPolicy.trigger_mode.in_(allowed_modes)
+                )
             policies = (await session.exec(statement)).all()
             for policy in policies:
                 if not _policy_matches_worker(policy, worker):
                     continue
                 try:
                     source = await resolve_distribution_source(session, policy)
-                except DistributionSourceUnavailable:
+                except DistributionSourceUnavailable as exc:
+                    policy.blocked_reason = str(exc)
+                    session.add(policy)
                     continue
                 profile = source.profile
                 connectivity = await latest_connectivity_results_for_workers(
@@ -279,7 +409,9 @@ class ModelPreheatWorkerReconciler:
                 current_worker = await _latest_worker(session, worker.worker_uuid)
                 try:
                     source = await resolve_distribution_source(session, policy)
-                except DistributionSourceUnavailable:
+                except DistributionSourceUnavailable as exc:
+                    policy.blocked_reason = str(exc)
+                    session.add(policy)
                     continue
                 if (
                     profile.lifecycle_state
@@ -293,9 +425,10 @@ class ModelPreheatWorkerReconciler:
                 ):
                     continue
                 await _create_or_rebind_distribution_task(
-                    session, policy, source, current_worker
+                    session, policy, source, current_worker, run_key=run_key
                 )
                 policy.last_reconciled_at = datetime.now(timezone.utc)
+                policy.blocked_reason = None
                 session.add(policy)
             try:
                 await session.commit()
@@ -444,6 +577,7 @@ async def _ensure_policy(session, task):
         source_artifact_id=(
             source_artifact.id if source_artifact is not None else None
         ),
+        trigger_mode=ModelPreheatDistributionPolicyTriggerModeEnum.CONTINUOUS,
     )
     session.add(policy)
     return policy
@@ -531,9 +665,11 @@ async def _reset_policy_tasks(session, policy_id, parent_attempt):
     )
 
 
-async def _create_or_rebind_distribution_task(session, policy, source, worker):
+async def _create_or_rebind_distribution_task(
+    session, policy, source, worker, *, run_key=None
+):
     operation_key = distribution_operation_key(
-        policy.id, worker.worker_uuid, policy.request_digest
+        policy.id, worker.worker_uuid, policy.request_digest, run_key
     )
     task = (
         await session.exec(
@@ -543,6 +679,11 @@ async def _create_or_rebind_distribution_task(session, policy, source, worker):
         )
     ).first()
     if task is None:
+        slot_claim = await _claim_distribution_worker_slot(
+            session, policy.id, worker.worker_uuid, operation_key
+        )
+        if slot_claim is not True:
+            return slot_claim
         task = ModelPreheatWorkerTask(
             distribution_policy_id=policy.id,
             operation_key=operation_key,
@@ -552,6 +693,22 @@ async def _create_or_rebind_distribution_task(session, policy, source, worker):
             role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
         )
         session.add(task)
+        await session.flush()
+        bound = await session.exec(
+            update(ModelPreheatDistributionWorkerSlot)
+            .where(
+                ModelPreheatDistributionWorkerSlot.policy_id == policy.id,
+                ModelPreheatDistributionWorkerSlot.worker_uuid == worker.worker_uuid,
+                ModelPreheatDistributionWorkerSlot.active_task_id.is_(None),
+                ModelPreheatDistributionWorkerSlot.active_operation_key
+                == operation_key,
+            )
+            .values(active_task_id=task.id)
+        )
+        if bound.rowcount != 1:
+            await session.delete(task)
+            await session.flush()
+            return await _active_slot_task(session, policy.id, worker.worker_uuid)
         return task
     if task.worker_id != worker.id:
         task.worker_id = worker.id
@@ -567,6 +724,84 @@ async def _create_or_rebind_distribution_task(session, policy, source, worker):
     elif task.state == ModelPreheatWorkerTaskStateEnum.ERROR:
         await _retry_distribution_error(session, task, source, worker)
     return task
+
+
+async def _claim_distribution_worker_slot(
+    session, policy_id, worker_uuid, operation_key
+):
+    slot = await _distribution_worker_slot(session, policy_id, worker_uuid)
+    if slot is None:
+        try:
+            async with session.begin_nested():
+                session.add(
+                    ModelPreheatDistributionWorkerSlot(
+                        policy_id=policy_id,
+                        worker_uuid=worker_uuid,
+                        active_operation_key=operation_key,
+                    )
+                )
+                await session.flush()
+            return True
+        except IntegrityError:
+            slot = await _distribution_worker_slot(session, policy_id, worker_uuid)
+            if slot is None:
+                return None
+
+    if slot.active_task_id is None:
+        if slot.active_operation_key == operation_key:
+            return True
+        if slot.active_operation_key is not None:
+            return await _active_slot_task(session, policy_id, worker_uuid)
+    else:
+        active_task = await session.get(ModelPreheatWorkerTask, slot.active_task_id)
+        if (
+            active_task is not None
+            and active_task.state in ACTIVE_DISTRIBUTION_TASK_STATES
+        ):
+            return active_task
+
+    old_task_id = slot.active_task_id
+    old_operation_key = slot.active_operation_key
+    conditions = [ModelPreheatDistributionWorkerSlot.id == slot.id]
+    conditions.append(
+        ModelPreheatDistributionWorkerSlot.active_task_id.is_(None)
+        if old_task_id is None
+        else ModelPreheatDistributionWorkerSlot.active_task_id == old_task_id
+    )
+    conditions.append(
+        ModelPreheatDistributionWorkerSlot.active_operation_key.is_(None)
+        if old_operation_key is None
+        else ModelPreheatDistributionWorkerSlot.active_operation_key
+        == old_operation_key
+    )
+    claimed = await session.exec(
+        update(ModelPreheatDistributionWorkerSlot)
+        .where(*conditions)
+        .values(active_task_id=None, active_operation_key=operation_key)
+    )
+    if claimed.rowcount == 1:
+        return True
+    return await _active_slot_task(session, policy_id, worker_uuid)
+
+
+async def _distribution_worker_slot(session, policy_id, worker_uuid):
+    return (
+        await session.exec(
+            select(ModelPreheatDistributionWorkerSlot).where(
+                ModelPreheatDistributionWorkerSlot.policy_id == policy_id,
+                ModelPreheatDistributionWorkerSlot.worker_uuid == worker_uuid,
+            )
+        )
+    ).first()
+
+
+async def _active_slot_task(session, policy_id, worker_uuid):
+    slot = await _distribution_worker_slot(session, policy_id, worker_uuid)
+    if slot is not None and slot.active_task_id is not None:
+        task = await session.get(ModelPreheatWorkerTask, slot.active_task_id)
+        if task is not None and task.state in ACTIVE_DISTRIBUTION_TASK_STATES:
+            return task
+    return None
 
 
 async def _retry_distribution_error(session, task, source, worker):

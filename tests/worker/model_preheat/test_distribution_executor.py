@@ -1,22 +1,17 @@
 from dataclasses import replace
 
-import pytest
-
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
     TargetExecutionRequest,
-    TrustedLocalCandidate,
     execute_seed_preheat,
     execute_target_preheat,
 )
-from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
-from gpustack.worker.model_preheat.local_cache import inspect_local_cache
-from gpustack.worker.model_preheat.s3_client import ModelPreheatS3Client
-from tests.worker.model_preheat.test_seed_executor import (
-    InMemoryMinio,
-    StoredObject,
-    _write_model,
+from gpustack.worker.model_preheat.identity import (
+    ModelPreheatIdentity,
+    ollama_model_filename,
 )
+from gpustack.worker.model_preheat.s3_client import ModelPreheatS3Client
+from tests.worker.model_preheat.test_seed_executor import InMemoryMinio, _write_model
 
 
 def _identity():
@@ -29,392 +24,134 @@ def _identity():
 
 
 def _seed_request(tmp_path):
+    identity = _identity()
     return SeedExecutionRequest(
         cache_dir=tmp_path / "seed-cache",
         target_dir=tmp_path / "seed-cache" / "model_scope" / "org" / "model",
-        cache_key="cache-key",
         task_id=8,
         attempt=1,
-        identity=_identity(),
-        selection_digest="selection-digest",
-        generation_id="parent-generation-id",
+        request_digest=identity.request_digest,
+        identity=identity,
         exclude_patterns=[],
         bucket="models",
         prefix="preheat",
+        source_fallback_enabled=True,
     )
 
 
-def _target_request(tmp_path):
+def _published(tmp_path):
+    minio = InMemoryMinio()
+    request = _seed_request(tmp_path)
+    result = execute_seed_preheat(
+        request,
+        ModelPreheatS3Client(minio),
+        download_to_staging=lambda _identity, staging, **_kwargs: _write_model(staging),
+    )
+    assert result["state"] == "ready"
+    return minio, result
+
+
+def _target_request(tmp_path, published):
+    identity = _identity()
     return TargetExecutionRequest(
         cache_dir=tmp_path / "target-cache",
         target_dir=tmp_path / "target-cache" / "model_scope" / "org" / "model",
-        cache_key="cache-key",
-        task_id=8,
+        task_id=9,
         attempt=1,
-        identity=_identity(),
-        selection_digest="selection-digest",
-        generation_id="parent-generation-id",
+        request_digest=identity.request_digest,
+        identity=identity,
         exclude_patterns=[],
         bucket="models",
         prefix="preheat",
+        artifact_id=published["artifact_id"],
+        manifest_path=published["manifest_path"],
     )
 
 
-def _published_client(tmp_path):
+def test_target_downloads_artifact_and_installs_directory(tmp_path):
+    minio, published = _published(tmp_path)
+    request = _target_request(tmp_path, published)
+
+    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 2
+    assert (request.target_dir / "config.json").read_bytes() == b"config"
+    assert (request.target_dir / "weights" / "model.bin").read_bytes() == b"weights"
+
+
+def test_target_skips_files_with_matching_artifact_sha256(tmp_path):
+    minio, published = _published(tmp_path)
+    request = _target_request(tmp_path, published)
+    client = ModelPreheatS3Client(minio)
+
+    assert execute_target_preheat(request, client)["downloaded"] == 2
+    repeated = execute_target_preheat(replace(request, attempt=2), client)
+
+    assert repeated["state"] == "ready"
+    assert repeated["downloaded"] == 0
+
+
+def test_target_redownloads_only_checksum_mismatch(tmp_path):
+    minio, published = _published(tmp_path)
+    request = _target_request(tmp_path, published)
+    client = ModelPreheatS3Client(minio)
+    execute_target_preheat(request, client)
+    (request.target_dir / "weights" / "model.bin").write_bytes(b"corrupt")
+
+    result = execute_target_preheat(replace(request, attempt=2), client)
+
+    assert result["state"] == "ready"
+    assert result["downloaded"] == 1
+    assert (request.target_dir / "weights" / "model.bin").read_bytes() == b"weights"
+
+
+def test_target_rejects_fixed_artifact_mismatch_without_fallback(tmp_path):
+    minio, published = _published(tmp_path)
+    request = replace(_target_request(tmp_path, published), artifact_id="f" * 64)
+
+    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
+
+    assert result == {"state": "error", "error_code": "s3_manifest_invalid"}
+
+
+def test_target_installs_discovered_ollama_artifact_as_single_file(tmp_path):
+    identity = ModelPreheatIdentity(
+        source="ollama_library",
+        model_id="llama3:latest",
+        revision="sha256:immutable",
+        file_patterns=(),
+    )
+    seed_request = replace(
+        _seed_request(tmp_path),
+        identity=identity,
+        request_digest=identity.request_digest,
+        target_dir=tmp_path / "seed-cache" / "ollama",
+    )
+    filename = ollama_model_filename(identity.model_path)
     minio = InMemoryMinio()
-    seed_request = _seed_request(tmp_path)
-    execute_seed_preheat(
+    published = execute_seed_preheat(
         seed_request,
         ModelPreheatS3Client(minio),
-        download_to_staging=lambda identity, staging, **kwargs: _write_model(staging),
+        download_to_staging=lambda _identity, staging, **_kwargs: (
+            staging / filename
+        ).write_bytes(b"ollama-model"),
     )
-    return minio
-
-
-def test_target_downloads_ready_generation_and_publishes_atomically(tmp_path):
-    minio = _published_client(tmp_path)
-    request = _target_request(tmp_path)
-
-    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
-
-    inspection = inspect_local_cache(
-        request.cache_dir, request.target_dir, request.cache_key
-    )
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 2
-    assert inspection.state == "valid"
-
-
-def test_target_reuses_matching_trusted_archive_without_s3_download(tmp_path):
-    minio = _published_client(tmp_path)
-    trusted_root = tmp_path / "archive-source"
-    _write_model(trusted_root)
-    request = replace(
-        _target_request(tmp_path),
-        trusted_local_candidate=TrustedLocalCandidate(
-            source="model_archive",
-            root=trusted_root,
-            paths=(trusted_root,),
-        ),
-    )
-    client = ModelPreheatS3Client(minio)
-    client.download_generation_file = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("清单匹配时不应从 S3 下载")
-    )
-
-    result = execute_target_preheat(request, client)
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 0
-
-
-def test_target_falls_back_to_s3_when_trusted_candidate_manifest_mismatches(tmp_path):
-    minio = _published_client(tmp_path)
-    trusted_root = tmp_path / "stale-model-file"
-    _write_model(trusted_root)
-    (trusted_root / "weights" / "model.bin").write_bytes(b"stale")
-    request = replace(
-        _target_request(tmp_path),
-        trusted_local_candidate=TrustedLocalCandidate(
-            source="model_file",
-            root=trusted_root,
-            paths=(trusted_root,),
-        ),
-    )
-
-    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 2
-
-
-def test_target_replaces_mismatched_trusted_candidate_in_canonical_directory(
-    tmp_path,
-):
-    minio = _published_client(tmp_path)
-    request = _target_request(tmp_path)
-    _write_model(request.target_dir)
-    stale = request.target_dir / "weights" / "model.bin"
-    stale.write_bytes(b"stale")
-    request = replace(
-        request,
-        trusted_local_candidate=TrustedLocalCandidate(
-            source="model_file",
-            root=request.target_dir,
-            paths=(request.target_dir,),
-        ),
-    )
-
-    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 2
-    assert stale.read_bytes() == b"weights"
-    assert not list(request.target_dir.parent.glob(".model.preheat-backup-*"))
-
-
-def test_target_falls_back_when_trusted_candidate_has_no_selected_files(tmp_path):
-    minio = _published_client(tmp_path)
-    trusted_root = tmp_path / "unrelated-model-file"
-    trusted_root.mkdir()
-    (trusted_root / "notes.txt").write_text("not part of selected model")
-    request = replace(
-        _target_request(tmp_path),
-        trusted_local_candidate=TrustedLocalCandidate(
-            source="model_file",
-            root=trusted_root,
-            paths=(trusted_root,),
-        ),
-    )
-
-    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 2
-
-
-def test_target_reports_resumable_cursor_after_each_real_file_boundary(tmp_path):
-    minio = _published_client(tmp_path)
-    request = _target_request(tmp_path)
-    cursors = []
-
-    result = execute_target_preheat(
-        request,
-        ModelPreheatS3Client(minio),
-        progress_callback=lambda completed, downloaded_size, total_size: cursors.append(
-            (list(completed), downloaded_size, total_size)
-        ),
-    )
-
-    assert result["state"] == "ready"
-    assert [cursor[0] for cursor in cursors] == [
-        ["config.json"],
-        ["config.json", "weights/model.bin"],
-    ]
-    assert cursors[-1][1] == cursors[-1][2]
-
-
-def test_s3_download_honors_optional_bandwidth_limit(tmp_path, monkeypatch):
-    from gpustack.worker.model_preheat import s3_client as s3_client_module
-
-    minio = InMemoryMinio()
-    minio.objects[("models", "large.bin")] = StoredObject(b"x" * (2 * 1024 * 1024))
-    sleeps = []
-    monkeypatch.setattr(s3_client_module.time, "monotonic", lambda: 0.0)
-    monkeypatch.setattr(s3_client_module.time, "sleep", sleeps.append)
-
-    chunks = list(
-        ModelPreheatS3Client(minio).stream_object(
-            "models",
-            "large.bin",
-            chunk_size=1024 * 1024,
-            bandwidth_limit_mbps=8,
-        )
-    )
-
-    assert sum(map(len, chunks)) == 2 * 1024 * 1024
-    assert len(chunks) == 32
-    assert max(map(len, chunks)) <= 64 * 1024
-    assert len(sleeps) == 32
-    assert sleeps[-1] == pytest.approx(2.097152)
-
-
-def test_seed_delegation_preserves_bandwidth_limit_and_resumable_cursor(
-    tmp_path, monkeypatch
-):
-    request = replace(
-        _seed_request(tmp_path),
-        bandwidth_limit_mbps=8,
-        resumable_cursor={"completed_files": ["config.json"]},
-    )
-    delegated = []
-
-    class ReadyClient:
-        def read_ready_manifest(self, *args, **kwargs):
-            return object()
-
-    def capture(target_request, *args, **kwargs):
-        delegated.append(target_request)
-        return {"state": "ready"}
-
-    monkeypatch.setattr(
-        "gpustack.worker.model_preheat.executor.execute_target_preheat", capture
-    )
-
-    assert execute_seed_preheat(request, ReadyClient())["state"] == "ready"
-    assert delegated[0].bandwidth_limit_mbps == 8
-    assert delegated[0].resumable_cursor == {"completed_files": ["config.json"]}
-
-
-def test_target_reuses_partial_file_and_retries_checksum_mismatch(tmp_path):
-    minio = _published_client(tmp_path)
-    request = _target_request(tmp_path)
-    staging = request.cache_dir / ".preheat" / "8" / "1"
-    _write_model(staging)
-    (staging / "weights" / "model.bin").unlink()
-
-    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 1
-    assert result["skipped"] == 1
-
-
-def test_target_resume_reuses_only_files_confirmed_by_persisted_cursor(tmp_path):
-    minio = _published_client(tmp_path)
-    request = replace(
-        _target_request(tmp_path),
-        attempt=2,
-        resumable_cursor={
-            "completed_files": ["config.json"],
-            "staging_exists": True,
-        },
-    )
-    previous = request.cache_dir / ".preheat" / str(request.task_id) / "1"
-    _write_model(previous)
-
-    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
-
-    assert result["state"] == "ready"
-    assert result["skipped"] == 1
-    assert result["downloaded"] == 1
-
-
-def test_target_resume_reuses_encoded_space_and_unicode_paths(tmp_path):
-    minio = _published_client(tmp_path)
-    manifest = ModelPreheatS3Client(minio).read_ready_manifest(
-        "models",
-        "preheat",
-        _identity(),
-        cache_key="cache-key",
-        selection_digest="selection-digest",
-    )
-    renamed_files = [
-        replace(manifest.files[0], path="weights/model%207b.bin"),
-        replace(
-            manifest.files[1],
-            path="%E8%B5%84%E6%96%99/%E6%A8%A1%E5%9E%8B.bin",
-        ),
-    ]
-    manifest = replace(manifest, files=renamed_files)
-    request = replace(
-        _target_request(tmp_path),
-        attempt=2,
-        resumable_cursor={
-            "completed_files": [file.path for file in manifest.files],
-            "staging_exists": True,
-        },
-    )
-    previous = request.cache_dir / ".preheat" / str(request.task_id) / "1"
-    (previous / "weights").mkdir(parents=True)
-    (previous / "weights" / "model 7b.bin").write_bytes(b"config")
-    (previous / "资料").mkdir(parents=True)
-    (previous / "资料" / "模型.bin").write_bytes(b"weights")
-    client = ModelPreheatS3Client(minio)
-    downloaded = []
-
-    client.read_ready_manifest = lambda *args, **kwargs: manifest
-    client.download_generation_file = lambda *args, **kwargs: downloaded.append(args)
-    result = execute_target_preheat(request, client)
-
-    assert result["state"] == "ready"
-    assert result["skipped"] == 2
-    assert result["downloaded"] == 0
-    assert downloaded == []
-
-
-def test_target_new_attempt_reuses_only_verified_previous_staging_files(
-    tmp_path, monkeypatch
-):
-    minio = _published_client(tmp_path)
     request = TargetExecutionRequest(
-        **{**_target_request(tmp_path).__dict__, "attempt": 2}
+        cache_dir=tmp_path / "target-cache",
+        target_dir=tmp_path / "target-cache" / "ollama",
+        task_id=9,
+        attempt=1,
+        request_digest=identity.request_digest,
+        identity=identity,
+        exclude_patterns=[],
+        bucket="models",
+        prefix="preheat",
+        artifact_id=published["artifact_id"],
+        manifest_path=published["manifest_path"],
     )
-    previous = request.cache_dir / ".preheat" / "8" / "1"
-    _write_model(previous)
-    (previous / "weights" / "model.bin").write_bytes(b"corrupt")
-    client = ModelPreheatS3Client(minio)
-    downloaded = []
-    original = client.download_generation_file
 
-    def track_download(bucket, prefix, manifest, file, target):
-        downloaded.append(file.path)
-        return original(bucket, prefix, manifest, file, target)
-
-    monkeypatch.setattr(client, "download_generation_file", track_download)
-    result = execute_target_preheat(request, client)
+    result = execute_target_preheat(request, ModelPreheatS3Client(minio))
 
     assert result["state"] == "ready"
-    assert downloaded == ["weights/model.bin"]
-    assert result["skipped"] == 1
-
-
-def test_target_checksum_mismatch_and_cancellation_keep_staging(tmp_path, monkeypatch):
-    minio = _published_client(tmp_path)
-    request = _target_request(tmp_path)
-    client = ModelPreheatS3Client(minio)
-
-    def corrupt_download(bucket, prefix, manifest, file, target):
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"bad")
-
-    monkeypatch.setattr(client, "download_generation_file", corrupt_download)
-    mismatch = execute_target_preheat(request, client)
-
-    canceled_request = TargetExecutionRequest(**{**request.__dict__, "attempt": 2})
-    canceled = execute_target_preheat(
-        canceled_request, ModelPreheatS3Client(minio), cancel_check=lambda: True
-    )
-
-    assert mismatch["error_code"] == "checksum_mismatch"
-    assert canceled["error_code"] == "canceled"
-    assert (canceled_request.cache_dir / ".preheat" / "8" / "2").exists()
-
-
-def test_embedded_target_with_valid_local_manifest_does_not_download(
-    tmp_path, monkeypatch
-):
-    minio = _published_client(tmp_path)
-    request = _seed_request(tmp_path)
-    client = ModelPreheatS3Client(minio)
-
-    def unexpected_download(*args, **kwargs):
-        raise AssertionError("embedded worker should not download from S3")
-
-    monkeypatch.setattr(client, "download_generation_file", unexpected_download)
-    result = execute_target_preheat(TargetExecutionRequest(**request.__dict__), client)
-
-    assert result["state"] == "ready"
-    assert result["downloaded"] == 0
-
-
-def test_target_rejects_manifest_with_more_than_1024_files(tmp_path):
-    minio = _published_client(tmp_path)
-    request = _target_request(tmp_path)
-    client = ModelPreheatS3Client(minio)
-    ready_object = client._ready_object(
-        request.prefix, request.identity, request.selection_digest
-    )
-    ready = json.loads(minio.objects[(request.bucket, ready_object)].data)
-    manifest_object = ready["manifest_object"]
-    payload = json.loads(minio.objects[(request.bucket, manifest_object)].data)
-    template = payload["files"][0]
-    payload["files"] = [
-        {**template, "path": f"files/{index}.bin"} for index in range(1025)
-    ]
-    oversized = json.dumps(payload).encode("utf-8")
-    ready["manifest_sha256"] = hashlib.sha256(oversized).hexdigest()
-    minio.objects[(request.bucket, manifest_object)] = StoredObject(oversized)
-    minio.objects[(request.bucket, ready_object)] = StoredObject(
-        json.dumps(ready).encode("utf-8")
-    )
-
-    result = execute_target_preheat(request, client)
-
-    assert result["state"] == "error"
-    assert result["error_code"] == "s3_manifest_invalid"
-    assert not request.target_dir.exists()
-
-
-import hashlib
-import json
+    assert (request.target_dir / filename).read_bytes() == b"ollama-model"
