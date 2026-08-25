@@ -3,7 +3,7 @@ import logging
 import os
 
 from gpustack.api.exceptions import HTTPException
-from gpustack.schemas.model_files import ModelFileStateEnum, ModelFileUpdate
+from gpustack.schemas.model_files import ModelFileStateEnum
 
 
 logger = logging.getLogger(__name__)
@@ -38,9 +38,9 @@ def reconcile_ready_model_files(clientset, worker_id: int, worker_name: str):
         if _resolved_paths_exist(model_file.resolved_paths):
             continue
         try:
-            clientset.model_files.update(
+            clientset.model_storage_sync_tasks.mark_model_file_source_missing(
                 model_file.id,
-                _model_file_error_update(model_file),
+                model_file.updated_at,
             )
         except HTTPException as exc:
             if exc.status_code == 404:
@@ -64,20 +64,6 @@ def _resolved_paths_exist(resolved_paths) -> bool:
         )
         for path in resolved_paths
     )
-
-
-def _model_file_error_update(model_file) -> ModelFileUpdate:
-    """仅复制 PUT 契约字段，避免将 Public 扩展字段写回服务端。"""
-    values = {
-        name: getattr(model_file, name)
-        for name in ModelFileUpdate.model_fields
-        if hasattr(model_file, name)
-    }
-    values.update(
-        state=ModelFileStateEnum.ERROR,
-        state_message="model_sync_source_not_found",
-    )
-    return ModelFileUpdate.model_validate(values)
 
 
 def cleanup_stale_model_instances(clientset, worker_id: int, worker_name: str):

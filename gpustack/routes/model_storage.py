@@ -80,6 +80,7 @@ from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncTask,
     ModelStorageSyncTaskCreate,
     ModelStorageSyncTaskFail,
+    ModelStorageSyncSourceMissing,
     ModelStorageSyncTaskDetail,
     ModelStorageSyncTaskProfilePublic,
     ModelStorageSyncTaskPublic,
@@ -162,6 +163,7 @@ _SYNC_FAILURE_CODES = {
     "worker_execution_failed",
     # 兼容已经发布的 Worker；新 Worker 统一使用 worker_execution_failed。
     "s3_publish_failed",
+    "manifest_invalid",
 }
 
 
@@ -1803,6 +1805,57 @@ async def get_model_storage_sync_execution_payload(
     )
 
 
+@worker_router.post("/model-files/{model_file_id}/source-missing")
+async def mark_model_file_source_missing(
+    session: SessionDep,
+    model_file_id: int,
+    body: ModelStorageSyncSourceMissing,
+    identity: WorkerIdentityDep,
+):
+    """仅当前 owner Worker 可用的 READY → ERROR 条件更新。"""
+    model_file = await ModelFile.one_by_id(session, model_file_id)
+    if model_file is None:
+        raise NotFoundException(message="model_file_not_found")
+    current = (
+        await session.exec(
+            select(Worker)
+            .where(Worker.worker_uuid == identity.worker_uuid)
+            .order_by(Worker.id.desc())
+        )
+    ).first()
+    if (
+        current is None
+        or current.id != identity.worker_id
+        or current.id != model_file.worker_id
+    ):
+        raise HTTPException(403, "worker_not_current", "worker_not_current")
+    expected_updated_at = body.expected_updated_at.astimezone(timezone.utc)
+    current_updated_at = model_file.updated_at.astimezone(timezone.utc)
+    if current_updated_at != expected_updated_at:
+        return Response(status_code=204)
+    changed = await session.exec(
+        update(ModelFile)
+        .where(
+            ModelFile.id == model_file_id,
+            ModelFile.worker_id == identity.worker_id,
+            ModelFile.state == ModelFileStateEnum.READY,
+            ModelFile.updated_at == model_file.updated_at,
+        )
+        .values(
+            state=ModelFileStateEnum.ERROR,
+            state_message="model_sync_source_not_found",
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if changed.rowcount != 1:
+        await session.rollback()
+        return Response(status_code=204)
+    await session.commit()
+    model_file = await session.get(ModelFile, model_file_id, populate_existing=True)
+    await ModelFile._publish_event(EventType.UPDATED, model_file)
+    return Response(status_code=200)
+
+
 @worker_router.post("/{task_id}/complete")
 async def complete_model_storage_sync_task(
     request: Request,
@@ -1963,6 +2016,7 @@ async def fail_model_storage_sync_task(
         raise ConflictException(message="lease_token_invalid")
     if len(failure.error_code) > 64 or failure.error_code not in _SYNC_FAILURE_CODES:
         raise HTTPException(422, "Validation Error", "invalid_sync_error_code")
+    error_code = failure.error_code
     if task.state in _TERMINAL_STATES:
         # 已终态：失败回写不得覆盖（也不折叠为 200，避免 Worker 误判成功）。
         raise ConflictException(message="sync_task_already_terminal")
@@ -1982,8 +2036,8 @@ async def fail_model_storage_sync_task(
         )
         .values(
             state=ModelStorageSyncTaskStateEnum.ERROR,
-            state_message=failure.error_code,
-            error_code=failure.error_code,
+            state_message=error_code,
+            error_code=error_code,
             finished_at=now,
         )
         .execution_options(synchronize_session=False)
@@ -1992,7 +2046,7 @@ async def fail_model_storage_sync_task(
         # CAS 未生效：任务在读取后被取消或完成，不覆盖、不折叠为成功。
         raise ConflictException(message="sync_task_conflict")
     drifted_model_file = None
-    if failure.error_code == "model_sync_source_not_found":
+    if error_code == "model_sync_source_not_found":
         current_model_file = await lock_model_file_for_sync_or_delete(
             session, task.model_file_id
         )
@@ -2006,7 +2060,7 @@ async def fail_model_storage_sync_task(
                 )
                 .values(
                     state=ModelFileStateEnum.ERROR,
-                    state_message=failure.error_code,
+                    state_message=error_code,
                 )
                 .execution_options(synchronize_session=False)
             )

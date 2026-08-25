@@ -432,6 +432,12 @@ class ModelStorageSyncTaskFail(SQLModel):
     error_code: str
 
 
+class ModelStorageSyncSourceMissing(SQLModel):
+    """Worker 启动核对发现冻结源路径缺失时使用的最小 CAS 请求。"""
+
+    expected_updated_at: datetime
+
+
 # 避免未使用告警，同时保证外键引用的表在仅导入本模块时也可 create_all。
 __all__ = [
     "ModelStorageSyncTask",

@@ -9,6 +9,7 @@ from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncExecutionPayload,
     ModelStorageSyncTaskComplete,
     ModelStorageSyncTaskFail,
+    ModelStorageSyncSourceMissing,
 )
 
 from .generated_http_client import HTTPClient
@@ -70,6 +71,16 @@ class ModelStorageSyncTaskClient:
         response = await self._client.get_async_httpx_client().post(
             f"{self._url}/{id}/fail",
             content=failure.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+        raise_if_response_error(response)
+
+    def mark_model_file_source_missing(self, id: int, expected_updated_at):
+        response = self._client.get_httpx_client().post(
+            f"{self._url}/model-files/{id}/source-missing",
+            content=ModelStorageSyncSourceMissing(
+                expected_updated_at=expected_updated_at
+            ).model_dump_json(),
             headers={"Content-Type": "application/json"},
         )
         raise_if_response_error(response)

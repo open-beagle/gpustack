@@ -533,8 +533,8 @@ def test_deduplicated_manual_task_is_not_paused_by_schedule_window(tmp_path):
 def test_default_task_creator_builds_real_scheduled_task_without_plain_credentials(
     tmp_path, monkeypatch
 ):
-    async def skip_connectivity_check(session, profile, config, workers):
-        del session, profile, config, workers
+    async def skip_connectivity_check(session, profile, config, workers, **kwargs):
+        del session, profile, config, workers, kwargs
 
     monkeypatch.setattr(
         model_preheats,
@@ -598,8 +598,8 @@ def test_default_task_creator_builds_real_scheduled_task_without_plain_credentia
 def test_default_task_creator_rejects_profile_maintained_before_final_lock(
     tmp_path, monkeypatch
 ):
-    async def skip_connectivity_check(session, profile, config, workers):
-        del session, profile, config, workers
+    async def skip_connectivity_check(session, profile, config, workers, **kwargs):
+        del session, profile, config, workers, kwargs
 
     async def reject_stale_active_profile(*args, **kwargs):
         del args, kwargs
@@ -688,8 +688,8 @@ def test_default_task_creator_rejects_busy_target_worker(tmp_path):
 
 
 def test_same_gpu_model_creator_does_not_reinclude_busy_worker(tmp_path, monkeypatch):
-    async def skip_connectivity_check(session, profile, config, workers):
-        del session, profile, config, workers
+    async def skip_connectivity_check(session, profile, config, workers, **kwargs):
+        del session, profile, config, workers, kwargs
 
     monkeypatch.setattr(
         model_preheats,

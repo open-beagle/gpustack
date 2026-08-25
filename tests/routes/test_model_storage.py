@@ -149,6 +149,13 @@ def app(tmp_path):
 
     asyncio.run(create_tables())
 
+    async def seed_system_user():
+        async with AsyncSession(engine) as session:
+            session.add(User(id=1, username="admin", is_admin=True, hashed_password=""))
+            await session.commit()
+
+    asyncio.run(seed_system_user())
+
     test_app = FastAPI()
     test_app.state.server_config = SimpleNamespace(
         model_preheat_credential_key=generate_model_preheat_credential_key(),
@@ -341,13 +348,6 @@ def test_create_sync_task_only_accepts_model_file_and_profile_id(app, client):
 
 def test_sync_policy_run_now_creates_existing_sync_task_and_replays(app, client):
     profile_id, model_file_id = _run(app, _seed_ids(app))
-
-    async def seed_user():
-        async with AsyncSession(_engine(app)) as session:
-            session.add(User(id=1, username="admin", is_admin=True, hashed_password=""))
-            await session.commit()
-
-    _run(app, seed_user())
     created = client.post(
         "/v1/model-storage-sync-policies",
         json={
@@ -498,7 +498,7 @@ def test_scheduled_sync_policy_claims_one_window_and_creates_sync_task(app, clie
     runs, tasks = _run(app, make_due_and_tick_twice())
 
     assert len(runs) == 1
-    assert runs[0].state.value == "ready"
+    assert runs[0].state.value == "pending"
     assert len(tasks) == 1
     assert tasks[0].model_file_id == model_file_id
 
@@ -2484,6 +2484,7 @@ async def _seed_two_workers_tasks(app):
             port=10150,
             worker_uuid="worker-a-uuid",
             state=WorkerStateEnum.READY,
+            model_storage_protocol_version=MODEL_STORAGE_PROTOCOL_VERSION,
         )
         worker_b = Worker(
             name="worker-b",
@@ -2492,6 +2493,7 @@ async def _seed_two_workers_tasks(app):
             port=10151,
             worker_uuid="worker-b-uuid",
             state=WorkerStateEnum.READY,
+            model_storage_protocol_version=MODEL_STORAGE_PROTOCOL_VERSION,
         )
         session.add_all([worker_a, worker_b])
         await session.flush()
@@ -2694,6 +2696,7 @@ def test_create_rejects_stale_worker_registration(app):
                 port=10150,
                 worker_uuid="worker-a-uuid",
                 state=WorkerStateEnum.READY,
+                model_storage_protocol_version=MODEL_STORAGE_PROTOCOL_VERSION,
             )
             session.add(worker_old)
             await session.flush()
@@ -2703,6 +2706,7 @@ def test_create_rejects_stale_worker_registration(app):
                 ip="127.0.0.1",
                 port=10150,
                 worker_uuid="worker-a-uuid",
+                model_storage_protocol_version=MODEL_STORAGE_PROTOCOL_VERSION,
                 state=WorkerStateEnum.READY,
             )
             session.add(worker_new)
@@ -3072,6 +3076,78 @@ def test_worker_fail_rejects_unstable_error_code(app):
             )
             assert response.status_code == 422
             assert client.get(DETAIL.format(id=task_id)).json()["state"] != "error"
+    finally:
+        app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
+
+
+def test_worker_source_missing_cas_is_owner_scoped_and_idempotent(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    del profile_id
+
+    async def model_file_snapshot():
+        async with AsyncSession(_engine(app)) as session:
+            model_file = await session.get(ModelFile, model_file_id)
+            await session.exec(
+                update(ModelFile)
+                .where(ModelFile.id == model_file_id)
+                .values(
+                    updated_at=datetime.now(timezone.utc).replace(microsecond=123456)
+                )
+            )
+            await session.commit()
+            await session.refresh(model_file)
+            worker = await session.get(Worker, model_file.worker_id)
+            return model_file.updated_at, worker.id, worker.worker_uuid
+
+    updated_at, worker_id, worker_uuid = _run(app, model_file_snapshot())
+
+    async def owner():
+        return _worker_principal(worker_id, worker_uuid)
+
+    app.dependency_overrides[get_model_preheat_worker_identity] = owner
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/v1/model-storage-worker-tasks/model-files/{model_file_id}/source-missing",
+                json={"expected_updated_at": updated_at.isoformat()},
+            )
+            stale = client.post(
+                f"/v1/model-storage-worker-tasks/model-files/{model_file_id}/source-missing",
+                json={"expected_updated_at": updated_at.isoformat()},
+            )
+            missing = client.post(
+                "/v1/model-storage-worker-tasks/model-files/999999/source-missing",
+                json={"expected_updated_at": updated_at.isoformat()},
+            )
+        assert response.status_code == 200
+        assert stale.status_code == 204
+        assert missing.status_code == 404
+    finally:
+        app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
+
+
+def test_worker_fail_accepts_legacy_manifest_invalid(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = _create_task(app, profile_id, model_file_id)
+    worker_id, worker_uuid = created["worker_id"], created["worker_uuid"]
+
+    async def owner():
+        return _worker_principal(worker_id, worker_uuid)
+
+    app.dependency_overrides[get_model_preheat_worker_identity] = owner
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                WORKER_FAIL.format(id=created["id"]),
+                json={
+                    "error_code": "manifest_invalid",
+                    "lease_token": _fetch_task_lease_token(app, created["id"]),
+                },
+            )
+            detail = client.get(DETAIL.format(id=created["id"])).json()
+        assert response.status_code == 200
+        assert detail["state"] == "error"
+        assert detail["error_code"] == "manifest_invalid"
     finally:
         app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
 

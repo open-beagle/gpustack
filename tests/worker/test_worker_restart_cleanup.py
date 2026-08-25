@@ -129,6 +129,7 @@ def test_worker_startup_marks_missing_ready_model_files_and_continues(tmp_path):
     class ModelFileRecord(SimpleNamespace):
         source = "model_scope"
         model_scope_model_id = "test/model"
+        updated_at = "version"
 
     class ModelFilesClient:
         def __init__(self):
@@ -148,20 +149,21 @@ def test_worker_startup_marks_missing_ready_model_files_and_continues(tmp_path):
             self.list_params.append(params)
             return SimpleNamespace(items=self.pages.pop(0))
 
-        def update(self, id, model_update):
-            self.updated.append((id, model_update.state, model_update.state_message))
+        def mark_model_file_source_missing(self, id, updated_at):
+            self.updated.append((id, updated_at))
             if id == 3:
                 raise RuntimeError("临时失败")
 
     client = ModelFilesClient()
-    reconcile_ready_model_files(SimpleNamespace(model_files=client), 42, "worker-a")
+    reconcile_ready_model_files(
+        SimpleNamespace(model_files=client, model_storage_sync_tasks=client),
+        42,
+        "worker-a",
+    )
 
     assert client.list_params == [
         {"worker_id": 42, "state": "ready", "page": 1, "perPage": 100},
         {"worker_id": 42, "state": "ready", "page": 2, "perPage": 100},
         {"worker_id": 42, "state": "ready", "page": 3, "perPage": 100},
     ]
-    assert client.updated == [
-        (3, "error", "model_sync_source_not_found"),
-        (4, "error", "model_sync_source_not_found"),
-    ]
+    assert [item[0] for item in client.updated] == [3, 4]
