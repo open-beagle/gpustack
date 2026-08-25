@@ -51,7 +51,9 @@ async def create_model_file_with_download_execution(session, model_file, config)
     return model_file
 
 
-async def prepare_model_file_download_execution(session, model_file, config):
+async def prepare_model_file_download_execution(
+    session, model_file, config, *, require_worker_ready=True
+):
     """为首次下载或本地文件丢失后的重下载准备唯一执行记录。"""
     execution = (
         await session.exec(
@@ -77,7 +79,9 @@ async def prepare_model_file_download_execution(session, model_file, config):
         session.add(execution)
         return execution
 
-    worker = await _current_protocol_worker(session, model_file.worker_id)
+    worker = await _current_protocol_worker(
+        session, model_file.worker_id, require_ready=require_worker_ready
+    )
     model_file.worker_uuid_snapshot = worker.worker_uuid
     model_file.worker_name_snapshot = worker.name
     request_identity = _request_identity(model_file)
@@ -138,7 +142,9 @@ async def prepare_model_file_download_execution(session, model_file, config):
     return execution
 
 
-async def _current_protocol_worker(session, worker_id: Optional[int]) -> Worker:
+async def _current_protocol_worker(
+    session, worker_id: Optional[int], *, require_ready=True
+) -> Worker:
     if worker_id is None:
         raise ConflictException(message="model_file_worker_required")
     worker = await session.get(Worker, worker_id)
@@ -153,7 +159,7 @@ async def _current_protocol_worker(session, worker_id: Optional[int]) -> Worker:
     ).first()
     if latest is None or latest.id != worker.id:
         raise ConflictException(message="model_file_worker_stale_registration")
-    if worker.state != WorkerStateEnum.READY:
+    if require_ready and worker.state != WorkerStateEnum.READY:
         raise ConflictException(message="model_file_worker_not_ready")
     if worker.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
         raise ConflictException(message="model_storage_protocol_mismatch")

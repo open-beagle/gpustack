@@ -1838,7 +1838,10 @@ async def mark_model_file_source_missing(
     if current_updated_at != expected_updated_at:
         return Response(status_code=204)
     await prepare_model_file_download_execution(
-        session, model_file, request.app.state.server_config
+        session,
+        model_file,
+        request.app.state.server_config,
+        require_worker_ready=False,
     )
     changed = await session.exec(
         update(ModelFile)

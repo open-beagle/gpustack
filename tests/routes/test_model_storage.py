@@ -3102,7 +3102,11 @@ def test_worker_source_missing_cas_is_owner_scoped_and_idempotent(app):
             await session.commit()
             await session.refresh(model_file)
             worker = await session.get(Worker, model_file.worker_id)
-            return model_file.updated_at, worker.id, worker.worker_uuid
+            snapshot = model_file.updated_at, worker.id, worker.worker_uuid
+            worker.state = WorkerStateEnum.NOT_READY
+            session.add(worker)
+            await session.commit()
+            return snapshot
 
     updated_at, worker_id, worker_uuid = _run(app, model_file_snapshot())
 
