@@ -217,6 +217,17 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
         """
         Score the candidates with the spread strategy.
         """
+        worker_map = {candidate.worker.id: candidate.worker for candidate in candidates}
+        if any(candidate.subordinate_workers for candidate in candidates):
+            async with AsyncSession(self._engine) as session:
+                workers = await Worker.all(session)
+                worker_map.update({worker.id: worker for worker in workers})
+
+        candidates = [
+            candidate
+            for candidate in candidates
+            if self._candidate_uses_only_idle_gpus(candidate, worker_map)
+        ]
         worker_model_instances_count_map = await self._get_worker_model_instance_count()
 
         for candidate in candidates:
@@ -227,6 +238,40 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
             )
 
         return candidates
+
+    @staticmethod
+    def _candidate_uses_only_idle_gpus(
+        candidate: ModelInstanceScheduleCandidate,
+        worker_map: Dict[int, Worker],
+    ) -> bool:
+        if not PlacementScorer._worker_gpus_are_idle(
+            candidate.worker, candidate.gpu_indexes
+        ):
+            return False
+
+        for subordinate_worker in candidate.subordinate_workers or []:
+            worker = worker_map.get(subordinate_worker.worker_id)
+            if not PlacementScorer._worker_gpus_are_idle(
+                worker, subordinate_worker.gpu_indexes
+            ):
+                return False
+
+        return True
+
+    @staticmethod
+    def _worker_gpus_are_idle(
+        worker: Optional[Worker], gpu_indexes: Optional[List[int]]
+    ) -> bool:
+        if not gpu_indexes:
+            return True
+        if worker is None or worker.status is None or not worker.status.gpu_devices:
+            return False
+        devices = {device.index: device for device in worker.status.gpu_devices}
+        for gpu_index in gpu_indexes:
+            device = devices.get(gpu_index)
+            if device is None or device.memory is None or device.memory.allocated != 0:
+                return False
+        return True
 
     async def score_spread_instances(
         self, instances: List[ModelInstance], worker_map: dict

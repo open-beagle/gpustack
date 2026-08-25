@@ -9,9 +9,20 @@ from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.policies.base import Allocatable, ModelInstanceScheduleCandidate
-from gpustack.schemas.models import ComputedResourceClaim, PlacementStrategyEnum
+from gpustack.schemas.links import ModelInstanceModelFileLink
+from gpustack.schemas.model_files import ModelFile
+from gpustack.schemas.models import (
+    ComputedResourceClaim,
+    Model,
+    ModelInstance,
+    PlacementStrategyEnum,
+    SourceEnum,
+)
 from gpustack.schemas.scheduler import SchedulingAttemptEvent, SchedulingOutcome
-from gpustack.scheduler.scheduler import _build_scheduling_event
+from gpustack.scheduler.scheduler import (
+    _build_scheduling_event,
+    _commit_scheduling_result,
+)
 from gpustack.schemas.workers import (
     GPUDeviceInfo,
     MemoryInfo,
@@ -87,6 +98,57 @@ async def test_scheduling_event_increments_existing_attempt():
 
         assert stored_outcome == "failed"
         assert event.attempt_no == 2
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_commit_scheduling_result_refreshes_instance_before_publish(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'scheduler.db'}")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(
+                SQLModel.metadata.create_all,
+                tables=[
+                    Model.__table__,
+                    ModelInstance.__table__,
+                    ModelFile.__table__,
+                    ModelInstanceModelFileLink.__table__,
+                    SchedulingAttemptEvent.__table__,
+                ],
+            )
+        async with AsyncSession(engine, expire_on_commit=True) as session:
+            session.add(
+                Model(
+                    id=1,
+                    name="model-a",
+                    source=SourceEnum.LOCAL_PATH,
+                    local_path="/models/a",
+                )
+            )
+            instance = ModelInstance(
+                name="instance-a",
+                model_id=1,
+                model_name="model-a",
+                source=SourceEnum.LOCAL_PATH,
+                local_path="/models/a",
+            )
+            event = await build_scheduling_event(session, "workload-commit")
+            event_id = event.event_id
+
+            async def publish(_event_type, published):
+                assert published.name == "instance-a"
+                assert published.id is not None
+
+            with patch.object(
+                ModelInstance, "_publish_event", new=AsyncMock(side_effect=publish)
+            ) as publish_mock:
+                await _commit_scheduling_result(session, event, instance)
+
+            assert instance.name == "instance-a"
+            publish_mock.assert_awaited_once()
+            stored = await session.get(SchedulingAttemptEvent, event_id)
+            assert stored is not None
     finally:
         await engine.dispose()
 

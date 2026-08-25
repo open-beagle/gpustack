@@ -679,14 +679,22 @@ class WorkerController:
         new_state_message,
         log_update_reason,
     ):
+        targets = [
+            (event_model_id(instance), instance.name)
+            for instance in instances
+            if instance.state == old_state
+        ]
         instance_names = []
-        for instance in instances:
-            if instance.state == old_state:
-                instance_names.append(instance.name)
-
-                instance.state = new_state
-                instance.state_message = new_state_message
-                await ModelInstanceService(session).update(instance)
+        for instance_id, instance_name in targets:
+            if instance_id is None:
+                continue
+            instance = await ModelInstance.one_by_id(session, instance_id)
+            if not instance or instance.state != old_state:
+                continue
+            instance.state = new_state
+            instance.state_message = new_state_message
+            await ModelInstanceService(session).update(instance)
+            instance_names.append(instance_name)
         if instance_names:
             logger.debug(
                 f"Marked instance {', '.join(instance_names)} {new_state} "

@@ -398,13 +398,7 @@ class Scheduler:
                         reason=model_instance.state_message or "No suitable workers",
                         started_at=started_at,
                     )
-                    session.add(event)
-                    session.add(model_instance)
-                    await session.commit()
-                    await session.refresh(model_instance)
-                    await ModelInstance._publish_event(
-                        EventType.UPDATED, model_instance
-                    )
+                    await _commit_scheduling_result(session, event, model_instance)
                 else:
                     await ModelInstanceService(session).update(model_instance)
                 logger.debug(
@@ -445,16 +439,24 @@ class Scheduler:
                     reason="Scheduler selected a target that satisfies the active policy",
                     started_at=started_at,
                 )
-                session.add(event)
-                session.add(model_instance)
-                await session.commit()
-                await session.refresh(model_instance)
-                await ModelInstance._publish_event(EventType.UPDATED, model_instance)
+                await _commit_scheduling_result(session, event, model_instance)
 
                 logger.debug(
                     f"Scheduled model instance {model_instance.name} to worker "
                     f"{model_instance.worker_name} gpu {candidate.gpu_indexes}"
                 )
+
+
+async def _commit_scheduling_result(
+    session: AsyncSession,
+    event: SchedulingAttemptEvent,
+    model_instance: ModelInstance,
+):
+    session.add(event)
+    session.add(model_instance)
+    await session.commit()
+    await session.refresh(model_instance)
+    await ModelInstance._publish_event(EventType.UPDATED, model_instance)
 
 
 async def find_candidate(
