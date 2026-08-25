@@ -3123,6 +3123,16 @@ def test_worker_source_missing_cas_is_owner_scoped_and_idempotent(app):
         assert response.status_code == 200
         assert stale.status_code == 204
         assert missing.status_code == 404
+
+        async def model_file_state():
+            async with AsyncSession(_engine(app)) as session:
+                return await session.get(ModelFile, model_file_id)
+
+        model_file = _run(app, model_file_state())
+        assert model_file.state == ModelFileStateEnum.DOWNLOADING
+        assert model_file.download_progress == 0
+        assert model_file.resolved_paths == []
+        assert model_file.state_message == "model_source_missing_redownload"
     finally:
         app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
 

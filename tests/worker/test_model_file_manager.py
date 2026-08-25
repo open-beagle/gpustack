@@ -1,11 +1,52 @@
 from types import SimpleNamespace
 
 from gpustack.api.exceptions import NotFoundException
+from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.worker.model_file_manager import (
+    ModelFileManager,
     _complete_download_execution_with_retries,
     _retry_download_completion_ack,
 )
 import pytest
+
+
+def test_manager_resumes_existing_downloading_files_before_watch():
+    class ModelFiles:
+        def __init__(self):
+            self.params = []
+            self.pages = [
+                [
+                    ModelFile(
+                        id=7,
+                        source="model_scope",
+                        model_scope_model_id="Qwen/test",
+                        worker_id=42,
+                        state=ModelFileStateEnum.DOWNLOADING,
+                    )
+                ],
+                [],
+            ]
+
+        def list(self, params):
+            self.params.append(params)
+            return SimpleNamespace(items=self.pages.pop(0))
+
+    model_files = ModelFiles()
+    manager = ModelFileManager(
+        worker_id=42,
+        clientset=SimpleNamespace(model_files=model_files),
+        cfg=SimpleNamespace(),
+    )
+    resumed = []
+    manager._create_download_task = lambda model_file: resumed.append(model_file.id)
+
+    manager._resume_downloading_model_files()
+
+    assert resumed == [7]
+    assert model_files.params == [
+        {"worker_id": 42, "state": "downloading", "page": 1, "perPage": 100},
+        {"worker_id": 42, "state": "downloading", "page": 2, "perPage": 100},
+    ]
 
 
 def test_complete_download_execution_retries_idempotently():

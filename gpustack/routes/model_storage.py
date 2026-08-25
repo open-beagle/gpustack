@@ -1812,7 +1812,7 @@ async def mark_model_file_source_missing(
     body: ModelStorageSyncSourceMissing,
     identity: WorkerIdentityDep,
 ):
-    """仅当前 owner Worker 可用的 READY → ERROR 条件更新。"""
+    """仅当前 owner Worker 可用的 READY → DOWNLOADING 条件更新。"""
     model_file = await ModelFile.one_by_id(session, model_file_id)
     if model_file is None:
         raise NotFoundException(message="model_file_not_found")
@@ -1842,8 +1842,10 @@ async def mark_model_file_source_missing(
             ModelFile.updated_at == model_file.updated_at,
         )
         .values(
-            state=ModelFileStateEnum.ERROR,
-            state_message="model_sync_source_not_found",
+            state=ModelFileStateEnum.DOWNLOADING,
+            state_message="model_source_missing_redownload",
+            download_progress=0,
+            resolved_paths=[],
         )
         .execution_options(synchronize_session=False)
     )

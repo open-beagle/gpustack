@@ -136,6 +136,7 @@ class ModelFileManager:
 
     async def watch_model_files(self):
         self._prerun()
+        self._resume_downloading_model_files()
         if self._watchdog_task is None:
             self._watchdog_task = asyncio.create_task(self._watch_active_downloads())
         while True:
@@ -149,6 +150,23 @@ class ModelFileManager:
             except Exception as e:
                 logger.error(f"Failed to watch model files: {e}")
                 await asyncio.sleep(5)
+
+    def _resume_downloading_model_files(self):
+        page = 1
+        while True:
+            result = self._clientset.model_files.list(
+                params={
+                    "worker_id": self._worker_id,
+                    "state": ModelFileStateEnum.DOWNLOADING.value,
+                    "page": page,
+                    "perPage": 100,
+                }
+            )
+            if not result or not result.items:
+                return
+            for model_file in result.items:
+                self._create_download_task(ModelFile.model_validate(model_file))
+            page += 1
 
     def _prerun(self):
         self._mp_manager = Manager()
