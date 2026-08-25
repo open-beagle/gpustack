@@ -25,6 +25,31 @@ class SchedulingOutcome(str, Enum):
     FAILED = "failed"
 
 
+class PlacementEvaluationReplicaGroup(SQLModel):
+    gpu_ids: list[str]
+
+
+class PlacementEvaluationRequest(SQLModel):
+    model_id: int
+    replica_groups: list[PlacementEvaluationReplicaGroup]
+    independent: bool = False
+    discover: bool = False
+
+
+class PlacementEvaluationReplicaResult(SQLModel):
+    group_index: int
+    fit: bool
+    reason_code: str
+    reason: str
+    candidate_targets: list[dict]
+    selected_targets: list[dict]
+
+
+class PlacementEvaluationResponse(SQLModel):
+    fit: bool
+    results: list[PlacementEvaluationReplicaResult]
+
+
 class SchedulerPolicy(SQLModel, BaseModelMixin, table=True):
     __tablename__ = "scheduler_policies"
     __table_args__ = (

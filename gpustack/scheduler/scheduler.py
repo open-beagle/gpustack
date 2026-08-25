@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -54,11 +55,15 @@ from gpustack.schemas.models import (
     is_audio_model,
     DistributedServerCoordinateModeEnum,
     PlacementStrategyEnum,
+    GPUSelector,
 )
 from gpustack.schemas.scheduler import (
     SchedulerPolicy,
     SchedulingAttemptEvent,
     SchedulingOutcome,
+    PlacementEvaluationReplicaGroup,
+    PlacementEvaluationReplicaResult,
+    PlacementEvaluationResponse,
 )
 from gpustack.server.bus import EventType
 from gpustack.server.db import get_engine
@@ -333,6 +338,7 @@ class Scheduler:
             candidates = []
             projected_loads = {}
             messages = []
+            scheduling_model = model
             policy = (
                 await SchedulerPolicy.one_by_field(session, "code", "aggregation")
                 if model
@@ -394,7 +400,9 @@ class Scheduler:
                         selected=None,
                         projected_loads=projected_loads,
                         outcome=SchedulingOutcome.FAILED,
-                        reason_code="no_suitable_target",
+                        reason_code=scheduling_failure_reason_code(
+                            scheduling_model, messages, candidates
+                        ),
                         reason=model_instance.state_message or "No suitable workers",
                         started_at=started_at,
                     )
@@ -488,6 +496,26 @@ async def find_candidate_detailed(
     List[ModelInstanceScheduleCandidate],
     dict,
 ]:
+    candidates, messages, evaluated_candidates, projected_loads = (
+        await find_candidate_options_detailed(
+            config, model, workers, aggregation_rate=aggregation_rate
+        )
+    )
+    candidate = pick_highest_score_candidate(candidates)
+    return candidate, messages, evaluated_candidates, projected_loads
+
+
+async def find_candidate_options_detailed(
+    config: Config,
+    model: Model,
+    workers: List[Worker],
+    aggregation_rate: Optional[float] = None,
+) -> Tuple[
+    List[ModelInstanceScheduleCandidate],
+    List[str],
+    List[ModelInstanceScheduleCandidate],
+    dict,
+]:
     filters = [
         GPUMatchingFilter(model),
         LabelMatchingFilter(model),
@@ -513,7 +541,7 @@ async def find_candidate_detailed(
             candidates_selector = VLLMResourceFitSelector(config, model)
     except Exception as e:
         return (
-            None,
+            [],
             [f"Failed to initialize {model.backend} candidates selector: {e}"],
             [],
             {},
@@ -533,7 +561,17 @@ async def find_candidate_detailed(
             )
 
     placement_scorer = PlacementScorer(model)
+    candidates_before_scoring = candidates
     candidates = await placement_scorer.score(candidates)
+
+    if (
+        not candidates
+        and candidates_before_scoring
+        and model.placement_strategy == PlacementStrategyEnum.SPREAD
+    ):
+        messages.append(
+            "Spread placement requires completely idle GPUs, but every matched GPU already has allocated resources."
+        )
 
     candidate = pick_highest_score_candidate(candidates)
 
@@ -545,7 +583,194 @@ async def find_candidate_detailed(
     elif candidate and candidate.overcommit:
         messages.extend(candidates_selector.get_messages())
 
-    return candidate, messages, evaluated_candidates, projected_loads
+    return candidates, messages, evaluated_candidates, projected_loads
+
+
+def scheduling_failure_reason_code(
+    model: Model,
+    messages: List[str],
+    evaluated_candidates: List[ModelInstanceScheduleCandidate],
+) -> str:
+    if any("aggregation rate" in message.lower() for message in messages):
+        return "aggregation_limit_exceeded"
+    if (
+        model.placement_strategy == PlacementStrategyEnum.SPREAD
+        and evaluated_candidates
+    ):
+        return "spread_requires_idle_gpu"
+    return "no_suitable_target"
+
+
+async def evaluate_model_placement(
+    config: Config,
+    session: AsyncSession,
+    model: Model,
+    replica_groups: List[PlacementEvaluationReplicaGroup],
+    independent: bool = False,
+) -> PlacementEvaluationResponse:
+    workers = [worker.model_copy(deep=True) for worker in await Worker.all(session)]
+    policy = await SchedulerPolicy.one_by_field(session, "code", "aggregation")
+    if policy is None:
+        return PlacementEvaluationResponse(
+            fit=False,
+            results=[
+                PlacementEvaluationReplicaResult(
+                    group_index=index,
+                    fit=False,
+                    reason_code="scheduler_policy_not_found",
+                    reason="Aggregation scheduler policy not found",
+                    candidate_targets=[],
+                    selected_targets=[],
+                )
+                for index, _ in enumerate(replica_groups)
+            ],
+        )
+    results = []
+
+    for index, group in enumerate(replica_groups):
+        scheduling_model = copy.deepcopy(model)
+        scheduling_model.gpu_selector = GPUSelector(gpu_ids=group.gpu_ids)
+        aggregation_rate = None
+        if policy and scheduling_model.placement_strategy == PlacementStrategyEnum.BINPACK:
+            if policy.enabled:
+                aggregation_rate = policy.aggregation_rate
+            else:
+                scheduling_model.placement_strategy = PlacementStrategyEnum.SPREAD
+
+        candidate, messages, candidates, projected_loads = await find_candidate_detailed(
+            config,
+            scheduling_model,
+            workers,
+            aggregation_rate=aggregation_rate,
+        )
+        reason_code = "target_selected"
+        reason = "Target satisfies the active scheduling policy"
+        if candidate is None:
+            reason_code = scheduling_failure_reason_code(
+                scheduling_model, messages, candidates
+            )
+            reason = "".join(messages).strip() or "No suitable workers"
+
+        results.append(
+            PlacementEvaluationReplicaResult(
+                group_index=index,
+                fit=candidate is not None,
+                reason_code=reason_code,
+                reason=reason,
+                candidate_targets=[
+                    candidate_snapshot(item, projected_loads.get(id(item)))
+                    for item in candidates
+                ],
+                selected_targets=(
+                    [candidate_snapshot(candidate, projected_loads.get(id(candidate)))]
+                    if candidate
+                    else []
+                ),
+            )
+        )
+        if candidate is None:
+            continue
+        if not independent:
+            _reserve_evaluated_candidate(candidate, workers)
+
+    return PlacementEvaluationResponse(
+        fit=bool(results) and all(result.fit for result in results),
+        results=results,
+    )
+
+
+async def discover_model_placement(
+    config: Config,
+    session: AsyncSession,
+    model: Model,
+) -> PlacementEvaluationResponse:
+    workers = [worker.model_copy(deep=True) for worker in await Worker.all(session)]
+    policy = await SchedulerPolicy.one_by_field(session, "code", "aggregation")
+    if policy is None:
+        return PlacementEvaluationResponse(
+            fit=False,
+            results=[
+                PlacementEvaluationReplicaResult(
+                    group_index=0,
+                    fit=False,
+                    reason_code="scheduler_policy_not_found",
+                    reason="Aggregation scheduler policy not found",
+                    candidate_targets=[],
+                    selected_targets=[],
+                )
+            ],
+        )
+    scheduling_model = copy.deepcopy(model)
+    aggregation_rate = None
+    if scheduling_model.placement_strategy == PlacementStrategyEnum.BINPACK:
+        if policy.enabled:
+            aggregation_rate = policy.aggregation_rate
+        else:
+            scheduling_model.placement_strategy = PlacementStrategyEnum.SPREAD
+    candidates, messages, evaluated, projected_loads = (
+        await find_candidate_options_detailed(
+            config,
+            scheduling_model,
+            workers,
+            aggregation_rate=aggregation_rate,
+        )
+    )
+    reason_code = "target_selected"
+    reason = "Targets satisfy the active scheduling policy"
+    if not candidates:
+        reason_code = scheduling_failure_reason_code(
+            scheduling_model, messages, evaluated
+        )
+        reason = "".join(messages).strip() or "No suitable workers"
+    return PlacementEvaluationResponse(
+        fit=bool(candidates),
+        results=[
+            PlacementEvaluationReplicaResult(
+                group_index=0,
+                fit=bool(candidates),
+                reason_code=reason_code,
+                reason=reason,
+                candidate_targets=[
+                    candidate_snapshot(item, projected_loads.get(id(item)))
+                    for item in candidates
+                ],
+                selected_targets=[],
+            )
+        ],
+    )
+
+
+def _reserve_evaluated_candidate(
+    candidate: ModelInstanceScheduleCandidate, workers: List[Worker]
+):
+    _reserve_worker_candidate(
+        candidate.worker,
+        candidate.gpu_indexes,
+        candidate.computed_resource_claim,
+    )
+    workers_by_id = {worker.id: worker for worker in workers}
+    for subordinate in candidate.subordinate_workers or []:
+        _reserve_worker_candidate(
+            workers_by_id.get(subordinate.worker_id),
+            subordinate.gpu_indexes,
+            subordinate.computed_resource_claim,
+        )
+
+
+def _reserve_worker_candidate(worker, gpu_indexes, claim):
+    if worker is None or worker.status is None or claim is None:
+        return
+    if worker.status.memory is not None and claim.ram:
+        worker.status.memory.allocated = (worker.status.memory.allocated or 0) + claim.ram
+    devices = {device.index: device for device in worker.status.gpu_devices or []}
+    for gpu_index in gpu_indexes or []:
+        device = devices.get(gpu_index)
+        required = (claim.vram or {}).get(gpu_index, 0) or (claim.vram or {}).get(
+            str(gpu_index), 0
+        )
+        if device is None or device.memory is None or required <= 0:
+            continue
+        device.memory.allocated = (device.memory.allocated or 0) + required
 
 
 async def _build_scheduling_event(

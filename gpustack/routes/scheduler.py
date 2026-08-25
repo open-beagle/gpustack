@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from sqlalchemy import func
 from sqlmodel import col, select
 
@@ -15,11 +15,46 @@ from gpustack.schemas.scheduler import (
     SchedulingAttemptEventPublic,
     SchedulingAttemptEventsPublic,
     SchedulingOutcome,
+    PlacementEvaluationRequest,
+    PlacementEvaluationResponse,
 )
+from gpustack.schemas.models import Model
+from gpustack.scheduler.scheduler import (
+    discover_model_placement,
+    evaluate_model_placement,
+)
+from gpustack.config.config import Config
 from gpustack.server.deps import CurrentAdminUserDep, ListParamsDep, SessionDep
 
 
 router = APIRouter()
+
+
+@router.post(
+    "/placement-evaluations", response_model=PlacementEvaluationResponse
+)
+async def create_placement_evaluation(
+    request: Request,
+    session: SessionDep,
+    evaluation_in: PlacementEvaluationRequest,
+):
+    model = await Model.one_by_id(session, evaluation_in.model_id)
+    if model is None:
+        raise NotFoundException(message="Model not found")
+    if not evaluation_in.discover and not evaluation_in.replica_groups:
+        raise HTTPException(400, "Bad Request", "replica_groups_must_not_be_empty")
+    if any(not group.gpu_ids for group in evaluation_in.replica_groups):
+        raise HTTPException(400, "Bad Request", "gpu_ids_must_not_be_empty")
+    config: Config = request.app.state.server_config
+    if evaluation_in.discover:
+        return await discover_model_placement(config, session, model)
+    return await evaluate_model_placement(
+        config,
+        session,
+        model,
+        evaluation_in.replica_groups,
+        independent=evaluation_in.independent,
+    )
 
 
 @router.get("/policies/aggregation", response_model=SchedulerPolicyPublic)
