@@ -595,7 +595,6 @@ def test_sync_policy_lost_lease_cancels_batch_without_terminal_write(app):
 
         profile_id, model_file_id = await _seed_ids(app)
         async with AsyncSession(_engine(app), expire_on_commit=False) as session:
-            session.add(User(id=1, username="admin", is_admin=True, hashed_password=""))
             policy = ModelStorageSyncPolicy(
                 name="lease-heartbeat-policy",
                 trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
@@ -693,6 +692,10 @@ def test_scheduled_sync_policy_without_creator_uses_stable_admin_or_errors(app):
         )
 
         profile_id, model_file_id = await _seed_ids(app)
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            system_user = await session.get(User, 1)
+            await session.delete(system_user)
+            await session.commit()
         no_user_run_id = await create_run(
             "scheduled-without-user", profile_id, model_file_id
         )
@@ -776,7 +779,6 @@ def test_sync_policy_plan_failure_is_terminal_error(app):
 
         profile_id, model_file_id = await _seed_ids(app)
         async with AsyncSession(_engine(app), expire_on_commit=False) as session:
-            session.add(User(id=1, username="admin", is_admin=True, hashed_password=""))
             policy = ModelStorageSyncPolicy(
                 name="plan-failure-policy",
                 trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
@@ -1177,7 +1179,6 @@ def test_sync_policy_waits_for_created_child_terminal_state(app):
         )
 
         async with AsyncSession(_engine(app), expire_on_commit=False) as session:
-            session.add(User(id=1, username="admin", is_admin=True, hashed_password=""))
             policy = ModelStorageSyncPolicy(
                 name="child-terminal-policy",
                 trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
