@@ -22,6 +22,7 @@ from gpustack.routes import (
     probes,
     proxy,
     runtime,
+    scheduler,
     update,
     users,
     models,
@@ -57,6 +58,9 @@ v1_admin_router.include_router(
     model_instances.router, prefix="/model-instances", tags=["Model Instances"]
 )
 v1_admin_router.include_router(runtime.router, prefix="/runtime", tags=["Runtime"])
+v1_admin_router.include_router(
+    scheduler.router, prefix="/scheduler", tags=["Scheduler"]
+)
 v1_admin_router.include_router(
     model_sets.router, prefix="/model-sets", tags=["Model Sets"]
 )

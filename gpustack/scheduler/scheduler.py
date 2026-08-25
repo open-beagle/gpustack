@@ -4,7 +4,10 @@ import json
 import logging
 import os
 import queue
+import time
+import uuid
 from typing import List, Tuple, Optional
+from sqlalchemy import func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -30,6 +33,10 @@ from gpustack.scheduler.model_registry import (
     vllm_supported_reranker_architectures,
 )
 from gpustack.scheduler.placement_override import get_model_for_instance_scheduling
+from gpustack.scheduler.aggregation import (
+    candidate_snapshot,
+    filter_by_aggregation_rate,
+)
 from gpustack.scheduler.queue import AsyncUniqueQueue
 from gpustack.policies.worker_filters.status_filter import StatusFilter
 from gpustack.schemas.workers import Worker
@@ -46,6 +53,12 @@ from gpustack.schemas.models import (
     is_gguf_backend,
     is_audio_model,
     DistributedServerCoordinateModeEnum,
+    PlacementStrategyEnum,
+)
+from gpustack.schemas.scheduler import (
+    SchedulerPolicy,
+    SchedulingAttemptEvent,
+    SchedulingOutcome,
 )
 from gpustack.server.bus import EventType
 from gpustack.server.db import get_engine
@@ -298,6 +311,7 @@ class Scheduler:
         logger.debug(f"Scheduling model instance {instance.name}")
 
         state_message = ""
+        started_at = time.monotonic()
 
         async with AsyncSession(self._engine) as session:
             workers = await Worker.all(session)
@@ -316,14 +330,43 @@ class Scheduler:
                 return
 
             candidate = None
+            candidates = []
+            projected_loads = {}
             messages = []
-            if workers and model:
+            policy = (
+                await SchedulerPolicy.one_by_field(session, "code", "aggregation")
+                if model
+                else None
+            )
+            if model and policy is None:
+                state_message = "Aggregation scheduler policy not found"
+            if workers and model and policy:
                 try:
                     scheduling_model = get_model_for_instance_scheduling(
                         model, model_instance
                     )
-                    candidate, messages = await find_candidate(
-                        self._config, scheduling_model, workers
+                    aggregation_rate = None
+                    if (
+                        policy.enabled
+                        and scheduling_model.placement_strategy
+                        == PlacementStrategyEnum.BINPACK
+                    ):
+                        aggregation_rate = policy.aggregation_rate
+                    elif (
+                        not policy.enabled
+                        and scheduling_model.placement_strategy
+                        == PlacementStrategyEnum.BINPACK
+                    ):
+                        scheduling_model.placement_strategy = (
+                            PlacementStrategyEnum.SPREAD
+                        )
+                    candidate, messages, candidates, projected_loads = (
+                        await find_candidate_detailed(
+                            self._config,
+                            scheduling_model,
+                            workers,
+                            aggregation_rate=aggregation_rate,
+                        )
                     )
                 except Exception as e:
                     state_message = f"Failed to find candidate: {e}"
@@ -341,7 +384,28 @@ class Scheduler:
                 if state_message != "":
                     model_instance.state_message = state_message
 
-                await ModelInstanceService(session).update(model_instance)
+                if model and policy:
+                    event = await _build_scheduling_event(
+                        session=session,
+                        model=model,
+                        model_instance=model_instance,
+                        policy=policy,
+                        candidates=candidates,
+                        selected=None,
+                        projected_loads=projected_loads,
+                        outcome=SchedulingOutcome.FAILED,
+                        reason_code="no_suitable_target",
+                        reason=model_instance.state_message or "No suitable workers",
+                        started_at=started_at,
+                    )
+                    session.add(event)
+                    session.add(model_instance)
+                    await session.commit()
+                    await ModelInstance._publish_event(
+                        EventType.UPDATED, model_instance
+                    )
+                else:
+                    await ModelInstanceService(session).update(model_instance)
                 logger.debug(
                     f"No suitable workers for model instance {model_instance.name}, state: {model_instance.state}"
                 )
@@ -367,7 +431,23 @@ class Scheduler:
                 elif is_gguf_backend(get_backend(model)):
                     model_instance.distributed_servers.download_model_files = False
 
-                await ModelInstanceService(session).update(model_instance)
+                event = await _build_scheduling_event(
+                    session=session,
+                    model=model,
+                    model_instance=model_instance,
+                    policy=policy,
+                    candidates=candidates,
+                    selected=candidate,
+                    projected_loads=projected_loads,
+                    outcome=SchedulingOutcome.SUCCESS,
+                    reason_code="target_selected",
+                    reason="Scheduler selected a target that satisfies the active policy",
+                    started_at=started_at,
+                )
+                session.add(event)
+                session.add(model_instance)
+                await session.commit()
+                await ModelInstance._publish_event(EventType.UPDATED, model_instance)
 
                 logger.debug(
                     f"Scheduled model instance {model_instance.name} to worker "
@@ -389,6 +469,21 @@ async def find_candidate(
                 - The schedule candidate.
                 - A list of messages for the scheduling process.
     """
+    candidate, messages, _, _ = await find_candidate_detailed(config, model, workers)
+    return candidate, messages
+
+
+async def find_candidate_detailed(
+    config: Config,
+    model: Model,
+    workers: List[Worker],
+    aggregation_rate: Optional[float] = None,
+) -> Tuple[
+    Optional[ModelInstanceScheduleCandidate],
+    List[str],
+    List[ModelInstanceScheduleCandidate],
+    dict,
+]:
     filters = [
         GPUMatchingFilter(model),
         LabelMatchingFilter(model),
@@ -413,9 +508,25 @@ async def find_candidate(
         else:
             candidates_selector = VLLMResourceFitSelector(config, model)
     except Exception as e:
-        return None, [f"Failed to initialize {model.backend} candidates selector: {e}"]
+        return (
+            None,
+            [f"Failed to initialize {model.backend} candidates selector: {e}"],
+            [],
+            {},
+        )
 
     candidates = await candidates_selector.select_candidates(workers)
+
+    projected_loads = {}
+    evaluated_candidates = candidates
+    if aggregation_rate is not None:
+        candidates, projected_loads = await filter_by_aggregation_rate(
+            get_engine(), candidates, workers, aggregation_rate
+        )
+        if not candidates:
+            messages.append(
+                f"No candidates remain below aggregation rate {aggregation_rate:.2f}%."
+            )
 
     placement_scorer = PlacementScorer(model)
     candidates = await placement_scorer.score(candidates)
@@ -430,7 +541,65 @@ async def find_candidate(
     elif candidate and candidate.overcommit:
         messages.extend(candidates_selector.get_messages())
 
-    return candidate, messages
+    return candidate, messages, evaluated_candidates, projected_loads
+
+
+async def _build_scheduling_event(
+    session,
+    model: Model,
+    model_instance: ModelInstance,
+    policy: SchedulerPolicy,
+    candidates: List[ModelInstanceScheduleCandidate],
+    selected: Optional[ModelInstanceScheduleCandidate],
+    projected_loads: dict,
+    outcome: SchedulingOutcome,
+    reason_code: str,
+    reason: str,
+    started_at: float,
+) -> SchedulingAttemptEvent:
+    workload_id = str(
+        (model.meta or {}).get("model_deploy_id") or f"gpustack-model-{model.id}"
+    )
+    attempt_statement = select(func.max(SchedulingAttemptEvent.attempt_no)).where(
+        SchedulingAttemptEvent.workload_id == workload_id
+    )
+    previous_attempt = (await session.exec(attempt_statement)).one() or 0
+    candidate_targets = [
+        candidate_snapshot(item, projected_loads.get(id(item))) for item in candidates
+    ]
+    selected_targets = (
+        [candidate_snapshot(selected, projected_loads.get(id(selected)))]
+        if selected
+        else []
+    )
+    resource_candidate = selected or (candidates[0] if candidates else None)
+    requested_resources = (
+        resource_candidate.computed_resource_claim.model_dump(mode="json")
+        if resource_candidate
+        else {}
+    )
+    return SchedulingAttemptEvent(
+        event_id=str(uuid.uuid4()),
+        workload_id=workload_id,
+        attempt_no=previous_attempt + 1,
+        policy_code=(
+            "aggregation"
+            if policy.enabled
+            and model.placement_strategy == PlacementStrategyEnum.BINPACK
+            else str(model.placement_strategy.value)
+        ),
+        policy_revision=policy.runtime_revision,
+        requested_replicas=model.replicas,
+        requested_resources=requested_resources,
+        candidate_targets=candidate_targets,
+        selected_targets=selected_targets,
+        outcome=outcome,
+        reason_code=reason_code,
+        reason=reason,
+        latency_ms=max(int((time.monotonic() - started_at) * 1000), 0),
+        trace_id=None,
+        occurred_at=datetime.now(timezone.utc),
+    )
 
 
 def pick_highest_score_candidate(candidates: List[ModelInstanceScheduleCandidate]):
