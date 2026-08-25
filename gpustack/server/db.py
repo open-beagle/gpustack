@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import time
 import re
@@ -108,7 +107,6 @@ def listen_events(engine: AsyncEngine):
 
     if engine.dialect.name == "sqlite":
         event.listen(engine.sync_engine, "connect", setup_sqlite_pragmas)
-        event.listen(engine.sync_engine, "close", ignore_cancel_on_close)
         if logger.isEnabledFor(logging.DEBUG):
             # Log slow queries on debugging
             event.listen(
@@ -128,13 +126,6 @@ def setup_sqlite_pragmas(conn, record):
     conn.execute("PRAGMA synchronous=normal")
     conn.execute("PRAGMA temp_store=memory")
     conn.execute("PRAGMA mmap_size=30000000000")
-
-
-def ignore_cancel_on_close(dbapi_connection, connection_record):
-    try:
-        dbapi_connection.close()
-    except asyncio.CancelledError:
-        pass
 
 
 def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):

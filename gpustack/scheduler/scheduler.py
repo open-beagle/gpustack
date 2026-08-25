@@ -563,7 +563,7 @@ async def _build_scheduling_event(
     attempt_statement = select(func.max(SchedulingAttemptEvent.attempt_no)).where(
         SchedulingAttemptEvent.workload_id == workload_id
     )
-    previous_attempt = (await session.exec(attempt_statement)).one() or 0
+    previous_attempt = (await session.exec(attempt_statement)).scalar_one_or_none() or 0
     candidate_targets = [
         candidate_snapshot(item, projected_loads.get(id(item))) for item in candidates
     ]

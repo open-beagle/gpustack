@@ -1,9 +1,17 @@
+import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlmodel import SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.policies.base import Allocatable, ModelInstanceScheduleCandidate
-from gpustack.schemas.models import ComputedResourceClaim
+from gpustack.schemas.models import ComputedResourceClaim, PlacementStrategyEnum
+from gpustack.schemas.scheduler import SchedulingAttemptEvent, SchedulingOutcome
+from gpustack.scheduler.scheduler import _build_scheduling_event
 from gpustack.schemas.workers import (
     GPUDeviceInfo,
     MemoryInfo,
@@ -13,6 +21,74 @@ from gpustack.schemas.workers import (
     WorkerStatus,
 )
 from gpustack.scheduler.aggregation import filter_by_aggregation_rate
+
+
+async def build_scheduling_event(session: AsyncSession, workload_id: str):
+    return await _build_scheduling_event(
+        session=session,
+        model=SimpleNamespace(
+            id=1,
+            meta={"model_deploy_id": workload_id},
+            placement_strategy=PlacementStrategyEnum.BINPACK,
+            replicas=1,
+        ),
+        model_instance=SimpleNamespace(),
+        policy=SimpleNamespace(enabled=True, runtime_revision=1),
+        candidates=[],
+        selected=None,
+        projected_loads={},
+        outcome=SchedulingOutcome.FAILED,
+        reason_code="no_candidate",
+        reason="No candidate available.",
+        started_at=time.monotonic(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduling_event_first_attempt_starts_at_one():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(
+                SQLModel.metadata.create_all, tables=[SchedulingAttemptEvent.__table__]
+            )
+        async with AsyncSession(engine) as session:
+            event = await build_scheduling_event(session, "workload-first")
+
+        assert event.attempt_no == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_scheduling_event_increments_existing_attempt():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(
+                SQLModel.metadata.create_all, tables=[SchedulingAttemptEvent.__table__]
+            )
+        async with AsyncSession(engine) as session:
+            existing = await build_scheduling_event(session, "workload-existing")
+            existing_event_id = existing.event_id
+            session.add(existing)
+            await session.commit()
+            stored_outcome = (
+                await session.exec(
+                    text(
+                        "SELECT outcome FROM scheduling_attempt_events "
+                        "WHERE event_id = :event_id"
+                    ),
+                    params={"event_id": existing_event_id},
+                )
+            ).scalar_one()
+
+            event = await build_scheduling_event(session, "workload-existing")
+
+        assert stored_outcome == "failed"
+        assert event.attempt_no == 2
+    finally:
+        await engine.dispose()
 
 
 def worker(worker_id: int, name: str) -> Worker:

@@ -7,6 +7,7 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     Column,
+    Enum as SAEnum,
     Index,
     Integer,
     String,
@@ -100,7 +101,19 @@ class SchedulingAttemptEvent(SQLModel, table=True):
     requested_resources: dict = Field(sa_column=Column(JSON, nullable=False))
     candidate_targets: list[dict] = Field(sa_column=Column(JSON, nullable=False))
     selected_targets: list[dict] = Field(sa_column=Column(JSON, nullable=False))
-    outcome: SchedulingOutcome
+    outcome: SchedulingOutcome = Field(
+        sa_column=Column(
+            SAEnum(
+                SchedulingOutcome,
+                values_callable=lambda outcomes: [
+                    outcome.value for outcome in outcomes
+                ],
+                native_enum=False,
+                length=16,
+            ),
+            nullable=False,
+        )
+    )
     reason_code: str = Field(sa_column=Column(String(128), nullable=False))
     reason: str = Field(sa_column=Column(Text, nullable=False))
     latency_ms: int = Field(sa_column=Column(BigInteger, nullable=False))
