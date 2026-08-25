@@ -13,6 +13,7 @@ from gpustack.model_preheat_credentials import (
 from gpustack.schemas.model_file_download_executions import (
     ModelFileDownloadExecution,
     ModelFileDownloadExecutionProfilePin,
+    ModelFileDownloadExecutionStateEnum,
 )
 from gpustack.schemas.model_files import ModelFile
 from gpustack.schemas.model_preheat_s3_profiles import (
@@ -41,6 +42,41 @@ from gpustack.worker.model_preheat.manifest import compute_request_digest
 
 async def create_model_file_with_download_execution(session, model_file, config):
     """在同一事务中创建 ModelFile 及其唯一私有下载执行记录。"""
+    session.add(model_file)
+    await session.flush()
+    await prepare_model_file_download_execution(session, model_file, config)
+    await session.commit()
+    await session.refresh(model_file)
+    await ModelFile._publish_event(EventType.CREATED, model_file)
+    return model_file
+
+
+async def prepare_model_file_download_execution(session, model_file, config):
+    """为首次下载或本地文件丢失后的重下载准备唯一执行记录。"""
+    execution = (
+        await session.exec(
+            select(ModelFileDownloadExecution).where(
+                ModelFileDownloadExecution.model_file_id == model_file.id
+            )
+        )
+    ).first()
+    if execution is not None:
+        execution.state = ModelFileDownloadExecutionStateEnum.PENDING
+        execution.resolved_revision = None
+        execution.artifact_id = None
+        execution.manifest_path = None
+        execution.artifact_total_size = None
+        execution.claimed_by_worker_uuid = None
+        execution.claimed_at = None
+        execution.transfer_source = None
+        execution.transfer_profile_id = None
+        execution.source_worker_id = None
+        execution.state_message = None
+        execution.error_code = None
+        execution.finished_at = None
+        session.add(execution)
+        return execution
+
     worker = await _current_protocol_worker(session, model_file.worker_id)
     model_file.worker_uuid_snapshot = worker.worker_uuid
     model_file.worker_name_snapshot = worker.name
@@ -77,8 +113,6 @@ async def create_model_file_with_download_execution(session, model_file, config)
             snapshot = None
             key_version = None
 
-    session.add(model_file)
-    await session.flush()
     execution = ModelFileDownloadExecution(
         model_file_id=model_file.id,
         request_identity=request_identity,
@@ -101,10 +135,7 @@ async def create_model_file_with_download_execution(session, model_file, config)
                 profile_id=profile.id,
             )
         )
-    await session.commit()
-    await session.refresh(model_file)
-    await ModelFile._publish_event(EventType.CREATED, model_file)
-    return model_file
+    return execution
 
 
 async def _current_protocol_worker(session, worker_id: Optional[int]) -> Worker:

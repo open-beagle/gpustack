@@ -41,6 +41,10 @@ from gpustack.schemas.model_files import (
     ModelFile,
     ModelFileStateEnum,
 )
+from gpustack.schemas.model_file_download_executions import (
+    ModelFileDownloadExecution,
+    ModelFileDownloadExecutionStateEnum,
+)
 from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3Profile,
     ModelPreheatS3ProfileLifecycleStateEnum,
@@ -3126,13 +3130,22 @@ def test_worker_source_missing_cas_is_owner_scoped_and_idempotent(app):
 
         async def model_file_state():
             async with AsyncSession(_engine(app)) as session:
-                return await session.get(ModelFile, model_file_id)
+                model_file = await session.get(ModelFile, model_file_id)
+                execution = (
+                    await session.exec(
+                        select(ModelFileDownloadExecution).where(
+                            ModelFileDownloadExecution.model_file_id == model_file_id
+                        )
+                    )
+                ).one()
+                return model_file, execution
 
-        model_file = _run(app, model_file_state())
+        model_file, execution = _run(app, model_file_state())
         assert model_file.state == ModelFileStateEnum.DOWNLOADING
         assert model_file.download_progress == 0
         assert model_file.resolved_paths == []
         assert model_file.state_message == "model_source_missing_redownload"
+        assert execution.state == ModelFileDownloadExecutionStateEnum.PENDING
     finally:
         app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
 

@@ -111,6 +111,9 @@ from gpustack.server.model_preheat_s3_profile_lifecycle import (
 )
 from gpustack.server.model_preheat_connectivity import current_ready_workers
 from gpustack.server.bus import EventType
+from gpustack.server.model_file_download_execution_service import (
+    prepare_model_file_download_execution,
+)
 from gpustack.server.model_storage_connection_test import (
     VerifiedEndpoint,
     build_pinned_http_client,
@@ -1807,6 +1810,7 @@ async def get_model_storage_sync_execution_payload(
 
 @worker_router.post("/model-files/{model_file_id}/source-missing")
 async def mark_model_file_source_missing(
+    request: Request,
     session: SessionDep,
     model_file_id: int,
     body: ModelStorageSyncSourceMissing,
@@ -1833,6 +1837,9 @@ async def mark_model_file_source_missing(
     current_updated_at = model_file.updated_at.astimezone(timezone.utc)
     if current_updated_at != expected_updated_at:
         return Response(status_code=204)
+    await prepare_model_file_download_execution(
+        session, model_file, request.app.state.server_config
+    )
     changed = await session.exec(
         update(ModelFile)
         .where(
