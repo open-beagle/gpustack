@@ -102,13 +102,19 @@ def _test_app(tmp_path):
     return app, engine
 
 
-def test_feature_flag_blocks_new_manual_task(tmp_path):
+def test_feature_flag_does_not_block_new_manual_task(tmp_path):
     app, engine = _test_app(tmp_path)
     app.state.server_config.model_preheat_enabled = False
+
+    async def seed():
+        async with AsyncSession(engine) as session:
+            profile, workers = await _seed(session)
+            return profile.id, workers[0].id
+
+    profile_id, worker_id = asyncio.run(seed())
     with TestClient(app) as client:
-        response = client.post(API_PREFIX, json=payload(1, [1]))
-    assert response.status_code == 503
-    assert response.json()["reason"] == "model_preheat_disabled"
+        response = client.post(API_PREFIX, json=payload(profile_id, [worker_id]))
+    assert response.status_code == 200, response.text
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 
@@ -1464,7 +1470,9 @@ def test_creation_requires_explicit_override_for_recent_connectivity_failure(tmp
     asyncio.run(engine.dispose())
 
     assert response.status_code == 422
-    assert response.json()["message"] == "s3_unavailable_on_workers_confirmation_required"
+    assert (
+        response.json()["message"] == "s3_unavailable_on_workers_confirmation_required"
+    )
     assert overridden.status_code == 200, overridden.text
     assert overridden.json()["connectivity_failure_override"] is True
 

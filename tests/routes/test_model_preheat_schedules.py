@@ -1221,6 +1221,29 @@ def test_manual_schedule_can_be_saved_without_cron_and_run_now(tmp_path):
     assert run.json()["trigger"] == "manual"
 
 
+def test_disabled_schedule_run_now_uses_schedule_specific_error(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id = asyncio.run(_seed_profile(engine))
+
+    with TestClient(app) as client:
+        created = client.post("/v1/model-preheat-schedules", json=_payload(profile_id))
+        disabled = client.patch(
+            f"/v1/model-preheat-schedules/{created.json()['id']}",
+            json={"enabled": False},
+        )
+        run = client.post(
+            f"/v1/model-preheat-schedules/{created.json()['id']}/run-now",
+            headers={"Idempotency-Key": "disabled-schedule"},
+        )
+
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+    assert disabled.status_code == 200, disabled.text
+    assert run.status_code == 409
+    assert run.json()["message"] == "model_preheat_schedule_disabled"
+
+
 def test_schedule_patterns_survive_create_unrelated_patch_and_worker_matching(tmp_path):
     app, engine = _test_app(tmp_path)
     profile_id = asyncio.run(_seed_profile(engine))

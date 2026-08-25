@@ -11,6 +11,9 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
     ModelPreheatDistributionPolicyCreate,
     ModelPreheatDistributionPolicyPublic,
+    ModelPreheatDistributionPolicyRun,
+    ModelPreheatDistributionPolicyRunPublic,
+    ModelPreheatDistributionPolicyRunsPublic,
     ModelPreheatDistributionPolicyUpdate,
     ModelPreheatDistributionPolicyTriggerModeEnum,
     distribution_selector_digest,
@@ -33,6 +36,37 @@ from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
 router = APIRouter()
+
+
+@router.get("/runs", response_model=ModelPreheatDistributionPolicyRunsPublic)
+async def get_distribution_policy_runs(session: SessionDep, params: ListParamsDep):
+    statement = (
+        select(ModelPreheatDistributionPolicyRun)
+        .order_by(ModelPreheatDistributionPolicyRun.created_at.desc())
+        .offset((params.page - 1) * params.perPage)
+        .limit(params.perPage)
+    )
+    runs = (await session.exec(statement)).all()
+    total = await ModelPreheatDistributionPolicyRun.count(session)
+    return PaginatedList[ModelPreheatDistributionPolicyRunPublic](
+        items=[await _run_public(session, run) for run in runs],
+        pagination=Pagination(
+            page=params.page,
+            perPage=params.perPage,
+            total=total,
+            totalPage=(total + params.perPage - 1) // params.perPage,
+        ),
+    )
+
+
+@router.get("/runs/{run_id}", response_model=ModelPreheatDistributionPolicyRunPublic)
+async def get_distribution_policy_run(session: SessionDep, run_id: int):
+    run = await session.get(ModelPreheatDistributionPolicyRun, run_id)
+    if run is None:
+        raise NotFoundException(
+            message="model_preheat_distribution_policy_run_not_found"
+        )
+    return await _run_public(session, run)
 
 
 @router.get("", response_model=ModelPreheatDistributionPoliciesPublic)
@@ -266,6 +300,19 @@ async def _public(session, policy):
     return ModelPreheatDistributionPolicyPublic.model_validate(
         policy,
         update={"source_artifact": artifact.artifact_id if artifact else None},
+    )
+
+
+async def _run_public(session, run):
+    policy = await session.get(ModelPreheatDistributionPolicy, run.policy_id)
+    return ModelPreheatDistributionPolicyRunPublic.model_validate(
+        run,
+        update={
+            "policy_name": policy.name if policy else None,
+            "model_id": (
+                (policy.request_identity or {}).get("model_id") if policy else None
+            ),
+        },
     )
 
 

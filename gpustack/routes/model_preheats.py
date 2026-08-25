@@ -225,7 +225,6 @@ async def create_model_preheat(
     task_in: ModelPreheatCreate,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    _ensure_model_preheat_enabled(request)
     request_hash = canonical_request_hash(
         task_in.model_dump(mode="json", exclude_none=True)
     )
@@ -431,12 +430,6 @@ async def create_model_preheat(
     return _to_public(task)
 
 
-def _ensure_model_preheat_enabled(request):
-    config = getattr(request.app.state, "server_config", None)
-    if config is not None and not getattr(config, "model_preheat_enabled", True):
-        raise HTTPException(503, "model_preheat_disabled", "model_preheat_disabled")
-
-
 async def release_task_lock_if_terminal(session, task: ModelPreheatTask) -> bool:
     if not is_terminal_task(task):
         return False
@@ -582,7 +575,9 @@ async def _ensure_profile_available_on_workers(
         and result[1].finished_at + ttl > datetime.now(timezone.utc)
     ]
     if failed and not allow_failure:
-        raise InvalidException(message="s3_unavailable_on_workers_confirmation_required")
+        raise InvalidException(
+            message="s3_unavailable_on_workers_confirmation_required"
+        )
     # 未检测、检查中、过期及历史结果均为诊断信息。真实 Worker 执行仍会校验 S3。
     return
 

@@ -17,6 +17,9 @@ from gpustack.api.auth import get_admin_user
 from gpustack.routes import model_preheat_distribution_policies
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
+    ModelPreheatDistributionPolicyRun,
+    ModelPreheatDistributionPolicyRunStateEnum,
+    ModelPreheatDistributionPolicyRunTriggerEnum,
     ModelPreheatWorkerObservation,
 )
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
@@ -104,6 +107,40 @@ async def _seed(engine):
         await session.commit()
         await session.refresh(policy)
         return policy.id
+
+
+def test_distribution_policy_runs_list_and_detail_are_public(tmp_path):
+    app, engine = _test_app(tmp_path)
+    policy_id = asyncio.run(_seed(engine))
+
+    async def seed_run():
+        async with AsyncSession(engine) as session:
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy_id,
+                trigger=ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+                state=ModelPreheatDistributionPolicyRunStateEnum.ERROR,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="run-public-test",
+                error_code="worker_execution_failed",
+            )
+            session.add(run)
+            await session.commit()
+            await session.refresh(run)
+            return run.id
+
+    run_id = asyncio.run(seed_run())
+    with TestClient(app) as client:
+        listed = client.get("/v1/model-preheat-distribution-policies/runs")
+        detail = client.get(f"/v1/model-preheat-distribution-policies/runs/{run_id}")
+    asyncio.run(engine.dispose())
+
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["items"][0]["id"] == run_id
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["policy_id"] == policy_id
+    assert detail.json()["policy_name"] == "模型同步"
+    assert detail.json()["model_id"] == "org/model"
+    assert detail.json()["error_code"] == "worker_execution_failed"
 
 
 async def _seed_artifact(engine):

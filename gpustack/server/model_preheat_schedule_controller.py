@@ -111,8 +111,6 @@ class ModelPreheatScheduleController:
     async def tick(self, now: datetime | None = None):
         now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         await self._close_active_windows(now)
-        if not self._feature_enabled():
-            return
         async with AsyncSession(self._engine) as session:
             schedule_ids = (
                 await session.exec(
@@ -144,8 +142,6 @@ class ModelPreheatScheduleController:
         idempotency_key: str | None,
         now: datetime | None = None,
     ) -> ModelPreheatScheduleRun:
-        if not self._feature_enabled():
-            raise ScheduleDisabled("model_preheat_disabled")
         if not schedule.enabled:
             raise ScheduleDisabled("model_preheat_schedule_disabled")
         operation_key = manual_run_operation_key(created_by_user_id, idempotency_key)
@@ -278,11 +274,6 @@ class ModelPreheatScheduleController:
             if savepoint.is_active:
                 await savepoint.rollback()
             raise
-
-    def _feature_enabled(self):
-        return self._config is None or getattr(
-            self._config, "model_preheat_enabled", True
-        )
 
     async def _close_active_windows(self, now):
         async with AsyncSession(self._engine) as session:

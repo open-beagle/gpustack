@@ -2,7 +2,10 @@ import logging
 from types import SimpleNamespace
 
 from gpustack.api.exceptions import HTTPException, NotFoundException
-from gpustack.worker.startup_cleanup import cleanup_stale_model_instances
+from gpustack.worker.startup_cleanup import (
+    cleanup_stale_model_instances,
+    reconcile_ready_model_files,
+)
 
 
 class FakeModelInstancesClient:
@@ -115,3 +118,50 @@ def test_worker_startup_logs_http_error_and_continues(caplog):
 
     assert client.model_instances.deleted_ids == [1, 2]
     assert "删除 worker worker-a 的遗留模型实例 model-a-1 失败" in caplog.text
+
+
+def test_worker_startup_marks_missing_ready_model_files_and_continues(tmp_path):
+    existing_file = tmp_path / "model.bin"
+    existing_file.write_text("ok")
+    existing_dir = tmp_path / "model-dir"
+    existing_dir.mkdir()
+
+    class ModelFileRecord(SimpleNamespace):
+        source = "model_scope"
+        model_scope_model_id = "test/model"
+
+    class ModelFilesClient:
+        def __init__(self):
+            self.list_params = []
+            self.updated = []
+            self.pages = [
+                [
+                    ModelFileRecord(id=1, resolved_paths=[str(existing_file)]),
+                    ModelFileRecord(id=2, resolved_paths=[str(existing_dir)]),
+                    ModelFileRecord(id=3, resolved_paths=[str(tmp_path / "*.missing")]),
+                ],
+                [ModelFileRecord(id=4, resolved_paths=[str(tmp_path / "gone")])],
+                [],
+            ]
+
+        def list(self, params):
+            self.list_params.append(params)
+            return SimpleNamespace(items=self.pages.pop(0))
+
+        def update(self, id, model_update):
+            self.updated.append((id, model_update.state, model_update.state_message))
+            if id == 3:
+                raise RuntimeError("临时失败")
+
+    client = ModelFilesClient()
+    reconcile_ready_model_files(SimpleNamespace(model_files=client), 42, "worker-a")
+
+    assert client.list_params == [
+        {"worker_id": 42, "state": "ready", "page": 1, "perPage": 100},
+        {"worker_id": 42, "state": "ready", "page": 2, "perPage": 100},
+        {"worker_id": 42, "state": "ready", "page": 3, "perPage": 100},
+    ]
+    assert client.updated == [
+        (3, "error", "model_sync_source_not_found"),
+        (4, "error", "model_sync_source_not_found"),
+    ]

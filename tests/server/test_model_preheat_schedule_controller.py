@@ -752,7 +752,7 @@ def test_same_gpu_model_creator_does_not_reinclude_busy_worker(tmp_path, monkeyp
     assert asyncio.run(run()) == ["worker-a"]
 
 
-def test_disabled_feature_flag_closes_windows_but_does_not_create_new_tasks(tmp_path):
+def test_disabled_feature_flag_does_not_block_schedule_runs(tmp_path):
     async def run():
         engine = await _database(tmp_path)
         await _seed_schedule(engine)
@@ -764,16 +764,13 @@ def test_disabled_feature_flag_closes_windows_but_does_not_create_new_tasks(tmp_
         )
         await controller.tick(datetime(2026, 8, 12, 0, 0, tzinfo=UTC))
         async with AsyncSession(engine) as session:
-            schedule = (await session.exec(select(ModelPreheatSchedule))).one()
-            with pytest.raises(RuntimeError, match="model_preheat_disabled"):
-                await controller.run_now(session, schedule, 1, "disabled")
             runs = (await session.exec(select(ModelPreheatScheduleRun))).all()
         await engine.dispose()
         return creator.calls, runs
 
     calls, runs = asyncio.run(run())
-    assert calls == []
-    assert runs == []
+    assert len(calls) == 1
+    assert len(runs) == 1
 
 
 def test_disable_committed_during_claim_prevents_window_task(tmp_path):

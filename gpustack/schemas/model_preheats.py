@@ -665,6 +665,7 @@ class ModelPreheatTaskPublic(SQLModel):
     desired_state: ModelPreheatDesiredStateEnum
     execution_state: ModelPreheatExecutionStateEnum
     paused_from_state: Optional[ModelPreheatExecutionStateEnum] = None
+    state_message: Optional[str] = None
     target_scope: ModelPreheatTargetScopeEnum
     target_worker_uuids: list[str]
     target_worker_snapshot: list[dict]
@@ -677,6 +678,8 @@ class ModelPreheatTaskPublic(SQLModel):
     transfer_source: Optional[str] = None
     transfer_profile_id: Optional[int] = None
     source_worker_id: Optional[int] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
     deduplicated: bool = False
@@ -746,4 +749,6 @@ from gpustack.schemas import (
 )  # noqa: E402,F401
 
 # 分发策略也引用同步任务，确保仅导入预热 schema 的 SQLite 测试可建立完整元数据。
-from gpustack.schemas import model_storage_sync as _model_storage_sync  # noqa: E402,F401
+from gpustack.schemas import (
+    model_storage_sync as _model_storage_sync,
+)  # noqa: E402,F401

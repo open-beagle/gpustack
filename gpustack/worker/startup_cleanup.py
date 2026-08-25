@@ -1,9 +1,83 @@
+import glob
 import logging
+import os
 
 from gpustack.api.exceptions import HTTPException
+from gpustack.schemas.model_files import ModelFileStateEnum, ModelFileUpdate
 
 
 logger = logging.getLogger(__name__)
+
+
+def reconcile_ready_model_files(clientset, worker_id: int, worker_name: str):
+    """标记当前 Worker 上已丢失本地源路径的 READY 模型文件。
+
+    仅核对服务端冻结的 ``resolved_paths``，不访问其他 Worker，也不会删除文件。
+    """
+    try:
+        model_files = []
+        page = 1
+        while True:
+            result = clientset.model_files.list(
+                params={
+                    "worker_id": worker_id,
+                    "state": ModelFileStateEnum.READY.value,
+                    "page": page,
+                    "perPage": 100,
+                }
+            )
+            if not result or not result.items:
+                break
+            model_files.extend(result.items)
+            page += 1
+    except Exception:
+        logger.exception("获取 worker %s 的 READY 模型文件失败。", worker_name)
+        return
+
+    for model_file in model_files:
+        if _resolved_paths_exist(model_file.resolved_paths):
+            continue
+        try:
+            clientset.model_files.update(
+                model_file.id,
+                _model_file_error_update(model_file),
+            )
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                continue
+            logger.exception(
+                "更新 worker %s 的遗留模型文件状态失败: %s", worker_name, exc
+            )
+        except Exception as exc:
+            logger.exception(
+                "更新 worker %s 的遗留模型文件状态失败: %s", worker_name, exc
+            )
+
+
+def _resolved_paths_exist(resolved_paths) -> bool:
+    """所有冻结路径均存在；glob 至少匹配一个路径才视为存在。"""
+    return bool(resolved_paths) and all(
+        (
+            bool(glob.glob(path, recursive=True))
+            if glob.has_magic(path)
+            else os.path.exists(path)
+        )
+        for path in resolved_paths
+    )
+
+
+def _model_file_error_update(model_file) -> ModelFileUpdate:
+    """仅复制 PUT 契约字段，避免将 Public 扩展字段写回服务端。"""
+    values = {
+        name: getattr(model_file, name)
+        for name in ModelFileUpdate.model_fields
+        if hasattr(model_file, name)
+    }
+    values.update(
+        state=ModelFileStateEnum.ERROR,
+        state_message="model_sync_source_not_found",
+    )
+    return ModelFileUpdate.model_validate(values)
 
 
 def cleanup_stale_model_instances(clientset, worker_id: int, worker_name: str):

@@ -224,7 +224,16 @@ def test_stable_error_code_maps_manifest_errors():
         == "model_sync_source_not_found"
     )
     assert (
-        msm._stable_error_code(ModelPreheatS3ManifestError("x")) == "manifest_invalid"
+        msm._stable_error_code(ModelPreheatManifestError("no_manifest_files"))
+        == "model_sync_source_not_found"
+    )
+    assert (
+        msm._stable_error_code(ModelPreheatS3ManifestError("x"))
+        == "s3_manifest_invalid"
+    )
+    assert (
+        msm._stable_error_code(ModelPreheatManifestError("x"))
+        == "local_manifest_invalid"
     )
 
 
@@ -245,6 +254,7 @@ def test_handle_event_filters_other_workers_and_non_pending(tmp_path):
             source="modelscope",
             model_id="Qwen/Test",
             resolved_revision="sha",
+            revision_kind="upstream",
             artifact_id=None,
             state=state,
             file_count=0,

@@ -260,8 +260,11 @@ async def run_model_preheat_schedule_now(
         raise HTTPException(
             409, "Conflict", "model_preheat_schedule_concurrency_limit"
         ) from None
-    except ScheduleDisabled:
-        raise HTTPException(503, "Unavailable", "model_preheat_disabled") from None
+    except ScheduleDisabled as exc:
+        code = str(exc)
+        if code != "model_preheat_schedule_disabled":
+            code = "model_preheat_schedule_disabled"
+        raise HTTPException(409, "Conflict", code) from None
     return _run_public(run)
 
 

@@ -137,23 +137,10 @@ class ModelStorageSyncManager:
             # 任务取消：不写 Manifest，不回写 ready。
             return
         except Exception as exc:
-            error_detail = (
-                str(exc)
-                if isinstance(
-                    exc,
-                    (
-                        ModelPreheatS3Conflict,
-                        ModelPreheatS3ManifestError,
-                        ModelPreheatIdentityError,
-                        ModelPreheatManifestError,
-                    ),
-                )
-                else type(exc).__name__
-            )
             logger.error(
                 "Model storage sync failed for task %s: %s",
                 task.id,
-                error_detail,
+                _stable_error_code(exc),
             )
             # 执行 payload 都拉取失败时没有可用 lease：失败回写无法通过
             # lease 校验（Server 稳定 409），只记录日志，不重复调用。
@@ -279,15 +266,16 @@ def _scan_spec_root_matches_source_paths(payload) -> bool:
 
 
 def _stable_error_code(exc: Exception) -> str:
-    if str(exc) in {"root_dir_not_found", "model_sync_source_not_found"}:
+    if str(exc) in {
+        "root_dir_not_found",
+        "no_manifest_files",
+        "model_sync_source_not_found",
+    }:
         return "model_sync_source_not_found"
-    if isinstance(
-        exc,
-        (
-            ModelPreheatS3ManifestError,
-            ModelPreheatIdentityError,
-            ModelPreheatManifestError,
-        ),
-    ):
-        return "manifest_invalid"
+    if isinstance(exc, ModelPreheatS3ManifestError):
+        return "s3_manifest_invalid"
+    if isinstance(exc, ModelPreheatS3Conflict):
+        return "s3_object_conflict"
+    if isinstance(exc, (ModelPreheatIdentityError, ModelPreheatManifestError)):
+        return "local_manifest_invalid"
     return "worker_execution_failed"

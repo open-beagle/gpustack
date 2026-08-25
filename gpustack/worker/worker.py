@@ -32,7 +32,10 @@ from gpustack.worker.model_preheat.executor import build_preheat_role_handlers
 from gpustack.worker.model_preheat.manager import ModelPreheatManager
 from gpustack.worker.model_storage_sync_manager import ModelStorageSyncManager
 from gpustack.worker.serve_manager import ServeManager
-from gpustack.worker.startup_cleanup import cleanup_stale_model_instances
+from gpustack.worker.startup_cleanup import (
+    cleanup_stale_model_instances,
+    reconcile_ready_model_files,
+)
 from gpustack.worker.exporter import MetricExporter
 from gpustack.worker.tools_manager import ToolsManager
 from gpustack.worker.worker_manager import WorkerManager
@@ -203,6 +206,7 @@ class Worker:
         cleanup_stale_model_instances(
             self._clientset, self._worker_id, self._worker_name
         )
+        reconcile_ready_model_files(self._clientset, self._worker_id, self._worker_name)
         if self._exporter_enabled:
             # Start the metric exporter with retry.
             run_periodically_in_thread(self._exporter.start, 15)

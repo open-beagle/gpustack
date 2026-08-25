@@ -309,14 +309,14 @@ def test_capabilities_reports_credential_encryption(app, client):
     assert "model_preheat_credential_key" not in response.text
 
 
-def test_capabilities_false_when_key_unavailable(app, client):
+def test_capabilities_keep_preheat_available_when_key_unavailable(app, client):
     app.state.server_config.model_preheat_credential_key = None
     app.state.server_config.model_preheat_enabled = False
     response = client.get("/v1/model-storage/capabilities")
     assert response.status_code == 200
     assert response.json() == {
         "credential_encryption_available": False,
-        "model_preheat_enabled": False,
+        "model_preheat_enabled": True,
     }
 
 
@@ -341,6 +341,13 @@ def test_create_sync_task_only_accepts_model_file_and_profile_id(app, client):
 
 def test_sync_policy_run_now_creates_existing_sync_task_and_replays(app, client):
     profile_id, model_file_id = _run(app, _seed_ids(app))
+
+    async def seed_user():
+        async with AsyncSession(_engine(app)) as session:
+            session.add(User(id=1, username="admin", is_admin=True, hashed_password=""))
+            await session.commit()
+
+    _run(app, seed_user())
     created = client.post(
         "/v1/model-storage-sync-policies",
         json={
@@ -373,7 +380,7 @@ def test_sync_policy_run_now_creates_existing_sync_task_and_replays(app, client)
     assert disabled.status_code == 200, disabled.text
     assert replay.status_code == 200, replay.text
     assert replay.json() == first.json()
-    assert first.json()["state"] == "ready"
+    assert first.json()["state"] == "pending"
     task_id = first.json()["response_payload"]["created"][0]["task_id"]
     assert task_id is not None
     detail = client.get(f"{API}/{task_id}")
@@ -3040,6 +3047,31 @@ def test_worker_fail_releases_slot_allows_new_task(app):
         assert _slot_task_id(app, model_file_id, profile_id) is None
         again = _create_task(app, profile_id, model_file_id)
         assert again["id"] != task_id
+    finally:
+        app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
+
+
+def test_worker_fail_rejects_unstable_error_code(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = _create_task(app, profile_id, model_file_id)
+    worker_id, worker_uuid = created["worker_id"], created["worker_uuid"]
+    task_id = created["id"]
+
+    async def override():
+        return _worker_principal(worker_id, worker_uuid)
+
+    app.dependency_overrides[get_model_preheat_worker_identity] = override
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                WORKER_FAIL.format(id=task_id),
+                json={
+                    "error_code": "path=/private/model",
+                    "lease_token": _fetch_task_lease_token(app, task_id),
+                },
+            )
+            assert response.status_code == 422
+            assert client.get(DETAIL.format(id=task_id)).json()["state"] != "error"
     finally:
         app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
 

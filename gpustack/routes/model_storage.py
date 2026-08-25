@@ -154,6 +154,15 @@ _TERMINAL_STATES = (
     ModelStorageSyncTaskStateEnum.ERROR,
     ModelStorageSyncTaskStateEnum.CANCELED,
 )
+_SYNC_FAILURE_CODES = {
+    "model_sync_source_not_found",
+    "s3_manifest_invalid",
+    "local_manifest_invalid",
+    "s3_object_conflict",
+    "worker_execution_failed",
+    # 兼容已经发布的 Worker；新 Worker 统一使用 worker_execution_failed。
+    "s3_publish_failed",
+}
 
 
 def _issue_lease_token() -> str:
@@ -186,10 +195,9 @@ def _lease_token_matches(
 async def get_model_storage_capabilities(request: Request):
     """只返回布尔能力，不返回密钥或敏感配置。"""
     cipher = _cipher_from_request(request)
-    config = getattr(request.app.state, "server_config", None)
     return ModelStorageSyncCapabilitiesPublic(
         credential_encryption_available=bool(cipher.current_key),
-        model_preheat_enabled=bool(getattr(config, "model_preheat_enabled", True)),
+        model_preheat_enabled=True,
     )
 
 
@@ -1953,6 +1961,8 @@ async def fail_model_storage_sync_task(
     # lease 校验：错 lease/无 lease 一律稳定拒绝（409）。
     if not _verify_sync_task_lease(request, task, failure.lease_token):
         raise ConflictException(message="lease_token_invalid")
+    if len(failure.error_code) > 64 or failure.error_code not in _SYNC_FAILURE_CODES:
+        raise HTTPException(422, "Validation Error", "invalid_sync_error_code")
     if task.state in _TERMINAL_STATES:
         # 已终态：失败回写不得覆盖（也不折叠为 200，避免 Worker 误判成功）。
         raise ConflictException(message="sync_task_already_terminal")

@@ -202,6 +202,26 @@ class ModelPreheatDistributionPolicyPublic(SQLModel):
     updated_at: datetime
 
 
+class ModelPreheatDistributionPolicyRunPublic(SQLModel):
+    id: int
+    policy_id: int
+    policy_name: Optional[str] = None
+    model_id: Optional[str] = None
+    trigger: ModelPreheatDistributionPolicyRunTriggerEnum
+    state: ModelPreheatDistributionPolicyRunStateEnum
+    error_code: Optional[str] = None
+    window_start_utc: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+ModelPreheatDistributionPolicyRunsPublic = PaginatedList[
+    ModelPreheatDistributionPolicyRunPublic
+]
+
+
 class ModelPreheatDistributionPolicyUpdate(SQLModel):
     model_config = ConfigDict(extra="forbid")
 

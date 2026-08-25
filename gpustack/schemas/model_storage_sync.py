@@ -146,7 +146,7 @@ class ModelStorageSyncTaskPublic(SQLModel):
     source: str
     model_id: str
     resolved_revision: str
-    revision_kind: str
+    revision_kind: Optional[str] = None
     artifact_id: Optional[str] = None
     state: ModelStorageSyncTaskStateEnum
     state_message: Optional[str] = None
