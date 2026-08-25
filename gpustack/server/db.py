@@ -9,7 +9,13 @@ from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy import DDL, event
 
-from gpustack.config.envs import DB_ECHO, DB_MAX_OVERFLOW, DB_POOL_SIZE, DB_POOL_TIMEOUT
+from gpustack.config.envs import (
+    DB_ECHO,
+    DB_MAX_OVERFLOW,
+    DB_POOL_RECYCLE,
+    DB_POOL_SIZE,
+    DB_POOL_TIMEOUT,
+)
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.model_usage import (
     ModelUsage,
@@ -47,7 +53,7 @@ async def get_session():
 
 
 async def init_db(db_url: str):
-    global _engine, _session_maker
+    global _engine
     if _engine is None:
         connect_args = {}
         if db_url.startswith("sqlite://"):
@@ -67,6 +73,9 @@ async def init_db(db_url: str):
             pool_size=DB_POOL_SIZE,
             max_overflow=DB_MAX_OVERFLOW,
             pool_timeout=DB_POOL_TIMEOUT,
+            pool_recycle=DB_POOL_RECYCLE,
+            pool_pre_ping=True,
+            pool_use_lifo=True,
             connect_args=connect_args,
         )
         listen_events(_engine)
