@@ -1839,7 +1839,6 @@ async def mark_model_file_source_missing(
             ModelFile.id == model_file_id,
             ModelFile.worker_id == identity.worker_id,
             ModelFile.state == ModelFileStateEnum.READY,
-            ModelFile.updated_at == model_file.updated_at,
         )
         .values(
             state=ModelFileStateEnum.DOWNLOADING,

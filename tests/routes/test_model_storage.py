@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel, select, update
@@ -3089,11 +3090,10 @@ def test_worker_source_missing_cas_is_owner_scoped_and_idempotent(app):
         async with AsyncSession(_engine(app)) as session:
             model_file = await session.get(ModelFile, model_file_id)
             await session.exec(
-                update(ModelFile)
-                .where(ModelFile.id == model_file_id)
-                .values(
-                    updated_at=datetime.now(timezone.utc).replace(microsecond=123456)
-                )
+                text(
+                    "UPDATE model_files SET updated_at = "
+                    "'2026-08-25 04:29:07' WHERE id = :model_file_id"
+                ).bindparams(model_file_id=model_file_id)
             )
             await session.commit()
             await session.refresh(model_file)
