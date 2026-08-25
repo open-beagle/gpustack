@@ -113,6 +113,7 @@ class WorkerManager:
         self._registration_completed = True
 
     def _register_worker(self, worker: Worker):
+        self._load_preheat_credential()
         logger.info(
             f"Registering worker: {worker.name}",
         )

@@ -353,6 +353,73 @@ def test_worker_reconcile_reloads_attached_expired_event_by_identity(tmp_path):
     asyncio.run(run())
 
 
+def test_worker_state_update_handles_multiple_instances_with_expiring_session(tmp_path):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'worker-state-update.db'}"
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                SQLModel.metadata.create_all,
+                tables=[
+                    Model.__table__,
+                    ModelInstance.__table__,
+                    ModelFile.__table__,
+                    ModelInstanceModelFileLink.__table__,
+                ],
+            )
+
+        async with AsyncSession(engine, expire_on_commit=True) as session:
+            session.add(
+                Model(
+                    id=3,
+                    name="model-a",
+                    source=SourceEnum.LOCAL_PATH,
+                    local_path="/models/a",
+                )
+            )
+            session.add_all(
+                [
+                    ModelInstance(
+                        name=f"instance-{index}",
+                        model_id=3,
+                        model_name="model-a",
+                        worker_name="worker-a",
+                        source=SourceEnum.LOCAL_PATH,
+                        local_path="/models/a",
+                        state=ModelInstanceStateEnum.RUNNING,
+                    )
+                    for index in range(2)
+                ]
+            )
+            await session.commit()
+            instances = await ModelInstance.all_by_field(
+                session, "worker_name", "worker-a"
+            )
+            controller = WorkerController.__new__(WorkerController)
+            with patch("gpustack.server.services.delete_cache_by_key", new=AsyncMock()):
+                await controller.update_instance_states(
+                    session,
+                    instances,
+                    ModelInstanceStateEnum.RUNNING,
+                    ModelInstanceStateEnum.UNREACHABLE,
+                    "Worker is unreachable from the server",
+                    "worker is unreachable",
+                )
+
+        async with AsyncSession(engine) as session:
+            instances = await ModelInstance.all_by_field(
+                session, "worker_name", "worker-a"
+            )
+            assert [instance.state for instance in instances] == [
+                ModelInstanceStateEnum.UNREACHABLE,
+                ModelInstanceStateEnum.UNREACHABLE,
+            ]
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
 def test_ensure_model_instance_file_links_adds_missing_links():
     session = FakeSession()
     instance = new_model_instance(376, "test-376", 80)
