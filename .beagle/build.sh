@@ -53,7 +53,7 @@ else
   rm -rf "$UI_TMP"
   mkdir -p "$UI_TMP"
 
-  if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
+  if ! curl --retry 12 --retry-all-errors --retry-delay 10 -sSfL \
     "https://cache.ali.wodcloud.com/vscode/gpustack/gpustack-ui-${UI_VERSION}.tar.gz" | \
     tar -xzf - --directory "$UI_TMP" 2>/dev/null; then
     echo "Failed to download UI assets for ${UI_VERSION}."
