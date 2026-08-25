@@ -426,7 +426,7 @@ def test_refresh_discovers_three_sources_from_shared_s3_in_independent_database(
     }
     assert all(row.created_by_task_id is None for row in rows)
     assert profile.inventory_last_success_at is not None
-    assert profile.inventory_last_scan_count == len(shared_minio.objects)
+    assert profile.inventory_last_scan_count == 3
     assert policy.source_artifact == huggingface_result["artifact_id"]
     assert policy.request_identity["source"] == "huggingface"
 
