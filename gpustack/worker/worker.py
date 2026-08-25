@@ -203,6 +203,7 @@ class Worker:
         add_signal_handlers_in_loop()
 
         self._get_current_worker_id()
+        self._worker_manager.sync_worker_status()
         cleanup_stale_model_instances(
             self._clientset, self._worker_id, self._worker_name
         )
@@ -216,7 +217,7 @@ class Worker:
             run_periodically_in_thread(self._check_worker_ip_change, 15)
 
         # Report the worker node status to the server every 30 seconds.
-        run_periodically_in_thread(self._worker_manager.sync_worker_status, 30)
+        run_periodically_in_thread(self._worker_manager.sync_worker_status, 30, 30)
 
         if not self._config.disable_rpc_servers:
             # Start rpc server instances with restart.
