@@ -401,6 +401,7 @@ class Scheduler:
                     session.add(event)
                     session.add(model_instance)
                     await session.commit()
+                    await session.refresh(model_instance)
                     await ModelInstance._publish_event(
                         EventType.UPDATED, model_instance
                     )
@@ -447,6 +448,7 @@ class Scheduler:
                 session.add(event)
                 session.add(model_instance)
                 await session.commit()
+                await session.refresh(model_instance)
                 await ModelInstance._publish_event(EventType.UPDATED, model_instance)
 
                 logger.debug(
