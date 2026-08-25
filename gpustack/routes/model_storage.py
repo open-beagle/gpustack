@@ -186,8 +186,10 @@ def _lease_token_matches(
 async def get_model_storage_capabilities(request: Request):
     """只返回布尔能力，不返回密钥或敏感配置。"""
     cipher = _cipher_from_request(request)
+    config = getattr(request.app.state, "server_config", None)
     return ModelStorageSyncCapabilitiesPublic(
-        credential_encryption_available=bool(cipher.current_key)
+        credential_encryption_available=bool(cipher.current_key),
+        model_preheat_enabled=bool(getattr(config, "model_preheat_enabled", True)),
     )
 
 
@@ -600,6 +602,21 @@ async def create_model_storage_sync_batch(
             continue
         try:
             identity, _, _ = _derive_task_identity(model_file)
+        except HTTPException as exc:
+            reason = str(exc.message)
+            item = ModelStorageSyncBatchItem(
+                model_file_id=model_file.id,
+                worker_id=model_file.worker_id,
+                reason=reason,
+            )
+            if reason in {
+                "model_sync_source_unsupported",
+                "model_file_not_ready",
+            }:
+                skipped.append(item)
+            else:
+                failed.append(item)
+            continue
         except Exception:
             failed.append(
                 ModelStorageSyncBatchItem(
@@ -735,7 +752,7 @@ async def create_model_storage_sync_batch(
                 )
         result = ModelStorageSyncBatchPublic(
             scope=batch_in.scope,
-            planned=len(model_files),
+            planned=len(planned_candidates),
             created=created,
             skipped=skipped,
             failed=failed,
@@ -1065,11 +1082,39 @@ async def cancel_model_storage_sync_task(session: SessionDep, id: int):
         await session.refresh(task)
         await ModelStorageSyncTask._publish_event(EventType.UPDATED, task)
         return Response(status_code=200)
+    if await _sync_task_referenced_by_pending_policy_run(session, task.id):
+        raise ConflictException(message="model_storage_sync_task_run_pending")
     # 删除终态任务前先断开槽位外键引用（兼容未开启 FK 的 SQLite 部署），
     # 随任务删除在同一事务提交。
     await _release_sync_task_slot(session, task)
     await task.delete(session)
     return Response(status_code=204)
+
+
+async def _sync_task_referenced_by_pending_policy_run(session, task_id) -> bool:
+    """终态子任务在策略 run 聚合前不可删除，避免丢失唯一结果来源。"""
+    from gpustack.schemas.model_storage_sync_policies import (
+        ModelStorageSyncPolicyRun,
+        ModelStorageSyncPolicyRunStateEnum,
+    )
+
+    payloads = (
+        await session.exec(
+            select(ModelStorageSyncPolicyRun.response_payload).where(
+                ModelStorageSyncPolicyRun.state
+                == ModelStorageSyncPolicyRunStateEnum.PENDING,
+                ModelStorageSyncPolicyRun.response_payload.is_not(None),
+            )
+        )
+    ).all()
+    for payload in payloads:
+        try:
+            result = ModelStorageSyncBatchPublic.model_validate(payload)
+        except Exception:
+            continue
+        if any(item.task_id == task_id for item in result.created):
+            return True
+    return False
 
 
 @router.get(
@@ -1108,10 +1153,10 @@ async def list_profile_artifacts(
             select(ModelPreheatArtifact)
             .where(*filters)
             .order_by(
-            ModelPreheatArtifact.model_id,
-            ModelPreheatArtifact.source,
-            ModelPreheatArtifact.artifact_id,
-        )
+                ModelPreheatArtifact.model_id,
+                ModelPreheatArtifact.source,
+                ModelPreheatArtifact.artifact_id,
+            )
             .offset((params.page - 1) * params.perPage)
             .limit(params.perPage)
         )
@@ -1927,6 +1972,7 @@ async def fail_model_storage_sync_task(
         )
         .values(
             state=ModelStorageSyncTaskStateEnum.ERROR,
+            state_message=failure.error_code,
             error_code=failure.error_code,
             finished_at=now,
         )
@@ -1935,12 +1981,66 @@ async def fail_model_storage_sync_task(
     if result.rowcount == 0:
         # CAS 未生效：任务在读取后被取消或完成，不覆盖、不折叠为成功。
         raise ConflictException(message="sync_task_conflict")
+    drifted_model_file = None
+    if failure.error_code == "model_sync_source_not_found":
+        current_model_file = await lock_model_file_for_sync_or_delete(
+            session, task.model_file_id
+        )
+        if _matches_frozen_sync_source(request, task, current_model_file):
+            changed = await session.exec(
+                update(ModelFile)
+                .where(
+                    ModelFile.id == current_model_file.id,
+                    ModelFile.worker_id == task.worker_id,
+                    ModelFile.state == ModelFileStateEnum.READY,
+                )
+                .values(
+                    state=ModelFileStateEnum.ERROR,
+                    state_message=failure.error_code,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if changed.rowcount == 1:
+                drifted_model_file = await session.get(
+                    ModelFile, current_model_file.id, populate_existing=True
+                )
     # 任务即将进入终态 error：同一事务释放去重槽位。
     await _release_sync_task_slot(session, task)
     await session.commit()
     await task.refresh(session)
     await ModelStorageSyncTask._publish_event(EventType.UPDATED, task)
+    if drifted_model_file is not None:
+        await drifted_model_file.refresh(session)
+        await ModelFile._publish_event(EventType.UPDATED, drifted_model_file)
     return Response(status_code=200)
+
+
+def _matches_frozen_sync_source(request, task, model_file) -> bool:
+    """仅当当前 Ready 文件仍等同于任务冻结源时允许标记库存漂移。"""
+    if (
+        model_file is None
+        or model_file.worker_id != task.worker_id
+        or model_file.state != ModelFileStateEnum.READY
+    ):
+        return False
+    try:
+        snapshot = _decrypt_execution_snapshot(_cipher_from_request(request), task)
+        identity, resolved_revision, scan_spec = _derive_task_identity(model_file)
+    except Exception:
+        return False
+    frozen_scan_spec = snapshot.get("scan_spec") or {}
+    normalized_frozen_scan_spec = {
+        "root": frozen_scan_spec.get("root") or "",
+        "include_patterns": list(frozen_scan_spec.get("include_patterns") or []),
+        "exclude_patterns": list(frozen_scan_spec.get("exclude_patterns") or []),
+    }
+    return (
+        list(model_file.resolved_paths or [])
+        == list(snapshot.get("source_paths") or [])
+        and scan_spec == normalized_frozen_scan_spec
+        and identity.request_digest == task.request_digest
+        and resolved_revision == task.resolved_revision
+    )
 
 
 async def _authorized_sync_task(session, task_id, identity) -> ModelStorageSyncTask:

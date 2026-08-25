@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
-from sqlalchemy import func, or_, update
+from sqlalchemy import String, case, cast, func, or_, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -15,6 +15,8 @@ from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncBatchItem,
     ModelStorageSyncBatchPublic,
     ModelStorageSyncScopeEnum,
+    ModelStorageSyncTask,
+    ModelStorageSyncTaskStateEnum,
 )
 from gpustack.schemas.model_storage_sync_policies import (
     ModelStorageSyncPolicy,
@@ -54,6 +56,8 @@ class ModelStorageSyncPolicyController:
         # 每个 Server 实例使用独立 owner，避免过期执行者覆盖重新认领后的终态。
         self._lease_owner = uuid4().hex
         self._lease_ttl = timedelta(seconds=60)
+        self._missing_child_grace = timedelta(minutes=5)
+        self._ready_repair_cursor = 0
 
     async def start(self):
         while True:
@@ -62,6 +66,7 @@ class ModelStorageSyncPolicyController:
 
     async def tick(self, now=None):
         now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        await self._repair_inconsistent_ready_runs()
         async with AsyncSession(self._engine) as session:
             pending_ids = (
                 await session.exec(
@@ -195,7 +200,20 @@ class ModelStorageSyncPolicyController:
                     lease_owner=self._lease_owner,
                     lease_token=lease_token,
                     lease_expires_at=now + self._lease_ttl,
-                    attempt=ModelStorageSyncPolicyRun.attempt + 1,
+                    attempt=case(
+                        (
+                            or_(
+                                ModelStorageSyncPolicyRun.response_payload.is_(None),
+                                cast(
+                                    ModelStorageSyncPolicyRun.response_payload,
+                                    String,
+                                )
+                                == "null",
+                            ),
+                            ModelStorageSyncPolicyRun.attempt + 1,
+                        ),
+                        else_=ModelStorageSyncPolicyRun.attempt,
+                    ),
                     started_at=func.coalesce(ModelStorageSyncPolicyRun.started_at, now),
                 )
             )
@@ -247,6 +265,11 @@ class ModelStorageSyncPolicyController:
                 policy = await session.get(ModelStorageSyncPolicy, run.policy_id)
                 if policy is None:
                     error_code = "model_storage_sync_policy_not_found"
+                elif run.response_payload is not None:
+                    result = ModelStorageSyncBatchPublic.model_validate(
+                        run.response_payload
+                    )
+                    response_payload = result.model_dump(mode="json")
                 else:
                     run_user_id = await self._run_user_id(session, run, lease_token)
                     if run_user_id is None:
@@ -280,11 +303,26 @@ class ModelStorageSyncPolicyController:
                     lease_token,
                     error_code=error_code,
                 )
+            started_at = run.started_at
+            if started_at is not None and started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            missing_is_expired = bool(
+                started_at is not None
+                and datetime.now(timezone.utc) - started_at >= self._missing_child_grace
+            )
+            terminal_state, result_error = await self._result_terminal_state(
+                result, missing_is_expired=missing_is_expired
+            )
+            if terminal_state is None:
+                return await self._defer_run(
+                    run_id, lease_token, response_payload=response_payload
+                )
             return await self._finish_run(
                 run_id,
-                ModelStorageSyncPolicyRunStateEnum.READY,
+                terminal_state,
                 lease_token,
                 response_payload=response_payload,
+                error_code=result_error,
             )
         except SyncPolicyRunLeaseLost:
             return await self._get_run(run_id)
@@ -366,6 +404,167 @@ class ModelStorageSyncPolicyController:
             )
             await session.commit()
         return await self._get_run(run_id)
+
+    async def _defer_run(self, run_id, lease_token, response_payload):
+        """保存规划结果并释放 lease，等待已创建子任务进入终态。"""
+        async with AsyncSession(self._engine) as session:
+            await session.exec(
+                update(ModelStorageSyncPolicyRun)
+                .where(
+                    ModelStorageSyncPolicyRun.id == run_id,
+                    ModelStorageSyncPolicyRun.state
+                    == ModelStorageSyncPolicyRunStateEnum.PENDING,
+                    ModelStorageSyncPolicyRun.lease_owner == self._lease_owner,
+                    ModelStorageSyncPolicyRun.lease_token == lease_token,
+                )
+                .values(
+                    response_payload=response_payload,
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                )
+            )
+            await session.commit()
+        return await self._get_run(run_id)
+
+    async def _result_terminal_state(
+        self,
+        result,
+        preserve_ready_on_missing=False,
+        missing_is_expired=False,
+    ):
+        error_codes = {item.reason for item in result.failed if item.reason}
+        task_ids = [item.task_id for item in result.created if item.task_id is not None]
+        if len(task_ids) != len(result.created):
+            error_codes.add("model_storage_sync_task_not_found")
+        if not task_ids:
+            if not error_codes:
+                return ModelStorageSyncPolicyRunStateEnum.READY, None
+            error_code = (
+                next(iter(error_codes))
+                if len(error_codes) == 1
+                else "model_storage_sync_policy_run_failed"
+            )
+            return ModelStorageSyncPolicyRunStateEnum.ERROR, error_code
+        async with AsyncSession(self._engine) as session:
+            tasks = (
+                await session.exec(
+                    select(ModelStorageSyncTask).where(
+                        ModelStorageSyncTask.id.in_(task_ids)
+                    )
+                )
+            ).all()
+        tasks_by_id = {task.id: task for task in tasks}
+        has_missing = len(tasks_by_id) != len(set(task_ids))
+        active_tasks = [
+            tasks_by_id[task_id]
+            for task_id in task_ids
+            if task_id in tasks_by_id
+            and tasks_by_id[task_id].state
+            not in {
+                ModelStorageSyncTaskStateEnum.READY,
+                ModelStorageSyncTaskStateEnum.ERROR,
+                ModelStorageSyncTaskStateEnum.CANCELED,
+            }
+        ]
+        if active_tasks:
+            return None, None
+        failed_tasks = [
+            tasks_by_id[task_id]
+            for task_id in task_ids
+            if task_id in tasks_by_id
+            if tasks_by_id[task_id].state
+            in {
+                ModelStorageSyncTaskStateEnum.ERROR,
+                ModelStorageSyncTaskStateEnum.CANCELED,
+            }
+        ]
+        if failed_tasks:
+            error_codes.update(
+                {
+                    task.error_code
+                    or (
+                        "model_storage_sync_task_canceled"
+                        if task.state == ModelStorageSyncTaskStateEnum.CANCELED
+                        else "model_storage_sync_task_failed"
+                    )
+                    for task in failed_tasks
+                }
+            )
+        if has_missing:
+            if preserve_ready_on_missing:
+                if not error_codes:
+                    return ModelStorageSyncPolicyRunStateEnum.READY, None
+            elif missing_is_expired:
+                error_codes.add("model_storage_sync_task_result_unavailable")
+            else:
+                return None, None
+        if not error_codes:
+            return ModelStorageSyncPolicyRunStateEnum.READY, None
+        error_code = (
+            next(iter(error_codes))
+            if len(error_codes) == 1
+            else "model_storage_sync_policy_run_failed"
+        )
+        return ModelStorageSyncPolicyRunStateEnum.ERROR, error_code
+
+    async def _repair_inconsistent_ready_runs(self):
+        """纠正旧版本曾过早标记 READY 的运行，不重放批次。"""
+
+        async def load_rows(after_id):
+            async with AsyncSession(self._engine) as session:
+                return (
+                    await session.exec(
+                        select(
+                            ModelStorageSyncPolicyRun.id,
+                            ModelStorageSyncPolicyRun.response_payload,
+                        )
+                        .where(
+                            ModelStorageSyncPolicyRun.id > after_id,
+                            ModelStorageSyncPolicyRun.state
+                            == ModelStorageSyncPolicyRunStateEnum.READY,
+                            ModelStorageSyncPolicyRun.response_payload.is_not(None),
+                        )
+                        .order_by(ModelStorageSyncPolicyRun.id)
+                        .limit(500)
+                    )
+                ).all()
+
+        rows = await load_rows(self._ready_repair_cursor)
+        if not rows and self._ready_repair_cursor:
+            self._ready_repair_cursor = 0
+            rows = await load_rows(0)
+        if rows:
+            self._ready_repair_cursor = max(run_id for run_id, _payload in rows)
+        for run_id, response_payload in rows:
+            try:
+                result = ModelStorageSyncBatchPublic.model_validate(response_payload)
+            except Exception:
+                continue
+            terminal_state, error_code = await self._result_terminal_state(
+                result, preserve_ready_on_missing=True
+            )
+            if terminal_state == ModelStorageSyncPolicyRunStateEnum.READY:
+                continue
+            values = {
+                "state": terminal_state or ModelStorageSyncPolicyRunStateEnum.PENDING,
+                "error_code": error_code,
+            }
+            if terminal_state is None:
+                values["finished_at"] = None
+            else:
+                values["finished_at"] = datetime.now(timezone.utc)
+            async with AsyncSession(self._engine) as session:
+                await session.exec(
+                    update(ModelStorageSyncPolicyRun)
+                    .where(
+                        ModelStorageSyncPolicyRun.id == run_id,
+                        ModelStorageSyncPolicyRun.state
+                        == ModelStorageSyncPolicyRunStateEnum.READY,
+                    )
+                    .values(**values)
+                )
+                await session.commit()
 
     async def _release_run_lease(self, run_id, lease_token):
         async with AsyncSession(self._engine) as session:

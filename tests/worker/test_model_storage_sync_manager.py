@@ -212,8 +212,17 @@ def test_publish_missing_source_paths_is_error(tmp_path, monkeypatch):
 
 def test_stable_error_code_maps_manifest_errors():
     assert msm._stable_error_code(ValueError()) == "worker_execution_failed"
+    assert (
+        msm._stable_error_code(ValueError("model_sync_source_not_found"))
+        == "model_sync_source_not_found"
+    )
+    from gpustack.worker.model_preheat.manifest import ModelPreheatManifestError
     from gpustack.worker.model_preheat.s3_client import ModelPreheatS3ManifestError
 
+    assert (
+        msm._stable_error_code(ModelPreheatManifestError("root_dir_not_found"))
+        == "model_sync_source_not_found"
+    )
     assert (
         msm._stable_error_code(ModelPreheatS3ManifestError("x")) == "manifest_invalid"
     )

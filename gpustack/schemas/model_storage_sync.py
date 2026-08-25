@@ -291,6 +291,7 @@ class ModelStorageSyncCapabilitiesPublic(SQLModel):
     """``GET /model-storage/capabilities``：只返回布尔能力，不返回密钥或敏感配置。"""
 
     credential_encryption_available: bool
+    model_preheat_enabled: bool
 
 
 class ModelStorageConnectionTestRequest(SQLModel):

@@ -279,6 +279,8 @@ def _scan_spec_root_matches_source_paths(payload) -> bool:
 
 
 def _stable_error_code(exc: Exception) -> str:
+    if str(exc) in {"root_dir_not_found", "model_sync_source_not_found"}:
+        return "model_sync_source_not_found"
     if isinstance(
         exc,
         (

@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
-from sqlmodel import SQLModel, select
+from sqlmodel import SQLModel, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api import exceptions
@@ -302,15 +302,22 @@ def _run(app, coro):
 def test_capabilities_reports_credential_encryption(app, client):
     response = client.get("/v1/model-storage/capabilities")
     assert response.status_code == 200
-    assert response.json() == {"credential_encryption_available": True}
+    assert response.json() == {
+        "credential_encryption_available": True,
+        "model_preheat_enabled": True,
+    }
     assert "model_preheat_credential_key" not in response.text
 
 
 def test_capabilities_false_when_key_unavailable(app, client):
     app.state.server_config.model_preheat_credential_key = None
+    app.state.server_config.model_preheat_enabled = False
     response = client.get("/v1/model-storage/capabilities")
     assert response.status_code == 200
-    assert response.json() == {"credential_encryption_available": False}
+    assert response.json() == {
+        "credential_encryption_available": False,
+        "model_preheat_enabled": False,
+    }
 
 
 def test_create_sync_task_only_accepts_model_file_and_profile_id(app, client):
@@ -742,6 +749,501 @@ def test_scheduled_sync_policy_without_creator_uses_stable_admin_or_errors(app):
     _run(app, run())
 
 
+def test_sync_policy_plan_failure_is_terminal_error(app):
+    async def run():
+        from gpustack.schemas.model_storage_sync import (
+            ModelStorageSyncBatchItem,
+            ModelStorageSyncBatchPublic,
+            ModelStorageSyncScopeEnum,
+        )
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicy,
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunStateEnum,
+            ModelStorageSyncPolicyRunTriggerEnum,
+            ModelStorageSyncPolicyTriggerModeEnum,
+        )
+        from gpustack.server.model_storage_sync_policy_controller import (
+            ModelStorageSyncPolicyController,
+        )
+
+        profile_id, model_file_id = await _seed_ids(app)
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            session.add(User(id=1, username="admin", is_admin=True, hashed_password=""))
+            policy = ModelStorageSyncPolicy(
+                name="plan-failure-policy",
+                trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
+                timezone="UTC",
+                profile_id=profile_id,
+                scope=ModelStorageSyncScopeEnum.SINGLE_MODEL,
+                model_file_id=model_file_id,
+            )
+            session.add(policy)
+            await session.flush()
+            record = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="plan-failure-operation",
+                request_hash="3" * 64,
+                created_by_user_id=1,
+            )
+            session.add(record)
+            await session.commit()
+            run_id = record.id
+
+        async def failed_batch(_request, _session, _user_id, batch, _key):
+            return ModelStorageSyncBatchPublic(
+                scope=batch.scope,
+                planned=0,
+                failed=[
+                    ModelStorageSyncBatchItem(
+                        model_file_id=model_file_id,
+                        reason="model_sync_source_unsupported",
+                    )
+                ],
+            )
+
+        controller = ModelStorageSyncPolicyController(
+            _engine(app), batch_executor=failed_batch
+        )
+        completed = await controller._claim_and_execute(
+            run_id, controller._internal_request()
+        )
+        assert completed.state == ModelStorageSyncPolicyRunStateEnum.ERROR
+        assert completed.error_code == "model_sync_source_unsupported"
+        assert completed.response_payload["failed"][0]["reason"] == (
+            "model_sync_source_unsupported"
+        )
+
+    _run(app, run())
+
+
+def test_sync_policy_tick_repairs_ready_run_with_failed_payload(app):
+    async def run():
+        from gpustack.schemas.model_storage_sync import ModelStorageSyncScopeEnum
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicy,
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunStateEnum,
+            ModelStorageSyncPolicyRunTriggerEnum,
+            ModelStorageSyncPolicyTriggerModeEnum,
+        )
+        from gpustack.server.model_storage_sync_policy_controller import (
+            ModelStorageSyncPolicyController,
+        )
+
+        profile_id, model_file_id = await _seed_ids(app)
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            policy = ModelStorageSyncPolicy(
+                name="repair-ready-policy",
+                trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
+                timezone="UTC",
+                profile_id=profile_id,
+                scope=ModelStorageSyncScopeEnum.SINGLE_MODEL,
+                model_file_id=model_file_id,
+            )
+            session.add(policy)
+            await session.flush()
+            low = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="repair-ready-low-operation",
+                request_hash="5" * 64,
+                state=ModelStorageSyncPolicyRunStateEnum.READY,
+                response_payload={
+                    "scope": "single_model",
+                    "planned": 0,
+                    "created": [],
+                    "skipped": [],
+                    "failed": [],
+                },
+                finished_at=datetime.now(timezone.utc),
+            )
+            high = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="repair-ready-high-operation",
+                request_hash="6" * 64,
+                state=ModelStorageSyncPolicyRunStateEnum.READY,
+                response_payload={
+                    "scope": "single_model",
+                    "planned": 0,
+                    "created": [],
+                    "skipped": [],
+                    "failed": [],
+                },
+                finished_at=datetime.now(timezone.utc),
+            )
+            session.add_all([low, high])
+            await session.commit()
+            low_run_id = low.id
+
+        controller = ModelStorageSyncPolicyController(_engine(app))
+        await controller.tick()
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            low = await session.get(ModelStorageSyncPolicyRun, low_run_id)
+            original_finished_at = low.finished_at
+            low.response_payload = {
+                "scope": "single_model",
+                "planned": 0,
+                "created": [],
+                "skipped": [],
+                "failed": [
+                    {
+                        "model_file_id": model_file_id,
+                        "reason": "model_sync_source_unsupported",
+                    }
+                ],
+            }
+            session.add(low)
+            await session.commit()
+
+        await controller.tick()
+        repaired = await controller._get_run(low_run_id)
+        assert repaired.state == ModelStorageSyncPolicyRunStateEnum.ERROR
+        assert repaired.error_code == "model_sync_source_unsupported"
+        assert repaired.response_payload["failed"]
+        assert repaired.finished_at > original_finished_at
+
+    _run(app, run())
+
+
+def test_sync_policy_ready_run_stays_ready_when_terminal_child_was_deleted(app, client):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    child = _create_task(app, profile_id, model_file_id)
+
+    async def seed_ready_run():
+        from gpustack.schemas.model_storage_sync import ModelStorageSyncScopeEnum
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicy,
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunStateEnum,
+            ModelStorageSyncPolicyRunTriggerEnum,
+            ModelStorageSyncPolicyTriggerModeEnum,
+        )
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            task = await session.get(ModelStorageSyncTask, child["id"])
+            task.state = ModelStorageSyncTaskStateEnum.READY
+            policy = ModelStorageSyncPolicy(
+                name="deleted-child-ready-policy",
+                trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
+                timezone="UTC",
+                profile_id=profile_id,
+                scope=ModelStorageSyncScopeEnum.SINGLE_MODEL,
+                model_file_id=model_file_id,
+            )
+            session.add_all([task, policy])
+            await session.flush()
+            run = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="deleted-child-ready-operation",
+                request_hash="7" * 64,
+                state=ModelStorageSyncPolicyRunStateEnum.READY,
+                response_payload={
+                    "scope": "single_model",
+                    "planned": 1,
+                    "created": [
+                        {
+                            "model_file_id": model_file_id,
+                            "task_id": child["id"],
+                        }
+                    ],
+                    "skipped": [],
+                    "failed": [],
+                },
+                finished_at=datetime.now(timezone.utc),
+            )
+            session.add(run)
+            await session.commit()
+            return run.id
+
+    run_id = _run(app, seed_ready_run())
+    assert client.delete(DETAIL.format(id=child["id"])).status_code == 204
+    controller = app.state.model_storage_sync_policy_controller
+    _run(app, controller.tick())
+    repaired = _run(app, controller._get_run(run_id))
+    assert repaired.state.value == "ready"
+    assert repaired.error_code is None
+
+
+def test_ready_repair_missing_child_does_not_hide_existing_child_failure(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    child = _create_task(app, profile_id, model_file_id)
+
+    async def seed_ready_run():
+        from gpustack.schemas.model_storage_sync import ModelStorageSyncScopeEnum
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicy,
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunStateEnum,
+            ModelStorageSyncPolicyRunTriggerEnum,
+            ModelStorageSyncPolicyTriggerModeEnum,
+        )
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            task = await session.get(ModelStorageSyncTask, child["id"])
+            task.state = ModelStorageSyncTaskStateEnum.ERROR
+            task.error_code = "model_sync_source_not_found"
+            policy = ModelStorageSyncPolicy(
+                name="mixed-missing-child-ready-policy",
+                trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
+                timezone="UTC",
+                profile_id=profile_id,
+                scope=ModelStorageSyncScopeEnum.SINGLE_MODEL,
+                model_file_id=model_file_id,
+            )
+            session.add_all([task, policy])
+            await session.flush()
+            run = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="mixed-missing-child-ready-operation",
+                request_hash="9" * 64,
+                state=ModelStorageSyncPolicyRunStateEnum.READY,
+                response_payload={
+                    "scope": "single_model",
+                    "planned": 2,
+                    "created": [
+                        {"model_file_id": model_file_id, "task_id": child["id"]},
+                        {"model_file_id": model_file_id, "task_id": 999999},
+                    ],
+                    "skipped": [],
+                    "failed": [],
+                },
+                finished_at=datetime.now(timezone.utc),
+            )
+            session.add(run)
+            await session.commit()
+            return run.id
+
+    run_id = _run(app, seed_ready_run())
+    controller = app.state.model_storage_sync_policy_controller
+    _run(app, controller.tick())
+    repaired = _run(app, controller._get_run(run_id))
+    assert repaired.state.value == "error"
+    assert repaired.error_code == "model_sync_source_not_found"
+
+
+def test_pending_sync_policy_missing_child_times_out_stably(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+
+    async def seed_pending_run():
+        from gpustack.schemas.model_storage_sync import ModelStorageSyncScopeEnum
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicy,
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunTriggerEnum,
+            ModelStorageSyncPolicyTriggerModeEnum,
+        )
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            policy = ModelStorageSyncPolicy(
+                name="missing-child-timeout-policy",
+                trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
+                timezone="UTC",
+                profile_id=profile_id,
+                scope=ModelStorageSyncScopeEnum.SINGLE_MODEL,
+                model_file_id=model_file_id,
+            )
+            session.add(policy)
+            await session.flush()
+            run = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="missing-child-timeout-operation",
+                request_hash="a" * 64,
+                response_payload={
+                    "scope": "single_model",
+                    "planned": 1,
+                    "created": [{"model_file_id": model_file_id, "task_id": 999999}],
+                    "skipped": [],
+                    "failed": [],
+                },
+                started_at=datetime.now(timezone.utc) - timedelta(minutes=6),
+            )
+            session.add(run)
+            await session.commit()
+            return run.id
+
+    run_id = _run(app, seed_pending_run())
+    controller = app.state.model_storage_sync_policy_controller
+    completed = _run(
+        app, controller._claim_and_execute(run_id, controller._internal_request())
+    )
+    assert completed.state.value == "error"
+    assert completed.error_code == "model_storage_sync_task_result_unavailable"
+    assert completed.attempt == 0
+    assert completed.finished_at is not None
+
+
+def test_pending_sync_policy_protects_terminal_child_until_aggregated(app, client):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    child = _create_task(app, profile_id, model_file_id)
+
+    async def seed_pending_run():
+        from gpustack.schemas.model_storage_sync import ModelStorageSyncScopeEnum
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicy,
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunTriggerEnum,
+            ModelStorageSyncPolicyTriggerModeEnum,
+        )
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            task = await session.get(ModelStorageSyncTask, child["id"])
+            task.state = ModelStorageSyncTaskStateEnum.READY
+            policy = ModelStorageSyncPolicy(
+                name="protected-child-pending-policy",
+                trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
+                timezone="UTC",
+                profile_id=profile_id,
+                scope=ModelStorageSyncScopeEnum.SINGLE_MODEL,
+                model_file_id=model_file_id,
+            )
+            session.add_all([task, policy])
+            await session.flush()
+            run = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="protected-child-pending-operation",
+                request_hash="8" * 64,
+                response_payload={
+                    "scope": "single_model",
+                    "planned": 1,
+                    "created": [
+                        {
+                            "model_file_id": model_file_id,
+                            "task_id": child["id"],
+                        }
+                    ],
+                    "skipped": [],
+                    "failed": [],
+                },
+            )
+            session.add(run)
+            await session.commit()
+            return run.id
+
+    run_id = _run(app, seed_pending_run())
+    blocked = client.delete(DETAIL.format(id=child["id"]))
+    assert blocked.status_code == 409
+    assert blocked.json()["message"] == "model_storage_sync_task_run_pending"
+
+    controller = app.state.model_storage_sync_policy_controller
+    completed = _run(
+        app, controller._claim_and_execute(run_id, controller._internal_request())
+    )
+    assert completed.state.value == "ready"
+    assert client.delete(DETAIL.format(id=child["id"])).status_code == 204
+
+
+def test_sync_policy_waits_for_created_child_terminal_state(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    child = _create_task(app, profile_id, model_file_id)
+
+    async def run():
+        from gpustack.schemas.model_storage_sync import (
+            ModelStorageSyncBatchItem,
+            ModelStorageSyncBatchPublic,
+            ModelStorageSyncScopeEnum,
+            ModelStorageSyncTask,
+            ModelStorageSyncTaskStateEnum,
+        )
+        from gpustack.schemas.model_storage_sync_policies import (
+            ModelStorageSyncPolicy,
+            ModelStorageSyncPolicyRun,
+            ModelStorageSyncPolicyRunStateEnum,
+            ModelStorageSyncPolicyRunTriggerEnum,
+            ModelStorageSyncPolicyTriggerModeEnum,
+        )
+        from gpustack.server.model_storage_sync_policy_controller import (
+            ModelStorageSyncPolicyController,
+        )
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            session.add(User(id=1, username="admin", is_admin=True, hashed_password=""))
+            policy = ModelStorageSyncPolicy(
+                name="child-terminal-policy",
+                trigger_mode=ModelStorageSyncPolicyTriggerModeEnum.MANUAL,
+                timezone="UTC",
+                profile_id=profile_id,
+                scope=ModelStorageSyncScopeEnum.SINGLE_MODEL,
+                model_file_id=model_file_id,
+            )
+            session.add(policy)
+            await session.flush()
+            record = ModelStorageSyncPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelStorageSyncPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="child-terminal-operation",
+                request_hash="4" * 64,
+                created_by_user_id=1,
+            )
+            session.add(record)
+            await session.commit()
+            run_id = record.id
+
+        calls = 0
+
+        async def created_batch(_request, _session, _user_id, batch, _key):
+            nonlocal calls
+            calls += 1
+            return ModelStorageSyncBatchPublic(
+                scope=batch.scope,
+                planned=1,
+                created=[
+                    ModelStorageSyncBatchItem(
+                        model_file_id=model_file_id,
+                        task_id=child["id"],
+                    )
+                ],
+                failed=[
+                    ModelStorageSyncBatchItem(
+                        model_file_id=999,
+                        reason="model_sync_source_unsupported",
+                    )
+                ],
+            )
+
+        controller = ModelStorageSyncPolicyController(
+            _engine(app), batch_executor=created_batch
+        )
+        pending = await controller._claim_and_execute(
+            run_id, controller._internal_request()
+        )
+        assert pending.state == ModelStorageSyncPolicyRunStateEnum.PENDING
+        assert pending.finished_at is None
+        assert pending.attempt == 1
+        assert calls == 1
+
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            task = await session.get(ModelStorageSyncTask, child["id"])
+            task.state = ModelStorageSyncTaskStateEnum.ERROR
+            task.error_code = "model_sync_source_not_found"
+            session.add(task)
+            await session.commit()
+
+        completed = await controller._claim_and_execute(
+            run_id, controller._internal_request()
+        )
+        assert completed.state == ModelStorageSyncPolicyRunStateEnum.ERROR
+        assert completed.error_code == "model_storage_sync_policy_run_failed"
+        assert completed.attempt == 1
+        assert calls == 1
+
+    _run(app, run())
+
+
 def test_stale_batch_placeholder_recovers_existing_child_idempotently(app, client):
     profile_id, model_file_id = _run(app, _seed_ids(app))
     key = "stale-batch-placeholder"
@@ -995,13 +1497,20 @@ def test_batch_sync_selected_workers_plans_ready_models_and_replays(app, client)
             )
             session.add_all([second, invalid])
             await session.commit()
-            return first_worker_id, ready_worker.id, not_ready_worker.id, second.id
+            return (
+                first_worker_id,
+                ready_worker.id,
+                not_ready_worker.id,
+                second.id,
+                invalid.id,
+            )
 
     (
         first_worker_id,
         ready_worker_id,
         not_ready_worker_id,
         second_model_file_id,
+        invalid_model_file_id,
     ) = _run(app, seed_more())
     first = client.post(
         "/v1/model-storage-sync-batches",
@@ -1051,12 +1560,18 @@ def test_batch_sync_selected_workers_plans_ready_models_and_replays(app, client)
     assert [item["task_id"] for item in replay.json()["created"]] == [
         item["task_id"] for item in first.json()["created"]
     ]
-    assert {item["worker_id"] for item in first.json()["skipped"]} == {
-        not_ready_worker_id
-    }
-    assert [item["reason"] for item in first.json()["failed"]] == [
-        "model_identity_invalid"
-    ]
+    assert any(
+        item["worker_id"] == not_ready_worker_id
+        and item["reason"] == "worker_not_ready"
+        for item in first.json()["skipped"]
+    )
+    assert first.json()["planned"] == 2
+    assert first.json()["failed"] == []
+    assert any(
+        item["model_file_id"] == invalid_model_file_id
+        and item["reason"] == "model_sync_source_unsupported"
+        for item in first.json()["skipped"]
+    )
     assert empty.status_code == 200, empty.text
     assert empty.json()["planned"] == 0
     assert empty.json()["created"] == []
@@ -1128,7 +1643,9 @@ def test_batch_all_identity_failures_replay_original_result_after_model_change(
     )
     assert first.status_code == 200, first.text
     assert first.json()["created"] == []
-    assert first.json()["failed"][0]["reason"] == "model_identity_invalid"
+    assert first.json()["planned"] == 0
+    assert first.json()["failed"] == []
+    assert first.json()["skipped"][0]["reason"] == "model_sync_source_unsupported"
 
     async def make_identity_valid():
         async with AsyncSession(_engine(app), expire_on_commit=False) as session:
@@ -2524,6 +3041,201 @@ def test_worker_fail_releases_slot_allows_new_task(app):
         again = _create_task(app, profile_id, model_file_id)
         assert again["id"] != task_id
     finally:
+        app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
+
+
+def test_missing_sync_source_marks_model_file_error_and_excludes_future_batches(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = _create_task(app, profile_id, model_file_id)
+    worker_id, worker_uuid = created["worker_id"], created["worker_uuid"]
+    task_id = created["id"]
+
+    async def override():
+        return _worker_principal(worker_id, worker_uuid)
+
+    app.dependency_overrides[get_model_preheat_worker_identity] = override
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/v1/model-storage-worker-tasks/{task_id}/fail",
+                json={
+                    "error_code": "model_sync_source_not_found",
+                    "lease_token": _fetch_task_lease_token(app, task_id),
+                },
+            )
+            assert response.status_code == 200
+            detail = client.get(DETAIL.format(id=task_id)).json()
+            assert detail["state"] == "error"
+            assert detail["error_code"] == "model_sync_source_not_found"
+            assert detail["state_message"] == "model_sync_source_not_found"
+
+            batch = client.post(
+                "/v1/model-storage-sync-batches",
+                headers={"Idempotency-Key": "missing-source-after-drift"},
+                json={
+                    "profile_id": profile_id,
+                    "scope": "single_model",
+                    "model_file_id": model_file_id,
+                },
+            )
+            assert batch.status_code == 200, batch.text
+            assert batch.json()["planned"] == 0
+            assert batch.json()["created"] == []
+            assert batch.json()["skipped"][0]["reason"] == "model_file_not_ready"
+
+        async def load_model_file():
+            async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+                return await session.get(ModelFile, model_file_id)
+
+        model_file = _run(app, load_model_file())
+        assert model_file.state == ModelFileStateEnum.ERROR
+        assert model_file.state_message == "model_sync_source_not_found"
+    finally:
+        app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
+
+
+def test_late_missing_source_failure_does_not_overwrite_redownloaded_model(app):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = _create_task(app, profile_id, model_file_id)
+    worker_id, worker_uuid = created["worker_id"], created["worker_uuid"]
+    task_id = created["id"]
+
+    async def replace_local_source():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            model_file = await session.get(ModelFile, model_file_id)
+            model_file.resolved_paths = ["/models/Qwen/Test-redownloaded"]
+            model_file.state = ModelFileStateEnum.READY
+            model_file.state_message = None
+            session.add(model_file)
+            await session.commit()
+
+    _run(app, replace_local_source())
+
+    async def override():
+        return _worker_principal(worker_id, worker_uuid)
+
+    app.dependency_overrides[get_model_preheat_worker_identity] = override
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                f"/v1/model-storage-worker-tasks/{task_id}/fail",
+                json={
+                    "error_code": "model_sync_source_not_found",
+                    "lease_token": _fetch_task_lease_token(app, task_id),
+                },
+            )
+            assert response.status_code == 200
+            detail = client.get(DETAIL.format(id=task_id)).json()
+            assert detail["state"] == "error"
+            assert detail["error_code"] == "model_sync_source_not_found"
+
+        async def load_model_file():
+            async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+                return await session.get(ModelFile, model_file_id)
+
+        model_file = _run(app, load_model_file())
+        assert model_file.state == ModelFileStateEnum.READY
+        assert model_file.state_message is None
+        assert model_file.resolved_paths == ["/models/Qwen/Test-redownloaded"]
+    finally:
+        app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
+
+
+def test_missing_source_failure_serializes_with_concurrent_redownload(app, monkeypatch):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    created = _create_task(app, profile_id, model_file_id)
+    worker_id, worker_uuid = created["worker_id"], created["worker_uuid"]
+    task_id = created["id"]
+
+    async def override():
+        return _worker_principal(worker_id, worker_uuid)
+
+    app.dependency_overrides[get_model_preheat_worker_identity] = override
+    locked = threading.Event()
+    release_failure = threading.Event()
+    redownload_started = threading.Event()
+    redownload_finished = threading.Event()
+    errors = []
+    original_matches = model_storage._matches_frozen_sync_source
+
+    def block_after_lock(request, task, model_file):
+        matched = original_matches(request, task, model_file)
+        locked.set()
+        assert release_failure.wait(timeout=5)
+        return matched
+
+    monkeypatch.setattr(model_storage, "_matches_frozen_sync_source", block_after_lock)
+
+    def fail_old_task():
+        try:
+            with TestClient(app) as client:
+                response = client.post(
+                    f"/v1/model-storage-worker-tasks/{task_id}/fail",
+                    json={
+                        "error_code": "model_sync_source_not_found",
+                        "lease_token": _fetch_task_lease_token(app, task_id),
+                    },
+                )
+                assert response.status_code == 200
+        except Exception as exc:
+            errors.append(exc)
+
+    def redownload():
+        async def update_model():
+            async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+                redownload_started.set()
+                await session.exec(
+                    update(ModelFile)
+                    .where(ModelFile.id == model_file_id)
+                    .values(
+                        resolved_paths=["/models/Qwen/Test-concurrent"],
+                        state=ModelFileStateEnum.DOWNLOADING,
+                        state_message=None,
+                    )
+                )
+                await session.commit()
+            async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+                await session.exec(
+                    update(ModelFile)
+                    .where(ModelFile.id == model_file_id)
+                    .values(state=ModelFileStateEnum.READY)
+                )
+                await session.commit()
+
+        try:
+            _run(app, update_model())
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            redownload_finished.set()
+
+    failure_thread = threading.Thread(target=fail_old_task)
+    redownload_thread = threading.Thread(target=redownload)
+    try:
+        failure_thread.start()
+        assert locked.wait(timeout=5)
+        redownload_thread.start()
+        assert redownload_started.wait(timeout=5)
+        assert not redownload_finished.wait(timeout=0.2)
+        release_failure.set()
+        failure_thread.join(timeout=5)
+        redownload_thread.join(timeout=5)
+        assert not failure_thread.is_alive()
+        assert not redownload_thread.is_alive()
+        assert errors == []
+
+        async def load_model_file():
+            async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+                return await session.get(ModelFile, model_file_id)
+
+        model_file = _run(app, load_model_file())
+        assert model_file.state == ModelFileStateEnum.READY
+        assert model_file.state_message is None
+        assert model_file.resolved_paths == ["/models/Qwen/Test-concurrent"]
+    finally:
+        release_failure.set()
+        failure_thread.join(timeout=5)
+        redownload_thread.join(timeout=5)
         app.dependency_overrides.pop(get_model_preheat_worker_identity, None)
 
 
