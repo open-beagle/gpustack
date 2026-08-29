@@ -543,12 +543,12 @@ async def _execute_payload(
             if getattr(payload, "trusted_local_candidate", None) is not None
             else None
         ),
-        "install_local": task.get("delivery_mode") != "s3_only",
     }
     if seed:
         request_fields["source_fallback_enabled"] = bool(
             profile.source_fallback_enabled
         )
+        request_fields["install_local"] = task.get("delivery_mode") != "s3_only"
         if request_fields["artifact_id"] is None:
             request_fields.pop("manifest_path")
     elif (

@@ -372,7 +372,7 @@ class ModelPreheatManager:
                 return
             raise
         except Exception as exc:
-            logger.error(
+            logger.exception(
                 "%s执行失败。worker_task_id=%s error_type=%s",
                 self._role_name(role),
                 worker_task_id,

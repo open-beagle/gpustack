@@ -1,8 +1,13 @@
+import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 
+from gpustack.schemas.model_preheats import ModelPreheatWorkerTaskRoleEnum
+from gpustack.worker.model_preheat import executor as preheat_executor
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
     TargetExecutionRequest,
+    build_preheat_role_handlers,
     execute_seed_preheat,
     execute_target_preheat,
 )
@@ -66,6 +71,61 @@ def _target_request(tmp_path, published):
         artifact_id=published["artifact_id"],
         manifest_path=published["manifest_path"],
     )
+
+
+def test_distribution_handler_constructs_target_request_without_seed_only_fields(
+    tmp_path, monkeypatch
+):
+    identity = _identity()
+    captured = {}
+
+    def execute(request, client, **kwargs):
+        captured["request"] = request
+        captured["client"] = client
+        captured["kwargs"] = kwargs
+        return {"state": "ready"}
+
+    monkeypatch.setattr(preheat_executor, "execute_target_preheat", execute)
+    payload = SimpleNamespace(
+        worker_task_id=9,
+        attempt=1,
+        resumable_cursor=None,
+        trusted_local_candidate=None,
+        task={
+            "id": 8,
+            "source": identity.source,
+            "model_id": identity.model_id,
+            "resolved_revision": identity.revision,
+            "requested_revision": None,
+            "include_patterns": list(identity.file_patterns),
+            "exclude_patterns": [],
+            "request_digest": identity.request_digest,
+            "artifact_id": "a" * 64,
+            "s3_manifest_path": "preheat/artifact/manifest.json",
+            "delivery_mode": "s3_and_workers",
+        },
+        profile=SimpleNamespace(
+            endpoint="https://s3.example.com",
+            access_key="access-key",
+            secret_key="secret-key",
+            tls_enabled=True,
+            tls_verify=True,
+            region="",
+            use_virtual_hosted_style=True,
+            bucket="models",
+            prefix="preheat",
+            source_fallback_enabled=True,
+        ),
+    )
+    context = SimpleNamespace(progress=None)
+    handler = build_preheat_role_handlers(tmp_path)[
+        ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE
+    ]
+
+    result = asyncio.run(handler(payload, context))
+
+    assert result == {"state": "ready"}
+    assert isinstance(captured["request"], TargetExecutionRequest)
 
 
 def test_target_downloads_artifact_and_installs_directory(tmp_path):

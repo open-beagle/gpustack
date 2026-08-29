@@ -197,6 +197,53 @@ def test_connectivity_payload_failure_writes_terminal_result_and_role_log(caplog
     assert "模型预热执行参数获取失败" not in caplog.text
 
 
+def test_execution_failure_logs_traceback_without_exposing_exception_to_task(caplog):
+    class ExecutionFailureClient(FakeWorkerTasksClient):
+        def __init__(self):
+            super().__init__()
+            self.failures = []
+
+        async def afail(self, id, failure):
+            self.failures.append(failure)
+
+    async def run():
+        client = ExecutionFailureClient()
+
+        async def failing_executor(payload, context):
+            del payload, context
+            raise RuntimeError("internal executor detail")
+
+        manager = ModelPreheatManager(
+            worker_id=11,
+            worker_uuid="worker-uuid",
+            clientset=SimpleNamespace(model_preheat_worker_tasks=client),
+            execution_handler=failing_executor,
+        )
+        manager.handle_event(
+            Event(EventType.CREATED, _public_task().model_dump(mode="json"))
+        )
+        await asyncio.gather(*manager._active_tasks.values())
+        return client
+
+    with caplog.at_level(logging.ERROR):
+        client = asyncio.run(run())
+
+    records = [
+        record for record in caplog.records if "模型预热执行失败" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].exc_info is not None
+    assert len(client.failures) == 1
+    failure = client.failures[0]
+    assert failure.error_code == "worker_execution_failed"
+    assert failure.state_message == "worker_execution_failed"
+    assert failure.result == {
+        "state": "error",
+        "error_code": "worker_execution_failed",
+    }
+    assert "internal executor detail" not in str(failure.model_dump())
+
+
 def test_periodic_reconciliation_claims_task_after_existing_lease_expires():
     class TakeoverClient(FakeWorkerTasksClient):
         def __init__(self):
