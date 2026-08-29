@@ -13,6 +13,11 @@ from sqlmodel import Field, SQLModel
 from gpustack.mixins import BaseModelMixin
 from gpustack.schemas.common import JSON, PaginatedList, UTCDateTime
 from gpustack.schemas.model_storage_sync import ModelStorageSyncScopeEnum
+from gpustack.schemas.policy_runs import (
+    PolicyRunExecutionStateEnum,
+    PolicyRunSummary,
+    PolicyRunTaskPublic,
+)
 
 
 class ModelStorageSyncPolicyTriggerModeEnum(str, Enum):
@@ -222,6 +227,7 @@ class ModelStorageSyncPolicyPublic(ModelStorageSyncPolicyBase):
     created_by_user_id: Optional[int] = None
     next_run_at: Optional[datetime] = None
     last_run_at: Optional[datetime] = None
+    latest_run: Optional["ModelStorageSyncPolicyRunPublic"] = None
     created_at: datetime
     updated_at: datetime
 
@@ -231,6 +237,9 @@ class ModelStorageSyncPolicyRunPublic(SQLModel):
     policy_id: int
     trigger: ModelStorageSyncPolicyRunTriggerEnum
     state: ModelStorageSyncPolicyRunStateEnum
+    execution_state: PolicyRunExecutionStateEnum
+    summary: PolicyRunSummary = Field(default_factory=PolicyRunSummary)
+    tasks: list[PolicyRunTaskPublic] = Field(default_factory=list)
     window_start_utc: datetime
     attempt: int
     response_payload: Optional[dict] = None

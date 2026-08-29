@@ -15,6 +15,7 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicyRun,
     ModelPreheatDistributionPolicyRunStateEnum,
     ModelPreheatDistributionPolicyRunTriggerEnum,
+    ModelPreheatDistributionPolicyRunTask,
     ModelPreheatDistributionPolicyTriggerModeEnum,
     ModelPreheatDistributionWorkerSlot,
     ModelPreheatDistributionSelectionModeEnum,
@@ -72,6 +73,38 @@ ACTIVE_DISTRIBUTION_TASK_STATES = (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _distribution_outcome_item(status, reason=None, *, worker=None, task_id=None):
+    item = {
+        "task_id": task_id,
+        "worker_id": worker.id if worker is not None else None,
+        "worker_uuid": worker.worker_uuid if worker is not None else None,
+    }
+    if reason is not None:
+        item["reason"] = reason
+    return status, item
+
+
+def _distribution_reconcile_result(items):
+    outcome = {"created": [], "skipped": [], "failed": []}
+    for status, item in items:
+        outcome[status].append(item)
+    if outcome["created"]:
+        error_code = (
+            "distribution_partial_outcome"
+            if outcome["skipped"] or outcome["failed"]
+            else None
+        )
+    elif outcome["failed"]:
+        error_code = outcome["failed"][0].get("reason") or "distribution_run_failed"
+    else:
+        error_code = "distribution_no_eligible_workers"
+    return {"outcome": outcome, "error_code": error_code}
+
+
+def _distribution_outcome_has_created(outcome):
+    return bool(isinstance(outcome, dict) and outcome.get("created"))
 
 
 class ModelPreheatWorkerReconciler:
@@ -205,22 +238,60 @@ class ModelPreheatWorkerReconciler:
             except (IntegrityError, OperationalError):
                 await session.rollback()
 
-    async def reconcile_policy(self, policy_id, run_key=None, lease_check=None):
+    async def reconcile_policy(
+        self, policy_id, run_key=None, lease_check=None, run_id=None
+    ):
+        outcomes = []
         async with AsyncSession(self._engine) as session:
             policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
             if policy is None:
-                return
+                return _distribution_reconcile_result(
+                    [
+                        _distribution_outcome_item(
+                            "failed", "distribution_policy_not_found"
+                        )
+                    ]
+                )
+            if run_id is not None:
+                try:
+                    await resolve_distribution_sources(session, policy)
+                except DistributionSourceUnavailable as exc:
+                    return _distribution_reconcile_result(
+                        [_distribution_outcome_item("failed", str(exc))]
+                    )
             workers = await current_registered_workers(session)
+        if run_id is not None and not workers:
+            outcomes.append(
+                _distribution_outcome_item(
+                    "failed", "distribution_no_registered_workers"
+                )
+            )
         for worker in workers:
             if lease_check is not None and not lease_check():
-                return
-            if (
+                outcomes.append(
+                    _distribution_outcome_item(
+                        "failed", "distribution_schedule_lease_lost"
+                    )
+                )
+                break
+            if run_id is not None:
+                if not _policy_selector_matches_worker(policy, worker):
+                    continue
+                outcomes.extend(
+                    await self._evaluate_worker(
+                        worker,
+                        policy_ids=[policy_id],
+                        run_key=run_key,
+                        run_id=run_id,
+                    )
+                )
+            elif (
                 worker.state == WorkerStateEnum.READY
                 and worker.model_storage_protocol_version
                 == MODEL_STORAGE_PROTOCOL_VERSION
             ):
                 await self._evaluate_worker(
-                    worker, policy_ids=[policy_id], run_key=run_key
+                    worker, policy_ids=[policy_id], run_key=run_key, run_id=run_id
                 )
         async with AsyncSession(self._engine) as session:
             policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
@@ -228,6 +299,7 @@ class ModelPreheatWorkerReconciler:
                 policy.last_reconciled_at = datetime.now(timezone.utc)
                 session.add(policy)
                 await session.commit()
+        return _distribution_reconcile_result(outcomes)
 
     async def reconcile_manual_policy(self, policy_id):
         return await self._run_policy(
@@ -268,12 +340,21 @@ class ModelPreheatWorkerReconciler:
                 await session.rollback()
                 return None
         error_code = None
+        result = None
         try:
-            await self.reconcile_policy(policy_id, operation_key)
+            result = await self.reconcile_policy(
+                policy_id, operation_key, run_id=run.id
+            )
         except Exception as exc:
             error_code = type(exc).__name__
             raise
         finally:
+            outcome = result.get("outcome") if isinstance(result, dict) else None
+            result_error = (
+                result.get("error_code") if isinstance(result, dict) else None
+            )
+            effective_error = error_code or result_error
+            has_created = _distribution_outcome_has_created(outcome)
             async with AsyncSession(self._engine) as session:
                 await session.exec(
                     update(ModelPreheatDistributionPolicyRun)
@@ -285,15 +366,17 @@ class ModelPreheatWorkerReconciler:
                     .values(
                         state=(
                             ModelPreheatDistributionPolicyRunStateEnum.ERROR
-                            if error_code
+                            if effective_error and not has_created
                             else ModelPreheatDistributionPolicyRunStateEnum.READY
                         ),
-                        error_code=error_code,
+                        error_code=effective_error,
+                        outcome=outcome,
                         finished_at=datetime.now(timezone.utc),
                     )
                 )
                 await session.commit()
-        return run
+        async with AsyncSession(self._engine, expire_on_commit=False) as session:
+            return await session.get(ModelPreheatDistributionPolicyRun, run.id)
 
     async def reconcile_worker(
         self, worker_uuid, *, event_driven=False, safety_check=True
@@ -367,10 +450,29 @@ class ModelPreheatWorkerReconciler:
                 )
 
     async def _evaluate_worker(
-        self, worker, policy_ids=None, allowed_modes=None, run_key=None
+        self, worker, policy_ids=None, allowed_modes=None, run_key=None, run_id=None
     ):
+        outcomes = []
+        if worker.state != WorkerStateEnum.READY:
+            if run_id is not None:
+                outcomes.append(
+                    _distribution_outcome_item(
+                        "skipped",
+                        "distribution_worker_not_ready",
+                        worker=worker,
+                    )
+                )
+            return outcomes
         if worker.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
-            return
+            if run_id is not None:
+                outcomes.append(
+                    _distribution_outcome_item(
+                        "skipped",
+                        "distribution_worker_protocol_unsupported",
+                        worker=worker,
+                    )
+                )
+            return outcomes
         async with AsyncSession(self._engine) as session:
             statement = select(ModelPreheatDistributionPolicy).where(
                 ModelPreheatDistributionPolicy.enabled.is_(True)
@@ -392,6 +494,22 @@ class ModelPreheatWorkerReconciler:
                 except DistributionSourceUnavailable as exc:
                     policy.blocked_reason = str(exc)
                     session.add(policy)
+                    if run_id is not None:
+                        outcomes.append(
+                            _distribution_outcome_item(
+                                "failed", str(exc), worker=worker
+                            )
+                        )
+                    continue
+                if not sources:
+                    if run_id is not None:
+                        outcomes.append(
+                            _distribution_outcome_item(
+                                "failed",
+                                "distribution_source_unavailable",
+                                worker=worker,
+                            )
+                        )
                     continue
                 profile = sources[0].profile
                 connectivity = await latest_connectivity_results_for_workers(
@@ -405,6 +523,14 @@ class ModelPreheatWorkerReconciler:
                     result is None
                     or result[0].state != ModelPreheatWorkerTaskStateEnum.READY
                 ):
+                    if run_id is not None:
+                        outcomes.append(
+                            _distribution_outcome_item(
+                                "skipped",
+                                "distribution_connectivity_not_ready",
+                                worker=worker,
+                            )
+                        )
                     continue
                 await session.refresh(policy)
                 await session.refresh(profile)
@@ -414,6 +540,12 @@ class ModelPreheatWorkerReconciler:
                 except DistributionSourceUnavailable as exc:
                     policy.blocked_reason = str(exc)
                     session.add(policy)
+                    if run_id is not None:
+                        outcomes.append(
+                            _distribution_outcome_item(
+                                "failed", str(exc), worker=worker
+                            )
+                        )
                     continue
                 if (
                     profile.lifecycle_state
@@ -425,11 +557,38 @@ class ModelPreheatWorkerReconciler:
                     or current_worker.model_storage_protocol_version
                     != MODEL_STORAGE_PROTOCOL_VERSION
                 ):
+                    if run_id is not None:
+                        outcomes.append(
+                            _distribution_outcome_item(
+                                "failed",
+                                "distribution_policy_changed_during_run",
+                                worker=worker,
+                            )
+                        )
                     continue
                 for source in sources:
-                    await _create_or_rebind_distribution_task(
+                    task = await _create_or_rebind_distribution_task(
                         session, policy, source, current_worker, run_key=run_key
                     )
+                    if run_id is not None and task is not None:
+                        await session.merge(
+                            ModelPreheatDistributionPolicyRunTask(
+                                run_id=run_id, task_id=task.id
+                            )
+                        )
+                        outcomes.append(
+                            _distribution_outcome_item(
+                                "created", worker=worker, task_id=task.id
+                            )
+                        )
+                    elif run_id is not None:
+                        outcomes.append(
+                            _distribution_outcome_item(
+                                "failed",
+                                "distribution_task_not_created",
+                                worker=worker,
+                            )
+                        )
                 policy.last_reconciled_at = datetime.now(timezone.utc)
                 policy.blocked_reason = None
                 session.add(policy)
@@ -437,6 +596,15 @@ class ModelPreheatWorkerReconciler:
                 await session.commit()
             except (IntegrityError, OperationalError):
                 await session.rollback()
+                if run_id is not None:
+                    return [
+                        _distribution_outcome_item(
+                            "failed",
+                            "distribution_outcome_persist_failed",
+                            worker=worker,
+                        )
+                    ]
+        return outcomes
 
     async def _reconcile_deleted(self, worker_uuid, worker_id):
         async with AsyncSession(self._engine) as session:
@@ -601,6 +769,10 @@ def _selectors_for_task(task):
 def _policy_matches_worker(policy, worker):
     if worker.model_storage_protocol_version != MODEL_STORAGE_PROTOCOL_VERSION:
         return False
+    return _policy_selector_matches_worker(policy, worker)
+
+
+def _policy_selector_matches_worker(policy, worker):
     selected_uuids = set(policy.worker_selector.get("worker_uuids", []))
     if selected_uuids and worker.worker_uuid not in selected_uuids:
         return False

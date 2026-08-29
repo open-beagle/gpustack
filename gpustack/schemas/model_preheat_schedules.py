@@ -15,6 +15,11 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatDeliveryModeEnum,
     ModelPreheatTargetScopeEnum,
 )
+from gpustack.schemas.policy_runs import (
+    PolicyRunExecutionStateEnum,
+    PolicyRunSummary,
+    PolicyRunTaskPublic,
+)
 from gpustack.worker.model_preheat.identity import (
     ModelPreheatIdentityError,
     encode_path,
@@ -346,6 +351,7 @@ class ModelPreheatSchedulePublic(ModelPreheatScheduleBase):
     created_by_user_id: Optional[int] = None
     next_window_start_utc: Optional[datetime] = None
     last_window_start_utc: Optional[datetime] = None
+    latest_run: Optional["ModelPreheatScheduleRunPublic"] = None
     created_at: datetime
     updated_at: datetime
 
@@ -357,6 +363,9 @@ class ModelPreheatScheduleRunPublic(SQLModel):
     window_end_utc: datetime
     trigger: ModelPreheatScheduleRunTriggerEnum
     state: ModelPreheatScheduleRunStateEnum
+    execution_state: PolicyRunExecutionStateEnum
+    summary: PolicyRunSummary = Field(default_factory=PolicyRunSummary)
+    tasks: list[PolicyRunTaskPublic] = Field(default_factory=list)
     task_id: Optional[int] = None
     error_code: Optional[str] = None
     started_at: Optional[datetime] = None

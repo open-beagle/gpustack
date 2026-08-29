@@ -30,6 +30,10 @@ from gpustack.server.model_storage_sync_policy_controller import (
     SyncPolicyDisabled,
     SyncPolicyRunConflict,
 )
+from gpustack.server.policy_run_observability import (
+    latest_runs_by_owner,
+    sync_policy_run_observations,
+)
 
 
 router = APIRouter()
@@ -45,9 +49,30 @@ async def get_sync_policies(session: SessionDep, params: ListParamsDep):
             .limit(params.perPage)
         )
     ).all()
+    latest_runs = await latest_runs_by_owner(
+        session,
+        ModelStorageSyncPolicyRun,
+        ModelStorageSyncPolicyRun.policy_id,
+        [item.id for item in items],
+    )
+    observations = await sync_policy_run_observations(
+        session, list(latest_runs.values())
+    )
     total = await ModelStorageSyncPolicy.count(session)
     return PaginatedList[ModelStorageSyncPolicyPublic](
-        items=[ModelStorageSyncPolicyPublic.model_validate(item) for item in items],
+        items=[
+            _public(
+                item,
+                latest_run=(
+                    _run_public(
+                        latest_runs[item.id], observations[latest_runs[item.id].id]
+                    )
+                    if item.id in latest_runs
+                    else None
+                ),
+            )
+            for item in items
+        ],
         pagination=_pagination(params, total),
     )
 
@@ -75,8 +100,24 @@ async def create_sync_policy(
 
 @router.get("/{id}", response_model=ModelStorageSyncPolicyPublic)
 async def get_sync_policy(session: SessionDep, id: int):
-    return ModelStorageSyncPolicyPublic.model_validate(
-        await _policy_or_404(session, id)
+    policy = await _policy_or_404(session, id)
+    latest_runs = await latest_runs_by_owner(
+        session,
+        ModelStorageSyncPolicyRun,
+        ModelStorageSyncPolicyRun.policy_id,
+        [policy.id],
+    )
+    latest_run = latest_runs.get(policy.id)
+    observations = await sync_policy_run_observations(
+        session, [latest_run] if latest_run is not None else []
+    )
+    return _public(
+        policy,
+        latest_run=(
+            _run_public(latest_run, observations[latest_run.id])
+            if latest_run is not None
+            else None
+        ),
     )
 
 
@@ -166,6 +207,7 @@ async def get_sync_policy_runs(session: SessionDep, params: ListParamsDep, id: i
             .limit(params.perPage)
         )
     ).all()
+    observations = await sync_policy_run_observations(session, items)
     total = (
         await session.exec(
             select(func.count(ModelStorageSyncPolicyRun.id)).where(
@@ -174,7 +216,7 @@ async def get_sync_policy_runs(session: SessionDep, params: ListParamsDep, id: i
         )
     ).one()
     return PaginatedList[ModelStorageSyncPolicyRunPublic](
-        items=[ModelStorageSyncPolicyRunPublic.model_validate(item) for item in items],
+        items=[_run_public(item, observations[item.id]) for item in items],
         pagination=_pagination(params, total),
     )
 
@@ -185,7 +227,10 @@ async def get_sync_policy_run(session: SessionDep, id: int, run_id: int):
     run = await session.get(ModelStorageSyncPolicyRun, run_id)
     if run is None or run.policy_id != id:
         raise NotFoundException(message="model_storage_sync_policy_run_not_found")
-    return ModelStorageSyncPolicyRunPublic.model_validate(run)
+    observations = await sync_policy_run_observations(
+        session, [run], include_tasks=True
+    )
+    return _run_public(run, observations[run.id])
 
 
 @router.post("/{id}/run-now", response_model=ModelStorageSyncPolicyRunPublic)
@@ -216,7 +261,10 @@ async def run_sync_policy_now(
         raise HTTPException(
             409, "Conflict", "model_storage_sync_policy_disabled"
         ) from None
-    return ModelStorageSyncPolicyRunPublic.model_validate(run)
+    observations = await sync_policy_run_observations(
+        session, [run], include_tasks=True
+    )
+    return _run_public(run, observations[run.id])
 
 
 async def _policy_or_404(session, policy_id):
@@ -250,4 +298,21 @@ def _pagination(params, total):
         perPage=params.perPage,
         total=total,
         totalPage=(total + params.perPage - 1) // params.perPage,
+    )
+
+
+def _public(policy, latest_run=None):
+    return ModelStorageSyncPolicyPublic.model_validate(
+        policy, update={"latest_run": latest_run}
+    )
+
+
+def _run_public(run, observation):
+    return ModelStorageSyncPolicyRunPublic.model_validate(
+        run,
+        update={
+            "execution_state": observation.execution_state,
+            "summary": observation.summary,
+            "tasks": observation.tasks,
+        },
     )

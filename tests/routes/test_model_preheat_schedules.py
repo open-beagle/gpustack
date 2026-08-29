@@ -1374,6 +1374,7 @@ def test_schedule_run_list_and_get_are_admin_queryable(tmp_path):
         fetched = client.get(
             f"/v1/model-preheat-schedules/{schedule['id']}/runs/{run['id']}"
         )
+        schedules = client.get("/v1/model-preheat-schedules")
 
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
@@ -1383,4 +1384,8 @@ def test_schedule_run_list_and_get_are_admin_queryable(tmp_path):
     assert listed.json()["items"][0]["id"] == run["id"]
     assert fetched.status_code == 200, fetched.text
     assert fetched.json()["id"] == run["id"]
+    assert fetched.json()["execution_state"] in {"waiting", "running", "ready"}
+    latest = schedules.json()["items"][0]["latest_run"]
+    assert latest["id"] == run["id"]
+    assert latest["tasks"] == []
     assert "operation_key" not in str(listed.json())

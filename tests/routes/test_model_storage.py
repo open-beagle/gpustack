@@ -386,11 +386,177 @@ def test_sync_policy_run_now_creates_existing_sync_task_and_replays(app, client)
     assert replay.status_code == 200, replay.text
     assert replay.json() == first.json()
     assert first.json()["state"] == "pending"
+    assert first.json()["execution_state"] == "waiting"
+    assert first.json()["summary"]["pending"] == 1
     task_id = first.json()["response_payload"]["created"][0]["task_id"]
     assert task_id is not None
     detail = client.get(f"{API}/{task_id}")
     assert detail.status_code == 200
     assert detail.json()["model_file_id"] == model_file_id
+    policies = client.get("/v1/model-storage-sync-policies")
+    latest = policies.json()["items"][0]["latest_run"]
+    assert latest["id"] == first.json()["id"]
+    assert latest["execution_state"] == "waiting"
+    assert latest["tasks"] == []
+    runs = client.get(f"/v1/model-storage-sync-policies/{policy_id}/runs")
+    run_detail = client.get(
+        f"/v1/model-storage-sync-policies/{policy_id}/runs/{first.json()['id']}"
+    )
+    assert runs.status_code == 200, runs.text
+    assert runs.json()["items"][0]["tasks"] == []
+    assert run_detail.status_code == 200, run_detail.text
+    assert run_detail.json()["tasks"][0]["id"] == task_id
+    assert "lease_token" not in str(run_detail.json())
+
+    async def fail_sync_task():
+        async with AsyncSession(_engine(app)) as session:
+            task = await session.get(ModelStorageSyncTask, task_id)
+            task.state = ModelStorageSyncTaskStateEnum.ERROR
+            task.error_code = "source_model_missing"
+            task.state_message = "source model is no longer available"
+            session.add(task)
+            await session.commit()
+
+    _run(app, fail_sync_task())
+    failed_detail = client.get(
+        f"/v1/model-storage-sync-policies/{policy_id}/runs/{first.json()['id']}"
+    )
+    assert failed_detail.json()["execution_state"] == "error"
+    assert failed_detail.json()["summary"]["error"] == 1
+    assert failed_detail.json()["tasks"][0]["error_code"] == "source_model_missing"
+    assert (
+        failed_detail.json()["tasks"][0]["state_message"]
+        == "source model is no longer available"
+    )
+
+
+def test_sync_policy_run_projects_created_skipped_and_failed_batch_items(app, client):
+    from gpustack.schemas.model_storage_sync_policies import ModelStorageSyncPolicyRun
+
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+    policy = client.post(
+        "/v1/model-storage-sync-policies",
+        json={
+            "name": "observable-sync",
+            "trigger_mode": "manual",
+            "profile_id": profile_id,
+            "scope": "single_model",
+            "model_file_id": model_file_id,
+        },
+    ).json()
+    run = client.post(
+        f"/v1/model-storage-sync-policies/{policy['id']}/run-now",
+        headers={"Idempotency-Key": "observable-sync-run"},
+    ).json()
+    task_id = run["response_payload"]["created"][0]["task_id"]
+
+    async def set_payload(response_payload):
+        async with AsyncSession(_engine(app)) as session:
+            task = await session.get(ModelStorageSyncTask, task_id)
+            task.state = ModelStorageSyncTaskStateEnum.READY
+            task.total_size = 4096
+            record = await session.get(ModelStorageSyncPolicyRun, run["id"])
+            record.response_payload = response_payload
+            session.add(task)
+            session.add(record)
+            await session.commit()
+
+    _run(
+        app,
+        set_payload(
+            {
+                "created": [
+                    {
+                        "task_id": task_id,
+                        "model_file_id": model_file_id,
+                        "worker_id": 1,
+                        "worker_uuid": "worker-a-uuid",
+                    }
+                ],
+                "skipped": [
+                    {
+                        "model_file_id": 901,
+                        "worker_id": 902,
+                        "worker_uuid": "worker-skipped",
+                        "reason": "worker_protocol_unsupported",
+                    }
+                ],
+                "failed": [
+                    {
+                        "model_file_id": 903,
+                        "worker_id": 904,
+                        "worker_uuid": "worker-failed",
+                        "reason": "source_model_missing",
+                    }
+                ],
+            }
+        ),
+    )
+    mixed = client.get(
+        f"/v1/model-storage-sync-policies/{policy['id']}/runs/{run['id']}"
+    ).json()
+
+    assert mixed["execution_state"] == "partial_error"
+    assert mixed["summary"] == {
+        "total": 3,
+        "pending": 0,
+        "running": 0,
+        "paused": 0,
+        "ready": 1,
+        "error": 1,
+        "failed": 1,
+        "skipped": 1,
+        "progress": 100 / 3,
+        "downloaded_bytes": 0,
+        "total_bytes": 4096,
+    }
+    assert mixed["tasks"][1]["model_file_id"] == 901
+    assert mixed["tasks"][1]["worker_id"] == 902
+    assert mixed["tasks"][1]["error_code"] == "worker_protocol_unsupported"
+    assert mixed["tasks"][2]["worker_uuid"] == "worker-failed"
+    assert mixed["tasks"][2]["state_message"] == "source_model_missing"
+    assert "lease" not in str(mixed).lower()
+
+    _run(
+        app,
+        set_payload(
+            {
+                "created": [],
+                "skipped": [],
+                "failed": [
+                    {"worker_uuid": "worker-a", "reason": "first_failed"},
+                    {"worker_uuid": "worker-b", "reason": "second_failed"},
+                ],
+            }
+        ),
+    )
+    failed = client.get(
+        f"/v1/model-storage-sync-policies/{policy['id']}/runs/{run['id']}"
+    ).json()
+    assert failed["execution_state"] == "error"
+    assert failed["summary"]["total"] == 2
+    assert failed["summary"]["error"] == 2
+    assert failed["summary"]["failed"] == 2
+
+    _run(
+        app,
+        set_payload(
+            {
+                "created": [],
+                "skipped": [
+                    {"worker_uuid": "worker-a", "reason": "not_selected"},
+                    {"worker_uuid": "worker-b", "reason": "not_ready"},
+                ],
+                "failed": [],
+            }
+        ),
+    )
+    skipped = client.get(
+        f"/v1/model-storage-sync-policies/{policy['id']}/runs/{run['id']}"
+    ).json()
+    assert skipped["execution_state"] == "skipped"
+    assert skipped["summary"]["total"] == 2
+    assert skipped["summary"]["skipped"] == 2
 
 
 def test_sync_policy_same_key_for_different_policy_conflicts(app, client):

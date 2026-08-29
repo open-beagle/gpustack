@@ -130,6 +130,8 @@ class ModelPreheatDistributionScheduleController:
 
     async def _execute_claimed_run(self, run_id, token):
         error_code = None
+        outcome = None
+        has_created = False
         try:
             async with AsyncSession(self._engine) as session:
                 run = await session.get(ModelPreheatDistributionPolicyRun, run_id)
@@ -166,6 +168,7 @@ class ModelPreheatDistributionScheduleController:
                         run.policy_id,
                         run.operation_key,
                         lease_check=lambda: not lease_lost.is_set(),
+                        run_id=run.id,
                     )
                 )
                 lost_task = asyncio.create_task(lease_lost.wait())
@@ -182,14 +185,29 @@ class ModelPreheatDistributionScheduleController:
                         lost_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await lost_task
-                        await reconcile_task
+                        result = await reconcile_task
+                        if isinstance(result, dict):
+                            outcome = result.get("outcome")
+                            has_created = bool(
+                                isinstance(outcome, dict) and outcome.get("created")
+                            )
+                            error_code = result.get("error_code")
+                        else:
+                            error_code = "distribution_reconcile_outcome_missing"
                 finally:
                     heartbeat.cancel()
                     with suppress(asyncio.CancelledError):
                         await heartbeat
         except Exception as exc:
             error_code = type(exc).__name__
-        await self._finish_run(run_id, token, error_code)
+            has_created = False
+        await self._finish_run(
+            run_id,
+            token,
+            error_code,
+            outcome=outcome,
+            has_created=has_created,
+        )
 
     async def _renew_lease(self, run_id, token, now=None):
         now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -220,7 +238,9 @@ class ModelPreheatDistributionScheduleController:
                 lease_lost.set()
                 return
 
-    async def _finish_run(self, run_id, token, error_code):
+    async def _finish_run(
+        self, run_id, token, error_code, *, outcome=None, has_created=False
+    ):
         async with AsyncSession(self._engine) as session:
             await session.exec(
                 update(ModelPreheatDistributionPolicyRun)
@@ -234,10 +254,11 @@ class ModelPreheatDistributionScheduleController:
                 .values(
                     state=(
                         ModelPreheatDistributionPolicyRunStateEnum.ERROR
-                        if error_code
+                        if error_code and not has_created
                         else ModelPreheatDistributionPolicyRunStateEnum.READY
                     ),
                     error_code=error_code,
+                    outcome=outcome,
                     finished_at=datetime.now(timezone.utc),
                     lease_owner=None,
                     lease_token=None,

@@ -39,6 +39,10 @@ from gpustack.server.model_preheat_schedule_controller import (
     ScheduleDisabled,
     ScheduleRunConflict,
 )
+from gpustack.server.policy_run_observability import (
+    latest_runs_by_owner,
+    preheat_schedule_run_observations,
+)
 
 
 router = APIRouter()
@@ -53,9 +57,30 @@ async def get_model_preheat_schedules(session: SessionDep, params: ListParamsDep
         .limit(params.perPage)
     )
     items = (await session.exec(statement)).all()
+    latest_runs = await latest_runs_by_owner(
+        session,
+        ModelPreheatScheduleRun,
+        ModelPreheatScheduleRun.schedule_id,
+        [item.id for item in items],
+    )
+    observations = await preheat_schedule_run_observations(
+        session, list(latest_runs.values())
+    )
     total = await ModelPreheatSchedule.count(session)
     return PaginatedList[ModelPreheatSchedulePublic](
-        items=[_public(item) for item in items],
+        items=[
+            _public(
+                item,
+                latest_run=(
+                    _run_public(
+                        latest_runs[item.id], observations[latest_runs[item.id].id]
+                    )
+                    if item.id in latest_runs
+                    else None
+                ),
+            )
+            for item in items
+        ],
         pagination=Pagination(
             page=params.page,
             perPage=params.perPage,
@@ -94,7 +119,25 @@ async def create_model_preheat_schedule(
 
 @router.get("/{id}", response_model=ModelPreheatSchedulePublic)
 async def get_model_preheat_schedule(session: SessionDep, id: int):
-    return _public(await _schedule_or_404(session, id))
+    schedule = await _schedule_or_404(session, id)
+    latest_runs = await latest_runs_by_owner(
+        session,
+        ModelPreheatScheduleRun,
+        ModelPreheatScheduleRun.schedule_id,
+        [schedule.id],
+    )
+    latest_run = latest_runs.get(schedule.id)
+    observations = await preheat_schedule_run_observations(
+        session, [latest_run] if latest_run is not None else []
+    )
+    return _public(
+        schedule,
+        latest_run=(
+            _run_public(latest_run, observations[latest_run.id])
+            if latest_run is not None
+            else None
+        ),
+    )
 
 
 @router.get("/{id}/runs", response_model=ModelPreheatScheduleRunsPublic)
@@ -110,6 +153,7 @@ async def get_model_preheat_schedule_runs(
         .limit(params.perPage)
     )
     items = (await session.exec(statement)).all()
+    observations = await preheat_schedule_run_observations(session, items)
     total = (
         await session.exec(
             select(func.count(ModelPreheatScheduleRun.id)).where(
@@ -118,7 +162,7 @@ async def get_model_preheat_schedule_runs(
         )
     ).one()
     return PaginatedList[ModelPreheatScheduleRunPublic](
-        items=[_run_public(item) for item in items],
+        items=[_run_public(item, observations[item.id]) for item in items],
         pagination=Pagination(
             page=params.page,
             perPage=params.perPage,
@@ -134,7 +178,10 @@ async def get_model_preheat_schedule_run(session: SessionDep, id: int, run_id: i
     run = await session.get(ModelPreheatScheduleRun, run_id)
     if run is None or run.schedule_id != id:
         raise NotFoundException(message="model_preheat_schedule_run_not_found")
-    return _run_public(run)
+    observations = await preheat_schedule_run_observations(
+        session, [run], include_tasks=True
+    )
+    return _run_public(run, observations[run.id])
 
 
 @router.patch("/{id}", response_model=ModelPreheatSchedulePublic)
@@ -265,7 +312,10 @@ async def run_model_preheat_schedule_now(
         if code != "model_preheat_schedule_disabled":
             code = "model_preheat_schedule_disabled"
         raise HTTPException(409, "Conflict", code) from None
-    return _run_public(run)
+    observations = await preheat_schedule_run_observations(
+        session, [run], include_tasks=True
+    )
+    return _run_public(run, observations[run.id])
 
 
 async def _schedule_or_404(session, schedule_id):
@@ -284,9 +334,18 @@ async def _profile_or_404(session, profile_id):
     return profile
 
 
-def _public(schedule):
-    return ModelPreheatSchedulePublic.model_validate(schedule)
+def _public(schedule, latest_run=None):
+    return ModelPreheatSchedulePublic.model_validate(
+        schedule, update={"latest_run": latest_run}
+    )
 
 
-def _run_public(run):
-    return ModelPreheatScheduleRunPublic.model_validate(run)
+def _run_public(run, observation):
+    return ModelPreheatScheduleRunPublic.model_validate(
+        run,
+        update={
+            "execution_state": observation.execution_state,
+            "summary": observation.summary,
+            "tasks": observation.tasks,
+        },
+    )

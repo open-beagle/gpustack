@@ -11,6 +11,8 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
     ModelPreheatDistributionPolicyRun,
+    ModelPreheatDistributionPolicyRunStateEnum,
+    ModelPreheatDistributionPolicyRunTask,
     ModelPreheatDistributionPolicyRunTriggerEnum,
     ModelPreheatDistributionPolicyTriggerModeEnum,
     ModelPreheatDistributionSelectionModeEnum,
@@ -427,14 +429,25 @@ def test_discovered_artifact_without_local_task_becomes_explicitly_blocked_when_
             policy_id = policy.id
         reconciler = ModelPreheatWorkerReconciler(engine)
         await reconciler.reconcile_policies()
+        run = await reconciler.reconcile_manual_policy(policy_id)
         async with AsyncSession(engine) as session:
             policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
         await engine.dispose()
-        return policy
+        return policy, run
 
-    policy = asyncio.run(run())
+    policy, distribution_run = asyncio.run(run())
     assert policy.enabled is True
     assert policy.blocked_reason == "distribution_artifact_stale"
+    assert distribution_run.state == ModelPreheatDistributionPolicyRunStateEnum.ERROR
+    assert distribution_run.error_code == "distribution_artifact_stale"
+    assert distribution_run.outcome["failed"] == [
+        {
+            "task_id": None,
+            "worker_id": None,
+            "worker_uuid": None,
+            "reason": "distribution_artifact_stale",
+        }
+    ]
 
 
 def test_manual_and_continuous_safety_runs_have_distinct_audit_identities(tmp_path):
@@ -470,6 +483,13 @@ def test_manual_and_continuous_safety_runs_have_distinct_audit_identities(tmp_pa
     assert [run.trigger for run in runs].count(
         ModelPreheatDistributionPolicyRunTriggerEnum.CONTINUOUS
     ) == 1
+    assert all(
+        run.state == ModelPreheatDistributionPolicyRunStateEnum.ERROR for run in runs
+    )
+    assert all(run.error_code == "distribution_no_eligible_workers" for run in runs)
+    assert all(
+        run.outcome == {"created": [], "skipped": [], "failed": []} for run in runs
+    )
 
 
 def test_scheduled_windows_reuse_existing_active_worker_task(tmp_path):
@@ -663,6 +683,11 @@ def test_new_worker_gets_incremental_connectivity_then_idempotent_distribution(
             reconciler.reconcile_worker(worker_uuid),
         )
         async with AsyncSession(engine) as session:
+            policy_id = (
+                await session.exec(select(ModelPreheatDistributionPolicy.id))
+            ).one()
+        manual_run = await reconciler.reconcile_manual_policy(policy_id)
+        async with AsyncSession(engine) as session:
             checks = (await session.exec(select(ModelPreheatS3ConnectivityCheck))).all()
             tasks = (
                 await session.exec(
@@ -672,16 +697,24 @@ def test_new_worker_gets_incremental_connectivity_then_idempotent_distribution(
                     )
                 )
             ).all()
+            links = (
+                await session.exec(
+                    select(ModelPreheatDistributionPolicyRunTask).where(
+                        ModelPreheatDistributionPolicyRunTask.run_id == manual_run.id
+                    )
+                )
+            ).all()
             parent = await session.get(ModelPreheatTask, task_id)
         await engine.dispose()
-        return checks, tasks, parent.target_worker_uuids, probe.calls
+        return checks, tasks, links, parent.target_worker_uuids, probe.calls
 
-    checks, tasks, targets, probe_calls = asyncio.run(run())
+    checks, tasks, links, targets, probe_calls = asyncio.run(run())
     assert len(checks) == 1
     assert len(tasks) == 1
     assert tasks[0].task_id is None
     assert tasks[0].distribution_policy_id is not None
     assert tasks[0].worker_uuid == "new-uuid"
+    assert [link.task_id for link in links] == [tasks[0].id]
     assert targets == ["old-uuid"]
     assert probe_calls == 0
 

@@ -40,6 +40,10 @@ from gpustack.server.model_preheat_distribution_source import (
     DistributionSourceUnavailable,
     resolve_distribution_sources,
 )
+from gpustack.server.policy_run_observability import (
+    distribution_run_observations,
+    latest_runs_by_owner,
+)
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
@@ -55,9 +59,16 @@ async def get_distribution_policy_runs(session: SessionDep, params: ListParamsDe
         .limit(params.perPage)
     )
     runs = (await session.exec(statement)).all()
+    observations = await distribution_run_observations(session, runs)
+    policies = await _policies_by_id(session, [run.policy_id for run in runs])
     total = await ModelPreheatDistributionPolicyRun.count(session)
     return PaginatedList[ModelPreheatDistributionPolicyRunPublic](
-        items=[await _run_public(session, run) for run in runs],
+        items=[
+            await _run_public(
+                session, run, observations[run.id], policy=policies.get(run.policy_id)
+            )
+            for run in runs
+        ],
         pagination=Pagination(
             page=params.page,
             perPage=params.perPage,
@@ -74,7 +85,10 @@ async def get_distribution_policy_run(session: SessionDep, run_id: int):
         raise NotFoundException(
             message="model_preheat_distribution_policy_run_not_found"
         )
-    return await _run_public(session, run)
+    observations = await distribution_run_observations(
+        session, [run], include_tasks=True
+    )
+    return await _run_public(session, run, observations[run.id])
 
 
 @router.get("", response_model=ModelPreheatDistributionPoliciesPublic)
@@ -86,9 +100,34 @@ async def get_distribution_policies(session: SessionDep, params: ListParamsDep):
         .limit(params.perPage)
     )
     items = (await session.exec(statement)).all()
+    latest_runs = await latest_runs_by_owner(
+        session,
+        ModelPreheatDistributionPolicyRun,
+        ModelPreheatDistributionPolicyRun.policy_id,
+        [item.id for item in items],
+    )
+    observations = await distribution_run_observations(
+        session, list(latest_runs.values())
+    )
     total = await ModelPreheatDistributionPolicy.count(session)
     return PaginatedList[ModelPreheatDistributionPolicyPublic](
-        items=[await _public(session, item) for item in items],
+        items=[
+            await _public(
+                session,
+                item,
+                latest_run=(
+                    await _run_public(
+                        session,
+                        latest_runs[item.id],
+                        observations[latest_runs[item.id].id],
+                        policy=item,
+                    )
+                    if item.id in latest_runs
+                    else None
+                ),
+            )
+            for item in items
+        ],
         pagination=Pagination(
             page=params.page,
             perPage=params.perPage,
@@ -235,7 +274,28 @@ async def create_distribution_policy(
 
 @router.get("/{id}", response_model=ModelPreheatDistributionPolicyPublic)
 async def get_distribution_policy(session: SessionDep, id: int):
-    return await _public(session, await _policy_or_404(session, id))
+    policy = await _policy_or_404(session, id)
+    latest_runs = await latest_runs_by_owner(
+        session,
+        ModelPreheatDistributionPolicyRun,
+        ModelPreheatDistributionPolicyRun.policy_id,
+        [policy.id],
+    )
+    latest_run = latest_runs.get(policy.id)
+    observations = await distribution_run_observations(
+        session, [latest_run] if latest_run is not None else []
+    )
+    return await _public(
+        session,
+        policy,
+        latest_run=(
+            await _run_public(
+                session, latest_run, observations[latest_run.id], policy=policy
+            )
+            if latest_run is not None
+            else None
+        ),
+    )
 
 
 @router.patch("/{id}", response_model=ModelPreheatDistributionPolicyPublic)
@@ -352,7 +412,7 @@ async def _policy_or_404(session, policy_id, populate_existing=False):
     return policy
 
 
-async def _public(session, policy):
+async def _public(session, policy, latest_run=None):
     artifact = (
         await session.get(ModelPreheatArtifact, policy.source_artifact_id)
         if policy.source_artifact_id is not None
@@ -375,12 +435,14 @@ async def _public(session, policy):
         update={
             "source_artifact": artifact.artifact_id if artifact else None,
             "artifact_ids": list(selected),
+            "latest_run": latest_run,
         },
     )
 
 
-async def _run_public(session, run):
-    policy = await session.get(ModelPreheatDistributionPolicy, run.policy_id)
+async def _run_public(session, run, observation, policy=None):
+    if policy is None:
+        policy = await session.get(ModelPreheatDistributionPolicy, run.policy_id)
     return ModelPreheatDistributionPolicyRunPublic.model_validate(
         run,
         update={
@@ -388,8 +450,25 @@ async def _run_public(session, run):
             "model_id": (
                 (policy.request_identity or {}).get("model_id") if policy else None
             ),
+            "execution_state": observation.execution_state,
+            "summary": observation.summary,
+            "tasks": observation.tasks,
         },
     )
+
+
+async def _policies_by_id(session, policy_ids):
+    policy_ids = list(dict.fromkeys(policy_ids))
+    if not policy_ids:
+        return {}
+    policies = (
+        await session.exec(
+            select(ModelPreheatDistributionPolicy).where(
+                ModelPreheatDistributionPolicy.id.in_(policy_ids)
+            )
+        )
+    ).all()
+    return {policy.id: policy for policy in policies}
 
 
 async def _artifact_by_identity(session, profile_id, profile_version, artifact_id):

@@ -19,15 +19,19 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
     ModelPreheatDistributionPolicyRun,
     ModelPreheatDistributionPolicyRunStateEnum,
+    ModelPreheatDistributionPolicyRunTask,
     ModelPreheatDistributionPolicyRunTriggerEnum,
     ModelPreheatDistributionPolicyArtifact,
     ModelPreheatWorkerObservation,
 )
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
-from gpustack.schemas.model_preheats import ModelPreheatTargetScopeEnum
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatInventoryManifestStateEnum,
+    ModelPreheatTargetScopeEnum,
+    ModelPreheatWorkerTask,
+    ModelPreheatWorkerTaskRoleEnum,
+    ModelPreheatWorkerTaskStateEnum,
 )
 from gpustack.schemas.users import User
 from gpustack.server.db import get_session
@@ -142,6 +146,93 @@ def test_distribution_policy_runs_list_and_detail_are_public(tmp_path):
     assert detail.json()["policy_name"] == "模型同步"
     assert detail.json()["model_id"] == "org/model"
     assert detail.json()["error_code"] == "worker_execution_failed"
+
+
+def test_distribution_run_uses_linked_worker_tasks_and_policy_exposes_latest_summary(
+    tmp_path,
+):
+    app, engine = _test_app(tmp_path)
+    policy_id = asyncio.run(_seed(engine))
+
+    async def seed_run_and_tasks():
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy_id,
+                trigger=ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+                state=ModelPreheatDistributionPolicyRunStateEnum.READY,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="observable-distribution-run",
+            )
+            session.add(run)
+            await session.flush()
+            tasks = [
+                ModelPreheatWorkerTask(
+                    distribution_policy_id=policy_id,
+                    operation_key=f"observable-task-{index}",
+                    worker_uuid=f"worker-{index}",
+                    role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                    state=ModelPreheatWorkerTaskStateEnum.PENDING,
+                    lease_token_hash=f"private-lease-{index}",
+                )
+                for index in range(2)
+            ]
+            session.add_all(tasks)
+            await session.flush()
+            session.add_all(
+                [
+                    ModelPreheatDistributionPolicyRunTask(
+                        run_id=run.id, task_id=task.id
+                    )
+                    for task in tasks
+                ]
+            )
+            await session.commit()
+            return run.id, [task.id for task in tasks]
+
+    run_id, task_ids = asyncio.run(seed_run_and_tasks())
+    with TestClient(app) as client:
+        policies = client.get("/v1/model-preheat-distribution-policies")
+        listed = client.get("/v1/model-preheat-distribution-policies/runs")
+
+    assert policies.status_code == 200, policies.text
+    latest = policies.json()["items"][0]["latest_run"]
+    assert latest["id"] == run_id
+    assert latest["state"] == "ready"
+    assert latest["execution_state"] == "waiting"
+    assert latest["summary"]["pending"] == 2
+    assert latest["tasks"] == []
+    assert listed.json()["items"][0]["execution_state"] == "waiting"
+
+    async def finish_with_partial_error():
+        async with AsyncSession(engine) as session:
+            first = await session.get(ModelPreheatWorkerTask, task_ids[0])
+            second = await session.get(ModelPreheatWorkerTask, task_ids[1])
+            first.state = ModelPreheatWorkerTaskStateEnum.READY
+            first.progress = 100
+            first.downloaded_size = 8
+            first.total_size = 8
+            second.state = ModelPreheatWorkerTaskStateEnum.ERROR
+            second.error_code = "worker_download_failed"
+            second.state_message = "download failed"
+            session.add(first)
+            session.add(second)
+            await session.commit()
+
+    asyncio.run(finish_with_partial_error())
+    with TestClient(app) as client:
+        detail = client.get(f"/v1/model-preheat-distribution-policies/runs/{run_id}")
+    asyncio.run(engine.dispose())
+
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["execution_state"] == "partial_error"
+    assert body["summary"]["ready"] == 1
+    assert body["summary"]["error"] == 1
+    assert body["summary"]["progress"] == 50
+    assert body["summary"]["downloaded_bytes"] == 8
+    assert [task["id"] for task in body["tasks"]] == task_ids
+    assert body["tasks"][1]["error_code"] == "worker_download_failed"
+    assert "lease" not in str(body).lower()
 
 
 async def _seed_artifact(engine):

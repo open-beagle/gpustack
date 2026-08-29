@@ -13,6 +13,11 @@ from sqlmodel import Field, SQLModel
 from gpustack.mixins import BaseModelMixin
 from gpustack.schemas.common import JSON, PaginatedList, UTCDateTime
 from gpustack.schemas.model_preheats import ModelPreheatTargetScopeEnum
+from gpustack.schemas.policy_runs import (
+    PolicyRunExecutionStateEnum,
+    PolicyRunSummary,
+    PolicyRunTaskPublic,
+)
 
 
 class ModelPreheatDistributionPolicyTriggerModeEnum(str, Enum):
@@ -147,11 +152,31 @@ class ModelPreheatDistributionPolicyRun(SQLModel, BaseModelMixin, table=True):
         default=None, sa_column=Column(UTCDateTime, nullable=True)
     )
     error_code: Optional[str] = None
+    outcome: Optional[dict] = Field(default=None, sa_column=Column(JSON, nullable=True))
     started_at: Optional[datetime] = Field(
         default=None, sa_column=Column(UTCDateTime, nullable=True)
     )
     finished_at: Optional[datetime] = Field(
         default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
+
+
+class ModelPreheatDistributionPolicyRunTask(SQLModel, table=True):
+    __tablename__ = "model_preheat_distribution_policy_run_tasks"
+
+    run_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_distribution_policy_runs.id", ondelete="CASCADE"),
+            nullable=False,
+            primary_key=True,
+        )
+    )
+    task_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_worker_tasks.id", ondelete="RESTRICT"),
+            nullable=False,
+            primary_key=True,
+        )
     )
 
 
@@ -240,6 +265,7 @@ class ModelPreheatDistributionPolicyPublic(SQLModel):
     next_run_at: Optional[datetime] = None
     last_run_at: Optional[datetime] = None
     blocked_reason: Optional[str] = None
+    latest_run: Optional["ModelPreheatDistributionPolicyRunPublic"] = None
     created_at: datetime
     updated_at: datetime
 
@@ -251,7 +277,11 @@ class ModelPreheatDistributionPolicyRunPublic(SQLModel):
     model_id: Optional[str] = None
     trigger: ModelPreheatDistributionPolicyRunTriggerEnum
     state: ModelPreheatDistributionPolicyRunStateEnum
+    execution_state: PolicyRunExecutionStateEnum
+    summary: PolicyRunSummary = Field(default_factory=PolicyRunSummary)
+    tasks: list[PolicyRunTaskPublic] = Field(default_factory=list)
     error_code: Optional[str] = None
+    outcome: Optional[dict] = None
     window_start_utc: datetime
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
