@@ -22,7 +22,7 @@ RUN python3 -m pip install --no-cache-dir --default-timeout=12000 \
 
 ENV GPUSTACK_THIRD_PARTY_BIN=/opt/gpustack/third_party/bin \
     HF_ENDPOINT=https://hf-mirror.com \
-    DISABLE_DYNAMIC_LINK_LLAMA_BOX=true
+    GPUSTACK_DISABLE_DYNAMIC_LINK_LLAMA_BOX=true
 
 COPY ./.beagle/tools-downloads.sh /tmp/gpustack-tools-downloads.sh
 RUN TOOLS_DOWNLOAD_BASE_URL=https://cache.ali.wodcloud.com/vscode \

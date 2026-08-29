@@ -48,7 +48,7 @@ def test_cuda_release_versions_are_kept_in_sync():
 def test_cuda_app_uses_static_llama_box():
     app_dockerfile = _read(".beagle/cuda.dockerfile")
 
-    assert "DISABLE_DYNAMIC_LINK_LLAMA_BOX=true" in app_dockerfile
+    assert "GPUSTACK_DISABLE_DYNAMIC_LINK_LLAMA_BOX=true" in app_dockerfile
 
 
 def test_cuda_base_builds_and_installs_cuda_13_llama_cpp():
