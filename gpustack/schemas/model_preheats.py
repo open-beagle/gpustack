@@ -223,6 +223,12 @@ class ModelPreheatWorkerTask(SQLModel, BaseModelMixin, table=True):
             nullable=True,
         ),
     )
+    distribution_artifact_id: Optional[str] = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    distribution_request_digest: Optional[str] = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
     operation_key: Optional[str] = None
     parent_attempt: int = 1
     worker_uuid: str

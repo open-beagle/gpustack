@@ -16,10 +16,15 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatInventoryManifestStateEnum,
     ModelPreheatTargetScopeEnum,
+    ModelPreheatWorkerTask,
+    ModelPreheatWorkerTaskRoleEnum,
+    ModelPreheatWorkerTaskStateEnum,
 )
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
+    ModelPreheatDistributionPolicyArtifact,
     ModelPreheatDistributionPolicyCreate,
+    ModelPreheatDistributionSelectionModeEnum,
 )
 from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncExecutionPayload,
@@ -247,6 +252,7 @@ def test_refresh_discovers_three_sources_from_shared_s3_in_independent_database(
                     ModelPreheatS3Profile.__table__,
                     ModelPreheatArtifact.__table__,
                     ModelPreheatDistributionPolicy.__table__,
+                    ModelPreheatDistributionPolicyArtifact.__table__,
                 ],
             )
         async with AsyncSession(engine) as session:
@@ -563,6 +569,124 @@ def test_refresh_keeps_existing_artifact_when_manifest_is_invalid(
 
     assert counts["deleted"] == 0
     assert row.manifest_state == ModelPreheatInventoryManifestStateEnum.INVALID
+
+
+def test_refresh_keeps_all_current_artifact_frozen_by_active_worker_task(
+    monkeypatch, tmp_path
+):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'all-current-reference.db'}"
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                SQLModel.metadata.create_all,
+                tables=[
+                    ModelPreheatS3Profile.__table__,
+                    ModelPreheatArtifact.__table__,
+                    ModelPreheatDistributionPolicy.__table__,
+                    ModelPreheatDistributionPolicyArtifact.__table__,
+                    ModelPreheatWorkerTask.__table__,
+                ],
+            )
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            profile = _profile()
+            session.add(profile)
+            await session.flush()
+            artifacts = [
+                _artifact(profile.id, profile.config_version, str(index) * 64)
+                for index in range(4, 8)
+            ]
+            session.add_all(artifacts)
+            policy = ModelPreheatDistributionPolicy(
+                name="all-current",
+                selection_mode=ModelPreheatDistributionSelectionModeEnum.ALL_CURRENT,
+                profile_id=profile.id,
+                profile_config_version=profile.config_version,
+                request_identity={"selection_mode": "all_current"},
+                request_digest="8" * 64,
+                target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
+                worker_selector={"worker_uuids": ["worker-a"]},
+                gpu_selector={},
+                selector_digest="9" * 64,
+            )
+            session.add(policy)
+            await session.flush()
+            task_cases = [
+                (artifacts[3], ModelPreheatWorkerTaskStateEnum.PENDING, None, 0),
+                (
+                    artifacts[2],
+                    ModelPreheatWorkerTaskStateEnum.ERROR,
+                    "network_timeout",
+                    2,
+                ),
+                (
+                    artifacts[1],
+                    ModelPreheatWorkerTaskStateEnum.ERROR,
+                    "local_cache_conflict",
+                    2,
+                ),
+                (
+                    artifacts[0],
+                    ModelPreheatWorkerTaskStateEnum.ERROR,
+                    "network_timeout",
+                    5,
+                ),
+            ]
+            session.add_all(
+                [
+                    ModelPreheatWorkerTask(
+                        distribution_policy_id=policy.id,
+                        distribution_artifact_id=artifact.artifact_id,
+                        distribution_request_digest="6" * 64,
+                        operation_key=f"operation-{index}",
+                        worker_uuid=f"worker-{index}",
+                        role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                        state=state,
+                        error_code=error_code,
+                        attempt=attempt,
+                        finished_at=(
+                            datetime.now(timezone.utc)
+                            if state == ModelPreheatWorkerTaskStateEnum.ERROR
+                            else None
+                        ),
+                    )
+                    for index, (artifact, state, error_code, attempt) in enumerate(
+                        task_cases
+                    )
+                ]
+            )
+            profile_id = profile.id
+            await session.commit()
+
+        monkeypatch.setattr(
+            inventory_module,
+            "_scan_profile",
+            lambda snapshot: ([], 0, 0, set()),
+        )
+        service = ModelPreheatS3Inventory(engine)
+        service._cipher = lambda: SimpleNamespace(decrypt=lambda value: "secret")
+        async with AsyncSession(engine) as session:
+            counts = await service.refresh_profile(session, profile_id, 1)
+        async with AsyncSession(engine) as session:
+            rows = (
+                await session.exec(
+                    select(ModelPreheatArtifact).order_by(
+                        ModelPreheatArtifact.artifact_id
+                    )
+                )
+            ).all()
+        await engine.dispose()
+        return counts, rows
+
+    counts, rows = asyncio.run(run())
+
+    assert counts["deleted"] == 2
+    assert [row.artifact_id for row in rows] == ["6" * 64, "7" * 64]
+    assert all(
+        row.manifest_state == ModelPreheatInventoryManifestStateEnum.STALE
+        for row in rows
+    )
 
 
 def test_refresh_records_credential_failure_without_leaking_ciphertext(tmp_path):

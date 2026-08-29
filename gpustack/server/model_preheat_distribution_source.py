@@ -7,6 +7,10 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3Profile,
     ModelPreheatS3ProfileLifecycleStateEnum,
 )
+from gpustack.schemas.model_preheat_distribution_policies import (
+    ModelPreheatDistributionPolicyArtifact,
+    ModelPreheatDistributionSelectionModeEnum,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatExecutionStateEnum,
@@ -17,6 +21,7 @@ from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncTask,
     ModelStorageSyncTaskStateEnum,
 )
+from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
 class DistributionSourceUnavailable(Exception):
@@ -33,7 +38,55 @@ class DistributionSource:
     preheat_task: ModelPreheatTask | None = None
 
 
-async def resolve_distribution_source(session, policy) -> DistributionSource:
+async def resolve_distribution_sources(session, policy) -> list[DistributionSource]:
+    if policy.selection_mode == ModelPreheatDistributionSelectionModeEnum.FIXED:
+        return [await resolve_distribution_source(session, policy)]
+    profile = await _active_profile(session, policy)
+    statement = select(ModelPreheatArtifact).where(
+        ModelPreheatArtifact.profile_id == profile.id,
+        ModelPreheatArtifact.profile_config_version == profile.config_version,
+    )
+    if policy.selection_mode == ModelPreheatDistributionSelectionModeEnum.SELECTED:
+        statement = statement.join(
+            ModelPreheatDistributionPolicyArtifact,
+            ModelPreheatDistributionPolicyArtifact.artifact_id
+            == ModelPreheatArtifact.id,
+        ).where(ModelPreheatDistributionPolicyArtifact.policy_id == policy.id)
+    else:
+        statement = statement.where(
+            ModelPreheatArtifact.manifest_state
+            == ModelPreheatInventoryManifestStateEnum.VALID
+        )
+    artifacts = (await session.exec(statement.order_by(ModelPreheatArtifact.id))).all()
+    if not artifacts:
+        raise DistributionSourceUnavailable("distribution_artifact_not_ready")
+    return [
+        await _source_from_artifact(profile, policy, artifact) for artifact in artifacts
+    ]
+
+
+async def resolve_distribution_source(
+    session, policy, artifact_id: str | None = None, request_digest: str | None = None
+) -> DistributionSource:
+    if artifact_id is not None:
+        profile = await _active_profile(session, policy)
+        artifact = (
+            await session.exec(
+                select(ModelPreheatArtifact).where(
+                    ModelPreheatArtifact.profile_id == profile.id,
+                    ModelPreheatArtifact.profile_config_version
+                    == profile.config_version,
+                    ModelPreheatArtifact.artifact_id == artifact_id,
+                )
+            )
+        ).first()
+        source = await _source_from_artifact(profile, policy, artifact)
+        if (
+            request_digest is not None
+            and source.payload["request_digest"] != request_digest
+        ):
+            raise DistributionSourceUnavailable("distribution_source_identity_mismatch")
+        return source
     profile = await session.get(ModelPreheatS3Profile, policy.profile_id)
     if (
         profile is None
@@ -165,6 +218,69 @@ async def resolve_distribution_source(session, policy) -> DistributionSource:
         encrypted_profile=encrypted_profile,
         attempt=attempt,
         preheat_task=trusted_preheat_task,
+    )
+
+
+async def _active_profile(session, policy):
+    profile = await session.get(ModelPreheatS3Profile, policy.profile_id)
+    if (
+        profile is None
+        or profile.lifecycle_state != ModelPreheatS3ProfileLifecycleStateEnum.ACTIVE
+        or profile.config_version != policy.profile_config_version
+    ):
+        raise DistributionSourceUnavailable("distribution_profile_not_active")
+    return profile
+
+
+async def _source_from_artifact(profile, policy, artifact):
+    if (
+        artifact is None
+        or artifact.profile_id != profile.id
+        or artifact.profile_config_version != profile.config_version
+    ):
+        raise DistributionSourceUnavailable("distribution_artifact_not_ready")
+    if artifact.manifest_state != ModelPreheatInventoryManifestStateEnum.VALID:
+        raise DistributionSourceUnavailable(
+            "distribution_artifact_stale"
+            if artifact.manifest_state == ModelPreheatInventoryManifestStateEnum.STALE
+            else "distribution_artifact_not_ready"
+        )
+    identity = ModelPreheatIdentity(
+        source=artifact.source,
+        model_id=artifact.model_id,
+        revision=artifact.resolved_revision,
+        file_patterns=tuple(artifact.include_patterns),
+        exclude_patterns=tuple(artifact.exclude_patterns),
+    )
+    encrypted_profile = {
+        "endpoint": profile.endpoint,
+        "bucket": profile.bucket,
+        "prefix": profile.prefix,
+        "tls_enabled": profile.tls_enabled,
+        "tls_verify": profile.tls_verify,
+        "region": profile.region,
+        "use_virtual_hosted_style": profile.use_virtual_hosted_style,
+        "access_key_encrypted": profile.access_key_encrypted,
+        "secret_key_encrypted": profile.secret_key_encrypted,
+    }
+    payload = {
+        "id": policy.id,
+        "source": artifact.source,
+        "model_id": artifact.model_id,
+        "requested_revision": None,
+        "resolved_revision": artifact.resolved_revision,
+        "include_patterns": list(artifact.include_patterns),
+        "exclude_patterns": list(artifact.exclude_patterns),
+        "request_digest": identity.request_digest,
+        "artifact_id": artifact.artifact_id,
+        "s3_manifest_path": artifact.manifest_path,
+    }
+    return DistributionSource(
+        artifact=artifact,
+        profile=profile,
+        payload=payload,
+        encrypted_profile=encrypted_profile,
+        attempt=1,
     )
 
 

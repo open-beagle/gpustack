@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
@@ -9,12 +11,14 @@ from gpustack.schemas.common import PaginatedList, Pagination
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPoliciesPublic,
     ModelPreheatDistributionPolicy,
+    ModelPreheatDistributionPolicyArtifact,
     ModelPreheatDistributionPolicyCreate,
     ModelPreheatDistributionPolicyPublic,
     ModelPreheatDistributionPolicyRun,
     ModelPreheatDistributionPolicyRunPublic,
     ModelPreheatDistributionPolicyRunsPublic,
     ModelPreheatDistributionPolicyUpdate,
+    ModelPreheatDistributionSelectionModeEnum,
     ModelPreheatDistributionPolicyTriggerModeEnum,
     distribution_selector_digest,
 )
@@ -32,6 +36,10 @@ from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncTaskStateEnum,
 )
 from gpustack.server.deps import CurrentAdminUserDep, ListParamsDep, SessionDep
+from gpustack.server.model_preheat_distribution_source import (
+    DistributionSourceUnavailable,
+    resolve_distribution_sources,
+)
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
@@ -98,6 +106,7 @@ async def create_distribution_policy(
 ):
     del current_user
     source_sync_task_id = None
+    selected_artifacts = []
     if policy_in.sync_task_id is not None:
         sync_task = await session.get(ModelStorageSyncTask, policy_in.sync_task_id)
         if (
@@ -120,9 +129,22 @@ async def create_distribution_policy(
         if profile is None:
             raise NotFoundException(message="model_preheat_s3_profile_not_found")
         profile_version = profile.config_version
-        artifact = await _artifact_by_identity(
-            session, profile_id, profile_version, policy_in.artifact_id
-        )
+        if policy_in.selection_mode == ModelPreheatDistributionSelectionModeEnum.FIXED:
+            artifact = await _artifact_by_identity(
+                session, profile_id, profile_version, policy_in.artifact_id
+            )
+        elif (
+            policy_in.selection_mode
+            == ModelPreheatDistributionSelectionModeEnum.SELECTED
+        ):
+            selected_artifacts = await _artifacts_by_identities(
+                session, profile_id, profile_version, policy_in.artifact_ids
+            )
+            artifact = None
+            if len(selected_artifacts) != len(policy_in.artifact_ids):
+                raise HTTPException(409, "Conflict", "artifact_not_ready")
+        else:
+            artifact = None
         if artifact is not None:
             identity = ModelPreheatIdentity(
                 source=artifact.source,
@@ -139,10 +161,34 @@ async def create_distribution_policy(
                 "exclude_patterns": list(artifact.exclude_patterns),
             }
             request_digest = identity.request_digest
-    if artifact is None:
+        elif (
+            selected_artifacts
+            or policy_in.selection_mode
+            == ModelPreheatDistributionSelectionModeEnum.ALL_CURRENT
+        ):
+            request_identity = {
+                "selection_mode": policy_in.selection_mode.value,
+                "profile_config_version": profile_version,
+                "artifact_ids": sorted(policy_in.artifact_ids),
+            }
+            request_digest = hashlib.sha256(
+                json.dumps(
+                    request_identity, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+    if (
+        artifact is None
+        and policy_in.selection_mode == ModelPreheatDistributionSelectionModeEnum.FIXED
+    ):
         raise HTTPException(409, "Conflict", "artifact_not_ready")
-    if artifact.manifest_state != ModelPreheatInventoryManifestStateEnum.VALID:
+    if (
+        artifact is not None
+        and artifact.manifest_state != ModelPreheatInventoryManifestStateEnum.VALID
+    ):
         raise HTTPException(409, "Conflict", _artifact_unavailable_code(artifact))
+    for selected in selected_artifacts:
+        if selected.manifest_state != ModelPreheatInventoryManifestStateEnum.VALID:
+            raise HTTPException(409, "Conflict", _artifact_unavailable_code(selected))
     profile = await session.get(ModelPreheatS3Profile, profile_id)
     if (
         profile is None
@@ -152,6 +198,7 @@ async def create_distribution_policy(
         raise HTTPException(409, "Conflict", "s3_profile_in_maintenance")
     policy = ModelPreheatDistributionPolicy(
         name=policy_in.name,
+        selection_mode=policy_in.selection_mode,
         profile_id=profile_id,
         profile_config_version=profile_version,
         request_identity=request_identity,
@@ -162,7 +209,7 @@ async def create_distribution_policy(
         selector_digest=distribution_selector_digest(
             policy_in.worker_selector, policy_in.gpu_selector
         ),
-        source_artifact_id=artifact.id,
+        source_artifact_id=artifact.id if artifact is not None else None,
         source_sync_task_id=source_sync_task_id,
         trigger_mode=policy_in.trigger_mode,
         cron_expression=policy_in.cron_expression,
@@ -171,6 +218,13 @@ async def create_distribution_policy(
     _set_next_run(policy)
     session.add(policy)
     try:
+        await session.flush()
+        for selected in selected_artifacts:
+            session.add(
+                ModelPreheatDistributionPolicyArtifact(
+                    policy_id=policy.id, artifact_id=selected.id
+                )
+            )
         await session.commit()
         await session.refresh(policy)
     except IntegrityError:
@@ -199,7 +253,18 @@ async def update_distribution_policy(
         "cron_expression": policy.cron_expression,
         "timezone": policy.timezone,
         "profile_id": policy.profile_id,
-        "artifact_id": "bound-artifact",
+        "selection_mode": policy.selection_mode,
+        "artifact_id": (
+            "bound-artifact"
+            if policy.selection_mode == ModelPreheatDistributionSelectionModeEnum.FIXED
+            else None
+        ),
+        "artifact_ids": (
+            ["bound-artifact"]
+            if policy.selection_mode
+            == ModelPreheatDistributionSelectionModeEnum.SELECTED
+            else []
+        ),
         "target_scope": policy.target_scope,
         "worker_selector": policy.worker_selector,
         "gpu_selector": policy.gpu_selector,
@@ -218,19 +283,15 @@ async def update_distribution_policy(
             raise HTTPException(409, "Conflict", "s3_profile_in_maintenance")
         if profile.config_version != policy.profile_config_version:
             raise HTTPException(409, "Conflict", "distribution_profile_version_stale")
-        artifact = (
-            await session.get(ModelPreheatArtifact, policy.source_artifact_id)
-            if policy.source_artifact_id is not None
-            else None
-        )
-        if (
-            artifact is None
-            or artifact.profile_id != policy.profile_id
-            or artifact.profile_config_version != policy.profile_config_version
-        ):
-            raise HTTPException(409, "Conflict", "artifact_not_ready")
-        if artifact.manifest_state != ModelPreheatInventoryManifestStateEnum.VALID:
-            raise HTTPException(409, "Conflict", _artifact_unavailable_code(artifact))
+        try:
+            await resolve_distribution_sources(session, policy)
+        except DistributionSourceUnavailable as exc:
+            code = str(exc)
+            if code == "distribution_artifact_stale":
+                code = "artifact_stale"
+            elif code == "distribution_artifact_not_ready":
+                code = "artifact_not_ready"
+            raise HTTPException(409, "Conflict", code) from None
     timing_changed = bool(
         {"trigger_mode", "cron_expression", "timezone"} & update_data.keys()
     )
@@ -297,9 +358,24 @@ async def _public(session, policy):
         if policy.source_artifact_id is not None
         else None
     )
+    selected = (
+        await session.exec(
+            select(ModelPreheatArtifact.artifact_id)
+            .join(
+                ModelPreheatDistributionPolicyArtifact,
+                ModelPreheatDistributionPolicyArtifact.artifact_id
+                == ModelPreheatArtifact.id,
+            )
+            .where(ModelPreheatDistributionPolicyArtifact.policy_id == policy.id)
+            .order_by(ModelPreheatArtifact.id)
+        )
+    ).all()
     return ModelPreheatDistributionPolicyPublic.model_validate(
         policy,
-        update={"source_artifact": artifact.artifact_id if artifact else None},
+        update={
+            "source_artifact": artifact.artifact_id if artifact else None,
+            "artifact_ids": list(selected),
+        },
     )
 
 
@@ -328,6 +404,20 @@ async def _artifact_by_identity(session, profile_id, profile_version, artifact_i
             )
         )
     ).first()
+
+
+async def _artifacts_by_identities(session, profile_id, profile_version, artifact_ids):
+    if not artifact_ids:
+        return []
+    return (
+        await session.exec(
+            select(ModelPreheatArtifact).where(
+                ModelPreheatArtifact.profile_id == profile_id,
+                ModelPreheatArtifact.profile_config_version == profile_version,
+                ModelPreheatArtifact.artifact_id.in_(artifact_ids),
+            )
+        )
+    ).all()
 
 
 def _artifact_unavailable_code(artifact):

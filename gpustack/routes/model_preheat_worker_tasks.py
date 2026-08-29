@@ -240,7 +240,12 @@ async def claim_model_preheat_worker_task(
     task = await _task_or_404(session, worker_task_id)
     _validate_task_identity(task, identity)
     if task.distribution_policy_id is not None:
-        await _active_distribution_source(session, task.distribution_policy_id)
+        await _active_distribution_source(
+            session,
+            task.distribution_policy_id,
+            task.distribution_artifact_id,
+            task.distribution_request_digest,
+        )
     now = _utcnow()
     lease_token = secrets.token_urlsafe(32)
     lease_token_hash = _hash_token(lease_token)
@@ -629,7 +634,10 @@ async def _execution_source(session, worker_task: ModelPreheatWorkerTask):
 
     if worker_task.distribution_policy_id is not None:
         _, source = await _active_distribution_source(
-            session, worker_task.distribution_policy_id
+            session,
+            worker_task.distribution_policy_id,
+            worker_task.distribution_artifact_id,
+            worker_task.distribution_request_digest,
         )
         return source.payload, source.encrypted_profile, source.preheat_task
 
@@ -703,7 +711,12 @@ async def _validate_active_lease(
     if task.state_message == "pause_requested" and not allow_pause_requested:
         _conflict("parent_not_running")
     if task.distribution_policy_id is not None:
-        await _active_distribution_source(session, task.distribution_policy_id)
+        await _active_distribution_source(
+            session,
+            task.distribution_policy_id,
+            task.distribution_artifact_id,
+            task.distribution_request_digest,
+        )
     elif task.task_id is not None:
         parent = await session.get(ModelPreheatTask, task.task_id)
         if parent is None:
@@ -753,12 +766,16 @@ def _validate_task_identity(task, identity):
         _conflict("stale_worker_registration")
 
 
-async def _active_distribution_source(session, policy_id):
+async def _active_distribution_source(
+    session, policy_id, artifact_id=None, request_digest=None
+):
     policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
     if policy is None or not policy.enabled:
         _conflict("distribution_policy_not_active")
     try:
-        source = await resolve_distribution_source(session, policy)
+        source = await resolve_distribution_source(
+            session, policy, artifact_id, request_digest
+        )
     except DistributionSourceUnavailable:
         _conflict("distribution_source_not_ready")
     return policy, source

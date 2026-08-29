@@ -17,6 +17,7 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicyRunTriggerEnum,
     ModelPreheatDistributionPolicyTriggerModeEnum,
     ModelPreheatDistributionWorkerSlot,
+    ModelPreheatDistributionSelectionModeEnum,
     ModelPreheatWorkerObservation,
     distribution_operation_key,
     distribution_policy_run_operation_key,
@@ -49,6 +50,7 @@ from gpustack.server.model_preheat_connectivity import (
 from gpustack.server.model_preheat_distribution_source import (
     DistributionSourceUnavailable,
     resolve_distribution_source,
+    resolve_distribution_sources,
 )
 from gpustack.utils.gpu import normalize_gpu_names
 
@@ -192,7 +194,7 @@ class ModelPreheatWorkerReconciler:
                         session.add(policy)
                     elif policy.enabled:
                         try:
-                            await resolve_distribution_source(session, policy)
+                            await resolve_distribution_sources(session, policy)
                         except DistributionSourceUnavailable as exc:
                             policy.blocked_reason = str(exc)
                             session.add(policy)
@@ -386,12 +388,12 @@ class ModelPreheatWorkerReconciler:
                 if not _policy_matches_worker(policy, worker):
                     continue
                 try:
-                    source = await resolve_distribution_source(session, policy)
+                    sources = await resolve_distribution_sources(session, policy)
                 except DistributionSourceUnavailable as exc:
                     policy.blocked_reason = str(exc)
                     session.add(policy)
                     continue
-                profile = source.profile
+                profile = sources[0].profile
                 connectivity = await latest_connectivity_results_for_workers(
                     session,
                     policy.profile_id,
@@ -408,7 +410,7 @@ class ModelPreheatWorkerReconciler:
                 await session.refresh(profile)
                 current_worker = await _latest_worker(session, worker.worker_uuid)
                 try:
-                    source = await resolve_distribution_source(session, policy)
+                    sources = await resolve_distribution_sources(session, policy)
                 except DistributionSourceUnavailable as exc:
                     policy.blocked_reason = str(exc)
                     session.add(policy)
@@ -424,9 +426,10 @@ class ModelPreheatWorkerReconciler:
                     != MODEL_STORAGE_PROTOCOL_VERSION
                 ):
                     continue
-                await _create_or_rebind_distribution_task(
-                    session, policy, source, current_worker, run_key=run_key
-                )
+                for source in sources:
+                    await _create_or_rebind_distribution_task(
+                        session, policy, source, current_worker, run_key=run_key
+                    )
                 policy.last_reconciled_at = datetime.now(timezone.utc)
                 policy.blocked_reason = None
                 session.add(policy)
@@ -565,6 +568,7 @@ async def _ensure_policy(session, task):
         return existing
     policy = ModelPreheatDistributionPolicy(
         name=f"{task.model_id} 自动同步"[:255],
+        selection_mode=ModelPreheatDistributionSelectionModeEnum.FIXED,
         profile_id=task.s3_profile_id,
         profile_config_version=task.s3_profile_config_version,
         request_identity=task.request_identity,
@@ -668,8 +672,22 @@ async def _reset_policy_tasks(session, policy_id, parent_attempt):
 async def _create_or_rebind_distribution_task(
     session, policy, source, worker, *, run_key=None
 ):
+    source_artifact_id = (
+        source.artifact.artifact_id
+        if hasattr(source, "artifact")
+        else source.artifact_id
+    )
+    source_request_digest = (
+        source.payload["request_digest"]
+        if hasattr(source, "payload")
+        else source.request_digest
+    )
     operation_key = distribution_operation_key(
-        policy.id, worker.worker_uuid, policy.request_digest, run_key
+        policy.id,
+        worker.worker_uuid,
+        source_request_digest,
+        run_key,
+        artifact_id=source_artifact_id,
     )
     task = (
         await session.exec(
@@ -678,14 +696,30 @@ async def _create_or_rebind_distribution_task(
             )
         )
     ).first()
+    if (
+        task is None
+        and policy.selection_mode == ModelPreheatDistributionSelectionModeEnum.FIXED
+    ):
+        legacy_operation_key = distribution_operation_key(
+            policy.id, worker.worker_uuid, source_request_digest, run_key
+        )
+        task = (
+            await session.exec(
+                select(ModelPreheatWorkerTask).where(
+                    ModelPreheatWorkerTask.operation_key == legacy_operation_key
+                )
+            )
+        ).first()
     if task is None:
         slot_claim = await _claim_distribution_worker_slot(
-            session, policy.id, worker.worker_uuid, operation_key
+            session, policy.id, source_artifact_id, worker.worker_uuid, operation_key
         )
         if slot_claim is not True:
             return slot_claim
         task = ModelPreheatWorkerTask(
             distribution_policy_id=policy.id,
+            distribution_artifact_id=source_artifact_id,
+            distribution_request_digest=source_request_digest,
             operation_key=operation_key,
             parent_attempt=source.attempt,
             worker_uuid=worker.worker_uuid,
@@ -698,6 +732,7 @@ async def _create_or_rebind_distribution_task(
             update(ModelPreheatDistributionWorkerSlot)
             .where(
                 ModelPreheatDistributionWorkerSlot.policy_id == policy.id,
+                ModelPreheatDistributionWorkerSlot.artifact_id == source_artifact_id,
                 ModelPreheatDistributionWorkerSlot.worker_uuid == worker.worker_uuid,
                 ModelPreheatDistributionWorkerSlot.active_task_id.is_(None),
                 ModelPreheatDistributionWorkerSlot.active_operation_key
@@ -708,7 +743,9 @@ async def _create_or_rebind_distribution_task(
         if bound.rowcount != 1:
             await session.delete(task)
             await session.flush()
-            return await _active_slot_task(session, policy.id, worker.worker_uuid)
+            return await _active_slot_task(
+                session, policy.id, source_artifact_id, worker.worker_uuid
+            )
         return task
     if task.worker_id != worker.id:
         task.worker_id = worker.id
@@ -723,19 +760,24 @@ async def _create_or_rebind_distribution_task(
         session.add(task)
     elif task.state == ModelPreheatWorkerTaskStateEnum.ERROR:
         await _retry_distribution_error(session, task, source, worker)
+    if task.distribution_artifact_id is None:
+        task.distribution_artifact_id = source_artifact_id
+        task.distribution_request_digest = source_request_digest
+        session.add(task)
     return task
 
 
 async def _claim_distribution_worker_slot(
-    session, policy_id, worker_uuid, operation_key
+    session, policy_id, artifact_id, worker_uuid, operation_key
 ):
-    slot = await _distribution_worker_slot(session, policy_id, worker_uuid)
+    slot = await _distribution_worker_slot(session, policy_id, artifact_id, worker_uuid)
     if slot is None:
         try:
             async with session.begin_nested():
                 session.add(
                     ModelPreheatDistributionWorkerSlot(
                         policy_id=policy_id,
+                        artifact_id=artifact_id,
                         worker_uuid=worker_uuid,
                         active_operation_key=operation_key,
                     )
@@ -743,7 +785,9 @@ async def _claim_distribution_worker_slot(
                 await session.flush()
             return True
         except IntegrityError:
-            slot = await _distribution_worker_slot(session, policy_id, worker_uuid)
+            slot = await _distribution_worker_slot(
+                session, policy_id, artifact_id, worker_uuid
+            )
             if slot is None:
                 return None
 
@@ -751,7 +795,7 @@ async def _claim_distribution_worker_slot(
         if slot.active_operation_key == operation_key:
             return True
         if slot.active_operation_key is not None:
-            return await _active_slot_task(session, policy_id, worker_uuid)
+            return await _active_slot_task(session, policy_id, artifact_id, worker_uuid)
     else:
         active_task = await session.get(ModelPreheatWorkerTask, slot.active_task_id)
         if (
@@ -781,22 +825,23 @@ async def _claim_distribution_worker_slot(
     )
     if claimed.rowcount == 1:
         return True
-    return await _active_slot_task(session, policy_id, worker_uuid)
+    return await _active_slot_task(session, policy_id, artifact_id, worker_uuid)
 
 
-async def _distribution_worker_slot(session, policy_id, worker_uuid):
+async def _distribution_worker_slot(session, policy_id, artifact_id, worker_uuid):
     return (
         await session.exec(
             select(ModelPreheatDistributionWorkerSlot).where(
                 ModelPreheatDistributionWorkerSlot.policy_id == policy_id,
+                ModelPreheatDistributionWorkerSlot.artifact_id == artifact_id,
                 ModelPreheatDistributionWorkerSlot.worker_uuid == worker_uuid,
             )
         )
     ).first()
 
 
-async def _active_slot_task(session, policy_id, worker_uuid):
-    slot = await _distribution_worker_slot(session, policy_id, worker_uuid)
+async def _active_slot_task(session, policy_id, artifact_id, worker_uuid):
+    slot = await _distribution_worker_slot(session, policy_id, artifact_id, worker_uuid)
     if slot is not None and slot.active_task_id is not None:
         task = await session.get(ModelPreheatWorkerTask, slot.active_task_id)
         if task is not None and task.state in ACTIVE_DISTRIBUTION_TASK_STATES:

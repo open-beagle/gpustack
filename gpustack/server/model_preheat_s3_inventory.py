@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, inspect, or_, update
+from sqlalchemy import and_, func, inspect, or_, update
 from sqlmodel import delete, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -20,9 +20,12 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatInventoryJobStateEnum,
     ModelPreheatInventoryManifestStateEnum,
     ModelPreheatTask,
+    ModelPreheatWorkerTask,
+    ModelPreheatWorkerTaskStateEnum,
 )
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
+    ModelPreheatDistributionPolicyArtifact,
 )
 from gpustack.schemas.model_storage_sync import ModelStorageSyncTask
 from gpustack.worker.model_preheat.identity import decode_path
@@ -444,9 +447,66 @@ async def _referenced_artifact_ids(session, profile_id, config_version, artifact
                     ModelPreheatDistributionPolicy.profile_id == profile_id,
                     ModelPreheatDistributionPolicy.profile_config_version
                     == config_version,
-                    ModelPreheatDistributionPolicy.source_artifact_id.in_(artifact_ids)
+                    ModelPreheatDistributionPolicy.source_artifact_id.in_(artifact_ids),
                 )
             )
+        )
+    if ModelPreheatDistributionPolicyArtifact.__tablename__ in table_names:
+        referenced.update(
+            await session.exec(
+                select(ModelPreheatDistributionPolicyArtifact.artifact_id).where(
+                    ModelPreheatDistributionPolicyArtifact.artifact_id.in_(artifact_ids)
+                )
+            )
+        )
+    if (
+        ModelPreheatWorkerTask.__tablename__ in table_names
+        and ModelPreheatDistributionPolicy.__tablename__ in table_names
+    ):
+        from gpustack.server.model_preheat_worker_reconciler import (
+            MAX_DISTRIBUTION_ATTEMPTS,
+            RETRYABLE_DISTRIBUTION_ERRORS,
+        )
+
+        task_artifact_ids = (
+            await session.exec(
+                select(ModelPreheatWorkerTask.distribution_artifact_id)
+                .join(
+                    ModelPreheatDistributionPolicy,
+                    ModelPreheatDistributionPolicy.id
+                    == ModelPreheatWorkerTask.distribution_policy_id,
+                )
+                .where(
+                    ModelPreheatDistributionPolicy.profile_id == profile_id,
+                    ModelPreheatDistributionPolicy.profile_config_version
+                    == config_version,
+                    ModelPreheatWorkerTask.distribution_artifact_id.in_(
+                        artifact_by_name
+                    ),
+                    or_(
+                        ModelPreheatWorkerTask.state.in_(
+                            [
+                                ModelPreheatWorkerTaskStateEnum.PENDING,
+                                ModelPreheatWorkerTaskStateEnum.RUNNING,
+                                ModelPreheatWorkerTaskStateEnum.PAUSED,
+                            ]
+                        ),
+                        and_(
+                            ModelPreheatWorkerTask.state
+                            == ModelPreheatWorkerTaskStateEnum.ERROR,
+                            ModelPreheatWorkerTask.error_code.in_(
+                                RETRYABLE_DISTRIBUTION_ERRORS
+                            ),
+                            ModelPreheatWorkerTask.attempt
+                            < MAX_DISTRIBUTION_ATTEMPTS,
+                            ModelPreheatWorkerTask.finished_at.is_not(None),
+                        ),
+                    ),
+                )
+            )
+        ).all()
+        referenced.update(
+            artifact_by_name[artifact_id] for artifact_id in task_artifact_ids
         )
     if ModelPreheatTask.__tablename__ in table_names:
         task_artifact_ids = (

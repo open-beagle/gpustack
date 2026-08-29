@@ -20,6 +20,7 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicyRun,
     ModelPreheatDistributionPolicyRunStateEnum,
     ModelPreheatDistributionPolicyRunTriggerEnum,
+    ModelPreheatDistributionPolicyArtifact,
     ModelPreheatWorkerObservation,
 )
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
@@ -244,6 +245,84 @@ def test_policy_can_be_created_from_existing_s3_artifact(tmp_path):
     assert created.json()["source_sync_task_id"] is None
     assert created.json()["request_identity"]["source"] == "huggingface"
     assert created.json()["trigger_mode"] == "manual"
+
+
+def test_policy_can_select_multiple_artifacts_in_one_policy(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id, artifact_id = asyncio.run(_seed_artifact(engine))
+
+    async def seed_second():
+        async with AsyncSession(engine) as session:
+            artifact = ModelPreheatArtifact(
+                profile_id=profile_id,
+                profile_config_version=1,
+                artifact_id="e" * 64,
+                source="modelscope",
+                model_id="org/second",
+                resolved_revision="commit-2",
+                include_patterns=[],
+                exclude_patterns=[],
+                manifest_path="models/modelscope/org/second/manifest.json",
+                manifest_digest="f" * 64,
+                file_count=1,
+                total_size=20,
+                manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+                last_verified_at=datetime.now(timezone.utc),
+            )
+            session.add(artifact)
+            await session.commit()
+
+    asyncio.run(seed_second())
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/model-preheat-distribution-policies",
+            json={
+                "name": "selected-artifacts",
+                "profile_id": profile_id,
+                "selection_mode": "selected",
+                "artifact_ids": [artifact_id, "e" * 64],
+                "target_scope": "selected_workers",
+                "worker_selector": {"worker_uuids": ["worker-a"]},
+                "gpu_selector": {},
+            },
+        )
+    assert created.status_code == 200, created.text
+    assert created.json()["selection_mode"] == "selected"
+    assert created.json()["artifact_ids"] == [artifact_id, "e" * 64]
+
+    async def association_count():
+        async with AsyncSession(engine) as session:
+            return len(
+                (
+                    await session.exec(select(ModelPreheatDistributionPolicyArtifact))
+                ).all()
+            )
+
+    assert asyncio.run(association_count()) == 2
+    asyncio.run(engine.dispose())
+
+
+def test_all_current_policy_has_no_fixed_artifact_binding(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id, _ = asyncio.run(_seed_artifact(engine))
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/model-preheat-distribution-policies",
+            json={
+                "name": "all-current",
+                "profile_id": profile_id,
+                "selection_mode": "all_current",
+                "target_scope": "selected_workers",
+                "worker_selector": {"worker_uuids": ["worker-a"]},
+                "gpu_selector": {},
+            },
+        )
+    asyncio.run(engine.dispose())
+
+    assert created.status_code == 200, created.text
+    assert created.json()["selection_mode"] == "all_current"
+    assert created.json()["source_artifact_id"] is None
+    assert created.json()["artifact_ids"] == []
 
 
 def test_policy_exposes_blocked_reason_for_stale_fixed_artifact(tmp_path):

@@ -13,6 +13,7 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicyRun,
     ModelPreheatDistributionPolicyRunTriggerEnum,
     ModelPreheatDistributionPolicyTriggerModeEnum,
+    ModelPreheatDistributionSelectionModeEnum,
     ModelPreheatDistributionWorkerSlot,
     ModelPreheatWorkerObservation,
     distribution_operation_key,
@@ -41,10 +42,97 @@ from gpustack.server.model_preheat_worker_reconciler import (
 )
 from gpustack.server.model_preheat_distribution_source import (
     resolve_distribution_source,
+    resolve_distribution_sources,
 )
 
 
 ARTIFACT_ID = "a" * 64
+
+
+def test_all_current_resolves_only_current_valid_artifacts_and_freezes_tasks(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            profile = ModelPreheatS3Profile(
+                name="all-current-profile",
+                endpoint="https://s3.example.com",
+                bucket="models",
+                access_key_encrypted={"ciphertext": "access"},
+                secret_key_encrypted={"ciphertext": "secret"},
+                encryption_key_version="v1",
+            )
+            worker = Worker(
+                name="worker",
+                hostname="worker",
+                ip="10.0.0.2",
+                port=10150,
+                worker_uuid="worker-all",
+                state=WorkerStateEnum.READY,
+                model_storage_protocol_version=1,
+            )
+            session.add(profile)
+            session.add(worker)
+            await session.flush()
+            for index, state in enumerate(
+                [
+                    ModelPreheatInventoryManifestStateEnum.VALID,
+                    ModelPreheatInventoryManifestStateEnum.VALID,
+                    ModelPreheatInventoryManifestStateEnum.STALE,
+                ]
+            ):
+                session.add(
+                    ModelPreheatArtifact(
+                        profile_id=profile.id,
+                        profile_config_version=profile.config_version,
+                        artifact_id=str(index + 1) * 64,
+                        source="huggingface",
+                        model_id=f"org/model-{index}",
+                        resolved_revision=f"commit-{index}",
+                        include_patterns=[],
+                        exclude_patterns=[],
+                        manifest_path=f"models/{index}/manifest.json",
+                        manifest_digest=str(index + 4) * 64,
+                        file_count=1,
+                        total_size=10,
+                        manifest_state=state,
+                        last_verified_at=datetime.now(timezone.utc),
+                    )
+                )
+            policy = ModelPreheatDistributionPolicy(
+                name="all-current",
+                selection_mode=ModelPreheatDistributionSelectionModeEnum.ALL_CURRENT,
+                profile_id=profile.id,
+                profile_config_version=profile.config_version,
+                request_identity={"selection_mode": "all_current"},
+                request_digest="9" * 64,
+                target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
+                worker_selector={"worker_uuids": [worker.worker_uuid]},
+                gpu_selector={},
+                selector_digest="8" * 64,
+            )
+            session.add(policy)
+            await session.commit()
+            await session.refresh(policy)
+            sources = await resolve_distribution_sources(session, policy)
+            for source in sources:
+                await _create_or_rebind_distribution_task(
+                    session, policy, source, worker, run_key="run"
+                )
+            await session.commit()
+            tasks = (
+                await session.exec(
+                    select(ModelPreheatWorkerTask).where(
+                        ModelPreheatWorkerTask.distribution_policy_id == policy.id
+                    )
+                )
+            ).all()
+        await engine.dispose()
+        return sources, tasks
+
+    sources, tasks = asyncio.run(run())
+    assert [source.artifact.artifact_id for source in sources] == ["1" * 64, "2" * 64]
+    assert {task.distribution_artifact_id for task in tasks} == {"1" * 64, "2" * 64}
+    assert len({task.distribution_request_digest for task in tasks}) == 2
 
 
 @dataclass

@@ -21,6 +21,12 @@ class ModelPreheatDistributionPolicyTriggerModeEnum(str, Enum):
     CONTINUOUS = "continuous"
 
 
+class ModelPreheatDistributionSelectionModeEnum(str, Enum):
+    FIXED = "fixed"
+    SELECTED = "selected"
+    ALL_CURRENT = "all_current"
+
+
 class ModelPreheatDistributionPolicyRunTriggerEnum(str, Enum):
     MANUAL = "manual"
     SCHEDULED = "scheduled"
@@ -48,6 +54,10 @@ class ModelPreheatDistributionPolicy(SQLModel, BaseModelMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     enabled: bool = True
+    selection_mode: ModelPreheatDistributionSelectionModeEnum = Field(
+        default=ModelPreheatDistributionSelectionModeEnum.FIXED,
+        sa_column=Column(String(32), nullable=False),
+    )
     profile_version_stale: bool = False
     trigger_mode: ModelPreheatDistributionPolicyTriggerModeEnum = Field(
         default=ModelPreheatDistributionPolicyTriggerModeEnum.CONTINUOUS,
@@ -149,7 +159,10 @@ class ModelPreheatDistributionWorkerSlot(SQLModel, BaseModelMixin, table=True):
     __tablename__ = "model_preheat_distribution_worker_slots"
     __table_args__ = (
         UniqueConstraint(
-            "policy_id", "worker_uuid", name="uix_distribution_policy_worker_slot"
+            "policy_id",
+            "artifact_id",
+            "worker_uuid",
+            name="uix_distribution_policy_artifact_worker_slot",
         ),
     )
 
@@ -160,10 +173,37 @@ class ModelPreheatDistributionWorkerSlot(SQLModel, BaseModelMixin, table=True):
             nullable=False,
         )
     )
+    artifact_id: str = Field(default="", sa_column=Column(String(64), nullable=False))
     worker_uuid: str = Field(sa_column=Column(String(255), nullable=False))
     active_task_id: Optional[int] = None
     active_operation_key: Optional[str] = Field(
         default=None, sa_column=Column(String(64), nullable=True)
+    )
+
+
+class ModelPreheatDistributionPolicyArtifact(SQLModel, table=True):
+    __tablename__ = "model_preheat_distribution_policy_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "policy_id",
+            "artifact_id",
+            name="uix_distribution_policy_selected_artifact",
+        ),
+    )
+
+    policy_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_distribution_policies.id", ondelete="CASCADE"),
+            nullable=False,
+            primary_key=True,
+        ),
+    )
+    artifact_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_artifacts.id", ondelete="RESTRICT"),
+            nullable=False,
+            primary_key=True,
+        ),
     )
 
 
@@ -180,6 +220,7 @@ class ModelPreheatDistributionPolicyPublic(SQLModel):
     id: int
     name: str
     enabled: bool
+    selection_mode: ModelPreheatDistributionSelectionModeEnum
     trigger_mode: ModelPreheatDistributionPolicyTriggerModeEnum
     cron_expression: Optional[str] = None
     timezone: str
@@ -193,6 +234,7 @@ class ModelPreheatDistributionPolicyPublic(SQLModel):
     created_by_task_id: Optional[int] = None
     source_artifact_id: Optional[int] = None
     source_artifact: Optional[str] = None
+    artifact_ids: list[str] = Field(default_factory=list)
     source_sync_task_id: Optional[int] = None
     last_reconciled_at: Optional[datetime] = None
     next_run_at: Optional[datetime] = None
@@ -254,7 +296,11 @@ class ModelPreheatDistributionPolicyCreate(SQLModel):
     cron_expression: Optional[str] = None
     timezone: str = "UTC"
     profile_id: Optional[int] = None
+    selection_mode: ModelPreheatDistributionSelectionModeEnum = (
+        ModelPreheatDistributionSelectionModeEnum.FIXED
+    )
     artifact_id: Optional[str] = None
+    artifact_ids: list[str] = Field(default_factory=list)
     sync_task_id: Optional[int] = None
     target_scope: ModelPreheatTargetScopeEnum
     worker_selector: dict = Field(default_factory=dict)
@@ -270,9 +316,24 @@ class ModelPreheatDistributionPolicyCreate(SQLModel):
 
     @model_validator(mode="after")
     def validate_source_and_selector(self):
-        if (self.artifact_id is None) == (self.sync_task_id is None):
-            raise ValueError("distribution_source_required")
-        if self.artifact_id is not None and self.profile_id is None:
+        if self.sync_task_id is not None:
+            if (
+                self.selection_mode != ModelPreheatDistributionSelectionModeEnum.FIXED
+                or self.artifact_id is not None
+                or self.artifact_ids
+            ):
+                raise ValueError("distribution_source_invalid")
+        elif self.selection_mode == ModelPreheatDistributionSelectionModeEnum.FIXED:
+            if self.artifact_id is None or self.artifact_ids:
+                raise ValueError("distribution_source_required")
+        elif self.selection_mode == ModelPreheatDistributionSelectionModeEnum.SELECTED:
+            if self.artifact_id is not None or not self.artifact_ids:
+                raise ValueError("distribution_source_required")
+            if len(set(self.artifact_ids)) != len(self.artifact_ids):
+                raise ValueError("duplicate_distribution_artifact")
+        elif self.artifact_id is not None or self.artifact_ids:
+            raise ValueError("distribution_source_invalid")
+        if self.sync_task_id is None and self.profile_id is None:
             raise ValueError("profile_id_required")
         worker_uuids = self.worker_selector.get("worker_uuids", [])
         gpu_names = self.gpu_selector.get("gpu_names", [])
@@ -311,14 +372,19 @@ def distribution_selector_digest(worker_selector: dict, gpu_selector: dict) -> s
 
 
 def distribution_operation_key(
-    policy_id: int, worker_uuid: str, request_digest: str, run_key: str | None = None
+    policy_id: int,
+    worker_uuid: str,
+    request_digest: str,
+    run_key: str | None = None,
+    artifact_id: str | None = None,
 ) -> str:
+    values = [policy_id, worker_uuid, request_digest]
+    if artifact_id is not None:
+        values.append(artifact_id)
+    if run_key is not None:
+        values.append(run_key)
     payload = json.dumps(
-        (
-            [policy_id, worker_uuid, request_digest]
-            if run_key is None
-            else [policy_id, worker_uuid, request_digest, run_key]
-        ),
+        values,
         separators=(",", ":"),
         ensure_ascii=False,
     )
