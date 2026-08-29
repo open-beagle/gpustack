@@ -265,6 +265,7 @@ class ModelPreheatDistributionPolicyPublic(SQLModel):
     next_run_at: Optional[datetime] = None
     last_run_at: Optional[datetime] = None
     blocked_reason: Optional[str] = None
+    structural_editable: bool = True
     latest_run: Optional["ModelPreheatDistributionPolicyRunPublic"] = None
     created_at: datetime
     updated_at: datetime
@@ -302,6 +303,13 @@ class ModelPreheatDistributionPolicyUpdate(SQLModel):
     trigger_mode: Optional[ModelPreheatDistributionPolicyTriggerModeEnum] = None
     cron_expression: Optional[str] = None
     timezone: Optional[str] = None
+    profile_id: Optional[int] = None
+    selection_mode: Optional[ModelPreheatDistributionSelectionModeEnum] = None
+    artifact_id: Optional[str] = None
+    artifact_ids: Optional[list[str]] = None
+    target_scope: Optional[ModelPreheatTargetScopeEnum] = None
+    worker_selector: Optional[dict] = None
+    gpu_selector: Optional[dict] = None
 
     @field_validator("name")
     @classmethod
