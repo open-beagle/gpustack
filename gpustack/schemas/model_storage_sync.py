@@ -4,8 +4,7 @@ from typing import Optional
 
 from sqlalchemy import Column, ForeignKey, Index, JSON, Text, UniqueConstraint
 from sqlmodel import Field, SQLModel
-from pydantic import ConfigDict
-from pydantic import field_validator
+from pydantic import ConfigDict, field_validator, model_validator
 
 from gpustack.mixins import BaseModelMixin
 from gpustack.schemas.common import PaginatedList, UTCDateTime
@@ -189,6 +188,7 @@ class ModelStorageSyncTaskCreate(SQLModel):
 
 class ModelStorageSyncScopeEnum(str, Enum):
     SINGLE_MODEL = "single_model"
+    SELECTED_MODELS = "selected_models"
     SELECTED_WORKERS = "selected_workers"
     ALL_READY_WORKERS = "all_ready_workers"
 
@@ -197,9 +197,40 @@ class ModelStorageSyncBatchCreate(SQLModel):
     profile_id: int
     scope: ModelStorageSyncScopeEnum = ModelStorageSyncScopeEnum.SINGLE_MODEL
     model_file_id: Optional[int] = None
+    model_file_ids: list[int] = Field(default_factory=list, max_length=500)
     worker_ids: list[int] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_scope_fields(self):
+        if self.profile_id <= 0:
+            raise ValueError("profile_id_invalid")
+        if self.model_file_id is not None and self.model_file_id <= 0:
+            raise ValueError("model_file_id_invalid")
+        if any(item <= 0 for item in self.model_file_ids):
+            raise ValueError("model_file_ids_invalid")
+        if any(item <= 0 for item in self.worker_ids):
+            raise ValueError("worker_ids_invalid")
+        self.model_file_ids = sorted(set(self.model_file_ids))
+        if self.scope == ModelStorageSyncScopeEnum.SINGLE_MODEL:
+            if self.model_file_id is None:
+                raise ValueError("model_file_id_required")
+            if self.model_file_ids or self.worker_ids:
+                raise ValueError("sync_batch_scope_fields_conflict")
+        elif self.scope == ModelStorageSyncScopeEnum.SELECTED_MODELS:
+            if not self.model_file_ids:
+                raise ValueError("model_file_ids_required")
+            if self.model_file_id is not None or self.worker_ids:
+                raise ValueError("sync_batch_scope_fields_conflict")
+        elif self.scope == ModelStorageSyncScopeEnum.SELECTED_WORKERS:
+            if not self.worker_ids:
+                raise ValueError("worker_ids_required")
+            if self.model_file_id is not None or self.model_file_ids:
+                raise ValueError("sync_batch_scope_fields_conflict")
+        elif self.model_file_id is not None or self.model_file_ids or self.worker_ids:
+            raise ValueError("sync_batch_scope_fields_conflict")
+        return self
 
 
 class ModelStorageSyncBatchItem(SQLModel):

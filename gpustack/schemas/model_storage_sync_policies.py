@@ -195,6 +195,8 @@ class ModelStorageSyncPolicyBase(SQLModel):
         if self.scope == ModelStorageSyncScopeEnum.SINGLE_MODEL:
             if self.model_file_id is None or self.worker_uuids:
                 raise ValueError("invalid_single_model_selector")
+        elif self.scope == ModelStorageSyncScopeEnum.SELECTED_MODELS:
+            raise ValueError("unsupported_sync_policy_scope")
         elif self.scope == ModelStorageSyncScopeEnum.SELECTED_WORKERS:
             if not self.worker_uuids or self.model_file_id is not None:
                 raise ValueError("invalid_worker_selector")

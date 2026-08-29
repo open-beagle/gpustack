@@ -497,14 +497,15 @@ async def create_model_storage_sync_batch(
     batch_in: ModelStorageSyncBatchCreate,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
-    batch_request_hash = canonical_request_hash(
-        {
-            "profile_id": batch_in.profile_id,
-            "scope": batch_in.scope.value,
-            "model_file_id": batch_in.model_file_id,
-            "worker_ids": sorted(set(batch_in.worker_ids)),
-        }
-    )
+    batch_request_identity = {
+        "profile_id": batch_in.profile_id,
+        "scope": batch_in.scope.value,
+        "model_file_id": batch_in.model_file_id,
+        "worker_ids": sorted(set(batch_in.worker_ids)),
+    }
+    if batch_in.scope == ModelStorageSyncScopeEnum.SELECTED_MODELS:
+        batch_request_identity["model_file_ids"] = batch_in.model_file_ids
+    batch_request_hash = canonical_request_hash(batch_request_identity)
     batch_record = await get_idempotency_record(
         session,
         current_user.id,
@@ -545,6 +546,7 @@ async def create_model_storage_sync_batch(
     ready_workers = await current_ready_workers(session)
     ready_worker_ids = {worker.id for worker in ready_workers}
     skipped = []
+    failed = []
 
     if batch_in.scope == ModelStorageSyncScopeEnum.SINGLE_MODEL:
         if batch_in.model_file_id is None:
@@ -552,6 +554,27 @@ async def create_model_storage_sync_batch(
         model_files = [await session.get(ModelFile, batch_in.model_file_id)]
         if model_files[0] is None:
             raise NotFoundException(message="model_file_not_found")
+    elif batch_in.scope == ModelStorageSyncScopeEnum.SELECTED_MODELS:
+        selected_model_files = (
+            await session.exec(
+                select(ModelFile).where(ModelFile.id.in_(batch_in.model_file_ids))
+            )
+        ).all()
+        model_files_by_id = {
+            model_file.id: model_file for model_file in selected_model_files
+        }
+        model_files = []
+        for model_file_id in batch_in.model_file_ids:
+            model_file = model_files_by_id.get(model_file_id)
+            if model_file is None:
+                failed.append(
+                    ModelStorageSyncBatchItem(
+                        model_file_id=model_file_id,
+                        reason="model_file_not_found",
+                    )
+                )
+            else:
+                model_files.append(model_file)
     else:
         if (
             batch_in.scope == ModelStorageSyncScopeEnum.SELECTED_WORKERS
@@ -602,7 +625,6 @@ async def create_model_storage_sync_batch(
 
     planned_candidates = []
     seen_identities = set()
-    failed = []
     for model_file in model_files:
         if model_file.state != ModelFileStateEnum.READY:
             skipped.append(
@@ -763,6 +785,10 @@ async def create_model_storage_sync_batch(
                 raise ServiceUnavailableException(
                     message="model_storage_sync_batch_in_progress"
                 )
+        if batch_in.scope == ModelStorageSyncScopeEnum.SELECTED_MODELS:
+            created.sort(key=lambda item: item.model_file_id)
+            skipped.sort(key=lambda item: item.model_file_id)
+            failed.sort(key=lambda item: item.model_file_id)
         result = ModelStorageSyncBatchPublic(
             scope=batch_in.scope,
             planned=len(planned_candidates),

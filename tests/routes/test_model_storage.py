@@ -1769,6 +1769,299 @@ def test_batch_sync_selected_workers_plans_ready_models_and_replays(app, client)
     assert empty_replay.json() == empty.json()
 
 
+def test_batch_sync_selected_models_normalizes_ids_and_replays_out_of_order(
+    app, client
+):
+    profile_id, first_model_file_id = _run(app, _seed_ids(app))
+
+    async def seed_more_models():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            first = await session.get(ModelFile, first_model_file_id)
+            ready_worker = Worker(
+                name="worker-selected-models",
+                hostname="worker-selected-models",
+                ip="127.0.0.2",
+                port=10150,
+                worker_uuid="worker-selected-models-uuid",
+                state=WorkerStateEnum.READY,
+                model_storage_protocol_version=MODEL_STORAGE_PROTOCOL_VERSION,
+            )
+            unsupported_worker = Worker(
+                name="worker-old-protocol",
+                hostname="worker-old-protocol",
+                ip="127.0.0.3",
+                port=10150,
+                worker_uuid="worker-old-protocol-uuid",
+                state=WorkerStateEnum.READY,
+                model_storage_protocol_version=0,
+            )
+            session.add_all([ready_worker, unsupported_worker])
+            await session.flush()
+            second = ModelFile(
+                source=SourceEnum.HUGGING_FACE,
+                huggingface_repo_id="org/selected-second",
+                worker_id=ready_worker.id,
+                resolved_paths=["/models/org/selected-second"],
+                state=ModelFileStateEnum.READY,
+                requested_revision="main",
+                resolved_revision="b" * 40,
+            )
+            not_ready = ModelFile(
+                source=SourceEnum.MODEL_SCOPE,
+                model_scope_model_id="org/not-ready",
+                worker_id=first.worker_id,
+                state=ModelFileStateEnum.DOWNLOADING,
+            )
+            unsupported = ModelFile(
+                source=SourceEnum.MODEL_SCOPE,
+                model_scope_model_id="org/old-protocol",
+                worker_id=unsupported_worker.id,
+                resolved_paths=["/models/org/old-protocol"],
+                state=ModelFileStateEnum.READY,
+                requested_revision="main",
+                resolved_revision="c" * 40,
+            )
+            duplicate_identity = ModelFile(
+                source=SourceEnum.MODEL_SCOPE,
+                model_scope_model_id="Qwen/Test",
+                worker_id=ready_worker.id,
+                resolved_paths=["/models/Qwen/Test-copy"],
+                state=ModelFileStateEnum.READY,
+                requested_revision="master",
+                resolved_revision="8f73c6a91b",
+            )
+            session.add_all([second, not_ready, unsupported, duplicate_identity])
+            await session.commit()
+            return second.id, not_ready.id, unsupported.id, duplicate_identity.id
+
+    second_id, not_ready_id, unsupported_id, duplicate_identity_id = _run(
+        app, seed_more_models()
+    )
+    missing_id = 999999
+    key = "batch-selected-models-1"
+    first = client.post(
+        "/v1/model-storage-sync-batches",
+        headers={"Idempotency-Key": key},
+        json={
+            "profile_id": profile_id,
+            "scope": "selected_models",
+            "model_file_ids": [
+                second_id,
+                first_model_file_id,
+                missing_id,
+                not_ready_id,
+                unsupported_id,
+                duplicate_identity_id,
+                first_model_file_id,
+            ],
+        },
+    )
+    replay = client.post(
+        "/v1/model-storage-sync-batches",
+        headers={"Idempotency-Key": key},
+        json={
+            "profile_id": profile_id,
+            "scope": "selected_models",
+            "model_file_ids": [
+                unsupported_id,
+                not_ready_id,
+                missing_id,
+                first_model_file_id,
+                second_id,
+                duplicate_identity_id,
+            ],
+        },
+    )
+    conflict = client.post(
+        "/v1/model-storage-sync-batches",
+        headers={"Idempotency-Key": key},
+        json={
+            "profile_id": profile_id,
+            "scope": "selected_models",
+            "model_file_ids": [first_model_file_id, second_id],
+        },
+    )
+
+    assert first.status_code == 200, first.text
+    assert first.json()["scope"] == "selected_models"
+    assert first.json()["planned"] == 3
+    assert [item["model_file_id"] for item in first.json()["created"]] == [
+        first_model_file_id,
+        second_id,
+    ]
+    assert [
+        (item["model_file_id"], item["reason"]) for item in first.json()["skipped"]
+    ] == [
+        (not_ready_id, "model_file_not_ready"),
+        (duplicate_identity_id, "duplicate_artifact_identity"),
+    ]
+    assert [
+        (item["model_file_id"], item["reason"]) for item in first.json()["failed"]
+    ] == [
+        (unsupported_id, "model_file_worker_protocol_unsupported"),
+        (missing_id, "model_file_not_found"),
+    ]
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first.json()
+    assert conflict.status_code == 409
+    assert conflict.json()["message"] == "idempotency_key_reused"
+
+
+def test_batch_sync_selected_models_limits_raw_model_file_ids(app, client):
+    profile_id, model_file_id = _run(app, _seed_ids(app))
+
+    accepted = client.post(
+        "/v1/model-storage-sync-batches",
+        headers={"Idempotency-Key": "batch-selected-models-limit-500"},
+        json={
+            "profile_id": profile_id,
+            "scope": "selected_models",
+            "model_file_ids": [model_file_id] * 500,
+        },
+    )
+    rejected = client.post(
+        "/v1/model-storage-sync-batches",
+        json={
+            "profile_id": profile_id,
+            "scope": "selected_models",
+            "model_file_ids": [model_file_id] * 501,
+        },
+    )
+
+    assert accepted.status_code == 200, accepted.text
+    assert [item["model_file_id"] for item in accepted.json()["created"]] == [
+        model_file_id
+    ]
+    assert rejected.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"profile_id": 1, "scope": "selected_models"},
+        {"profile_id": 1, "scope": "selected_models", "model_file_ids": [0]},
+        {
+            "profile_id": 1,
+            "scope": "selected_models",
+            "model_file_ids": [1],
+            "worker_ids": [1],
+        },
+        {
+            "profile_id": 1,
+            "scope": "single_model",
+            "model_file_id": 1,
+            "model_file_ids": [1],
+        },
+        {
+            "profile_id": 1,
+            "scope": "selected_workers",
+            "worker_ids": [1],
+            "model_file_ids": [1],
+        },
+        {
+            "profile_id": 1,
+            "scope": "all_ready_workers",
+            "model_file_id": 1,
+        },
+    ],
+)
+def test_batch_sync_scope_fields_are_strictly_mutually_exclusive(client, body):
+    response = client.post("/v1/model-storage-sync-batches", json=body)
+    assert response.status_code == 422
+
+
+def test_selected_models_scope_remains_batch_only_for_sync_policies(app, client):
+    profile_id, _ = _run(app, _seed_ids(app))
+    response = client.post(
+        "/v1/model-storage-sync-policies",
+        json={
+            "name": "unsupported-selected-models-policy",
+            "profile_id": profile_id,
+            "scope": "selected_models",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_concurrent_selected_models_replay_uses_one_normalized_batch(app, monkeypatch):
+    profile_id, first_model_file_id = _run(app, _seed_ids(app))
+
+    async def seed_second():
+        async with AsyncSession(_engine(app), expire_on_commit=False) as session:
+            first = await session.get(ModelFile, first_model_file_id)
+            second = ModelFile(
+                source=SourceEnum.HUGGING_FACE,
+                huggingface_repo_id="org/concurrent-second",
+                worker_id=first.worker_id,
+                resolved_paths=["/models/org/concurrent-second"],
+                state=ModelFileStateEnum.READY,
+                requested_revision="main",
+                resolved_revision="d" * 40,
+            )
+            session.add(second)
+            await session.commit()
+            return second.id
+
+    second_model_file_id = _run(app, seed_second())
+    original_create = model_storage.create_model_storage_sync_task
+    owner_reached_child_creation = threading.Barrier(2)
+    release_owner = threading.Event()
+    first_call_lock = threading.Lock()
+    first_call = True
+
+    async def blocked_first_child(*args, **kwargs):
+        nonlocal first_call
+        with first_call_lock:
+            should_block = first_call
+            first_call = False
+        if should_block:
+            owner_reached_child_creation.wait(timeout=5)
+            assert release_owner.wait(timeout=5)
+        return await original_create(*args, **kwargs)
+
+    monkeypatch.setattr(
+        model_storage,
+        "create_model_storage_sync_task",
+        blocked_first_child,
+    )
+    key = "batch-selected-models-concurrent"
+    responses = []
+
+    def post(model_file_ids):
+        with TestClient(app) as concurrent_client:
+            responses.append(
+                concurrent_client.post(
+                    "/v1/model-storage-sync-batches",
+                    headers={"Idempotency-Key": key},
+                    json={
+                        "profile_id": profile_id,
+                        "scope": "selected_models",
+                        "model_file_ids": model_file_ids,
+                    },
+                )
+            )
+
+    owner = threading.Thread(
+        target=post, args=([second_model_file_id, first_model_file_id],)
+    )
+    owner.start()
+    owner_reached_child_creation.wait(timeout=5)
+    replay = threading.Thread(
+        target=post, args=([first_model_file_id, second_model_file_id],)
+    )
+    replay.start()
+    release_owner.set()
+    owner.join(timeout=5)
+    replay.join(timeout=5)
+
+    assert not owner.is_alive()
+    assert not replay.is_alive()
+    assert len(responses) == 2
+    assert all(response.status_code == 200 for response in responses)
+    assert responses[0].json() == responses[1].json()
+    assert len(responses[0].json()["created"]) == 2
+
+
 def test_batch_sync_single_and_all_ready_scope_contract(app, client):
     profile_id, model_file_id = _run(app, _seed_ids(app))
 
