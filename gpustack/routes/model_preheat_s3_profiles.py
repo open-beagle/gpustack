@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Header, Request
-from sqlalchemy import update
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import delete, select
 
@@ -41,6 +41,7 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatConnectivityCheckPublic,
     ModelPreheatConnectivityWorkerPublic,
     ModelPreheatArtifact,
+    ModelPreheatInventoryManifestStateEnum,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatTask,
     ModelPreheatWorkerTask,
@@ -104,8 +105,12 @@ async def get_profiles(request: Request, session: SessionDep, params: ListParams
     await _persist_expired_profiles_as_stale(
         session, profiles, request.app.state.server_config
     )
+    inventory_model_counts = await _inventory_model_counts(session, profiles)
     return PaginatedList[ModelPreheatS3ProfilePublic](
-        items=[_to_public(profile) for profile in profiles],
+        items=[
+            _to_public(profile, inventory_model_counts.get(profile.id, 0))
+            for profile in profiles
+        ],
         pagination=Pagination(
             page=params.page,
             perPage=params.perPage,
@@ -121,7 +126,8 @@ async def get_profile(request: Request, session: SessionDep, id: int):
     await _persist_expired_profiles_as_stale(
         session, [profile], request.app.state.server_config
     )
-    return _to_public(profile)
+    inventory_model_counts = await _inventory_model_counts(session, [profile])
+    return _to_public(profile, inventory_model_counts.get(profile.id, 0))
 
 
 @router.post("", response_model=ModelPreheatS3ProfilePublic)
@@ -654,7 +660,49 @@ def _rotate_if_needed(cipher: ModelPreheatCredentialCipher, encrypted):
     return rotated
 
 
-def _to_public(profile: ModelPreheatS3Profile) -> ModelPreheatS3ProfilePublic:
+async def _inventory_model_counts(session, profiles):
+    if not profiles:
+        return {}
+    profile_versions = {profile.id: profile.config_version for profile in profiles}
+    current_profile = or_(
+        *(
+            and_(
+                ModelPreheatArtifact.profile_id == profile_id,
+                ModelPreheatArtifact.profile_config_version == config_version,
+            )
+            for profile_id, config_version in profile_versions.items()
+        )
+    )
+    distinct_models = (
+        select(
+            ModelPreheatArtifact.profile_id.label("profile_id"),
+            ModelPreheatArtifact.source.label("source"),
+            ModelPreheatArtifact.model_id.label("model_id"),
+        )
+        .where(
+            current_profile,
+            ModelPreheatArtifact.manifest_state
+            == ModelPreheatInventoryManifestStateEnum.VALID,
+        )
+        .distinct()
+        .subquery()
+    )
+    rows = (
+        await session.exec(
+            select(
+                distinct_models.c.profile_id,
+                func.count().label("model_count"),
+            ).group_by(distinct_models.c.profile_id)
+        )
+    ).all()
+    counts = {profile_id: 0 for profile_id in profile_versions}
+    counts.update(dict(rows))
+    return counts
+
+
+def _to_public(
+    profile: ModelPreheatS3Profile, inventory_model_count: int | None = None
+) -> ModelPreheatS3ProfilePublic:
     return ModelPreheatS3ProfilePublic(
         id=profile.id,
         name=profile.name,
@@ -683,7 +731,11 @@ def _to_public(profile: ModelPreheatS3Profile) -> ModelPreheatS3ProfilePublic:
         inventory_refresh_interval_seconds=profile.inventory_refresh_interval_seconds,
         inventory_last_attempt_at=profile.inventory_last_attempt_at,
         inventory_last_success_at=profile.inventory_last_success_at,
-        inventory_last_scan_count=profile.inventory_last_scan_count,
+        inventory_last_scan_count=(
+            profile.inventory_last_scan_count
+            if inventory_model_count is None
+            else inventory_model_count
+        ),
         inventory_last_error_code=profile.inventory_last_error_code,
         created_at=profile.created_at,
         updated_at=profile.updated_at,

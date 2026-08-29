@@ -32,7 +32,9 @@ from gpustack.schemas.model_preheat_s3_profiles import (
 )
 from gpustack.schemas.model_preheat_schedules import ModelPreheatSchedule
 from gpustack.schemas.model_preheats import (
+    ModelPreheatArtifact,
     ModelPreheatBackfillPolicyEnum,
+    ModelPreheatInventoryManifestStateEnum,
     ModelPreheatTask,
     ModelPreheatTargetScopeEnum,
 )
@@ -157,6 +159,7 @@ def test_profile_public_includes_inventory_refresh_status(client, app):
             },
         )
     )
+    asyncio.run(_seed_inventory_models(app, created["id"]))
 
     detail = client.get(f"{API_PREFIX}/{created['id']}")
     listing = client.get(API_PREFIX)
@@ -169,8 +172,55 @@ def test_profile_public_includes_inventory_refresh_status(client, app):
         assert body["inventory_last_success_at"] == succeeded_at.isoformat().replace(
             "+00:00", "Z"
         )
-        assert body["inventory_last_scan_count"] == 12
+        assert body["inventory_last_scan_count"] == 2
         assert body["inventory_last_error_code"] == "inventory_scan_failed"
+
+
+def test_inventory_model_count_uses_current_valid_models_per_profile(client, app):
+    first = create_profile(client, name="first", endpoint="https://first.example.com")
+    second = create_profile(
+        client, name="second", endpoint="https://second.example.com"
+    )
+    empty = create_profile(client, name="empty", endpoint="https://empty.example.com")
+
+    asyncio.run(
+        _seed_inventory_artifacts(
+            app,
+            first["id"],
+            [
+                ("modelscope", "org/model-a", "v1", 0, "valid"),
+                ("modelscope", "org/model-a", "v2", 0, "valid"),
+                ("huggingface", "org/model-a", "v1", 0, "valid"),
+                ("modelscope", "org/model-b", "v1", 0, "valid"),
+                ("modelscope", "org/old", "v1", -1, "valid"),
+                ("modelscope", "org/stale", "v1", 0, "stale"),
+                ("modelscope", "org/invalid", "v1", 0, "invalid"),
+            ],
+        )
+    )
+    asyncio.run(
+        _seed_inventory_artifacts(
+            app,
+            second["id"],
+            [
+                ("modelscope", "org/model-c", "v1", 0, "valid"),
+                ("modelscope", "org/model-c", "v2", 0, "valid"),
+            ],
+        )
+    )
+
+    response = client.get(API_PREFIX)
+    assert response.status_code == 200, response.text
+    counts = {
+        item["id"]: item["inventory_last_scan_count"]
+        for item in response.json()["items"]
+    }
+    assert counts == {first["id"]: 3, second["id"]: 1, empty["id"]: 0}
+
+    for profile_id, expected_count in counts.items():
+        detail = client.get(f"{API_PREFIX}/{profile_id}")
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["inventory_last_scan_count"] == expected_count
 
 
 def test_maintenance_clears_default_and_reactivation_requires_explicit_default(client):
@@ -1279,4 +1329,44 @@ async def _update_stored_profile(app, profile_id, values):
         for key, value in values.items():
             setattr(profile, key, value)
         session.add(profile)
+        await session.commit()
+
+
+async def _seed_inventory_models(app, profile_id):
+    await _seed_inventory_artifacts(
+        app,
+        profile_id,
+        [
+            ("modelscope", "org/model-a", "v1", 0, "valid"),
+            ("modelscope", "org/model-a", "v2", 0, "valid"),
+            ("modelscope", "org/model-b", "v1", 0, "valid"),
+        ],
+    )
+
+
+async def _seed_inventory_artifacts(app, profile_id, artifacts):
+    session_override = app.dependency_overrides[get_session]
+    async for session in session_override():
+        profile = await session.get(ModelPreheatS3Profile, profile_id)
+        for index, (source, model_id, revision, version_offset, state) in enumerate(
+            artifacts
+        ):
+            session.add(
+                ModelPreheatArtifact(
+                    profile_id=profile_id,
+                    profile_config_version=profile.config_version + version_offset,
+                    artifact_id=f"{index + 1:064x}",
+                    source=source,
+                    model_id=model_id,
+                    resolved_revision=revision,
+                    include_patterns=[],
+                    exclude_patterns=[],
+                    manifest_path=f"artifacts/{index + 1}/manifest.json",
+                    manifest_digest=f"{index + 101:064x}",
+                    file_count=1,
+                    total_size=1,
+                    manifest_state=ModelPreheatInventoryManifestStateEnum(state),
+                    last_verified_at=datetime.now(timezone.utc),
+                )
+            )
         await session.commit()
