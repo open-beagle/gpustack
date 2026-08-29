@@ -305,7 +305,9 @@ class ModelPreheatS3Inventory:
             .values(
                 inventory_last_attempt_at=attempt_at,
                 inventory_last_success_at=now,
-                inventory_last_scan_count=len(records),
+                inventory_last_scan_count=len(
+                    {(record["source"], record["model_id"]) for record in records}
+                ),
                 inventory_last_error_code=None,
                 ever_used_at=(
                     func.coalesce(ModelPreheatS3Profile.ever_used_at, now)

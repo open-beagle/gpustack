@@ -193,12 +193,15 @@ def test_refresh_rebuilds_current_version_and_marks_old_version_stale(
             profile_id = profile.id
             await session.commit()
 
-        record = _artifact_values("c" * 64)
-        record.pop("last_verified_at")
+        first_record = _artifact_values("c" * 64)
+        first_record.pop("last_verified_at")
+        second_record = _artifact_values("d" * 64)
+        second_record.pop("last_verified_at")
+        second_record["resolved_revision"] = "another-commit"
         monkeypatch.setattr(
             inventory_module,
             "_scan_profile",
-            lambda snapshot: ([record], 1, 0, set()),
+            lambda snapshot: ([first_record, second_record], 2, 0, set()),
         )
         service = ModelPreheatS3Inventory(engine)
         service._cipher = lambda: SimpleNamespace(decrypt=lambda value: "secret")
@@ -215,19 +218,22 @@ def test_refresh_rebuilds_current_version_and_marks_old_version_stale(
             ).all()
             refreshed_profile = await session.get(ModelPreheatS3Profile, profile_id)
             ever_used_at = refreshed_profile.ever_used_at
+            inventory_last_scan_count = refreshed_profile.inventory_last_scan_count
         await engine.dispose()
-        return counts, rows, ever_used_at
+        return counts, rows, ever_used_at, inventory_last_scan_count
 
-    counts, rows, ever_used_at = asyncio.run(run())
+    counts, rows, ever_used_at, inventory_last_scan_count = asyncio.run(run())
 
-    assert counts == {"scanned": 1, "valid": 1, "invalid": 0, "deleted": 1}
+    assert counts == {"scanned": 2, "valid": 2, "invalid": 0, "deleted": 1}
     assert [(row.profile_config_version, row.artifact_id) for row in rows] == [
         (1, "a" * 64),
         (2, "c" * 64),
+        (2, "d" * 64),
     ]
     assert rows[0].manifest_state == ModelPreheatInventoryManifestStateEnum.STALE
     assert rows[1].manifest_state == ModelPreheatInventoryManifestStateEnum.VALID
     assert ever_used_at is not None
+    assert inventory_last_scan_count == 1
 
 
 def test_refresh_discovers_three_sources_from_shared_s3_in_independent_database(
