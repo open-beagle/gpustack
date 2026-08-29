@@ -61,25 +61,48 @@ ARG CUDA_VERSION=13.0.3
 
 COPY ./.beagle/llama.cpp.lock /tmp/llama.cpp.lock
 COPY ./dist/llama.cpp.tar.gz /tmp/llama.cpp.tar.gz
+COPY ./.beagle/llama-box.lock /tmp/llama-box.lock
+COPY ./dist/llama-box.tar.gz /tmp/llama-box.tar.gz
 RUN set -eux; \
     expected_cuda_version="${CUDA_VERSION}"; \
     . /tmp/llama.cpp.lock; \
+    . /tmp/llama-box.lock; \
     test "${CUDA_VERSION}" = "${expected_cuda_version}"; \
     test -n "${LLAMA_CPP_VERSION}"; \
     test -n "${LLAMA_CPP_COMMIT}"; \
+    test -n "${LLAMA_BOX_VERSION}"; \
+    test -n "${LLAMA_BOX_COMMIT}"; \
     test "${LLAMA_CPP_PACKAGE}" = "llama-cpp-cuda-${CUDA_VERSION}-${LLAMA_CPP_VERSION}-linux-x64"; \
     third_party_bin=/opt/gpustack/third_party/bin; \
     llama_cpp_dir="llama.cpp-${LLAMA_CPP_VERSION}-linux-amd64-cuda"; \
+    llama_box_dir="llama-box-${LLAMA_BOX_VERSION}-linux-amd64-cuda"; \
+    test "${LLAMA_BOX_PACKAGE}" = "llama-box-cuda-${CUDA_VERSION}-${LLAMA_BOX_VERSION}-linux-x64"; \
     mkdir -p "${third_party_bin}/llama.cpp/${llama_cpp_dir}"; \
+    mkdir -p "${third_party_bin}/llama-box/${llama_box_dir}"; \
     tar -xzf /tmp/llama.cpp.tar.gz \
       -C "${third_party_bin}/llama.cpp/${llama_cpp_dir}"; \
-    printf '{\n  "%s": "%s"\n}\n' \
+    tar -xzf /tmp/llama-box.tar.gz \
+      -C "${third_party_bin}/llama-box/${llama_box_dir}"; \
+    if find "${third_party_bin}/llama-box/${llama_box_dir}" -maxdepth 1 -type f \
+      \( -name llama-box -o -name 'lib*.so*' \) -exec ldd {} \; \
+      | grep -Eq 'lib(cudart|cublas).*\.so\.12'; then \
+      echo "llama-box unexpectedly links against CUDA 12" >&2; \
+      exit 1; \
+    fi; \
+    ln -s llama-box "${third_party_bin}/llama-box/${llama_box_dir}/llama-box-rpc-server"; \
+    ln -s "${llama_box_dir}" "${third_party_bin}/llama-box/llama-box-default"; \
+    printf '{\n  "%s": "%s",\n  "%s": "%s"\n}\n' \
       "${llama_cpp_dir}" "${LLAMA_CPP_VERSION}" \
+      "${llama_box_dir}" "${LLAMA_BOX_VERSION}" \
       > "${third_party_bin}/versions.json"; \
     install -m 0644 /tmp/llama.cpp.lock "${third_party_bin}/llama.cpp.lock"; \
+    install -m 0644 /tmp/llama-box.lock "${third_party_bin}/llama-box.lock"; \
     test -x "${third_party_bin}/llama.cpp/${llama_cpp_dir}/llama-server"; \
     test -x "${third_party_bin}/llama.cpp/${llama_cpp_dir}/ggml-rpc-server"; \
-    rm -f /tmp/llama.cpp.tar.gz /tmp/llama.cpp.lock
+    test -x "${third_party_bin}/llama-box/llama-box-default/llama-box"; \
+    test -x "${third_party_bin}/llama-box/llama-box-default/llama-box-rpc-server"; \
+    rm -f /tmp/llama.cpp.tar.gz /tmp/llama.cpp.lock \
+      /tmp/llama-box.tar.gz /tmp/llama-box.lock
 
 ARG PYPI_MIRROR=https://pypi.org/simple/
 

@@ -5,7 +5,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gpustack.schemas.models import BackendEnum
-from gpustack.worker.tools_manager import ToolsManager
+from gpustack.worker.tools_manager import (
+    BUILTIN_LLAMA_BOX_VERSION,
+    is_disabled_dynamic_link,
+    ToolsManager,
+)
 
 
 def test_install_llama_cpp_discovers_built_in_version(tmp_path, monkeypatch):
@@ -24,6 +28,64 @@ def test_install_llama_cpp_discovers_built_in_version(tmp_path, monkeypatch):
     manager = ToolsManager(system="linux", arch="amd64", device="cuda")
 
     assert manager.install_llama_cpp() == command
+
+
+def test_download_llama_box_reuses_bundled_cuda_build(tmp_path, monkeypatch):
+    third_party_bin = tmp_path / "third-party"
+    version_dir = f"llama-box-{BUILTIN_LLAMA_BOX_VERSION}-linux-amd64-cuda"
+    command = third_party_bin / "llama-box" / version_dir / "llama-box"
+    command.parent.mkdir(parents=True)
+    command.write_text("#!/bin/sh\n", encoding="utf-8")
+    command.chmod(0o755)
+    (third_party_bin / "versions.json").write_text(
+        json.dumps({version_dir: BUILTIN_LLAMA_BOX_VERSION}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GPUSTACK_THIRD_PARTY_BIN", str(third_party_bin))
+    monkeypatch.setenv("GPUSTACK_DISABLE_DYNAMIC_LINK_LLAMA_BOX", "true")
+    monkeypatch.setattr(
+        "gpustack.worker.tools_manager.platform.system", lambda: "linux"
+    )
+    monkeypatch.setattr("gpustack.worker.tools_manager.platform.arch", lambda: "amd64")
+    monkeypatch.setattr("gpustack.worker.tools_manager.platform.device", lambda: "cuda")
+
+    manager = ToolsManager(system="linux", arch="amd64", device="cuda")
+
+    with patch.object(manager, "_download_llama_box") as download:
+        manager.download_llama_box()
+
+    download.assert_not_called()
+    assert is_disabled_dynamic_link(BUILTIN_LLAMA_BOX_VERSION) is False
+    assert (command.parent / "llama-box-rpc-server").resolve() == command
+    assert (
+        third_party_bin / "llama-box" / "llama-box-default"
+    ).resolve() == command.parent
+
+
+def test_dynamic_link_disable_env_is_preserved_without_bundled_cuda_build(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GPUSTACK_THIRD_PARTY_BIN", str(tmp_path / "third-party"))
+    monkeypatch.setenv("GPUSTACK_DISABLE_DYNAMIC_LINK_LLAMA_BOX", "true")
+    monkeypatch.setattr(
+        "gpustack.worker.tools_manager.platform.system", lambda: "linux"
+    )
+    monkeypatch.setattr("gpustack.worker.tools_manager.platform.arch", lambda: "amd64")
+    monkeypatch.setattr("gpustack.worker.tools_manager.platform.device", lambda: "cuda")
+
+    assert is_disabled_dynamic_link(BUILTIN_LLAMA_BOX_VERSION) is True
+
+
+def test_bundled_override_is_not_applied_to_other_platforms(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUSTACK_THIRD_PARTY_BIN", str(tmp_path / "third-party"))
+    monkeypatch.setenv("GPUSTACK_DISABLE_DYNAMIC_LINK_LLAMA_BOX", "true")
+    monkeypatch.setattr(
+        "gpustack.worker.tools_manager.platform.system", lambda: "darwin"
+    )
+    monkeypatch.setattr("gpustack.worker.tools_manager.platform.arch", lambda: "arm64")
+    monkeypatch.setattr("gpustack.worker.tools_manager.platform.device", lambda: "mps")
+
+    assert is_disabled_dynamic_link(BUILTIN_LLAMA_BOX_VERSION) is True
 
 
 def test_prepare_versioned_backend_supports_vllm_omni():
