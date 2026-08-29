@@ -1191,4 +1191,32 @@ def is_disabled_dynamic_link(version: Optional[str]) -> Optional[bool]:
     if version < "v0.0.157":
         return True
 
+    if _has_bundled_cuda_llama_box(version):
+        return False
+
     return envs.get_gpustack_env_bool("DISABLE_DYNAMIC_LINK_LLAMA_BOX")
+
+
+def _has_bundled_cuda_llama_box(version: str) -> bool:
+    if (
+        platform.system() != "linux"
+        or platform.arch() != "amd64"
+        or platform.device() != platform.DeviceTypeEnum.CUDA.value
+    ):
+        return False
+
+    version_dir = get_llama_box_version_dir_name(version)
+    command = get_llama_box_command(
+        third_party_bin_path("llama-box", version_dir)
+    )
+    if not command.is_file():
+        return False
+
+    versions_file = third_party_bin_path("versions.json")
+    try:
+        with open(versions_file, "r", encoding="utf-8") as file:
+            versions = json.load(file)
+    except (OSError, ValueError):
+        return False
+
+    return versions.get(version_dir) == version

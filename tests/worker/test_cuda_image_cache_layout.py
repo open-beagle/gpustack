@@ -9,6 +9,7 @@ from gpustack.worker.tools_manager import (
 
 CUDA_VERSION = "13.0.3"
 GPUSTACK_VERSION = "0.7.7"
+UI_VERSION = "0.7.7"
 VLLM_VERSION = "0.26.0"
 
 
@@ -42,26 +43,54 @@ def test_cuda_release_versions_are_kept_in_sync():
     assert f'RUNTIME_TAG: "{runtime_tag}"' in release_workflow
     assert f"gpustack:{runtime_tag}" in app_dockerfile
     assert f'VERSION: "v{GPUSTACK_VERSION}"' in release_workflow
-    assert f'UI_VERSION: "v{GPUSTACK_VERSION}"' in release_workflow
+    assert f'UI_VERSION: "v{UI_VERSION}"' in release_workflow
 
+
+def test_cuda_app_uses_bundled_cuda_13_llama_box():
+    app_dockerfile = _read(".beagle/cuda.dockerfile")
+
+    assert "GPUSTACK_DISABLE_DYNAMIC_LINK_LLAMA_BOX=true" not in app_dockerfile
+
+
+def test_cuda_base_builds_and_installs_cuda_13_llama_box():
+    workflow = _read(".github/workflows/release-cuda-base.yml")
+    dockerfile = _read(".beagle/cuda-base.dockerfile")
+    build_script = _read(".beagle/build-cuda-llama-box.sh")
+    lock = _read(".beagle/llama-box.lock")
+
+    assert "LLAMA_BOX_VERSION=v0.0.171" in lock
+    assert "LLAMA_BOX_COMMIT=437e8041d4db2747d016c2d020415695f53a3159" in lock
+    assert "https://github.com/gpustack/llama-box.git" in build_script
+    assert "--recurse-submodules" in build_script
+    assert "-DGGML_CUDA=ON" in build_script
+    assert "-DGGML_RPC=ON" in build_script
+    assert "-DBUILD_SHARED_LIBS=ON" in build_script
+    assert "llama-box unexpectedly links against CUDA 12" in build_script
+    assert "lib(cudart|cublas).*\\.so\\.12" in build_script
+    assert "dist/llama-box.tar.gz" in workflow
+    assert "bash .beagle/build-cuda-llama-box.sh" in workflow
+    assert "gpustack/llama-box/${LLAMA_BOX_PACKAGE}" not in workflow
+    assert "COPY ./dist/llama-box.tar.gz /tmp/llama-box.tar.gz" in dockerfile
+    assert "llama-box-default" in dockerfile
+    assert "llama-box-rpc-server" in dockerfile
+    assert "llama-box unexpectedly links against CUDA 12" in dockerfile
 
 def test_cuda_base_builds_and_installs_cuda_13_llama_cpp():
     workflow = _read(".github/workflows/release-cuda-base.yml")
     dockerfile = _read(".beagle/cuda-base.dockerfile")
     build_script = _read(".beagle/build-cuda-tools.sh")
 
-    image_registry = "registry.cn-qingdao.aliyuncs.com/wod/cuda"
+    image_registry = "nvidia/cuda"
     assert f'BASE_IMG: {image_registry}:{CUDA_VERSION}-runtime-ubuntu24.04' in workflow
     assert (
         f'LLAMA_BUILD_IMG: {image_registry}:{CUDA_VERSION}-devel-ubuntu24.04'
         in workflow
     )
-    assert "bash .beagle/build-cuda-tools.sh" in workflow
+    assert "bash .beagle/build-cuda-llama-box.sh" in workflow
     assert 'CUDA_ARCHITECTURES: "75;80;86;89;90;100;120"' in workflow
     assert "LLAMA_CPP_VERSION:" not in workflow
 
     assert f"ARG BASE={image_registry}:{CUDA_VERSION}-runtime-ubuntu24.04" in dockerfile
-    assert "/etc/apt/sources.list.d/ubuntu.sources" in dockerfile
     assert "python3-venv" in dockerfile
     assert "python3 -m venv /opt/gpustack/venv" in dockerfile
     assert "PATH=/opt/gpustack/venv/bin:${PATH}" in dockerfile
@@ -79,7 +108,7 @@ def test_cuda_base_builds_and_installs_cuda_13_llama_cpp():
     assert ". /tmp/llama.cpp.lock" in dockerfile
     assert "ggml-rpc-server" in dockerfile
     assert "ggml-rpc-server" in build_script
-    assert "llama-box" not in dockerfile
+    assert "llama-box-default" in dockerfile
     assert "python3 -m pip check" in dockerfile
     assert "release 13.0" in dockerfile
     assert "12-8" not in dockerfile
