@@ -1,4 +1,7 @@
+import io
 import re
+import subprocess
+import tarfile
 from pathlib import Path
 
 from gpustack.worker.tools_manager import (
@@ -60,20 +63,166 @@ def test_cuda_base_builds_and_installs_cuda_13_llama_box():
 
     assert "LLAMA_BOX_VERSION=v0.0.171" in lock
     assert "LLAMA_BOX_COMMIT=437e8041d4db2747d016c2d020415695f53a3159" in lock
+    assert (
+        "LLAMA_BOX_SHA256="
+        "81b49650f237649996b204b37f3ce5bc3e92aa4a39d3d1539301440dc3c0ab2d"
+    ) in lock
     assert "https://github.com/gpustack/llama-box.git" in build_script
     assert "--recurse-submodules" in build_script
     assert "-DGGML_CUDA=ON" in build_script
     assert "-DGGML_RPC=ON" in build_script
     assert "-DBUILD_SHARED_LIBS=ON" in build_script
-    assert "llama-box unexpectedly links against CUDA 12" in build_script
     assert "lib(cudart|cublas).*\\.so\\.12" in build_script
     assert "dist/llama-box.tar.gz" in workflow
     assert "bash .beagle/build-cuda-llama-box.sh" in workflow
-    assert "gpustack/llama-box/${LLAMA_BOX_PACKAGE}" not in workflow
+    assert (
+        "https://cache.ali.wodcloud.com/vscode/gpustack/llama-box/"
+        "${LLAMA_BOX_PACKAGE}.tar.gz"
+    ) in workflow
+    assert "actual_sha256" in workflow
+    assert "--validate-package dist/llama-box.tar.gz" in workflow
+    cache_validation = workflow[
+        workflow.index('actual_sha256="$(sha256sum') : workflow.index(
+            'if [ "${cache_hit}" != "true" ]'
+        )
+    ]
+    assert "docker run" not in cache_validation
+    assert "cache_hit" in workflow
+    assert "mc cp" not in workflow
+    assert "mc mirror" not in workflow
+    assert "unsafe path" in build_script
+    assert "unsupported special files" in build_script
+    assert "NEEDED.*lib(cudart|cublas)" in build_script
+    assert "RPATH/RUNPATH" in build_script
+    assert "cuda_stub_dir=/usr/local/cuda/lib64/stubs" in build_script
+    assert 'ln -s "${cuda_stub_dir}/libcuda.so"' in build_script
+    assert build_script.index('if [ "${1:-}" = "--validate-package" ]') < (
+        build_script.index("apt-get update")
+    )
+    assert 'sha256sum "${DIST_DIR}/llama-box.tar.gz"' in build_script
     assert "COPY ./dist/llama-box.tar.gz /tmp/llama-box.tar.gz" in dockerfile
     assert "llama-box-default" in dockerfile
     assert "llama-box-rpc-server" in dockerfile
-    assert "llama-box unexpectedly links against CUDA 12" in dockerfile
+    assert "llama-box has invalid CUDA runtime dependencies" in dockerfile
+    assert "not found|lib(cudart|cublas).*\\.so\\.12" in dockerfile
+    assert "cuda_stub_dir=/usr/local/cuda/lib64/stubs" in dockerfile
+    assert 'ln -s "${cuda_stub_dir}/libcuda.so"' in dockerfile
+    assert 'LD_LIBRARY_PATH="${llama_box_path}:${cuda_stub_dir}' in dockerfile
+
+
+def test_cuda_llama_box_package_validator_rejects_path_traversal(tmp_path):
+    archive_path = tmp_path / "unsafe.tar.gz"
+    payload = b"unsafe"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        entry = tarfile.TarInfo("../escape")
+        entry.size = len(payload)
+        archive.addfile(entry, io.BytesIO(payload))
+
+    result = subprocess.run(
+        [
+            "bash",
+            ".beagle/build-cuda-llama-box.sh",
+            "--validate-package",
+            str(archive_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe path" in result.stderr
+
+
+def test_cuda_llama_box_package_validator_accepts_valid_elf(tmp_path):
+    source_path = tmp_path / "llama-box.c"
+    executable_path = tmp_path / "llama-box"
+    archive_path = tmp_path / "valid.tar.gz"
+    source_path.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "gcc",
+            str(source_path),
+            "-Wl,-rpath,$ORIGIN",
+            "-o",
+            str(executable_path),
+        ],
+        check=True,
+    )
+    with tarfile.open(archive_path, "w:gz") as archive:
+        archive.add(executable_path, arcname="llama-box")
+
+    result = subprocess.run(
+        [
+            "bash",
+            ".beagle/build-cuda-llama-box.sh",
+            "--validate-package",
+            str(archive_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Validated llama-box package" in result.stdout
+
+
+def test_cuda_llama_box_package_validator_rejects_cuda_12_needed(tmp_path):
+    library_source = tmp_path / "cudart.c"
+    main_source = tmp_path / "llama-box.c"
+    library_path = tmp_path / "libcudart.so.12"
+    executable_path = tmp_path / "llama-box"
+    archive_path = tmp_path / "cuda12.tar.gz"
+    library_source.write_text("int cuda_test(void) { return 0; }\n", encoding="utf-8")
+    main_source.write_text(
+        "extern int cuda_test(void); int main(void) { return cuda_test(); }\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "gcc",
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libcudart.so.12",
+            str(library_source),
+            "-o",
+            str(library_path),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "gcc",
+            str(main_source),
+            "-Wl,-rpath,$ORIGIN",
+            f"-L{tmp_path}",
+            "-Wl,--no-as-needed",
+            "-l:libcudart.so.12",
+            "-o",
+            str(executable_path),
+        ],
+        check=True,
+    )
+    with tarfile.open(archive_path, "w:gz") as archive:
+        archive.add(executable_path, arcname="llama-box")
+        archive.add(library_path, arcname="libcudart.so.12")
+
+    result = subprocess.run(
+        [
+            "bash",
+            ".beagle/build-cuda-llama-box.sh",
+            "--validate-package",
+            str(archive_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "invalid CUDA ABI dependencies" in result.stderr
+
 
 def test_cuda_base_builds_and_installs_cuda_13_llama_cpp():
     workflow = _read(".github/workflows/release-cuda-base.yml")

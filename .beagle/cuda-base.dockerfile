@@ -83,12 +83,25 @@ RUN set -eux; \
       -C "${third_party_bin}/llama.cpp/${llama_cpp_dir}"; \
     tar -xzf /tmp/llama-box.tar.gz \
       -C "${third_party_bin}/llama-box/${llama_box_dir}"; \
-    if find "${third_party_bin}/llama-box/${llama_box_dir}" -maxdepth 1 -type f \
-      \( -name llama-box -o -name 'lib*.so*' \) -exec ldd {} \; \
-      | grep -Eq 'lib(cudart|cublas).*\.so\.12'; then \
-      echo "llama-box unexpectedly links against CUDA 12" >&2; \
-      exit 1; \
+    llama_box_path="${third_party_bin}/llama-box/${llama_box_dir}"; \
+    cuda_stub_dir=/usr/local/cuda/lib64/stubs; \
+    if [ ! -e "${cuda_stub_dir}/libcuda.so.1" ] && [ -e "${cuda_stub_dir}/libcuda.so" ]; then \
+      ln -s "${cuda_stub_dir}/libcuda.so" "${cuda_stub_dir}/libcuda.so.1"; \
     fi; \
+    find "${llama_box_path}" -maxdepth 1 -type f \
+      \( -name llama-box -o -name 'lib*.so*' \) -print | \
+      while IFS= read -r file; do \
+        if ! ldd_output="$(LD_LIBRARY_PATH="${llama_box_path}:${cuda_stub_dir}:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ldd "${file}" 2>&1)"; then \
+          echo "failed to resolve llama-box ELF dependencies: ${file}" >&2; \
+          echo "${ldd_output}" >&2; \
+          exit 1; \
+        fi; \
+        if echo "${ldd_output}" | grep -Eq 'not found|lib(cudart|cublas).*\.so\.12'; then \
+          echo "llama-box has invalid CUDA runtime dependencies: ${file}" >&2; \
+          echo "${ldd_output}" >&2; \
+          exit 1; \
+        fi; \
+      done; \
     ln -s llama-box "${third_party_bin}/llama-box/${llama_box_dir}/llama-box-rpc-server"; \
     ln -s "${llama_box_dir}" "${third_party_bin}/llama-box/llama-box-default"; \
     printf '{\n  "%s": "%s",\n  "%s": "%s"\n}\n' \
