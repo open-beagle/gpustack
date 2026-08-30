@@ -544,7 +544,7 @@ def test_default_task_creator_builds_real_scheduled_task_without_plain_credentia
     monkeypatch.setattr(
         model_preheat_schedule_controller,
         "resolve_model_preheat_revision",
-        lambda source, model_id, revision, token=None: revision,
+        lambda source, model_id, revision, token=None, **kwargs: revision,
     )
 
     async def run():
@@ -613,7 +613,7 @@ def test_default_task_creator_rejects_profile_maintained_before_final_lock(
     monkeypatch.setattr(
         model_preheat_schedule_controller,
         "resolve_model_preheat_revision",
-        lambda source, model_id, revision, token=None: revision,
+        lambda source, model_id, revision, token=None, **kwargs: revision,
     )
     monkeypatch.setattr(
         model_preheat_schedule_controller,
@@ -699,7 +699,7 @@ def test_same_gpu_model_creator_does_not_reinclude_busy_worker(tmp_path, monkeyp
     monkeypatch.setattr(
         model_preheat_schedule_controller,
         "resolve_model_preheat_revision",
-        lambda source, model_id, revision, token=None: revision,
+        lambda source, model_id, revision, token=None, **kwargs: revision,
     )
 
     async def run():

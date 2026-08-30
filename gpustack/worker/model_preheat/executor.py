@@ -187,10 +187,15 @@ def execute_seed_preheat(
                 "progress_callback": progress_callback,
             }
             if request.identity.source == "ollama_library":
-                download_kwargs["private_cache_dir"] = request.cache_dir / ".ollama-auth"
+                download_kwargs["private_cache_dir"] = (
+                    request.cache_dir / ".ollama-auth"
+                )
             downloader(request.identity, staging, **download_kwargs)
         identity = request.identity
-        if identity.source == "ollama_library" and identity.revision == "ollama-pending":
+        if (
+            identity.source == "ollama_library"
+            and identity.revision == "ollama-pending"
+        ):
             filename = ollama_model_filename(decode_path(identity.model_path))
             blob = staging / filename
             if not blob.is_file():
@@ -202,9 +207,11 @@ def execute_seed_preheat(
                 revision=local_snapshot_revision(
                     source_index=_sha256_file(
                         blob,
-                        (lambda: _raise_if_cancelled(cancel_check))
-                        if cancel_check is not None
-                        else None,
+                        (
+                            (lambda: _raise_if_cancelled(cancel_check))
+                            if cancel_check is not None
+                            else None
+                        ),
                     ),
                     source=identity.source,
                     resolved_paths=[filename],
@@ -369,7 +376,10 @@ def _ready_result(
     resolved_revision=None,
 ):
     manifest_bytes = manifest.to_artifact_json_bytes()
-    resolved_revision = resolved_revision or decode_path(manifest.identity.revision_path)
+    resolved_revision = resolved_revision or decode_path(
+        manifest.identity.revision_path
+    )
+    resolved_paths = _resolved_paths_for_manifest(request.target_dir, manifest)
     return {
         "state": "ready",
         "request_digest": request.request_digest,
@@ -384,7 +394,15 @@ def _ready_result(
         "skipped": skipped,
         "downloaded": downloaded,
         "resolved_revision": resolved_revision,
+        "local_dir": str(request.target_dir),
+        "resolved_paths": resolved_paths,
     }
+
+
+def _resolved_paths_for_manifest(target_dir, manifest):
+    if not manifest.identity.file_patterns:
+        return [str(target_dir)]
+    return [str(Path(target_dir) / decode_path(file.path)) for file in manifest.files]
 
 
 def _error_result(error_code, *args, **kwargs):

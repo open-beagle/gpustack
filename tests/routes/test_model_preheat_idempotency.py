@@ -121,7 +121,7 @@ def _test_app(tmp_path):
         huggingface_token=None,
     )
     app.state.model_preheat_revision_resolver = (
-        lambda source, model_id, revision, token=None: revision
+        lambda source, model_id, revision, token=None, **kwargs: revision
     )
 
     async def session_override():

@@ -77,7 +77,7 @@ def _app(tmp_path):
         huggingface_token=None,
     )
     app.state.model_file_download_revision_resolver = (
-        lambda source, model_id, revision, token=None: SHA
+        lambda source, model_id, revision, token=None, **kwargs: SHA
     )
     app.state.model_file_download_file_listing_resolver = (
         lambda source, model_id, revision, token=None: ["model.gguf"]
@@ -606,7 +606,7 @@ def test_claim_requires_complete_artifact_for_glob_selection(
     app, engine, key = _app(tmp_path)
     _, model_file_id, _ = asyncio.run(_seed(engine, key, filename="*.gguf"))
     app.state.model_file_download_file_listing_resolver = (
-        lambda source, model_id, revision, token=None: [
+        lambda source, model_id, revision, token=None, **kwargs: [
             "model-1.gguf",
             "model-2.gguf",
         ]
@@ -659,7 +659,7 @@ def test_concurrent_first_claim_returns_one_pinned_revision(tmp_path):
     lock = threading.Lock()
     revisions = iter(("a" * 40, "b" * 40))
 
-    def resolver(source, model_id, revision, token=None):
+    def resolver(source, model_id, revision, token=None, **kwargs):
         with lock:
             resolved = next(revisions)
         barrier.wait(timeout=5)

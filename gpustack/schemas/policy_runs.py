@@ -17,8 +17,11 @@ class PolicyRunExecutionStateEnum(str, Enum):
 class PolicyRunTaskPublic(SQLModel):
     id: Optional[int] = None
     model_file_id: Optional[int] = None
+    model_id: Optional[str] = None
     worker_id: Optional[int] = None
     worker_uuid: Optional[str] = None
+    worker_name: Optional[str] = None
+    worker_ip: Optional[str] = None
     artifact_id: Optional[str] = None
     state: str
     progress: float = 0

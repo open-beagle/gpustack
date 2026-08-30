@@ -394,7 +394,9 @@ def test_sync_policy_run_now_creates_existing_sync_task_and_replays(app, client)
     assert detail.status_code == 200
     assert detail.json()["model_file_id"] == model_file_id
     policies = client.get("/v1/model-storage-sync-policies")
-    assert policies.json()["items"][0]["last_run_at"] == first.json()["window_start_utc"]
+    assert (
+        policies.json()["items"][0]["last_run_at"] == first.json()["window_start_utc"]
+    )
     latest = policies.json()["items"][0]["latest_run"]
     assert latest["id"] == first.json()["id"]
     assert latest["execution_state"] == "waiting"
@@ -1565,8 +1567,11 @@ def test_selected_worker_policy_resolves_latest_registration_by_uuid(app, client
     assert run.json()["response_payload"]["skipped"] == [
         {
             "model_file_id": None,
+            "model_id": None,
             "worker_id": None,
             "worker_uuid": "worker-a-uuid",
+            "worker_name": None,
+            "worker_ip": None,
             "task_id": None,
             "reason": "worker_protocol_unsupported",
         }

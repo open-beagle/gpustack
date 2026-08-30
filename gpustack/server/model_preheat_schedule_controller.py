@@ -1008,6 +1008,8 @@ async def create_scheduled_model_preheat_task(
         task_in.source,
         task_in.model_id,
         task_in.revision,
+        include_patterns=task_in.include_patterns,
+        exclude_patterns=task_in.exclude_patterns,
         token=getattr(config, "huggingface_token", None),
     )
     resolved_revision = resolved_revision or "ollama-pending"

@@ -83,7 +83,7 @@ def _test_app(tmp_path):
         huggingface_token=None,
     )
     app.state.model_preheat_revision_resolver = (
-        lambda source, model_id, revision, token=None: revision
+        lambda source, model_id, revision, token=None, **kwargs: revision
     )
 
     async def session_override():
@@ -315,8 +315,8 @@ def test_creation_resolves_requested_revision_before_persisting(tmp_path):
     profile, workers = asyncio.run(seed())
     calls = []
 
-    def resolver(source, model_id, revision, token=None):
-        calls.append((source, model_id, revision, token))
+    def resolver(source, model_id, revision, token=None, **kwargs):
+        calls.append((source, model_id, revision, token, kwargs))
         return "a" * 40
 
     app.state.model_preheat_revision_resolver = resolver
@@ -334,7 +334,18 @@ def test_creation_resolves_requested_revision_before_persisting(tmp_path):
     assert response.status_code == 200, response.text
     assert response.json()["requested_revision"] == "release-branch"
     assert response.json()["resolved_revision"] == "a" * 40
-    assert calls == [("huggingface", "Qwen/Qwen-Image-2512", "release-branch", None)]
+    assert calls == [
+        (
+            "huggingface",
+            "Qwen/Qwen-Image-2512",
+            "release-branch",
+            None,
+            {
+                "include_patterns": ["config.json", "weights/*.safetensors"],
+                "exclude_patterns": [],
+            },
+        )
+    ]
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 
@@ -796,7 +807,7 @@ def test_creation_resolves_and_persists_default_revision(tmp_path):
 
     profile, workers = asyncio.run(seed())
     app.state.model_preheat_revision_resolver = (
-        lambda source, model_id, revision, token=None: "c" * 40
+        lambda source, model_id, revision, token=None, **kwargs: "c" * 40
     )
     with TestClient(app) as client:
         response = client.post(

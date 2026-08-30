@@ -17,6 +17,7 @@ from gpustack.model_preheat_credentials import (
 )
 from gpustack.routes import model_preheat_worker_tasks
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatBackfillPolicyEnum,
@@ -87,6 +88,7 @@ async def _seed(
     source="modelscope",
     model_id="Qwen/Test",
     resolved_revision="a" * 40,
+    role=ModelPreheatWorkerTaskRoleEnum.SEED,
 ):
     cipher = ModelPreheatCredentialCipher(key, "v1")
     identity = ModelPreheatIdentity(
@@ -165,7 +167,7 @@ async def _seed(
             task_id=task.id,
             worker_uuid=worker.worker_uuid,
             worker_id=worker.id,
-            role=ModelPreheatWorkerTaskRoleEnum.SEED,
+            role=role,
         )
         session.add(child)
         await session.flush()
@@ -393,6 +395,170 @@ def test_seed_complete_cas_binds_artifact_and_inventory(tmp_path):
     asyncio.run(engine.dispose())
 
 
+def test_distribution_complete_registers_ready_model_file(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    artifact_id = "c" * 64
+    child_id, _task_id, request_digest = asyncio.run(
+        _seed(
+            engine,
+            key,
+            artifact_id=artifact_id,
+            model_id="Qwen/Qwen-7B-Chat-Int8",
+            role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+        )
+    )
+    result = {
+        **_ready_result(request_digest, artifact_id),
+        "transfer_source": "s3",
+        "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8",
+        "resolved_paths": [
+            "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
+        ],
+    }
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            rows = (await session.exec(select(ModelFile))).all()
+            return rows
+
+    model_files = asyncio.run(inspect())
+    assert completed.status_code == 200, completed.text
+    assert len(model_files) == 1
+    model_file = model_files[0]
+    assert model_file.state == ModelFileStateEnum.READY
+    assert model_file.worker_id == 1
+    assert model_file.model_scope_model_id == "Qwen/Qwen-7B-Chat-Int8"
+    assert model_file.resolved_revision == "a" * 40
+    assert model_file.resolved_paths == [
+        "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
+    ]
+    asyncio.run(engine.dispose())
+
+
+@pytest.mark.parametrize(
+    "result_patch",
+    [
+        {"resolved_paths": None},
+        {
+            "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8",
+            "resolved_paths": ["/tmp/outside/model.bin"],
+        },
+        {
+            "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8",
+            "resolved_paths": [
+                "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8/../outside/model.bin"
+            ],
+        },
+        {
+            "local_dir": "relative/cache",
+            "resolved_paths": ["relative/cache/model.bin"],
+        },
+    ],
+)
+def test_distribution_complete_rejects_untrusted_model_paths(tmp_path, result_patch):
+    app, engine, key = _test_app(tmp_path)
+    artifact_id = "c" * 64
+    child_id, _task_id, request_digest = asyncio.run(
+        _seed(
+            engine,
+            key,
+            artifact_id=artifact_id,
+            model_id="Qwen/Qwen-7B-Chat-Int8",
+            role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+        )
+    )
+    result = {
+        **_ready_result(request_digest, artifact_id),
+        "transfer_source": "s3",
+        "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8",
+        "resolved_paths": [
+            "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
+        ],
+        **result_patch,
+    }
+    if result["resolved_paths"] is None:
+        result.pop("resolved_paths")
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def count_model_files():
+        async with AsyncSession(engine) as session:
+            return len((await session.exec(select(ModelFile))).all())
+
+    assert completed.status_code == 422, completed.text
+    assert completed.json()["message"] == "invalid_preheat_result"
+    assert asyncio.run(count_model_files()) == 0
+    asyncio.run(engine.dispose())
+
+
+def test_distribution_complete_accepts_windows_absolute_model_paths(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    artifact_id = "c" * 64
+    child_id, _task_id, request_digest = asyncio.run(
+        _seed(
+            engine,
+            key,
+            artifact_id=artifact_id,
+            model_id="Qwen/Qwen-7B-Chat-Int8",
+            role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+        )
+    )
+    result = {
+        **_ready_result(request_digest, artifact_id),
+        "transfer_source": "s3",
+        "local_dir": "C:\\gpustack\\cache\\model_scope\\Qwen\\Qwen-7B-Chat-Int8",
+        "resolved_paths": [
+            "C:\\gpustack\\cache\\model_scope\\Qwen\\Qwen-7B-Chat-Int8\\model.safetensors"
+        ],
+    }
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            rows = (await session.exec(select(ModelFile))).all()
+            return rows
+
+    model_files = asyncio.run(inspect())
+    assert completed.status_code == 200, completed.text
+    assert len(model_files) == 1
+    assert model_files[0].local_dir == result["local_dir"]
+    assert model_files[0].resolved_paths == result["resolved_paths"]
+    asyncio.run(engine.dispose())
+
+
 @pytest.mark.parametrize(
     ("source", "model_id", "revision", "filename"),
     [
@@ -539,11 +705,13 @@ def test_pending_ollama_complete_binds_only_actual_local_snapshot(tmp_path):
                 "result": result,
             },
         )
+
     async def inspect():
         async with AsyncSession(engine) as session:
             parent = await session.get(ModelPreheatTask, task_id)
             artifact = (await session.exec(select(ModelPreheatArtifact))).one()
             return parent, artifact
+
     parent, artifact = asyncio.run(inspect())
     assert completed.status_code == 200, completed.text
     assert parent.resolved_revision == result["resolved_revision"]
@@ -553,7 +721,14 @@ def test_pending_ollama_complete_binds_only_actual_local_snapshot(tmp_path):
 
 @pytest.mark.parametrize(
     "resolved_revision",
-    ["local-snapshot-x", "local-snapshot-" + "A" * 64, "local-snapshot-" + "a" * 63, 1, [], None],
+    [
+        "local-snapshot-x",
+        "local-snapshot-" + "A" * 64,
+        "local-snapshot-" + "a" * 63,
+        1,
+        [],
+        None,
+    ],
 )
 def test_pending_ollama_complete_rejects_malformed_snapshot_without_binding(
     tmp_path, resolved_revision

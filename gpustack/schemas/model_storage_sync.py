@@ -139,6 +139,8 @@ class ModelStorageSyncTaskPublic(SQLModel):
     model_file_id: int
     worker_id: int
     worker_uuid: str
+    worker_name: Optional[str] = None
+    worker_ip: Optional[str] = None
     profile_id: int
     profile_config_version: int
     request_digest: str
@@ -156,6 +158,7 @@ class ModelStorageSyncTaskPublic(SQLModel):
     transfer_profile_id: Optional[int] = None
     source_worker_id: Optional[int] = None
     source_worker_name: Optional[str] = None
+    source_worker_ip: Optional[str] = None
     profile_name: Optional[str] = None
     profile_endpoint: Optional[str] = None
     profile_bucket: Optional[str] = None
@@ -235,8 +238,11 @@ class ModelStorageSyncBatchCreate(SQLModel):
 
 class ModelStorageSyncBatchItem(SQLModel):
     model_file_id: Optional[int] = None
+    model_id: Optional[str] = None
     worker_id: Optional[int] = None
     worker_uuid: Optional[str] = None
+    worker_name: Optional[str] = None
+    worker_ip: Optional[str] = None
     task_id: Optional[int] = None
     reason: Optional[str] = None
 
@@ -294,6 +300,8 @@ class ModelStorageSyncTaskDetail(SQLModel):
     model_file_id: int
     worker_id: int
     worker_uuid: str
+    worker_name: Optional[str] = None
+    worker_ip: Optional[str] = None
     # 模型身份来源（ModelScope / Hugging Face）。
     source: str
     model_id: str
@@ -306,6 +314,7 @@ class ModelStorageSyncTaskDetail(SQLModel):
     transfer_profile_id: Optional[int] = None
     source_worker_id: Optional[int] = None
     source_worker_name: Optional[str] = None
+    source_worker_ip: Optional[str] = None
     artifact_id: Optional[str] = None
     state: ModelStorageSyncTaskStateEnum
     state_message: Optional[str] = None

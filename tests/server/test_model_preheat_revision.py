@@ -2,6 +2,7 @@ import pytest
 
 from gpustack.server.model_preheat_revision import (
     ModelPreheatRevisionResolutionError,
+    modelscope_filelist_revision,
     resolve_model_preheat_revision,
 )
 
@@ -127,6 +128,103 @@ def test_modelscope_aliases_with_same_files_share_fingerprint():
     }
 
     assert len(resolved) == 1
+
+
+def test_modelscope_file_fingerprint_ignores_default_git_metadata():
+    base_rows = [
+        type(
+            "File",
+            (),
+            {"path": "model.bin", "size": 10, "blob_id": "a" * 64},
+        )(),
+    ]
+    with_metadata = [
+        *base_rows,
+        type(
+            "File",
+            (),
+            {"path": ".gitattributes", "size": 1, "blob_id": "b" * 64},
+        )(),
+    ]
+    changed_metadata = [
+        *base_rows,
+        type(
+            "File",
+            (),
+            {"path": ".gitattributes", "size": 2, "blob_id": "c" * 64},
+        )(),
+    ]
+
+    assert modelscope_filelist_revision(with_metadata) == modelscope_filelist_revision(
+        changed_metadata
+    )
+
+
+def test_modelscope_file_fingerprint_keeps_explicit_git_metadata():
+    rows = [
+        type(
+            "File",
+            (),
+            {"path": ".gitattributes", "size": 1, "blob_id": "a" * 64},
+        )(),
+    ]
+    changed = [
+        type(
+            "File",
+            (),
+            {"path": ".gitattributes", "size": 1, "blob_id": "b" * 64},
+        )(),
+    ]
+
+    assert modelscope_filelist_revision(
+        rows, include_patterns=[".gitattributes"]
+    ) != modelscope_filelist_revision(changed, include_patterns=[".gitattributes"])
+
+
+def test_modelscope_revision_resolution_uses_requested_file_selection():
+    class FakeHubApi:
+        def get_valid_revision(self, model_id, revision=None):
+            return revision
+
+    class FakeFileApi:
+        def list_repo_files(self, model_id, repo_type, *, revision, recursive):
+            return [
+                type(
+                    "File",
+                    (),
+                    {"path": ".gitattributes", "size": 1, "blob_id": "a" * 64},
+                )(),
+                type(
+                    "File",
+                    (),
+                    {"path": "model.bin", "size": 10, "blob_id": "b" * 64},
+                )(),
+                type(
+                    "File",
+                    (),
+                    {"path": "notes.md", "size": 2, "blob_id": "c" * 64},
+                )(),
+            ]
+
+    resolved = resolve_model_preheat_revision(
+        "modelscope",
+        "org/model",
+        "release",
+        include_patterns=["*.bin"],
+        modelscope_api_factory=FakeHubApi,
+        modelscope_file_api_factory=FakeFileApi,
+    )
+
+    assert resolved == modelscope_filelist_revision(
+        [
+            type(
+                "File",
+                (),
+                {"path": "model.bin", "size": 10, "blob_id": "b" * 64},
+            )()
+        ],
+        include_patterns=["*.bin"],
+    )
 
 
 def test_modelscope_file_fingerprint_rejects_missing_content_digest():

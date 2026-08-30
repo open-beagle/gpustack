@@ -1,6 +1,8 @@
 import hashlib
 import hmac
 import json
+import ntpath
+import posixpath
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -24,6 +26,7 @@ from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
 )
+from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.model_preheats import (
     ModelPreheatDesiredStateEnum,
     ModelPreheatExecutionStateEnum,
@@ -48,6 +51,7 @@ from gpustack.schemas.model_preheats import (
     is_terminal_task,
 )
 from gpustack.schemas.workers import MODEL_STORAGE_PROTOCOL_VERSION, Worker
+from gpustack.schemas.models import SourceEnum
 from gpustack.server.bus import EventType
 from gpustack.server.deps import EngineDep, ListParamsDep, SessionDep
 from gpustack.server.model_preheat_connectivity import aggregate_connectivity_check
@@ -163,6 +167,8 @@ PREHEAT_RESULT_FIELDS = {
     "downloaded",
     "total_size",
     "resolved_revision",
+    "local_dir",
+    "resolved_paths",
     "cursor",
 }
 PREHEAT_RESULT_STATES = {"ready", "error"}
@@ -171,6 +177,8 @@ PREHEAT_CURSOR_FIELDS = {"completed_files", "staging_exists"}
 MAX_PREHEAT_OBJECT_PATH_LENGTH = 2048
 MAX_PREHEAT_CURSOR_FILES = 1024
 MAX_PREHEAT_CURSOR_PATH_LENGTH = 1024
+MAX_PREHEAT_RESOLVED_PATHS = 1024
+MAX_PREHEAT_RESOLVED_PATH_LENGTH = 4096
 MAX_STATE_MESSAGE_LENGTH = 256
 STATE_MESSAGE_ALLOWLIST = {
     "distributing",
@@ -989,7 +997,146 @@ async def _bind_preheat_artifact(session, worker_task, result, now):
         )
     elif parent.artifact_id != artifact_id:
         _conflict("artifact_binding_conflict")
+    if worker_task.role == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE:
+        _validate_distributed_model_paths(result)
+        await _upsert_distributed_model_file(session, parent, worker_task, result, now)
     await session.flush()
+
+
+async def _upsert_distributed_model_file(session, parent, worker_task, result, now):
+    source = _model_file_source(parent.source)
+    model_source = _model_file_source_fields(
+        source,
+        parent.model_id,
+        parent.include_patterns,
+        result.get("resolved_paths") or [],
+    )
+    source_index = _distributed_model_source_index(
+        worker_task.worker_id,
+        parent.s3_profile_id,
+        result["artifact_id"],
+    )
+    existing = (
+        await session.exec(
+            select(ModelFile).where(ModelFile.source_index == source_index)
+        )
+    ).first()
+    worker = (
+        await session.get(Worker, worker_task.worker_id)
+        if worker_task.worker_id is not None
+        else None
+    )
+    values = {
+        "source": source,
+        **model_source,
+        "local_dir": result["local_dir"],
+        "worker_id": worker_task.worker_id,
+        "worker_uuid_snapshot": worker_task.worker_uuid,
+        "worker_name_snapshot": worker.name if worker is not None else None,
+        "cleanup_on_delete": False,
+        "size": result["total_size"],
+        "download_progress": 100,
+        "resolved_paths": result.get("resolved_paths") or [],
+        "state": ModelFileStateEnum.READY,
+        "state_message": None,
+        "requested_revision": parent.requested_revision,
+        "resolved_revision": result["resolved_revision"],
+        "updated_at": now,
+    }
+    if existing is None:
+        session.add(ModelFile(source_index=source_index, **values))
+        return
+    for field, value in values.items():
+        setattr(existing, field, value)
+    session.add(existing)
+
+
+def _model_file_source(source):
+    if source == "modelscope":
+        return SourceEnum.MODEL_SCOPE
+    if source == "huggingface":
+        return SourceEnum.HUGGING_FACE
+    if source == "ollama_library":
+        return SourceEnum.OLLAMA_LIBRARY
+    raise HTTPException(422, "Invalid", "invalid_preheat_result")
+
+
+def _model_file_source_fields(source, model_id, include_patterns, resolved_paths):
+    first_pattern = include_patterns[0] if include_patterns else None
+    if source == SourceEnum.MODEL_SCOPE:
+        return {
+            "model_scope_model_id": model_id,
+            "model_scope_file_path": first_pattern if first_pattern else None,
+        }
+    if source == SourceEnum.HUGGING_FACE:
+        return {
+            "huggingface_repo_id": model_id,
+            "huggingface_filename": first_pattern if first_pattern else None,
+        }
+    if source == SourceEnum.OLLAMA_LIBRARY:
+        return {"ollama_library_model_name": model_id}
+    raise HTTPException(422, "Invalid", "invalid_preheat_result")
+
+
+def _validate_distributed_model_paths(result):
+    local_dir = result.get("local_dir")
+    resolved_paths = result.get("resolved_paths")
+    if not _is_valid_local_dir(local_dir) or not resolved_paths:
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    path_module = _path_module_for_paths([local_dir, *resolved_paths])
+    normalized_local_dir = path_module.normpath(local_dir)
+    for path in resolved_paths:
+        normalized_path = path_module.normpath(path)
+        try:
+            if (
+                path_module.commonpath([normalized_local_dir, normalized_path])
+                != normalized_local_dir
+            ):
+                raise HTTPException(422, "Invalid", "invalid_preheat_result")
+        except ValueError:
+            raise HTTPException(422, "Invalid", "invalid_preheat_result") from None
+
+
+def _distributed_model_local_dir(resolved_paths):
+    if not resolved_paths:
+        return None
+    if len(resolved_paths) == 1:
+        return resolved_paths[0]
+    path_module = _path_module_for_paths(resolved_paths)
+    try:
+        common = path_module.commonpath(
+            [path_module.normpath(path) for path in resolved_paths]
+        )
+    except ValueError:
+        return path_module.dirname(resolved_paths[0])
+    if common in resolved_paths:
+        return common
+    return common if common else path_module.dirname(resolved_paths[0])
+
+
+def _path_module_for_paths(paths):
+    return (
+        ntpath
+        if any("\\" in path or _has_windows_drive(path) for path in paths)
+        else posixpath
+    )
+
+
+def _has_windows_drive(path):
+    return len(path) >= 2 and path[1] == ":"
+
+
+def _distributed_model_source_index(worker_id, profile_id, artifact_id):
+    seed = json.dumps(
+        {
+            "worker_id": worker_id,
+            "profile_id": profile_id,
+            "artifact_id": artifact_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(f"distributed-artifact:{seed}".encode("utf-8")).hexdigest()
 
 
 async def _task_or_404(session, worker_task_id):
@@ -1127,6 +1274,8 @@ def _validated_preheat_result(value):
     for field in ("manifest_path",):
         if field in value and not _is_canonical_object_path(value[field]):
             raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    if "local_dir" in value and not _is_valid_local_dir(value["local_dir"]):
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
     if value.get("transfer_source") not in {
         "current_node",
         "s3",
@@ -1139,9 +1288,12 @@ def _validated_preheat_result(value):
     for field in ("uploaded", "skipped", "downloaded", "file_count", "total_size"):
         if field in value and (not isinstance(value[field], int) or value[field] < 0):
             raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    resolved_paths = None
+    if "resolved_paths" in value:
+        resolved_paths = _validated_resolved_paths(value["resolved_paths"])
     cursor = _validated_cursor_value(value.get("cursor"))
     if state == "ready":
-        return {
+        sanitized = {
             field: value[field]
             for field in (
                 "state",
@@ -1157,8 +1309,13 @@ def _validated_preheat_result(value):
                 "downloaded",
                 "total_size",
                 "resolved_revision",
+                "local_dir",
             )
+            if field in value
         }
+        if resolved_paths is not None:
+            sanitized["resolved_paths"] = resolved_paths
+        return sanitized
     sanitized = {
         "state": value["state"],
         "error_code": value["error_code"],
@@ -1178,6 +1335,38 @@ def _validated_cursor(role, value):
     }:
         raise HTTPException(422, "Invalid", "resumable_cursor_not_supported")
     return _validated_cursor_value(value)
+
+
+def _validated_resolved_paths(value):
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > MAX_PREHEAT_RESOLVED_PATHS
+        or not all(
+            isinstance(path, str)
+            and path
+            and _is_abs_path(path)
+            and len(path) <= MAX_PREHEAT_RESOLVED_PATH_LENGTH
+            and not any(ord(char) < 32 or ord(char) == 127 for char in path)
+            for path in value
+        )
+    ):
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    return value
+
+
+def _is_valid_local_dir(value):
+    return (
+        isinstance(value, str)
+        and value
+        and _is_abs_path(value)
+        and len(value) <= MAX_PREHEAT_RESOLVED_PATH_LENGTH
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+
+def _is_abs_path(path):
+    return _path_module_for_paths([path]).isabs(path)
 
 
 def _validated_cursor_value(value):

@@ -20,6 +20,7 @@ from modelscope_hub.api import HubApi as ModelScopeHubApi
 from modelscope.hub.snapshot_download import (
     snapshot_download as modelscope_snapshot_download,
 )
+from modelscope.hub.errors import NotExistError as ModelScopeNotExistError
 from modelscope.hub.file_download import model_file_download
 from modelscope.hub.utils.utils import model_id_to_group_owner_name
 import base64
@@ -53,8 +54,11 @@ from gpustack.worker.model_preheat.s3_client import (
     ModelPreheatS3ManifestError,
 )
 from gpustack.server.model_preheat_revision import (
+    is_modelscope_git_metadata_path,
     is_modelscope_filelist_revision,
+    modelscope_file_selected,
     modelscope_filelist_revision,
+    modelscope_patterns_select_git_metadata,
     modelscope_upstream_revision,
 )
 
@@ -264,6 +268,8 @@ def download_model_with_execution(
         model.model_scope_model_id,
         upstream_revision,
         expected_revision,
+        execution.include_patterns,
+        execution.exclude_patterns,
     )
     result = ModelScopeDownloader.download(
         model_id=model.model_scope_model_id,
@@ -278,6 +284,8 @@ def download_model_with_execution(
         model.model_scope_model_id,
         upstream_revision,
         expected_revision,
+        execution.include_patterns,
+        execution.exclude_patterns,
     )
     return result
 
@@ -482,6 +490,11 @@ def download_resolved_revision_to_staging(
             model_id,
             revision,
             resolved_revision,
+            patterns,
+            ignored_patterns,
+        )
+        modelscope_ignore_patterns = _modelscope_download_ignore_patterns(
+            patterns, ignored_patterns
         )
         if cancel_check is None and progress_callback is None:
             modelscope_snapshot_download(
@@ -489,13 +502,15 @@ def download_resolved_revision_to_staging(
                 revision=revision,
                 local_dir=str(destination),
                 allow_patterns=patterns or None,
-                ignore_patterns=ignored_patterns or None,
+                ignore_patterns=modelscope_ignore_patterns or None,
                 max_workers=ModelScopeDownloader._max_workers,
             )
             _verify_modelscope_filelist_revision(
                 model_id,
                 revision,
                 resolved_revision,
+                patterns,
+                ignored_patterns,
             )
             return str(destination)
         files = sorted(
@@ -506,15 +521,15 @@ def download_resolved_revision_to_staging(
                 revision=revision,
                 recursive=True,
             )
-            if _preheat_file_selected(item.path, patterns, ignored_patterns)
+            if modelscope_file_selected(item.path, patterns, ignored_patterns)
         )
         _download_preheat_files(
             files,
-            lambda path: model_file_download(
-                model_id=model_id,
-                file_path=path,
-                revision=revision,
-                local_dir=str(destination),
+            lambda path: _download_modelscope_preheat_file(
+                model_id,
+                path,
+                revision,
+                destination,
             ),
             cancel_check,
             progress_callback,
@@ -523,6 +538,8 @@ def download_resolved_revision_to_staging(
             model_id,
             revision,
             resolved_revision,
+            patterns,
+            ignored_patterns,
         )
         return str(destination)
     if identity.source == "ollama_library":
@@ -538,7 +555,13 @@ def download_resolved_revision_to_staging(
     raise ValueError("unsupported_preheat_source")
 
 
-def _verify_modelscope_filelist_revision(model_id, upstream_revision, expected):
+def _verify_modelscope_filelist_revision(
+    model_id,
+    upstream_revision,
+    expected,
+    include_patterns=(),
+    exclude_patterns=(),
+):
     if not is_modelscope_filelist_revision(expected):
         return
     current = modelscope_filelist_revision(
@@ -547,10 +570,21 @@ def _verify_modelscope_filelist_revision(model_id, upstream_revision, expected):
             "model",
             revision=upstream_revision,
             recursive=True,
-        )
+        ),
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
     )
     if current != expected:
         raise ValueError("modelscope_revision_changed")
+
+
+def _modelscope_download_ignore_patterns(patterns, ignored_patterns):
+    ignored = list(ignored_patterns or [])
+    if modelscope_patterns_select_git_metadata(patterns):
+        return ignored
+    for name in (".gitattributes", ".gitignore", ".gitmodules"):
+        ignored.extend((name, f"**/{name}"))
+    return ignored
 
 
 def _preheat_file_selected(path, patterns, ignored_patterns):
@@ -563,6 +597,21 @@ def _preheat_file_selected(path, patterns, ignored_patterns):
     return included and not excluded
 
 
+def _download_modelscope_preheat_file(model_id, path, revision, destination):
+    try:
+        return model_file_download(
+            model_id=model_id,
+            file_path=path,
+            revision=revision,
+            local_dir=str(destination),
+        )
+    except ModelScopeNotExistError:
+        if is_modelscope_git_metadata_path(path):
+            logger.info("Skip missing ModelScope git metadata file: %s", path)
+            return False
+        raise
+
+
 def _download_preheat_files(files, download_file, cancel_check, progress_callback):
     from gpustack.worker.model_preheat.s3_client import ModelPreheatCanceled
 
@@ -572,7 +621,8 @@ def _download_preheat_files(files, download_file, cancel_check, progress_callbac
     for path, size in files:
         if cancel_check is not None and cancel_check():
             raise ModelPreheatCanceled("model_preheat_canceled")
-        download_file(path)
+        if download_file(path) is False:
+            continue
         completed.append(path)
         downloaded_size += size
         if progress_callback is not None:

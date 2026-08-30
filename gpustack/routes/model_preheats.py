@@ -258,6 +258,8 @@ async def create_model_preheat(
             task_in.source,
             task_in.model_id,
             task_in.revision,
+            include_patterns=task_in.include_patterns,
+            exclude_patterns=task_in.exclude_patterns,
             token=getattr(request.app.state.server_config, "huggingface_token", None),
         )
     except Exception:

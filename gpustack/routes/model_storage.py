@@ -797,6 +797,7 @@ async def create_model_storage_sync_batch(
             skipped=skipped,
             failed=failed,
         )
+        await _enrich_sync_batch_result(session, result)
         if owns_batch_record:
             persisted_result = ModelStorageSyncBatchResult(
                 idempotency_record_id=batch_record_id,
@@ -839,6 +840,61 @@ async def create_model_storage_sync_batch(
         raise
 
     return result
+
+
+async def _enrich_sync_batch_result(session, result):
+    model_file_ids = {
+        item.model_file_id
+        for item in result.created + result.skipped + result.failed
+        if item.model_file_id
+    }
+    model_lookup = {}
+    if model_file_ids:
+        rows = (
+            await session.exec(
+                select(ModelFile).where(ModelFile.id.in_(model_file_ids))
+            )
+        ).all()
+        model_lookup = {model_file.id: model_file for model_file in rows}
+    worker_ids = {
+        item.worker_id
+        for item in result.created + result.skipped + result.failed
+        if item.worker_id
+    }
+    worker_ids.update(
+        model_file.worker_id
+        for model_file in model_lookup.values()
+        if model_file.worker_id
+    )
+    workers = (
+        {
+            worker.id: worker
+            for worker in (
+                await session.exec(select(Worker).where(Worker.id.in_(worker_ids)))
+            ).all()
+        }
+        if worker_ids
+        else {}
+    )
+    for item in result.created + result.skipped + result.failed:
+        model_file = model_lookup.get(item.model_file_id)
+        if model_file is not None:
+            item.model_id = item.model_id or _model_file_display_id(model_file)
+            item.worker_id = item.worker_id or model_file.worker_id
+        worker = workers.get(item.worker_id)
+        if worker is not None:
+            item.worker_uuid = item.worker_uuid or worker.worker_uuid
+            item.worker_name = item.worker_name or worker.name
+            item.worker_ip = item.worker_ip or worker.ip
+
+
+def _model_file_display_id(model_file):
+    return (
+        model_file.huggingface_repo_id
+        or model_file.model_scope_model_id
+        or model_file.ollama_library_model_name
+        or model_file.local_path
+    )
 
 
 async def _claim_sync_batch_placeholder(session, record_id):
@@ -1408,7 +1464,12 @@ def _to_public(task: ModelStorageSyncTask) -> ModelStorageSyncTaskPublic:
 
 async def _sync_tasks_public(session, tasks, cipher):
     profile_ids = {task.profile_id for task in tasks}
-    worker_ids = {task.source_worker_id or task.worker_id for task in tasks}
+    worker_ids = {
+        worker_id
+        for task in tasks
+        for worker_id in (task.worker_id, task.source_worker_id)
+        if worker_id is not None
+    }
     profiles = {}
     if profile_ids:
         profile_rows = (
@@ -1432,11 +1493,19 @@ async def _sync_tasks_public(session, tasks, cipher):
         profile = profiles.get(task.profile_id)
         frozen_profile = _frozen_sync_profile(task, cipher)
         source_worker_id = task.source_worker_id or task.worker_id
-        worker = workers.get(source_worker_id)
+        worker = workers.get(task.worker_id)
+        source_worker = workers.get(source_worker_id)
         result.append(
             public.model_copy(
                 update={
-                    "source_worker_name": worker.name if worker is not None else None,
+                    "worker_name": worker.name if worker is not None else None,
+                    "worker_ip": worker.ip if worker is not None else None,
+                    "source_worker_name": (
+                        source_worker.name if source_worker is not None else None
+                    ),
+                    "source_worker_ip": (
+                        source_worker.ip if source_worker is not None else None
+                    ),
                     "profile_name": profile.name if profile is not None else None,
                     "profile_endpoint": frozen_profile.get("endpoint"),
                     "profile_bucket": frozen_profile.get("bucket"),
@@ -1530,16 +1599,26 @@ async def _to_detail(
         else None
     )
     source_worker_name = None
+    source_worker_ip = None
+    worker_name = None
+    worker_ip = None
+    worker = await Worker.one_by_id(session, task.worker_id)
+    if worker is not None:
+        worker_name = worker.name
+        worker_ip = worker.ip
     source_worker_id = task.source_worker_id or task.worker_id
     if source_worker_id is not None:
         source_worker = await Worker.one_by_id(session, source_worker_id)
         if source_worker is not None:
             source_worker_name = source_worker.name
+            source_worker_ip = source_worker.ip
     return ModelStorageSyncTaskDetail(
         id=task.id,
         model_file_id=task.model_file_id,
         worker_id=task.worker_id,
         worker_uuid=task.worker_uuid,
+        worker_name=worker_name,
+        worker_ip=worker_ip,
         source=task.source,
         model_id=task.model_id,
         resolved_revision=task.resolved_revision,
@@ -1550,6 +1629,7 @@ async def _to_detail(
         transfer_profile_id=task.transfer_profile_id,
         source_worker_id=source_worker_id,
         source_worker_name=source_worker_name,
+        source_worker_ip=source_worker_ip,
         artifact_id=task.artifact_id,
         state=task.state,
         state_message=task.state_message,

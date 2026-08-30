@@ -2,9 +2,11 @@ import hashlib
 import json
 import threading
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from modelscope.hub.errors import NotExistError as ModelScopeNotExistError
 
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
@@ -185,9 +187,10 @@ def test_ollama_pending_seed_keeps_auth_cache_outside_artifact_and_returns_revis
 
     assert result["state"] == "ready"
     assert result["resolved_revision"].startswith("local-snapshot-")
-    assert _validated_preheat_result(result)["resolved_revision"] == result[
-        "resolved_revision"
-    ]
+    assert (
+        _validated_preheat_result(result)["resolved_revision"]
+        == result["resolved_revision"]
+    )
     manifest = next(
         payload.data
         for (bucket, name), payload in minio.objects.items()
@@ -310,6 +313,205 @@ def test_modelscope_filelist_revision_downloads_requested_upstream_revision(tmp_
         download_resolved_revision_to_staging(identity, tmp_path / "staging")
 
     assert snapshot_download.call_args.kwargs["revision"] == "release"
+
+
+def test_modelscope_preheat_progress_download_skips_missing_git_metadata(tmp_path):
+    from gpustack.server.model_preheat_revision import modelscope_filelist_revision
+
+    files = [
+        type(
+            "File",
+            (),
+            {"path": ".gitattributes", "size": 1, "blob_id": "a" * 64},
+        )(),
+        type(
+            "File",
+            (),
+            {"path": "nested/.gitignore", "size": 1, "blob_id": "c" * 64},
+        )(),
+        type(
+            "File",
+            (),
+            {"path": "model.bin", "size": 10, "blob_id": "b" * 64},
+        )(),
+    ]
+    patterns = (".gitattributes", "nested/.gitignore", "model.bin")
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="Qwen/Qwen3-Reranker-0.6B",
+        revision=modelscope_filelist_revision(files, include_patterns=patterns),
+        requested_revision="master",
+        file_patterns=patterns,
+    )
+    attempted = []
+    progress = []
+
+    def download_file(*, file_path, local_dir, **kwargs):
+        del kwargs
+        attempted.append(file_path)
+        if file_path in {".gitattributes", "nested/.gitignore"}:
+            raise ModelScopeNotExistError(f"{file_path} not exist")
+        path = Path(local_dir) / file_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"model")
+        return str(path)
+
+    with (
+        patch("gpustack.worker.downloaders.ModelScopeHubApi") as hub_api,
+        patch(
+            "gpustack.worker.downloaders.model_file_download",
+            side_effect=download_file,
+        ),
+    ):
+        hub_api.return_value.list_repo_files.return_value = files
+        download_resolved_revision_to_staging(
+            identity,
+            tmp_path / "staging",
+            progress_callback=lambda completed, downloaded_size, total_size: progress.append(
+                (completed, downloaded_size, total_size)
+            ),
+        )
+
+    assert attempted == [".gitattributes", "model.bin", "nested/.gitignore"]
+    assert not (tmp_path / "staging" / ".gitattributes").exists()
+    assert not (tmp_path / "staging" / "nested" / ".gitignore").exists()
+    assert (tmp_path / "staging" / "model.bin").is_file()
+    assert progress == [(("model.bin",), 10, 12)]
+
+
+def test_modelscope_preheat_progress_download_ignores_default_git_metadata(tmp_path):
+    from gpustack.server.model_preheat_revision import modelscope_filelist_revision
+
+    files = [
+        type(
+            "File",
+            (),
+            {"path": ".gitattributes", "size": 1, "blob_id": "a" * 64},
+        )(),
+        type(
+            "File",
+            (),
+            {"path": "nested/.gitignore", "size": 1, "blob_id": "c" * 64},
+        )(),
+        type(
+            "File",
+            (),
+            {"path": "model.bin", "size": 10, "blob_id": "b" * 64},
+        )(),
+    ]
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="Qwen/Qwen3-Reranker-0.6B",
+        revision=modelscope_filelist_revision(files),
+        requested_revision="master",
+        file_patterns=(),
+    )
+    attempted = []
+    progress = []
+
+    def download_file(*, file_path, local_dir, **kwargs):
+        del kwargs
+        attempted.append(file_path)
+        path = Path(local_dir) / file_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"model")
+        return str(path)
+
+    with (
+        patch("gpustack.worker.downloaders.ModelScopeHubApi") as hub_api,
+        patch(
+            "gpustack.worker.downloaders.model_file_download",
+            side_effect=download_file,
+        ),
+    ):
+        hub_api.return_value.list_repo_files.return_value = files
+        download_resolved_revision_to_staging(
+            identity,
+            tmp_path / "staging",
+            progress_callback=lambda completed, downloaded_size, total_size: progress.append(
+                (completed, downloaded_size, total_size)
+            ),
+        )
+
+    assert attempted == ["model.bin"]
+    assert not (tmp_path / "staging" / ".gitattributes").exists()
+    assert not (tmp_path / "staging" / "nested" / ".gitignore").exists()
+    assert (tmp_path / "staging" / "model.bin").is_file()
+    assert progress == [(("model.bin",), 10, 10)]
+
+
+def test_modelscope_preheat_progress_download_keeps_existing_git_metadata(tmp_path):
+    files = [
+        type(
+            "File",
+            (),
+            {"path": ".gitattributes", "size": 1, "blob_id": "a" * 64},
+        )()
+    ]
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="Qwen/Qwen3-Reranker-0.6B",
+        revision="master",
+        requested_revision="master",
+        file_patterns=(".gitattributes",),
+    )
+    downloaded = []
+
+    def download_file(*, file_path, local_dir, **kwargs):
+        del kwargs
+        downloaded.append(file_path)
+        path = Path(local_dir) / file_path
+        path.write_bytes(b"metadata")
+        return str(path)
+
+    with (
+        patch("gpustack.worker.downloaders.ModelScopeHubApi") as hub_api,
+        patch(
+            "gpustack.worker.downloaders.model_file_download",
+            side_effect=download_file,
+        ),
+    ):
+        hub_api.return_value.list_repo_files.return_value = files
+        download_resolved_revision_to_staging(
+            identity,
+            tmp_path / "staging",
+            progress_callback=lambda *args: None,
+        )
+
+    assert downloaded == [".gitattributes"]
+    assert (tmp_path / "staging" / ".gitattributes").read_bytes() == b"metadata"
+
+
+def test_modelscope_preheat_progress_download_fails_for_missing_model_file(tmp_path):
+    files = [
+        type(
+            "File",
+            (),
+            {"path": "model.bin", "size": 10, "blob_id": "b" * 64},
+        )()
+    ]
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="Qwen/Qwen3-Reranker-0.6B",
+        revision="master",
+        requested_revision="master",
+        file_patterns=(),
+    )
+
+    with (
+        patch("gpustack.worker.downloaders.ModelScopeHubApi") as hub_api,
+        patch(
+            "gpustack.worker.downloaders.model_file_download",
+            side_effect=ModelScopeNotExistError("model.bin not exist"),
+        ),
+        pytest.raises(ModelScopeNotExistError, match="model.bin not exist"),
+    ):
+        hub_api.return_value.list_repo_files.return_value = files
+        download_resolved_revision_to_staging(
+            identity,
+            tmp_path / "staging",
+            progress_callback=lambda *args: None,
+        )
 
 
 def test_modelscope_filelist_revision_change_rejects_download(tmp_path):

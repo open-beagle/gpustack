@@ -1,3 +1,4 @@
+import fnmatch
 import hashlib
 import json
 import re
@@ -18,6 +19,11 @@ class ModelPreheatRevisionResolutionError(ValueError):
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 MODELSCOPE_FILELIST_REVISION_PREFIX = "modelscope-filelist-v1-"
 _OLLAMA_DIGEST = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
+_MODELSCOPE_GIT_METADATA_FILES = {
+    ".gitattributes",
+    ".gitignore",
+    ".gitmodules",
+}
 
 
 def resolve_model_preheat_revision(
@@ -25,6 +31,8 @@ def resolve_model_preheat_revision(
     model_id: str,
     requested_revision: str | None,
     *,
+    include_patterns: tuple[str, ...] | list[str] = (),
+    exclude_patterns: tuple[str, ...] | list[str] = (),
     token: str | None = None,
     hf_api_factory=HfApi,
     modelscope_api_factory=HubApi,
@@ -80,7 +88,9 @@ def resolve_model_preheat_revision(
                 "model",
                 revision=resolved,
                 recursive=True,
-            )
+            ),
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
         )
     except Exception as exc:
         if isinstance(exc, ModelPreheatRevisionResolutionError):
@@ -167,7 +177,49 @@ def _extract_modelscope_commit(value):
     return None
 
 
-def modelscope_filelist_revision(rows) -> str:
+def is_modelscope_git_metadata_path(path: str) -> bool:
+    return (
+        isinstance(path, str)
+        and path.rsplit("/", 1)[-1] in _MODELSCOPE_GIT_METADATA_FILES
+    )
+
+
+def modelscope_file_selected(
+    path: str,
+    include_patterns: tuple[str, ...] | list[str] = (),
+    exclude_patterns: tuple[str, ...] | list[str] = (),
+) -> bool:
+    if not path:
+        return False
+    included = not include_patterns or any(
+        fnmatch.fnmatch(path, pattern) for pattern in include_patterns
+    )
+    excluded = any(fnmatch.fnmatch(path, pattern) for pattern in exclude_patterns)
+    if not included or excluded:
+        return False
+    if is_modelscope_git_metadata_path(
+        path
+    ) and not modelscope_patterns_select_git_metadata(include_patterns):
+        return False
+    return True
+
+
+def modelscope_patterns_select_git_metadata(
+    patterns: tuple[str, ...] | list[str],
+) -> bool:
+    return any(
+        isinstance(pattern, str)
+        and pattern.rsplit("/", 1)[-1] in _MODELSCOPE_GIT_METADATA_FILES
+        for pattern in patterns
+    )
+
+
+def modelscope_filelist_revision(
+    rows,
+    *,
+    include_patterns: tuple[str, ...] | list[str] = (),
+    exclude_patterns: tuple[str, ...] | list[str] = (),
+) -> str:
     files = []
     for row in rows:
         if isinstance(row, dict):
@@ -183,6 +235,8 @@ def modelscope_filelist_revision(rows) -> str:
             blob_id = getattr(row, "blob_id", None)
             lfs = getattr(row, "lfs", None)
         if not isinstance(path, str) or not path or row_type == "tree":
+            continue
+        if not modelscope_file_selected(path, include_patterns, exclude_patterns):
             continue
         if not isinstance(size, int) or isinstance(size, bool) or size < 0:
             raise ValueError("invalid_modelscope_file_size")

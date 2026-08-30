@@ -1,17 +1,20 @@
 from collections import defaultdict
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlmodel import select
 
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicyRunTask,
 )
 from gpustack.schemas.model_preheats import (
+    ModelPreheatArtifact,
     ModelPreheatExecutionStateEnum,
     ModelPreheatTask,
     ModelPreheatWorkerTask,
 )
+from gpustack.schemas.model_files import ModelFile
 from gpustack.schemas.model_storage_sync import ModelStorageSyncTask
+from gpustack.schemas.workers import Worker
 from gpustack.schemas.policy_runs import (
     PolicyRunExecutionStateEnum,
     PolicyRunObservation,
@@ -41,8 +44,23 @@ async def distribution_run_observations(session, runs, *, include_tasks=False):
                 )
             )
         ).all()
+        worker_lookup = await _worker_lookup(
+            session,
+            worker_ids=[task.worker_id for _run_id, task in rows],
+            worker_uuids=[task.worker_uuid for _run_id, task in rows],
+        )
+        artifact_lookup = await _artifact_lookup(
+            session,
+            [
+                task.distribution_artifact_id
+                for _run_id, task in rows
+                if task.distribution_artifact_id
+            ],
+        )
         for run_id, task in rows:
-            grouped[run_id].append(_preheat_worker_item(task))
+            grouped[run_id].append(
+                _preheat_worker_item(task, worker_lookup, artifact_lookup)
+            )
     for run in runs:
         grouped[run.id].extend(_outcome_items(run.outcome))
     return {
@@ -71,8 +89,23 @@ async def preheat_schedule_run_observations(session, runs, *, include_tasks=Fals
                 .order_by(ModelPreheatWorkerTask.task_id, ModelPreheatWorkerTask.id)
             )
         ).all()
+        worker_lookup = await _worker_lookup(
+            session,
+            worker_ids=[task.worker_id for task in workers],
+            worker_uuids=[task.worker_uuid for task in workers],
+        )
+        artifact_lookup = await _artifact_lookup(
+            session,
+            [
+                task.distribution_artifact_id
+                for task in workers
+                if task.distribution_artifact_id
+            ],
+        )
         for task in workers:
-            grouped[task.task_id].append(_preheat_worker_item(task))
+            grouped[task.task_id].append(
+                _preheat_worker_item(task, worker_lookup, artifact_lookup)
+            )
     observations = {}
     for run in runs:
         parent = parents.get(run.task_id)
@@ -88,6 +121,9 @@ async def sync_policy_run_observations(session, runs, *, include_tasks=False):
     run_task_ids = {}
     run_outcome_items = defaultdict(list)
     all_task_ids = set()
+    payload_model_file_ids = set()
+    payload_worker_ids = set()
+    payload_worker_uuids = set()
     for run in runs:
         task_ids = []
         payload = run.response_payload if isinstance(run.response_payload, dict) else {}
@@ -99,25 +135,61 @@ async def sync_policy_run_observations(session, runs, *, include_tasks=False):
             if isinstance(task_id, int):
                 task_ids.append(task_id)
                 all_task_ids.add(task_id)
-        run_outcome_items[run.id].extend(_payload_items(payload, "skipped"))
-        run_outcome_items[run.id].extend(_payload_items(payload, "failed"))
+        payload_items = _payload_items(payload, "skipped") + _payload_items(
+            payload, "failed"
+        )
+        run_outcome_items[run.id].extend(payload_items)
+        payload_model_file_ids.update(
+            item.model_file_id for item in payload_items if item.model_file_id
+        )
+        payload_worker_ids.update(
+            item.worker_id for item in payload_items if item.worker_id
+        )
+        payload_worker_uuids.update(
+            item.worker_uuid for item in payload_items if item.worker_uuid
+        )
         run_task_ids[run.id] = task_ids
     tasks = {}
+    worker_lookup = {}
+    model_file_lookup = {}
     if all_task_ids:
-        tasks = {
-            task.id: task
-            for task in (
-                await session.exec(
-                    select(ModelStorageSyncTask).where(
-                        ModelStorageSyncTask.id.in_(all_task_ids)
-                    )
+        sync_tasks = (
+            await session.exec(
+                select(ModelStorageSyncTask).where(
+                    ModelStorageSyncTask.id.in_(all_task_ids)
                 )
-            ).all()
-        }
+            )
+        ).all()
+        tasks = {task.id: task for task in sync_tasks}
+        worker_lookup = await _worker_lookup(
+            session,
+            worker_ids=[task.worker_id for task in sync_tasks],
+            worker_uuids=[task.worker_uuid for task in sync_tasks],
+        )
+    if payload_model_file_ids:
+        model_files = (
+            await session.exec(
+                select(ModelFile).where(ModelFile.id.in_(payload_model_file_ids))
+            )
+        ).all()
+        model_file_lookup = {model_file.id: model_file for model_file in model_files}
+        payload_worker_ids.update(
+            model_file.worker_id for model_file in model_files if model_file.worker_id
+        )
+    if payload_worker_ids or payload_worker_uuids:
+        payload_worker_lookup = await _worker_lookup(
+            session,
+            worker_ids=payload_worker_ids,
+            worker_uuids=payload_worker_uuids,
+        )
+        worker_lookup = {**payload_worker_lookup, **worker_lookup}
+    for items in run_outcome_items.values():
+        for item in items:
+            _enrich_payload_item(item, model_file_lookup, worker_lookup)
     return {
         run.id: _observation(
             [
-                _sync_item(tasks[task_id])
+                _sync_item(tasks[task_id], worker_lookup)
                 for task_id in run_task_ids[run.id]
                 if task_id in tasks
             ]
@@ -156,10 +228,51 @@ async def latest_runs_by_owner(session, run_model, owner_field, owner_ids):
     return {getattr(run, owner_field.key): run for run in runs}
 
 
-def _preheat_worker_item(task):
+async def _worker_lookup(session, *, worker_ids, worker_uuids):
+    ids = {worker_id for worker_id in worker_ids if worker_id is not None}
+    uuids = {uuid for uuid in worker_uuids if uuid}
+    if not ids and not uuids:
+        return {}
+    conditions = []
+    if ids:
+        conditions.append(Worker.id.in_(ids))
+    if uuids:
+        conditions.append(Worker.worker_uuid.in_(uuids))
+    rows = (await session.exec(select(Worker).where(or_(*conditions)))).all()
+    lookup = {}
+    for worker in rows:
+        lookup[("id", worker.id)] = worker
+        lookup[("uuid", worker.worker_uuid)] = worker
+    return lookup
+
+
+async def _artifact_lookup(session, artifact_ids):
+    ids = {artifact_id for artifact_id in artifact_ids if artifact_id}
+    if not ids:
+        return {}
+    rows = (
+        await session.exec(
+            select(ModelPreheatArtifact).where(
+                ModelPreheatArtifact.artifact_id.in_(ids)
+            )
+        )
+    ).all()
+    return {artifact.artifact_id: artifact for artifact in rows}
+
+
+def _lookup_worker(lookup, worker_id, worker_uuid):
+    return lookup.get(("id", worker_id)) or lookup.get(("uuid", worker_uuid))
+
+
+def _preheat_worker_item(task, worker_lookup=None, artifact_lookup=None):
+    worker = _lookup_worker(worker_lookup or {}, task.worker_id, task.worker_uuid)
+    artifact = (artifact_lookup or {}).get(task.distribution_artifact_id)
     return PolicyRunTaskPublic(
         id=task.id,
+        model_id=artifact.model_id if artifact is not None else None,
         worker_uuid=task.worker_uuid,
+        worker_name=worker.name if worker is not None else None,
+        worker_ip=worker.ip if worker is not None else None,
         artifact_id=task.distribution_artifact_id,
         state=task.state.value,
         progress=task.progress,
@@ -170,14 +283,18 @@ def _preheat_worker_item(task):
     )
 
 
-def _sync_item(task):
+def _sync_item(task, worker_lookup=None):
     state = task.state.value
     progress = 100 if state == "ready" else 0
+    worker = _lookup_worker(worker_lookup or {}, task.worker_id, task.worker_uuid)
     return PolicyRunTaskPublic(
         id=task.id,
         model_file_id=task.model_file_id,
+        model_id=task.model_id,
         worker_id=task.worker_id,
         worker_uuid=task.worker_uuid,
+        worker_name=worker.name if worker is not None else None,
+        worker_ip=worker.ip if worker is not None else None,
         artifact_id=task.artifact_id,
         state=state,
         progress=progress,
@@ -216,14 +333,50 @@ def _payload_items(payload, key):
             PolicyRunTaskPublic(
                 id=task_id,
                 model_file_id=model_file_id,
+                model_id=(
+                    raw.get("model_id")
+                    if isinstance(raw.get("model_id"), str)
+                    else None
+                ),
                 worker_id=worker_id,
                 worker_uuid=worker_uuid,
+                worker_name=(
+                    raw.get("worker_name")
+                    if isinstance(raw.get("worker_name"), str)
+                    else None
+                ),
+                worker_ip=(
+                    raw.get("worker_ip")
+                    if isinstance(raw.get("worker_ip"), str)
+                    else None
+                ),
                 state=state,
                 error_code=reason,
                 state_message=reason,
             )
         )
     return items
+
+
+def _enrich_payload_item(item, model_file_lookup, worker_lookup):
+    model_file = model_file_lookup.get(item.model_file_id)
+    if model_file is not None:
+        item.model_id = item.model_id or _model_file_display_id(model_file)
+        item.worker_id = item.worker_id or model_file.worker_id
+    worker = _lookup_worker(worker_lookup, item.worker_id, item.worker_uuid)
+    if worker is not None:
+        item.worker_uuid = item.worker_uuid or worker.worker_uuid
+        item.worker_name = item.worker_name or worker.name
+        item.worker_ip = item.worker_ip or worker.ip
+
+
+def _model_file_display_id(model_file):
+    return (
+        model_file.huggingface_repo_id
+        or model_file.model_scope_model_id
+        or model_file.ollama_library_model_name
+        or model_file.local_path
+    )
 
 
 def _missing_sync_task_item(task_id):

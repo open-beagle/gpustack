@@ -156,7 +156,12 @@ async def _claim_pending_execution(request, session, execution, model_file, iden
     if resolved_revision is None:
         if source in {"huggingface", "modelscope"}:
             resolved_revision = await _resolve_revision(
-                request, source, model_id, requested_revision
+                request,
+                source,
+                model_id,
+                requested_revision,
+                request_identity.get("include_patterns") or [],
+                request_identity.get("exclude_patterns") or [],
             )
             expected_include_patterns = (
                 await _resolve_artifact_selection(
@@ -296,7 +301,14 @@ async def _authorize_execution(session, execution, model_file, identity) -> Work
     return worker
 
 
-async def _resolve_revision(request, source, model_id, requested_revision) -> str:
+async def _resolve_revision(
+    request,
+    source,
+    model_id,
+    requested_revision,
+    include_patterns=(),
+    exclude_patterns=(),
+) -> str:
     if not isinstance(model_id, str) or not model_id:
         raise HTTPException(409, "invalid_model_identity", "invalid_model_identity")
     if _is_immutable_revision(requested_revision):
@@ -312,6 +324,8 @@ async def _resolve_revision(request, source, model_id, requested_revision) -> st
             source,
             model_id,
             requested_revision,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
             token=getattr(request.app.state.server_config, "huggingface_token", None),
         )
     except Exception:
