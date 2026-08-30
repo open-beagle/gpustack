@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Header, Request
 from pydantic import ValidationError
-from sqlalchemy import func, or_, update
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
@@ -273,11 +273,15 @@ async def delete_model_preheat_schedule(session: SessionDep, id: int):
             .where(
                 ModelPreheatScheduleRun.schedule_id == id,
                 or_(
-                    ModelPreheatScheduleRun.state.in_(
-                        [
-                            ModelPreheatScheduleRunStateEnum.PENDING,
-                            ModelPreheatScheduleRunStateEnum.RUNNING,
-                        ]
+                    and_(
+                        ModelPreheatScheduleRun.state.in_(
+                            [
+                                ModelPreheatScheduleRunStateEnum.PENDING,
+                                ModelPreheatScheduleRunStateEnum.RUNNING,
+                            ]
+                        ),
+                        ModelPreheatTask.id.is_not(None),
+                        ModelPreheatTask.execution_state.not_in(terminal_states),
                     ),
                     (
                         ModelPreheatScheduleRun.state
@@ -290,6 +294,26 @@ async def delete_model_preheat_schedule(session: SessionDep, id: int):
     ).first()
     if active is not None:
         raise HTTPException(409, "Conflict", "model_preheat_schedule_in_use")
+    await session.exec(
+        update(ModelPreheatScheduleRun)
+        .where(
+            ModelPreheatScheduleRun.schedule_id == id,
+            ModelPreheatScheduleRun.task_id.is_(None),
+            ModelPreheatScheduleRun.state.in_(
+                [
+                    ModelPreheatScheduleRunStateEnum.PENDING,
+                    ModelPreheatScheduleRunStateEnum.RUNNING,
+                    ModelPreheatScheduleRunStateEnum.PAUSED,
+                ]
+            ),
+        )
+        .values(
+            state=ModelPreheatScheduleRunStateEnum.ERROR,
+            error_code="model_preheat_task_not_found",
+            finished_at=datetime.now(timezone.utc),
+            slot=None,
+        )
+    )
     await session.delete(schedule)
     await session.commit()
     return {"ok": True}

@@ -42,6 +42,7 @@ from gpustack.server.db import get_session
 from gpustack.server.model_preheat_worker_identity import (
     get_model_preheat_worker_identity,
 )
+from gpustack.server.bus import EventType
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 from gpustack.worker.model_preheat.executor import (
     SeedExecutionRequest,
@@ -499,8 +500,14 @@ def test_seed_complete_cas_binds_artifact_and_inventory(tmp_path):
     asyncio.run(engine.dispose())
 
 
-def test_distribution_complete_registers_ready_model_file(tmp_path):
+def test_distribution_complete_registers_ready_model_file(tmp_path, monkeypatch):
     app, engine, key = _test_app(tmp_path)
+    events = []
+
+    async def capture_model_file_event(event_type, data):
+        events.append((event_type, data))
+
+    monkeypatch.setattr(ModelFile, "_publish_event", capture_model_file_event)
     artifact_id = "c" * 64
     child_id, _task_id, request_digest = asyncio.run(
         _seed(
@@ -531,6 +538,16 @@ def test_distribution_complete_registers_ready_model_file(tmp_path):
                 "result": result,
             },
         )
+        repeated = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
 
     async def inspect():
         async with AsyncSession(engine) as session:
@@ -548,11 +565,99 @@ def test_distribution_complete_registers_ready_model_file(tmp_path):
     assert model_file.resolved_paths == [
         "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
     ]
+    assert len(events) == 1
+    assert events[0][0] == EventType.CREATED
+    assert events[0][1].id == model_file.id
+    assert repeated.status_code == 200, repeated.text
     asyncio.run(engine.dispose())
 
 
-def test_policy_distribution_complete_registers_ready_model_file(tmp_path):
+def test_distribution_complete_publishes_model_file_update_event(tmp_path, monkeypatch):
     app, engine, key = _test_app(tmp_path)
+    events = []
+
+    async def capture_model_file_event(event_type, data):
+        events.append((event_type, data.id, data.local_dir))
+
+    monkeypatch.setattr(ModelFile, "_publish_event", capture_model_file_event)
+    artifact_id = "c" * 64
+    child_id, task_id, request_digest = asyncio.run(
+        _seed(
+            engine,
+            key,
+            artifact_id=artifact_id,
+            model_id="Qwen/Qwen-7B-Chat-Int8",
+            role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+        )
+    )
+
+    async def seed_existing_model_file():
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            task = await session.get(ModelPreheatTask, task_id)
+            source_index = model_preheat_worker_tasks._distributed_model_source_index(
+                1,
+                task.s3_profile_id,
+                artifact_id,
+            )
+            model_file = ModelFile(
+                source="model_scope",
+                model_scope_model_id="Qwen/Qwen-7B-Chat-Int8",
+                source_index=source_index,
+                worker_id=1,
+                local_dir="/old/path",
+                resolved_paths=["/old/path"],
+                state=ModelFileStateEnum.READY,
+                requested_revision="master",
+                resolved_revision="a" * 40,
+            )
+            session.add(model_file)
+            await session.commit()
+            return model_file.id
+
+    existing_id = asyncio.run(seed_existing_model_file())
+    result = {
+        **_ready_result(request_digest, artifact_id),
+        "transfer_source": "s3",
+        "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8",
+        "resolved_paths": [
+            "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
+        ],
+    }
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            rows = (await session.exec(select(ModelFile))).all()
+            return rows
+
+    model_files = asyncio.run(inspect())
+    assert completed.status_code == 200, completed.text
+    assert len(model_files) == 1
+    assert model_files[0].id == existing_id
+    assert model_files[0].local_dir == result["local_dir"]
+    assert events == [(EventType.UPDATED, existing_id, result["local_dir"])]
+    asyncio.run(engine.dispose())
+
+
+def test_policy_distribution_complete_registers_ready_model_file(tmp_path, monkeypatch):
+    app, engine, key = _test_app(tmp_path)
+    events = []
+
+    async def capture_model_file_event(event_type, data):
+        events.append((event_type, data.id))
+
+    monkeypatch.setattr(ModelFile, "_publish_event", capture_model_file_event)
     artifact_id = "c" * 64
     child_id, request_digest = asyncio.run(
         _seed_distribution_policy_task(
@@ -599,6 +704,7 @@ def test_policy_distribution_complete_registers_ready_model_file(tmp_path):
     assert model_file.resolved_paths == [
         "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
     ]
+    assert events == [(EventType.CREATED, model_file.id)]
     asyncio.run(engine.dispose())
 
 

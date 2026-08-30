@@ -27,11 +27,18 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ProfileLifecycleStateEnum,
 )
 from gpustack.schemas.model_preheat_schedules import (
+    ModelPreheatSchedule,
     ModelPreheatScheduleRun,
     ModelPreheatScheduleRunStateEnum,
     ModelPreheatScheduleRunTriggerEnum,
 )
-from gpustack.schemas.model_preheats import ModelPreheatCreate, ModelPreheatTask
+from gpustack.schemas.model_preheats import (
+    ModelPreheatCreate,
+    ModelPreheatBackfillPolicyEnum,
+    ModelPreheatExecutionStateEnum,
+    ModelPreheatTargetScopeEnum,
+    ModelPreheatTask,
+)
 from gpustack.schemas.users import User
 from gpustack.server.db import get_session
 from gpustack.worker.downloaders import _preheat_file_selected
@@ -1176,6 +1183,133 @@ def test_schedule_admin_crud_validates_profile_and_hides_internal_keys(tmp_path)
     assert "must-not-leak" not in str(created.json())
     assert deleted.status_code == 200
     assert missing.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "run_state",
+    [
+        ModelPreheatScheduleRunStateEnum.PENDING,
+        ModelPreheatScheduleRunStateEnum.RUNNING,
+        ModelPreheatScheduleRunStateEnum.PAUSED,
+    ],
+)
+def test_delete_schedule_allows_orphan_active_run(tmp_path, run_state):
+    app, engine = _test_app(tmp_path)
+    profile_id = asyncio.run(_seed_profile(engine))
+
+    async def seed_orphan_run(schedule_id):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            run = ModelPreheatScheduleRun(
+                schedule_id=schedule_id,
+                window_start_utc=datetime.now(timezone.utc),
+                window_end_utc=datetime.now(timezone.utc),
+                trigger=ModelPreheatScheduleRunTriggerEnum.MANUAL,
+                state=run_state,
+                operation_key=f"orphan-active-run-{run_state.value}",
+                task_id=None,
+                started_at=datetime.now(timezone.utc),
+                created_by_user_id=1,
+            )
+            session.add(run)
+            await session.commit()
+            return run.id
+
+    with TestClient(app) as client:
+        created = client.post("/v1/model-preheat-schedules", json=_payload(profile_id))
+        schedule_id = created.json()["id"]
+        run_id = asyncio.run(seed_orphan_run(schedule_id))
+        deleted = client.delete(f"/v1/model-preheat-schedules/{schedule_id}")
+
+    async def persisted():
+        async with AsyncSession(engine) as session:
+            return (
+                await session.get(ModelPreheatScheduleRun, run_id),
+                await session.get(ModelPreheatSchedule, schedule_id),
+            )
+
+    run, schedule = asyncio.run(persisted())
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+    assert deleted.status_code == 200, deleted.text
+    assert run is not None
+    assert run.state == ModelPreheatScheduleRunStateEnum.ERROR
+    assert run.error_code == "model_preheat_task_not_found"
+    assert run.finished_at is not None
+    assert schedule is None
+
+
+def test_delete_schedule_rejects_real_active_task_run(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id = asyncio.run(_seed_profile(engine))
+
+    async def seed_active_run(schedule_id):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            task = ModelPreheatTask(
+                source="modelscope",
+                model_id="Qwen/Test",
+                requested_revision="master",
+                resolved_revision="a" * 40,
+                include_patterns=[],
+                exclude_patterns=[],
+                selection_digest="b" * 64,
+                request_identity={
+                    "source": "modelscope",
+                    "model_id": "Qwen/Test",
+                    "requested_revision": "master",
+                    "include_patterns": [],
+                    "exclude_patterns": [],
+                },
+                request_digest="c" * 64,
+                target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
+                target_worker_uuids=["worker-a"],
+                target_worker_snapshot=[],
+                s3_profile_id=profile_id,
+                s3_profile_config_version=1,
+                s3_profile_snapshot_encrypted={"ciphertext": "encrypted"},
+                encryption_key_version="v1",
+                s3_backfill_policy=ModelPreheatBackfillPolicyEnum.WHEN_MISSING,
+                execution_state=ModelPreheatExecutionStateEnum.DISTRIBUTING,
+            )
+            session.add(task)
+            await session.flush()
+            run = ModelPreheatScheduleRun(
+                schedule_id=schedule_id,
+                window_start_utc=datetime.now(timezone.utc),
+                window_end_utc=datetime.now(timezone.utc),
+                trigger=ModelPreheatScheduleRunTriggerEnum.MANUAL,
+                state=ModelPreheatScheduleRunStateEnum.RUNNING,
+                operation_key="real-active-run",
+                task_id=task.id,
+                started_at=datetime.now(timezone.utc),
+                created_by_user_id=1,
+            )
+            session.add(run)
+            await session.commit()
+            return run.id
+
+    with TestClient(app) as client:
+        created = client.post("/v1/model-preheat-schedules", json=_payload(profile_id))
+        schedule_id = created.json()["id"]
+        run_id = asyncio.run(seed_active_run(schedule_id))
+        deleted = client.delete(f"/v1/model-preheat-schedules/{schedule_id}")
+
+    async def persisted():
+        async with AsyncSession(engine) as session:
+            return (
+                await session.get(ModelPreheatScheduleRun, run_id),
+                await session.get(ModelPreheatSchedule, schedule_id),
+            )
+
+    run, schedule = asyncio.run(persisted())
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+    assert deleted.status_code == 409, deleted.text
+    assert deleted.json()["message"] == "model_preheat_schedule_in_use"
+    assert run is not None
+    assert run.state == ModelPreheatScheduleRunStateEnum.RUNNING
+    assert schedule is not None
 
 
 def test_manual_schedule_can_be_saved_without_cron_and_run_now(tmp_path):

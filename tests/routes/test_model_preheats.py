@@ -317,7 +317,7 @@ async def _seed_preheat_task_record(
         window_start_utc=datetime.now(timezone.utc),
         window_end_utc=datetime.now(timezone.utc),
         trigger=ModelPreheatScheduleRunTriggerEnum.MANUAL,
-        state=ModelPreheatScheduleRunStateEnum.READY,
+        state=ModelPreheatScheduleRunStateEnum.RUNNING,
         operation_key="preheat-task-delete-run",
         task_id=task.id,
     )
@@ -390,6 +390,8 @@ def test_delete_model_preheat_removes_terminal_task_record_without_artifacts(tmp
     assert policy.created_by_task_id is None
     assert run is not None
     assert run.task_id is None
+    assert run.state == ModelPreheatScheduleRunStateEnum.READY
+    assert run.finished_at is not None
     assert idempotency is None
 
 

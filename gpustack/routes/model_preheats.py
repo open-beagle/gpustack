@@ -26,7 +26,10 @@ from gpustack.schemas.model_preheat_s3_profiles import (
 from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
 )
-from gpustack.schemas.model_preheat_schedules import ModelPreheatScheduleRun
+from gpustack.schemas.model_preheat_schedules import (
+    ModelPreheatScheduleRun,
+    ModelPreheatScheduleRunStateEnum,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatCreate,
     ModelPreheatDeliveryModeEnum,
@@ -100,6 +103,7 @@ async def delete_model_preheat(session: SessionDep, id: int):
     if not is_terminal_task(task):
         raise HTTPException(409, "Conflict", "model_preheat_task_in_use")
     await release_task_lock_if_terminal(session, task)
+    await finish_schedule_runs_for_terminal_task(session, task)
     await session.exec(
         update(ModelPreheatScheduleRun)
         .where(ModelPreheatScheduleRun.task_id == task.id)
@@ -482,6 +486,43 @@ async def release_task_lock_if_terminal(session, task: ModelPreheatTask) -> bool
     )
     await session.flush()
     return True
+
+
+async def finish_schedule_runs_for_terminal_task(session, task: ModelPreheatTask):
+    if not is_terminal_task(task):
+        return
+    state = (
+        ModelPreheatScheduleRunStateEnum.READY
+        if task.execution_state
+        in {
+            ModelPreheatExecutionStateEnum.READY,
+            ModelPreheatExecutionStateEnum.PARTIAL,
+        }
+        else ModelPreheatScheduleRunStateEnum.ERROR
+    )
+    await session.exec(
+        update(ModelPreheatScheduleRun)
+        .where(
+            ModelPreheatScheduleRun.task_id == task.id,
+            ModelPreheatScheduleRun.state.in_(
+                [
+                    ModelPreheatScheduleRunStateEnum.PENDING,
+                    ModelPreheatScheduleRunStateEnum.RUNNING,
+                    ModelPreheatScheduleRunStateEnum.PAUSED,
+                ]
+            ),
+        )
+        .values(
+            state=state,
+            error_code=(
+                None
+                if state == ModelPreheatScheduleRunStateEnum.READY
+                else task.state_message or "model_preheat_task_failed"
+            ),
+            finished_at=datetime.now(timezone.utc),
+            slot=None,
+        )
+    )
 
 
 async def set_task_execution_state(

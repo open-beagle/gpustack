@@ -489,14 +489,19 @@ async def complete_model_preheat_worker_task(
         await _aggregate_connectivity(session, task)
         return await _refresh_task(session, worker_task_id)
     result_payload = _validated_result(task.role, complete.result)
+    model_file_event = None
     now = _utcnow()
     if task.task_id is not None and result_payload.get("state") == "ready":
-        await _bind_preheat_artifact(session, task, result_payload, now)
+        model_file_event = await _bind_preheat_artifact(
+            session, task, result_payload, now
+        )
     elif (
         task.distribution_policy_id is not None
         and result_payload.get("state") == "ready"
     ):
-        await _bind_distribution_artifact(session, task, result_payload, now)
+        model_file_event = await _bind_distribution_artifact(
+            session, task, result_payload, now
+        )
     result = await session.exec(
         _active_lease_update(worker_task_id, complete, now).values(
             state=ModelPreheatWorkerTaskStateEnum.READY,
@@ -520,6 +525,10 @@ async def complete_model_preheat_worker_task(
         return await _refresh_task(session, worker_task_id)
     await session.commit()
     task = await _refresh_task(session, worker_task_id)
+    if model_file_event is not None:
+        event_type, model_file = model_file_event
+        await session.refresh(model_file)
+        await ModelFile._publish_event(event_type, model_file)
     await _aggregate_connectivity(session, task)
     task = await _refresh_task(session, worker_task_id)
     await _publish(task)
@@ -1009,8 +1018,13 @@ async def _bind_preheat_artifact(session, worker_task, result, now):
         _conflict("artifact_binding_conflict")
     if worker_task.role == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE:
         _validate_distributed_model_paths(result)
-        await _upsert_distributed_model_file(session, parent, worker_task, result, now)
+        model_file_event = await _upsert_distributed_model_file(
+            session, parent, worker_task, result, now
+        )
+    else:
+        model_file_event = None
     await session.flush()
+    return model_file_event
 
 
 async def _bind_distribution_artifact(session, worker_task, result, now):
@@ -1040,8 +1054,11 @@ async def _bind_distribution_artifact(session, worker_task, result, now):
         resolved_revision=artifact.resolved_revision,
         s3_profile_id=policy.profile_id,
     )
-    await _upsert_distributed_model_file(session, parent, worker_task, result, now)
+    model_file_event = await _upsert_distributed_model_file(
+        session, parent, worker_task, result, now
+    )
     await session.flush()
+    return model_file_event
 
 
 async def _upsert_distributed_model_file(session, parent, worker_task, result, now):
@@ -1082,14 +1099,15 @@ async def _upsert_distributed_model_file(session, parent, worker_task, result, n
         "state_message": None,
         "requested_revision": parent.requested_revision,
         "resolved_revision": result["resolved_revision"],
-        "updated_at": now,
     }
     if existing is None:
-        session.add(ModelFile(source_index=source_index, **values))
-        return
+        model_file = ModelFile(source_index=source_index, **values)
+        session.add(model_file)
+        return EventType.CREATED, model_file
     for field, value in values.items():
         setattr(existing, field, value)
     session.add(existing)
+    return EventType.UPDATED, existing
 
 
 def _model_file_source(source):
