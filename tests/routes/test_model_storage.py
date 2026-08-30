@@ -387,12 +387,8 @@ def test_sync_policy_run_now_creates_existing_sync_task_and_replays(app, client)
     assert replay.json() == first.json()
     assert first.json()["state"] == "pending"
     assert first.json()["execution_state"] == "waiting"
-    assert first.json()["summary"]["pending"] == 1
-    task_id = first.json()["response_payload"]["created"][0]["task_id"]
-    assert task_id is not None
-    detail = client.get(f"{API}/{task_id}")
-    assert detail.status_code == 200
-    assert detail.json()["model_file_id"] == model_file_id
+    assert first.json()["summary"]["pending"] == 0
+    assert first.json()["response_payload"] is None
     policies = client.get("/v1/model-storage-sync-policies")
     assert (
         policies.json()["items"][0]["last_run_at"] == first.json()["window_start_utc"]
@@ -408,8 +404,22 @@ def test_sync_policy_run_now_creates_existing_sync_task_and_replays(app, client)
     assert runs.status_code == 200, runs.text
     assert runs.json()["items"][0]["tasks"] == []
     assert run_detail.status_code == 200, run_detail.text
-    assert run_detail.json()["tasks"][0]["id"] == task_id
+    assert run_detail.json()["tasks"] == []
     assert "lease_token" not in str(run_detail.json())
+
+    controller = ModelStorageSyncPolicyController(
+        _engine(app), config=app.state.server_config
+    )
+    _run(app, controller.tick())
+    run_detail = client.get(
+        f"/v1/model-storage-sync-policies/{policy_id}/runs/{first.json()['id']}"
+    )
+    task_id = run_detail.json()["response_payload"]["created"][0]["task_id"]
+    assert task_id is not None
+    assert run_detail.json()["tasks"][0]["id"] == task_id
+    detail = client.get(f"{API}/{task_id}")
+    assert detail.status_code == 200
+    assert detail.json()["model_file_id"] == model_file_id
 
     async def fail_sync_task():
         async with AsyncSession(_engine(app)) as session:
@@ -453,6 +463,13 @@ def test_sync_policy_run_projects_created_skipped_and_failed_batch_items(app, cl
     run = client.post(
         f"/v1/model-storage-sync-policies/{policy['id']}/run-now",
         headers={"Idempotency-Key": "observable-sync-run"},
+    ).json()
+    controller = ModelStorageSyncPolicyController(
+        _engine(app), config=app.state.server_config
+    )
+    _run(app, controller.tick())
+    run = client.get(
+        f"/v1/model-storage-sync-policies/{policy['id']}/runs/{run['id']}"
     ).json()
     task_id = run["response_payload"]["created"][0]["task_id"]
 
@@ -1560,11 +1577,22 @@ def test_selected_worker_policy_resolves_latest_registration_by_uuid(app, client
     )
 
     assert run.status_code == 200, run.text
-    assert run.json()["state"] == "error"
-    assert run.json()["execution_state"] == "error"
-    assert run.json()["error_code"] == "worker_protocol_unsupported"
-    assert run.json()["response_payload"]["created"] == []
-    assert run.json()["response_payload"]["skipped"] == [
+    assert run.json()["state"] == "pending"
+    assert run.json()["execution_state"] == "waiting"
+
+    controller = ModelStorageSyncPolicyController(
+        _engine(app), config=app.state.server_config
+    )
+    _run(app, controller.tick())
+    detail = client.get(
+        f"/v1/model-storage-sync-policies/{created.json()['id']}/runs/{run.json()['id']}"
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["state"] == "error"
+    assert detail.json()["execution_state"] == "error"
+    assert detail.json()["error_code"] == "worker_protocol_unsupported"
+    assert detail.json()["response_payload"]["created"] == []
+    assert detail.json()["response_payload"]["skipped"] == [
         {
             "model_file_id": None,
             "model_id": None,

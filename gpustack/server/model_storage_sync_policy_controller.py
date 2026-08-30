@@ -135,7 +135,8 @@ class ModelStorageSyncPolicyController:
             ):
                 raise SyncPolicyRunConflict from None
             return existing
-        return await self._claim_and_execute(run.id, request)
+        del request
+        return run
 
     async def _claim_due_run(self, policy_id, now):
         async with AsyncSession(self._engine, expire_on_commit=False) as session:
