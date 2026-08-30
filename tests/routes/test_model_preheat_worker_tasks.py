@@ -30,6 +30,7 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatBackfillPolicyEnum,
     ModelPreheatConnectivityCheckStateEnum,
     ModelPreheatInventoryManifestStateEnum,
+    ModelPreheatDeliveryModeEnum,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatTargetScopeEnum,
     ModelPreheatTask,
@@ -98,6 +99,7 @@ async def _seed(
     model_id="Qwen/Test",
     resolved_revision="a" * 40,
     role=ModelPreheatWorkerTaskRoleEnum.SEED,
+    delivery_mode=ModelPreheatDeliveryModeEnum.S3_AND_WORKERS,
 ):
     cipher = ModelPreheatCredentialCipher(key, "v1")
     identity = ModelPreheatIdentity(
@@ -169,6 +171,7 @@ async def _seed(
             s3_profile_snapshot_encrypted=cipher.encrypt(json.dumps(profile_payload)),
             encryption_key_version="v1",
             s3_backfill_policy=ModelPreheatBackfillPolicyEnum.WHEN_MISSING,
+            delivery_mode=delivery_mode,
         )
         session.add(task)
         await session.flush()
@@ -509,7 +512,7 @@ def test_distribution_complete_registers_ready_model_file(tmp_path, monkeypatch)
 
     monkeypatch.setattr(ModelFile, "_publish_event", capture_model_file_event)
     artifact_id = "c" * 64
-    child_id, _task_id, request_digest = asyncio.run(
+    child_id, task_id, request_digest = asyncio.run(
         _seed(
             engine,
             key,
@@ -647,6 +650,270 @@ def test_distribution_complete_publishes_model_file_update_event(tmp_path, monke
     assert model_files[0].id == existing_id
     assert model_files[0].local_dir == result["local_dir"]
     assert events == [(EventType.UPDATED, existing_id, result["local_dir"])]
+    asyncio.run(engine.dispose())
+
+
+def test_seed_complete_registers_ready_local_model_file(tmp_path, monkeypatch):
+    app, engine, key = _test_app(tmp_path)
+    events = []
+
+    async def capture_model_file_event(event_type, data):
+        events.append((event_type, data.id))
+
+    monkeypatch.setattr(ModelFile, "_publish_event", capture_model_file_event)
+    artifact_id = "c" * 64
+    child_id, _task_id, request_digest = asyncio.run(
+        _seed(
+            engine,
+            key,
+            artifact_id=artifact_id,
+            model_id="Qwen/Qwen-7B-Chat-Int8",
+        )
+    )
+    result = {
+        **_ready_result(request_digest, artifact_id),
+        "transfer_source": "s3",
+        "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8",
+        "resolved_paths": [
+            "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
+        ],
+    }
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+        repeated = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            return (await session.exec(select(ModelFile))).all()
+
+    model_files = asyncio.run(inspect())
+    assert completed.status_code == 200, completed.text
+    assert repeated.status_code == 200, repeated.text
+    assert len(model_files) == 1
+    model_file = model_files[0]
+    assert model_file.state == ModelFileStateEnum.READY
+    assert model_file.worker_id == 1
+    assert model_file.worker_uuid_snapshot == "worker-uuid"
+    assert model_file.worker_name_snapshot == "worker-a"
+    assert model_file.model_scope_model_id == "Qwen/Qwen-7B-Chat-Int8"
+    assert model_file.local_dir == result["local_dir"]
+    assert model_file.resolved_paths == result["resolved_paths"]
+    assert model_file.resolved_revision == "a" * 40
+    assert events == [(EventType.CREATED, model_file.id)]
+    asyncio.run(engine.dispose())
+
+
+def test_seed_complete_updates_existing_local_model_file(tmp_path, monkeypatch):
+    app, engine, key = _test_app(tmp_path)
+    events = []
+    artifact_id = "c" * 64
+    child_id, task_id, request_digest = asyncio.run(
+        _seed(
+            engine,
+            key,
+            artifact_id=artifact_id,
+            model_id="Qwen/Qwen-7B-Chat-Int8",
+        )
+    )
+
+    async def seed_existing_model_file():
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            model_file = ModelFile(
+                source="model_scope",
+                model_scope_model_id="Qwen/Qwen-7B-Chat-Int8",
+                source_index="legacy-source-index",
+                worker_id=1,
+                local_dir=None,
+                resolved_paths=[],
+                state=ModelFileStateEnum.ERROR,
+                requested_revision=None,
+                resolved_revision=None,
+            )
+            session.add(model_file)
+            await session.commit()
+            return model_file.id
+
+    existing_id = asyncio.run(seed_existing_model_file())
+
+    async def capture_model_file_event(event_type, data):
+        events.append((event_type, data.id, data.local_dir, data.state))
+
+    monkeypatch.setattr(ModelFile, "_publish_event", capture_model_file_event)
+    result = {
+        **_ready_result(request_digest, artifact_id),
+        "transfer_source": "s3",
+        "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8",
+        "resolved_paths": [
+            "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
+        ],
+    }
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            return (await session.exec(select(ModelFile))).all()
+
+    model_files = asyncio.run(inspect())
+    assert completed.status_code == 200, completed.text
+    assert len(model_files) == 1
+    assert model_files[0].id == existing_id
+    assert model_files[0].state == ModelFileStateEnum.READY
+    assert model_files[0].local_dir == result["local_dir"]
+    assert model_files[0].source_index != "legacy-source-index"
+    assert events == [
+        (EventType.UPDATED, existing_id, result["local_dir"], ModelFileStateEnum.READY)
+    ]
+    asyncio.run(engine.dispose())
+
+
+def test_seed_complete_does_not_overwrite_distinct_local_model_file(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    artifact_id = "c" * 64
+    child_id, _task_id, request_digest = asyncio.run(
+        _seed(
+            engine,
+            key,
+            artifact_id=artifact_id,
+            model_id="Qwen/Qwen-7B-Chat-Int8",
+        )
+    )
+
+    async def seed_existing_model_file():
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            model_file = ModelFile(
+                source="model_scope",
+                model_scope_model_id="Qwen/Qwen-7B-Chat-Int8",
+                source_index="existing-ready-source-index",
+                worker_id=1,
+                local_dir="/existing/path",
+                resolved_paths=["/existing/path"],
+                state=ModelFileStateEnum.READY,
+                requested_revision="master",
+                resolved_revision="b" * 40,
+            )
+            session.add(model_file)
+            await session.commit()
+            return model_file.id
+
+    existing_id = asyncio.run(seed_existing_model_file())
+    result = {
+        **_ready_result(request_digest, artifact_id),
+        "transfer_source": "s3",
+        "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8",
+        "resolved_paths": [
+            "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
+        ],
+    }
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            return (await session.exec(select(ModelFile))).all()
+
+    model_files = asyncio.run(inspect())
+    assert completed.status_code == 200, completed.text
+    assert len(model_files) == 2
+    existing = next(item for item in model_files if item.id == existing_id)
+    created = next(item for item in model_files if item.id != existing_id)
+    assert existing.local_dir == "/existing/path"
+    assert existing.resolved_revision == "b" * 40
+    assert created.local_dir == result["local_dir"]
+    assert created.resolved_revision == "a" * 40
+    asyncio.run(engine.dispose())
+
+
+@pytest.mark.parametrize(
+    ("result_patch", "delivery_mode"),
+    [
+        ({}, ModelPreheatDeliveryModeEnum.S3_AND_WORKERS),
+        (
+            {
+                "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Test",
+                "resolved_paths": ["/var/lib/gpustack/cache/model_scope/Qwen/Test"],
+            },
+            ModelPreheatDeliveryModeEnum.S3_ONLY,
+        ),
+    ],
+)
+def test_seed_complete_does_not_register_without_local_artifact(
+    tmp_path, monkeypatch, result_patch, delivery_mode
+):
+    app, engine, key = _test_app(tmp_path)
+    events = []
+
+    async def capture_model_file_event(event_type, data):
+        events.append((event_type, data.id))
+
+    monkeypatch.setattr(ModelFile, "_publish_event", capture_model_file_event)
+    artifact_id = "c" * 64
+    child_id, _task_id, request_digest = asyncio.run(
+        _seed(engine, key, artifact_id=artifact_id, delivery_mode=delivery_mode)
+    )
+    result = {
+        **_ready_result(request_digest, artifact_id),
+        **result_patch,
+    }
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def count_model_files():
+        async with AsyncSession(engine) as session:
+            return len((await session.exec(select(ModelFile))).all())
+
+    assert completed.status_code == 200, completed.text
+    assert asyncio.run(count_model_files()) == 0
+    assert events == []
     asyncio.run(engine.dispose())
 
 

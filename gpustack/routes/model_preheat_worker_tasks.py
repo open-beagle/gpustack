@@ -30,6 +30,7 @@ from gpustack.schemas.model_preheat_distribution_policies import (
 from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.model_preheats import (
     ModelPreheatDesiredStateEnum,
+    ModelPreheatDeliveryModeEnum,
     ModelPreheatExecutionStateEnum,
     ModelPreheatExecutionProfile,
     ModelPreheatArtifact,
@@ -1018,7 +1019,12 @@ async def _bind_preheat_artifact(session, worker_task, result, now):
         _conflict("artifact_binding_conflict")
     if worker_task.role == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE:
         _validate_distributed_model_paths(result)
-        model_file_event = await _upsert_distributed_model_file(
+        model_file_event = await _upsert_preheat_model_file(
+            session, parent, worker_task, result, now
+        )
+    elif _seed_result_has_local_artifact(parent, result):
+        _validate_distributed_model_paths(result)
+        model_file_event = await _upsert_preheat_model_file(
             session, parent, worker_task, result, now
         )
     else:
@@ -1054,14 +1060,22 @@ async def _bind_distribution_artifact(session, worker_task, result, now):
         resolved_revision=artifact.resolved_revision,
         s3_profile_id=policy.profile_id,
     )
-    model_file_event = await _upsert_distributed_model_file(
+    model_file_event = await _upsert_preheat_model_file(
         session, parent, worker_task, result, now
     )
     await session.flush()
     return model_file_event
 
 
-async def _upsert_distributed_model_file(session, parent, worker_task, result, now):
+def _seed_result_has_local_artifact(parent, result):
+    return (
+        parent.delivery_mode != ModelPreheatDeliveryModeEnum.S3_ONLY
+        and result.get("local_dir") is not None
+        and result.get("resolved_paths") is not None
+    )
+
+
+async def _upsert_preheat_model_file(session, parent, worker_task, result, now):
     source = _model_file_source(parent.source)
     model_source = _model_file_source_fields(
         source,
@@ -1074,11 +1088,9 @@ async def _upsert_distributed_model_file(session, parent, worker_task, result, n
         parent.s3_profile_id,
         result["artifact_id"],
     )
-    existing = (
-        await session.exec(
-            select(ModelFile).where(ModelFile.source_index == source_index)
-        )
-    ).first()
+    existing = await _existing_preheat_model_file(
+        session, source_index, worker_task.worker_id, source, model_source
+    )
     worker = (
         await session.get(Worker, worker_task.worker_id)
         if worker_task.worker_id is not None
@@ -1106,8 +1118,36 @@ async def _upsert_distributed_model_file(session, parent, worker_task, result, n
         return EventType.CREATED, model_file
     for field, value in values.items():
         setattr(existing, field, value)
+    existing.source_index = source_index
     session.add(existing)
     return EventType.UPDATED, existing
+
+
+async def _existing_preheat_model_file(
+    session, source_index, worker_id, source, model_source
+):
+    existing = (
+        await session.exec(
+            select(ModelFile).where(ModelFile.source_index == source_index)
+        )
+    ).first()
+    if existing is not None or worker_id is None:
+        return existing
+    conditions = [
+        ModelFile.worker_id == worker_id,
+        ModelFile.source == source,
+        ModelFile.state == ModelFileStateEnum.ERROR,
+        ModelFile.local_dir.is_(None),
+        ModelFile.resolved_revision.is_(None),
+    ]
+    for field, value in model_source.items():
+        conditions.append(getattr(ModelFile, field) == value)
+    candidates = (
+        await session.exec(
+            select(ModelFile).where(*conditions).order_by(ModelFile.id.desc())
+        )
+    ).all()
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _model_file_source(source):
