@@ -244,6 +244,49 @@ def test_execution_failure_logs_traceback_without_exposing_exception_to_task(cap
     assert "internal executor detail" not in str(failure.model_dump())
 
 
+def test_executor_error_result_uses_safe_message_for_fail_request():
+    class ExecutionFailureClient(FakeWorkerTasksClient):
+        def __init__(self):
+            super().__init__()
+            self.failures = []
+
+        async def afail(self, id, failure):
+            self.failures.append(failure)
+
+    async def run():
+        client = ExecutionFailureClient()
+
+        async def failing_executor(payload, context):
+            del payload, context
+            return {
+                "state": "error",
+                "error_code": "worker_execution_failed",
+                "error_type": "OSError",
+                "error_message": "No space left on device: /models/org/model",
+            }
+
+        manager = ModelPreheatManager(
+            worker_id=11,
+            worker_uuid="worker-uuid",
+            clientset=SimpleNamespace(model_preheat_worker_tasks=client),
+            execution_handler=failing_executor,
+        )
+        manager.handle_event(
+            Event(EventType.CREATED, _public_task().model_dump(mode="json"))
+        )
+        await asyncio.gather(*manager._active_tasks.values())
+        return client.failures[0]
+
+    failure = asyncio.run(run())
+
+    assert failure.error_code == "worker_execution_failed"
+    assert failure.state_message == "No space left on device: /models/org/model"
+    assert failure.result["error_type"] == "OSError"
+    assert (
+        failure.result["error_message"] == "No space left on device: /models/org/model"
+    )
+
+
 def test_periodic_reconciliation_claims_task_after_existing_lease_expires():
     class TakeoverClient(FakeWorkerTasksClient):
         def __init__(self):
@@ -439,6 +482,7 @@ async def _restart_protocol_fixture(tmp_path):
             port=10150,
             worker_uuid="worker-uuid",
             state=WorkerStateEnum.READY,
+            model_storage_protocol_version=1,
         )
         session.add(worker)
         await session.flush()
@@ -504,6 +548,7 @@ def _restart_ready_result():
         "skipped": 0,
         "downloaded": 0,
         "total_size": 3,
+        "resolved_revision": "commit-1",
     }
 
 

@@ -644,6 +644,32 @@ def test_target_rejects_manifest_for_different_file_selection(tmp_path):
     assert result == {"state": "error", "error_code": "s3_manifest_invalid"}
 
 
+def test_target_execution_failure_returns_safe_error_details(tmp_path):
+    source = tmp_path / "source"
+    _write_model(source)
+    manifest = build_model_preheat_manifest(source, _identity())
+    minio = InMemoryMinio()
+    client = ModelPreheatS3Client(minio)
+    client.publish_artifact("models", "model-storage", manifest, source)
+
+    def fail_download(*args, **kwargs):
+        del args, kwargs
+        raise OSError(
+            "failed token=secret-value at https://access:secret@s3.example.com/object"
+        )
+
+    client.download_artifact_file = fail_download
+    result = execute_target_preheat(_target_request(tmp_path, manifest, client), client)
+
+    assert result["state"] == "error"
+    assert result["error_code"] == "worker_execution_failed"
+    assert result["error_type"] == "OSError"
+    assert "secret-value" not in result["error_message"]
+    assert "access:secret" not in result["error_message"]
+    assert "token=" not in result["error_message"]
+    assert "[redacted]" in result["error_message"]
+
+
 def test_requested_revision_does_not_change_artifact_manifest(tmp_path):
     root = tmp_path / "source"
     _write_model(root)

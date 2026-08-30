@@ -65,6 +65,18 @@ class ScheduleDisabled(RuntimeError):
     pass
 
 
+TASK_CREATION_ERROR_CODES = {
+    "credential_encryption_unavailable",
+    "model_preheat_s3_profile_in_maintenance",
+    "model_preheat_s3_profile_not_found",
+    "model_preheat_schedule_config_required",
+    "seed_worker_not_idle",
+    "seed_worker_not_online",
+    "target_workers_not_idle",
+    "target_workers_not_online",
+}
+
+
 def manual_run_operation_key(user_id: int, idempotency_key: str | None) -> str:
     if not idempotency_key:
         return uuid4().hex
@@ -237,6 +249,24 @@ class ModelPreheatScheduleController:
             except ScheduleConcurrencyLimit:
                 await session.rollback()
                 raise
+            except RuntimeError as exc:
+                await session.rollback()
+                existing = await self._run_for_operation(session, operation_key)
+                if existing is not None:
+                    if existing.schedule_id != schedule_id:
+                        raise ScheduleRunConflict
+                    return existing
+                schedule = await session.get(ModelPreheatSchedule, schedule_id)
+                if schedule is None:
+                    raise ScheduleRunConflict
+                return await self._persist_failed_manual_run(
+                    session,
+                    schedule,
+                    operation_key,
+                    created_by_user_id,
+                    now,
+                    _task_creation_error_code(exc),
+                )
             except (IntegrityError, OperationalError) as exc:
                 last_retry_error = exc
                 await session.rollback()
@@ -254,6 +284,38 @@ class ModelPreheatScheduleController:
         if isinstance(last_retry_error, OperationalError):
             raise last_retry_error
         raise ScheduleConcurrencyLimit
+
+    async def _persist_failed_manual_run(
+        self,
+        session,
+        schedule,
+        operation_key,
+        created_by_user_id,
+        now,
+        error_code,
+    ):
+        run = ModelPreheatScheduleRun(
+            schedule_id=schedule.id,
+            window_start_utc=now,
+            window_end_utc=window_end_utc(now, schedule.window_duration_minutes),
+            trigger=ModelPreheatScheduleRunTriggerEnum.MANUAL,
+            state=ModelPreheatScheduleRunStateEnum.ERROR,
+            operation_key=operation_key,
+            error_code=error_code,
+            finished_at=now,
+            created_by_user_id=created_by_user_id,
+        )
+        session.add(run)
+        try:
+            await session.commit()
+            await session.refresh(run)
+            return run
+        except IntegrityError:
+            await session.rollback()
+            existing = await self._run_for_operation(session, operation_key)
+            if existing is None or existing.schedule_id != schedule.id:
+                raise ScheduleRunConflict
+            return existing
 
     async def _create_task_behind_pause_gate(
         self,
@@ -931,6 +993,15 @@ class ModelPreheatScheduleController:
         )
         run.finished_at = now
         run.slot = None
+
+
+def _task_creation_error_code(exc: RuntimeError) -> str:
+    code = str(exc) or ""
+    return (
+        code
+        if code in TASK_CREATION_ERROR_CODES
+        else "model_preheat_schedule_run_failed"
+    )
 
 
 async def create_scheduled_model_preheat_task(

@@ -170,6 +170,8 @@ PREHEAT_RESULT_FIELDS = {
     "resolved_revision",
     "local_dir",
     "resolved_paths",
+    "error_type",
+    "error_message",
     "cursor",
 }
 PREHEAT_RESULT_STATES = {"ready", "error"}
@@ -181,6 +183,7 @@ MAX_PREHEAT_CURSOR_PATH_LENGTH = 1024
 MAX_PREHEAT_RESOLVED_PATHS = 1024
 MAX_PREHEAT_RESOLVED_PATH_LENGTH = 4096
 MAX_STATE_MESSAGE_LENGTH = 256
+MAX_PREHEAT_ERROR_TYPE_LENGTH = 80
 STATE_MESSAGE_ALLOWLIST = {
     "distributing",
     "downloading",
@@ -540,6 +543,7 @@ async def fail_model_preheat_worker_task(
     if failure.error_code not in SAFE_ERROR_CODES:
         raise HTTPException(422, "Invalid", "invalid_error_code")
     result_payload = _validated_result(task.role, failure.result)
+    state_message = _failure_state_message(failure, result_payload)
     if task.state == ModelPreheatWorkerTaskStateEnum.ERROR:
         await _aggregate_connectivity(session, task)
         return await _refresh_task(session, worker_task_id)
@@ -548,7 +552,7 @@ async def fail_model_preheat_worker_task(
         _active_lease_update(worker_task_id, failure, now).values(
             state=ModelPreheatWorkerTaskStateEnum.ERROR,
             error_code=failure.error_code,
-            state_message=failure.error_code,
+            state_message=state_message,
             resumable_cursor=result_payload,
             last_heartbeat_at=now,
             lease_expires_at=None,
@@ -1358,9 +1362,56 @@ def _validated_preheat_result(value):
         "error_code": value["error_code"],
         "local_cache_state": value.get("local_cache_state", "error"),
     }
+    error_type = value.get("error_type")
+    if error_type is not None:
+        if (
+            not isinstance(error_type, str)
+            or not error_type
+            or len(error_type) > MAX_PREHEAT_ERROR_TYPE_LENGTH
+            or not error_type.replace("_", "").replace(".", "").isalnum()
+        ):
+            raise HTTPException(422, "Invalid", "invalid_preheat_result")
+        sanitized["error_type"] = error_type
+    error_message = _validated_failure_message(value.get("error_message"))
+    if error_message is not None:
+        sanitized["error_message"] = error_message
     if cursor:
         sanitized["cursor"] = cursor
     return sanitized
+
+
+def _failure_state_message(failure, result_payload):
+    if isinstance(result_payload, dict):
+        result_message = _validated_failure_message(result_payload.get("error_message"))
+        if result_message is not None:
+            return result_message
+    return _validated_failure_message(failure.state_message) or failure.error_code
+
+
+def _validated_failure_message(value):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    value = "".join(
+        " " if ord(char) < 32 or ord(char) == 127 else char for char in value
+    )
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > MAX_STATE_MESSAGE_LENGTH:
+        value = value[:MAX_STATE_MESSAGE_LENGTH]
+    lowered = value.lower()
+    sensitive_markers = (
+        "access_key",
+        "secret_key",
+        "token=",
+        "password=",
+        "authorization",
+    )
+    if any(marker in lowered for marker in sensitive_markers):
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    return value
 
 
 def _validated_cursor(role, value):

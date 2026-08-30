@@ -1578,7 +1578,7 @@ def test_resume_paused_task_cas_does_not_overwrite_concurrent_cancel(tmp_path):
     )
 
 
-def test_run_now_rolls_back_when_task_creator_commits_then_fails(tmp_path):
+def test_run_now_persists_failed_run_when_task_creator_commits_then_fails(tmp_path):
     async def run():
         engine = await _database(tmp_path)
         await _seed_schedule(engine)
@@ -1593,14 +1593,19 @@ def test_run_now_rolls_back_when_task_creator_commits_then_fails(tmp_path):
         )
         async with AsyncSession(engine) as session:
             schedule = (await session.exec(select(ModelPreheatSchedule))).one()
-            with pytest.raises(RuntimeError, match="preflight_failed"):
-                await controller.run_now(session, schedule, 1, "failure")
+            run = await controller.run_now(session, schedule, 1, "failure")
         async with AsyncSession(engine) as session:
             runs = (await session.exec(select(ModelPreheatScheduleRun))).all()
         await engine.dispose()
-        return runs
+        return run.state, run.error_code, len(runs), runs[0].task_id, runs[0].slot
 
-    assert asyncio.run(run()) == []
+    assert asyncio.run(run()) == (
+        ModelPreheatScheduleRunStateEnum.ERROR,
+        "model_preheat_schedule_run_failed",
+        1,
+        None,
+        None,
+    )
 
 
 def test_run_now_does_not_mask_persistent_database_lock_as_concurrency_limit(

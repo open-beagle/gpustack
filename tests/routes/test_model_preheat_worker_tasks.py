@@ -1043,3 +1043,72 @@ def test_connectivity_terminal_updates_remain_serializable_after_aggregation(
 
     assert asyncio.run(connectivity_did_not_use_storage()) is None
     asyncio.run(engine.dispose())
+
+
+def test_preheat_fail_persists_safe_worker_error_details(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    child_id, _, _ = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        failed = client.post(
+            f"{API_PREFIX}/{child_id}/fail",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "error_code": "worker_execution_failed",
+                "result": {
+                    "state": "error",
+                    "error_code": "worker_execution_failed",
+                    "local_cache_state": "error",
+                    "error_type": "OSError",
+                    "error_message": "No space left on device: /models/org/model",
+                },
+            },
+        )
+
+    async def persisted():
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatWorkerTask, child_id)
+            return task.state_message, task.resumable_cursor
+
+    state_message, cursor = asyncio.run(persisted())
+    asyncio.run(engine.dispose())
+
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["state"] == "error"
+    assert (
+        failed.json()["state_message"] == "No space left on device: /models/org/model"
+    )
+    assert state_message == "No space left on device: /models/org/model"
+    assert cursor["error_type"] == "OSError"
+    assert cursor["error_message"] == "No space left on device: /models/org/model"
+
+
+def test_preheat_fail_rejects_sensitive_worker_error_details(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    child_id, _, _ = asyncio.run(_seed(engine, key))
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        failed = client.post(
+            f"{API_PREFIX}/{child_id}/fail",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "error_code": "worker_execution_failed",
+                "result": {
+                    "state": "error",
+                    "error_code": "worker_execution_failed",
+                    "error_type": "OSError",
+                    "error_message": "token=must-not-leak",
+                },
+            },
+        )
+
+    asyncio.run(engine.dispose())
+
+    assert failed.status_code == 422
+    assert failed.json()["message"] == "invalid_preheat_result"

@@ -447,13 +447,18 @@ class ModelPreheatManager:
     async def _fail(self, lease, error_code, result=None, *, role=None):
         if result is None:
             result = self._failure_result(role, error_code)
+        state_message = (
+            result.get("error_message")
+            if isinstance(result, dict) and result.get("error_message")
+            else error_code
+        )
         try:
             await self._client.afail(
                 id=lease.worker_task_id,
                 failure=ModelPreheatWorkerTaskFail(
                     **lease.request().model_dump(),
                     error_code=error_code,
-                    state_message=error_code,
+                    state_message=state_message,
                     result=result,
                 ),
             )

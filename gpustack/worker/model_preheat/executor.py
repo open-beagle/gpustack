@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import io
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -267,8 +268,8 @@ def execute_seed_preheat(
         return _error_result("s3_manifest_invalid")
     except ModelPreheatS3Conflict as exc:
         return _error_result(_safe_s3_error(exc))
-    except (OSError, ValueError):
-        return _error_result("worker_execution_failed")
+    except (OSError, ValueError) as exc:
+        return _error_result("worker_execution_failed", exc)
 
 
 def execute_target_preheat(
@@ -347,8 +348,8 @@ def execute_target_preheat(
         return _error_result("s3_manifest_invalid")
     except ModelPreheatS3Conflict as exc:
         return _error_result(_safe_s3_error(exc))
-    except (OSError, ValueError):
-        return _error_result("worker_execution_failed")
+    except (OSError, ValueError) as exc:
+        return _error_result("worker_execution_failed", exc)
 
 
 def _manifest_matches_request(manifest, request) -> bool:
@@ -405,8 +406,33 @@ def _resolved_paths_for_manifest(target_dir, manifest):
     return [str(Path(target_dir) / decode_path(file.path)) for file in manifest.files]
 
 
-def _error_result(error_code, *args, **kwargs):
-    return {"state": "error", "error_code": error_code}
+def _error_result(error_code, exc=None):
+    result = {"state": "error", "error_code": error_code}
+    details = _safe_error_details(exc)
+    if details:
+        result["error_type"] = details["error_type"]
+        result["error_message"] = details["error_message"]
+    return result
+
+
+def _safe_error_details(exc):
+    if exc is None:
+        return None
+    message = str(exc) or type(exc).__name__
+    message = re.sub(
+        r"(?i)(access_key|secret_key|token|password)=([^\s&]+)",
+        "[redacted]",
+        message,
+    )
+    message = re.sub(r"://([^:/\s]+):([^@/\s]+)@", r"://\1:***@", message)
+    message = "".join(
+        " " if ord(char) < 32 or ord(char) == 127 else char for char in message
+    )
+    message = message[:256]
+    return {
+        "error_type": type(exc).__name__[:80],
+        "error_message": message,
+    }
 
 
 def _validate_ollama_staging(staging: Path, expected_filename: str) -> None:

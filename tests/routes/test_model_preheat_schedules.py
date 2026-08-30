@@ -1244,7 +1244,7 @@ def test_disabled_schedule_run_now_uses_schedule_specific_error(tmp_path):
     assert run.json()["message"] == "model_preheat_schedule_disabled"
 
 
-def test_schedule_run_now_returns_task_creation_error_code(tmp_path):
+def test_schedule_run_now_persists_task_creation_error_run(tmp_path):
     app, engine = _test_app(tmp_path)
     profile_id = asyncio.run(_seed_profile(engine))
 
@@ -1259,13 +1259,26 @@ def test_schedule_run_now_returns_task_creation_error_code(tmp_path):
             f"/v1/model-preheat-schedules/{created.json()['id']}/run-now",
             headers={"Idempotency-Key": "busy-workers"},
         )
+        repeated = client.post(
+            f"/v1/model-preheat-schedules/{created.json()['id']}/run-now",
+            headers={"Idempotency-Key": "busy-workers"},
+        )
+        runs = client.get(f"/v1/model-preheat-schedules/{created.json()['id']}/runs")
 
     asyncio.run(_drop_tables(engine))
     asyncio.run(engine.dispose())
 
     assert created.status_code == 200, created.text
-    assert run.status_code == 409
-    assert run.json()["message"] == "target_workers_not_idle"
+    assert run.status_code == 200, run.text
+    assert run.json()["state"] == "error"
+    assert run.json()["error_code"] == "target_workers_not_idle"
+    assert run.json()["task_id"] is None
+    assert run.json()["tasks"] == []
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["id"] == run.json()["id"]
+    assert runs.status_code == 200, runs.text
+    assert runs.json()["pagination"]["total"] == 1
+    assert runs.json()["items"][0]["error_code"] == "target_workers_not_idle"
 
 
 def test_schedule_patterns_survive_create_unrelated_patch_and_worker_matching(tmp_path):
