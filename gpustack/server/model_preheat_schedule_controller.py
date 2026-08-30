@@ -1032,10 +1032,9 @@ async def create_scheduled_model_preheat_task(
         # 精确 Artifact 命中不需要任何 Worker；未命中时随后只解析一个 Seed。
         target_worker_ids, seed_worker_id = [], None
     elif schedule.target_scope.value == "selected_workers":
+        workers_by_uuid = ready_workers_by_uuid
         missing = set(schedule.target_worker_uuids) - set(workers_by_uuid)
         if missing:
-            if missing <= set(ready_workers_by_uuid):
-                raise RuntimeError("target_workers_not_idle")
             raise RuntimeError("target_workers_not_online")
         target_worker_ids = [
             workers_by_uuid[worker_uuid].id
@@ -1111,9 +1110,10 @@ async def create_scheduled_model_preheat_task(
         workers, seed_worker, target_gpu_names = await _resolve_target_workers(
             session, task_in
         )
-        workers = [worker for worker in workers if worker.id not in busy_worker_ids]
-        if not workers:
-            raise RuntimeError("target_workers_not_idle")
+        if task_in.target_scope.value != "selected_workers":
+            workers = [worker for worker in workers if worker.id not in busy_worker_ids]
+            if not workers:
+                raise RuntimeError("target_workers_not_idle")
         await _ensure_profile_available_on_workers(
             session,
             profile,

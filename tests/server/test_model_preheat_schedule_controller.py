@@ -752,6 +752,81 @@ def test_same_gpu_model_creator_does_not_reinclude_busy_worker(tmp_path, monkeyp
     assert asyncio.run(run()) == ["worker-a"]
 
 
+def test_selected_workers_creator_keeps_busy_targets_in_parent_task(
+    tmp_path, monkeypatch
+):
+    async def skip_connectivity_check(session, profile, config, workers, **kwargs):
+        del session, profile, config, workers, kwargs
+
+    monkeypatch.setattr(
+        model_preheats,
+        "_ensure_profile_available_on_workers",
+        skip_connectivity_check,
+    )
+    monkeypatch.setattr(
+        model_preheat_schedule_controller,
+        "resolve_model_preheat_revision",
+        lambda source, model_id, revision, token=None, **kwargs: revision,
+    )
+
+    async def run():
+        engine = await _database(tmp_path)
+        schedule_id = await _seed_schedule(engine)
+        async with AsyncSession(engine) as session:
+            busy = await _add_worker(session, "worker-b")
+            session.add(
+                ModelInstance(
+                    source=SourceEnum.HUGGING_FACE,
+                    name="busy-instance",
+                    model_name="busy-model",
+                    model_id=1,
+                    worker_id=busy.id,
+                    state=ModelInstanceStateEnum.RUNNING,
+                )
+            )
+            session.add(
+                ModelPreheatS3Profile(
+                    id=1,
+                    name="profile",
+                    endpoint="https://s3.example.com",
+                    bucket="models",
+                    access_key_encrypted={"ciphertext": "access-secret"},
+                    secret_key_encrypted={"ciphertext": "secret-secret"},
+                    encryption_key_version="v1",
+                )
+            )
+            schedule = await session.get(ModelPreheatSchedule, schedule_id)
+            schedule.target_scope = ModelPreheatTargetScopeEnum.SELECTED_WORKERS
+            schedule.target_worker_uuids = ["worker-a", "worker-b"]
+            schedule.seed_worker_uuid = None
+            session.add(schedule)
+            await session.commit()
+        config = SimpleNamespace(
+            model_preheat_credential_key=generate_model_preheat_credential_key(),
+            model_preheat_credential_key_version="v1",
+            model_preheat_credential_old_keys=None,
+            huggingface_token=None,
+        )
+        async with AsyncSession(engine) as session:
+            schedule = await session.get(ModelPreheatSchedule, schedule_id)
+            task = await create_scheduled_model_preheat_task(
+                session, schedule, 1, config
+            )
+            result = (
+                task.target_worker_uuids,
+                task.seed_worker_uuid,
+                [item["worker_uuid"] for item in task.target_worker_snapshot],
+            )
+        await engine.dispose()
+        return result
+
+    assert asyncio.run(run()) == (
+        ["worker-a", "worker-b"],
+        "worker-a",
+        ["worker-a", "worker-b"],
+    )
+
+
 def test_disabled_feature_flag_does_not_block_schedule_runs(tmp_path):
     async def run():
         engine = await _database(tmp_path)
