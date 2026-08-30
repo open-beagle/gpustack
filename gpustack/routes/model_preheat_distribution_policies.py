@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
-from sqlalchemy import delete
+from sqlalchemy import delete, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
@@ -32,6 +32,8 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatInventoryManifestStateEnum,
     ModelPreheatWorkerTask,
+    ModelPreheatWorkerTaskRoleEnum,
+    ModelPreheatWorkerTaskStateEnum,
 )
 from gpustack.schemas.model_storage_sync import (
     ModelStorageSyncTask,
@@ -50,6 +52,14 @@ from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
 router = APIRouter()
+
+
+_TERMINAL_DISTRIBUTION_TASK_STATES = (
+    ModelPreheatWorkerTaskStateEnum.READY,
+    ModelPreheatWorkerTaskStateEnum.ERROR,
+    ModelPreheatWorkerTaskStateEnum.CANCELED,
+    ModelPreheatWorkerTaskStateEnum.SKIPPED_WORKER_REMOVED,
+)
 
 
 @router.get("/runs", response_model=ModelPreheatDistributionPolicyRunsPublic)
@@ -351,7 +361,30 @@ async def update_distribution_policy(
 @router.delete("/{id}")
 async def delete_distribution_policy(session: SessionDep, id: int):
     policy = await _policy_or_404(session, id)
+    active_task_id = (
+        await session.exec(
+            select(ModelPreheatWorkerTask.id).where(
+                ModelPreheatWorkerTask.distribution_policy_id == id,
+                ModelPreheatWorkerTask.role
+                == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                ModelPreheatWorkerTask.state.not_in(_TERMINAL_DISTRIBUTION_TASK_STATES),
+            )
+        )
+    ).first()
+    if active_task_id is not None:
+        raise HTTPException(409, "Conflict", "distribution_policy_in_use")
+
     try:
+        await session.exec(
+            update(ModelPreheatWorkerTask)
+            .where(
+                ModelPreheatWorkerTask.distribution_policy_id == id,
+                ModelPreheatWorkerTask.role
+                == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                ModelPreheatWorkerTask.state.in_(_TERMINAL_DISTRIBUTION_TASK_STATES),
+            )
+            .values(distribution_policy_id=None)
+        )
         await session.delete(policy)
         await session.commit()
     except IntegrityError:

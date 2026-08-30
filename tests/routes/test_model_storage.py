@@ -394,6 +394,7 @@ def test_sync_policy_run_now_creates_existing_sync_task_and_replays(app, client)
     assert detail.status_code == 200
     assert detail.json()["model_file_id"] == model_file_id
     policies = client.get("/v1/model-storage-sync-policies")
+    assert policies.json()["items"][0]["last_run_at"] == first.json()["window_start_utc"]
     latest = policies.json()["items"][0]["latest_run"]
     assert latest["id"] == first.json()["id"]
     assert latest["execution_state"] == "waiting"
@@ -431,7 +432,10 @@ def test_sync_policy_run_now_creates_existing_sync_task_and_replays(app, client)
 
 
 def test_sync_policy_run_projects_created_skipped_and_failed_batch_items(app, client):
-    from gpustack.schemas.model_storage_sync_policies import ModelStorageSyncPolicyRun
+    from gpustack.schemas.model_storage_sync_policies import (
+        ModelStorageSyncPolicyRun,
+        ModelStorageSyncPolicyRunStateEnum,
+    )
 
     profile_id, model_file_id = _run(app, _seed_ids(app))
     policy = client.post(
@@ -450,13 +454,15 @@ def test_sync_policy_run_projects_created_skipped_and_failed_batch_items(app, cl
     ).json()
     task_id = run["response_payload"]["created"][0]["task_id"]
 
-    async def set_payload(response_payload):
+    async def set_payload(response_payload, state=None):
         async with AsyncSession(_engine(app)) as session:
             task = await session.get(ModelStorageSyncTask, task_id)
             task.state = ModelStorageSyncTaskStateEnum.READY
             task.total_size = 4096
             record = await session.get(ModelStorageSyncPolicyRun, run["id"])
             record.response_payload = response_payload
+            if state is not None:
+                record.state = state
             session.add(task)
             session.add(record)
             await session.commit()
@@ -543,12 +549,31 @@ def test_sync_policy_run_projects_created_skipped_and_failed_batch_items(app, cl
         set_payload(
             {
                 "created": [],
+                "skipped": [{"worker_uuid": "worker-a", "reason": "not_ready"}],
+                "failed": [{"worker_uuid": "worker-b", "reason": "source_missing"}],
+            },
+            ModelStorageSyncPolicyRunStateEnum.ERROR,
+        ),
+    )
+    failed_without_success = client.get(
+        f"/v1/model-storage-sync-policies/{policy['id']}/runs/{run['id']}"
+    ).json()
+    assert failed_without_success["execution_state"] == "error"
+    assert failed_without_success["summary"]["ready"] == 0
+    assert failed_without_success["summary"]["skipped"] == 1
+
+    _run(
+        app,
+        set_payload(
+            {
+                "created": [],
                 "skipped": [
                     {"worker_uuid": "worker-a", "reason": "not_selected"},
                     {"worker_uuid": "worker-b", "reason": "not_ready"},
                 ],
                 "failed": [],
-            }
+            },
+            ModelStorageSyncPolicyRunStateEnum.READY,
         ),
     )
     skipped = client.get(
@@ -1533,6 +1558,9 @@ def test_selected_worker_policy_resolves_latest_registration_by_uuid(app, client
     )
 
     assert run.status_code == 200, run.text
+    assert run.json()["state"] == "error"
+    assert run.json()["execution_state"] == "error"
+    assert run.json()["error_code"] == "worker_protocol_unsupported"
     assert run.json()["response_payload"]["created"] == []
     assert run.json()["response_payload"]["skipped"] == [
         {

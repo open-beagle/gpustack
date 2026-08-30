@@ -323,6 +323,7 @@ def _bucket(state):
 
 
 def _execution_state(summary, stored_state):
+    value = getattr(stored_state, "value", stored_state)
     if summary.total:
         if summary.paused:
             return PolicyRunExecutionStateEnum.PAUSED
@@ -330,16 +331,19 @@ def _execution_state(summary, stored_state):
             return PolicyRunExecutionStateEnum.RUNNING
         if summary.pending:
             return PolicyRunExecutionStateEnum.WAITING
+        if value == "error" and not summary.ready:
+            return PolicyRunExecutionStateEnum.ERROR
         if summary.error:
             return (
                 PolicyRunExecutionStateEnum.PARTIAL_ERROR
                 if summary.ready or summary.skipped
                 else PolicyRunExecutionStateEnum.ERROR
             )
+        if value == "error":
+            return PolicyRunExecutionStateEnum.ERROR
         if summary.ready:
             return PolicyRunExecutionStateEnum.READY
         return PolicyRunExecutionStateEnum.SKIPPED
-    value = getattr(stored_state, "value", stored_state)
     if value == "ready":
         return PolicyRunExecutionStateEnum.READY
     if value == "error":

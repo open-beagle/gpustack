@@ -116,6 +116,8 @@ class ModelStorageSyncPolicyController:
             request_hash=request_hash,
             created_by_user_id=user_id,
         )
+        policy.last_run_at = now
+        session.add(policy)
         session.add(run)
         try:
             await session.commit()
@@ -438,6 +440,9 @@ class ModelStorageSyncPolicyController:
         if len(task_ids) != len(result.created):
             error_codes.add("model_storage_sync_task_not_found")
         if not task_ids:
+            skipped_codes = {item.reason for item in result.skipped if item.reason}
+            if skipped_codes:
+                error_codes.update(skipped_codes)
             if not error_codes:
                 return ModelStorageSyncPolicyRunStateEnum.READY, None
             error_code = (

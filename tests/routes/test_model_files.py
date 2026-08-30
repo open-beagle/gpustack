@@ -2,6 +2,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 import pytest
@@ -26,7 +27,7 @@ from gpustack.routes.model_files import (
     update_model_file,
 )
 from gpustack.schemas.common import ListParams
-from gpustack.server.bus import EventType, event_bus
+from gpustack.server.bus import Event, EventType, event_bus
 from gpustack.schemas.links import ModelInstanceModelFileLink
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
 from gpustack.schemas.model_storage_sync import (
@@ -65,6 +66,55 @@ def test_model_storage_sync_task_is_owned_by_model_file():
 
     assert foreign_key.target_fullname == "model_files.id"
     assert foreign_key.ondelete == "CASCADE"
+
+
+@pytest.mark.parametrize(
+    ("streamer", "event_model"),
+    [
+        (model_files_routes._stream_model_files, ModelFile),
+        (model_storage._stream_sync_tasks, ModelStorageSyncTask),
+    ],
+)
+def test_streaming_cancellation_closes_session_outside_cancel_scope(
+    monkeypatch, streamer, event_model
+):
+    session_started = anyio.Event()
+    session_closed = anyio.Event()
+
+    class BlockingSession:
+        def __init__(self, _engine):
+            pass
+
+        async def get(self, *_args):
+            session_started.set()
+            await anyio.sleep_forever()
+
+        async def close(self):
+            await anyio.sleep(0)
+            session_closed.set()
+
+    async def subscribe(_cls, _engine):
+        yield Event(EventType.UPDATED, SimpleNamespace(id=1))
+
+    async def consume():
+        stream = streamer(object())
+        try:
+            await anext(stream)
+        except StopAsyncIteration:
+            pass
+
+    monkeypatch.setattr(model_files_routes, "AsyncSession", BlockingSession)
+    monkeypatch.setattr(model_storage, "AsyncSession", BlockingSession)
+    monkeypatch.setattr(event_model, "subscribe", classmethod(subscribe))
+
+    async def run():
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(consume)
+            await session_started.wait()
+            task_group.cancel_scope.cancel()
+        assert session_closed.is_set()
+
+    anyio.run(run)
 
 
 def test_model_file_crud_cascades_sync_tasks(tmp_path):
@@ -491,8 +541,12 @@ async def _run_sync_creation_commits_before_delete_is_rejected(
         delete_attempted.set()
         return await original_lock(session, row_id)
 
-    monkeypatch.setattr(model_storage, "lock_model_file_for_sync_or_delete", create_lock)
-    monkeypatch.setattr(model_files_routes, "lock_model_file_for_sync_or_delete", delete_lock)
+    monkeypatch.setattr(
+        model_storage, "lock_model_file_for_sync_or_delete", create_lock
+    )
+    monkeypatch.setattr(
+        model_files_routes, "lock_model_file_for_sync_or_delete", delete_lock
+    )
 
     async with (
         AsyncSession(engine, expire_on_commit=False) as create_session,
@@ -528,7 +582,9 @@ async def _run_sync_creation_commits_before_delete_is_rejected(
     assert getattr(error, "message", None) == "model_file_has_active_sync_task"
     async with AsyncSession(engine) as verify_session:
         assert await verify_session.get(ModelFile, model_file_id) is not None
-        assert await verify_session.get(ModelStorageSyncTask, created_task_id) is not None
+        assert (
+            await verify_session.get(ModelStorageSyncTask, created_task_id) is not None
+        )
     await engine.dispose()
 
 
@@ -553,8 +609,12 @@ async def _run_delete_holds_lock_before_sync_creation_observes_missing_model_fil
         create_attempted.set()
         return await original_lock(session, row_id)
 
-    monkeypatch.setattr(model_files_routes, "lock_model_file_for_sync_or_delete", delete_lock)
-    monkeypatch.setattr(model_storage, "lock_model_file_for_sync_or_delete", create_lock)
+    monkeypatch.setattr(
+        model_files_routes, "lock_model_file_for_sync_or_delete", delete_lock
+    )
+    monkeypatch.setattr(
+        model_storage, "lock_model_file_for_sync_or_delete", create_lock
+    )
 
     async with (
         AsyncSession(engine, expire_on_commit=False) as delete_session,
@@ -593,11 +653,13 @@ async def _run_delete_holds_lock_before_sync_creation_observes_missing_model_fil
         assert create_result.failed[0].reason == "model_file_not_found"
     async with AsyncSession(engine) as verify_session:
         assert await verify_session.get(ModelFile, model_file_id) is None
-        tasks = (await verify_session.exec(
-            select(ModelStorageSyncTask).where(
-                ModelStorageSyncTask.model_file_id == model_file_id
+        tasks = (
+            await verify_session.exec(
+                select(ModelStorageSyncTask).where(
+                    ModelStorageSyncTask.model_file_id == model_file_id
+                )
             )
-        )).all()
+        ).all()
         assert tasks == []
     await engine.dispose()
 

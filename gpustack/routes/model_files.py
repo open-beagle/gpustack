@@ -1,4 +1,7 @@
+import asyncio
 from typing import Optional
+
+import anyio
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import inspect
@@ -51,17 +54,13 @@ async def lock_model_file_for_sync_or_delete(session, model_file_id: int):
     if dialect in {"postgresql", "mysql"}:
         return (
             await session.exec(
-                select(ModelFile)
-                .where(ModelFile.id == model_file_id)
-                .with_for_update()
+                select(ModelFile).where(ModelFile.id == model_file_id).with_for_update()
             )
         ).first()
 
     # SQLite 不支持行级 FOR UPDATE；无变化 UPDATE 在当前事务持有写锁。
     result = await session.exec(
-        update(ModelFile)
-        .where(ModelFile.id == model_file_id)
-        .values(id=ModelFile.id)
+        update(ModelFile).where(ModelFile.id == model_file_id).values(id=ModelFile.id)
     )
     if result.rowcount != 1:
         return None
@@ -144,31 +143,40 @@ async def get_model_files(
 
 async def _stream_model_files(engine, fields=None, filter_func=None):
     """输出带传输来源名称的 ModelFile SSE，初始与增量事件使用同一序列化。"""
-    async for event in ModelFile.subscribe(engine):
-        if event.type == EventType.HEARTBEAT:
-            yield "\n\n"
-            continue
-        async with AsyncSession(engine) as session:
-            if (
-                event.type != EventType.DELETED
-                and _event_model_id(event.data) is not None
-                and _event_timestamps_missing(event.data)
-            ):
-                persisted = await session.get(ModelFile, _event_model_id(event.data))
-                if persisted is not None:
-                    event.data = persisted
-            matches = ModelFile._match_fields(event, fields) and (
-                not filter_func or ModelFile._safe_filter(filter_func, event.data)
-            )
-            if not matches:
-                # UPDATE 离开当前筛选集合时通知客户端移除旧行；对从未进入
-                # 集合的记录发送 DELETE 是幂等的。CREATED 不匹配仍忽略。
-                if event.type == EventType.UPDATED:
-                    event.type = EventType.DELETED
-                    yield ModelFile._format_event(event)
+    try:
+        async for event in ModelFile.subscribe(engine):
+            if event.type == EventType.HEARTBEAT:
+                yield "\n\n"
                 continue
-            event.data = (await _model_files_public(session, [event.data]))[0]
-        yield ModelFile._format_event(event)
+            session = AsyncSession(engine)
+            try:
+                if (
+                    event.type != EventType.DELETED
+                    and _event_model_id(event.data) is not None
+                    and _event_timestamps_missing(event.data)
+                ):
+                    persisted = await session.get(
+                        ModelFile, _event_model_id(event.data)
+                    )
+                    if persisted is not None:
+                        event.data = persisted
+                matches = ModelFile._match_fields(event, fields) and (
+                    not filter_func or ModelFile._safe_filter(filter_func, event.data)
+                )
+                if not matches:
+                    # UPDATE 离开当前筛选集合时通知客户端移除旧行；对从未进入
+                    # 集合的记录发送 DELETE 是幂等的。CREATED 不匹配仍忽略。
+                    if event.type == EventType.UPDATED:
+                        event.type = EventType.DELETED
+                        yield ModelFile._format_event(event)
+                    continue
+                event.data = (await _model_files_public(session, [event.data]))[0]
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await session.close()
+            yield ModelFile._format_event(event)
+    except asyncio.CancelledError:
+        return
 
 
 def _event_model_id(data):

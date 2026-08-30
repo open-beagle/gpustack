@@ -312,6 +312,9 @@ async def run_model_preheat_schedule_now(
         if code != "model_preheat_schedule_disabled":
             code = "model_preheat_schedule_disabled"
         raise HTTPException(409, "Conflict", code) from None
+    except RuntimeError as exc:
+        code = str(exc) or "model_preheat_schedule_run_failed"
+        raise HTTPException(409, "Conflict", code) from None
     observations = await preheat_schedule_run_observations(
         session, [run], include_tasks=True
     )

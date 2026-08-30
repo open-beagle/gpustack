@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Callable, Optional
 from uuid import uuid4
 
+import anyio
 from fastapi import APIRouter, Depends, Header, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, func, update
@@ -1447,29 +1448,42 @@ async def _sync_tasks_public(session, tasks, cipher):
 
 
 async def _stream_sync_tasks(engine, fields=None, cipher=None):
-    async for event in ModelStorageSyncTask.subscribe(engine):
-        if event.type == EventType.HEARTBEAT:
-            yield "\n\n"
-            continue
-        async with AsyncSession(engine) as session:
-            if (
-                ModelStorageSyncTask._safe_event_value(event.data, "created_at", None)
-                is None
-                or ModelStorageSyncTask._safe_event_value(
-                    event.data, "updated_at", None
-                )
-                is None
-            ):
-                task_id = ModelStorageSyncTask._safe_event_value(event.data, "id", None)
-                if task_id is None:
-                    continue
-                event.data = await session.get(ModelStorageSyncTask, task_id)
-                if event.data is None:
-                    continue
-            if not ModelStorageSyncTask._match_fields(event, fields):
+    try:
+        async for event in ModelStorageSyncTask.subscribe(engine):
+            if event.type == EventType.HEARTBEAT:
+                yield "\n\n"
                 continue
-            event.data = (await _sync_tasks_public(session, [event.data], cipher))[0]
-        yield ModelStorageSyncTask._format_event(event)
+            session = AsyncSession(engine)
+            try:
+                if (
+                    ModelStorageSyncTask._safe_event_value(
+                        event.data, "created_at", None
+                    )
+                    is None
+                    or ModelStorageSyncTask._safe_event_value(
+                        event.data, "updated_at", None
+                    )
+                    is None
+                ):
+                    task_id = ModelStorageSyncTask._safe_event_value(
+                        event.data, "id", None
+                    )
+                    if task_id is None:
+                        continue
+                    event.data = await session.get(ModelStorageSyncTask, task_id)
+                    if event.data is None:
+                        continue
+                if not ModelStorageSyncTask._match_fields(event, fields):
+                    continue
+                event.data = (await _sync_tasks_public(session, [event.data], cipher))[
+                    0
+                ]
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await session.close()
+            yield ModelStorageSyncTask._format_event(event)
+    except asyncio.CancelledError:
+        return
 
 
 def _frozen_sync_profile(task, cipher):

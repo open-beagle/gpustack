@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
+import pytest
+from sqlalchemy import event
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -55,6 +57,11 @@ def _test_app(tmp_path):
         f"sqlite+aiosqlite:///{tmp_path / 'policies.db'}",
         poolclass=NullPool,
         connect_args={"check_same_thread": False},
+    )
+    event.listen(
+        engine.sync_engine,
+        "connect",
+        lambda connection, _: connection.execute("PRAGMA foreign_keys=ON"),
     )
     asyncio.run(_create_tables(engine))
     app = FastAPI()
@@ -125,6 +132,108 @@ async def _seed(engine):
         await session.commit()
         await session.refresh(policy)
         return policy.id
+
+
+def test_delete_distribution_policy_unlinks_terminal_worker_tasks(tmp_path):
+    app, engine = _test_app(tmp_path)
+    policy_id = asyncio.run(_seed(engine))
+
+    async def seed_terminal_task_and_run_link():
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy_id,
+                trigger=ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+                state=ModelPreheatDistributionPolicyRunStateEnum.READY,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="terminal-delete-run",
+            )
+            task = ModelPreheatWorkerTask(
+                distribution_policy_id=policy_id,
+                operation_key="terminal-delete-task",
+                worker_uuid="worker-terminal",
+                role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                state=ModelPreheatWorkerTaskStateEnum.READY,
+                lease_owner="worker-terminal",
+                lease_token_hash="terminal-lease-token",
+            )
+            session.add_all([run, task])
+            await session.flush()
+            session.add(
+                ModelPreheatDistributionPolicyRunTask(run_id=run.id, task_id=task.id)
+            )
+            await session.commit()
+            return run.id, task.id
+
+    run_id, task_id = asyncio.run(seed_terminal_task_and_run_link())
+    with TestClient(app) as client:
+        response = client.delete(f"/v1/model-preheat-distribution-policies/{policy_id}")
+
+    async def assert_deleted_and_unlinked():
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatWorkerTask, task_id)
+            assert await session.get(ModelPreheatDistributionPolicy, policy_id) is None
+            assert await session.get(ModelPreheatDistributionPolicyRun, run_id) is None
+            assert task is not None
+            assert task.distribution_policy_id is None
+            assert task.lease_owner == "worker-terminal"
+            assert task.lease_token_hash == "terminal-lease-token"
+            assert (
+                await session.get(
+                    ModelPreheatDistributionPolicyRunTask,
+                    (run_id, task_id),
+                )
+            ) is None
+
+    asyncio.run(assert_deleted_and_unlinked())
+    asyncio.run(engine.dispose())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        ModelPreheatWorkerTaskStateEnum.PENDING,
+        ModelPreheatWorkerTaskStateEnum.RUNNING,
+        ModelPreheatWorkerTaskStateEnum.PAUSED,
+    ],
+)
+def test_delete_distribution_policy_rejects_active_worker_tasks(tmp_path, state):
+    app, engine = _test_app(tmp_path)
+    policy_id = asyncio.run(_seed(engine))
+
+    async def seed_active_task():
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            task = ModelPreheatWorkerTask(
+                distribution_policy_id=policy_id,
+                operation_key=f"active-delete-task-{state.value}",
+                worker_uuid=f"worker-{state.value}",
+                role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                state=state,
+            )
+            session.add(task)
+            await session.commit()
+            return task.id
+
+    task_id = asyncio.run(seed_active_task())
+    with TestClient(app) as client:
+        response = client.delete(f"/v1/model-preheat-distribution-policies/{policy_id}")
+
+    async def assert_policy_still_linked():
+        async with AsyncSession(engine) as session:
+            task = await session.get(ModelPreheatWorkerTask, task_id)
+            assert (
+                await session.get(ModelPreheatDistributionPolicy, policy_id) is not None
+            )
+            assert task is not None
+            assert task.distribution_policy_id == policy_id
+
+    asyncio.run(assert_policy_still_linked())
+    asyncio.run(engine.dispose())
+
+    assert response.status_code == 409, response.text
+    assert "distribution_policy_in_use" in response.text
 
 
 def test_distribution_policy_runs_list_and_detail_are_public(tmp_path):
