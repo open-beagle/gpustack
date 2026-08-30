@@ -150,16 +150,7 @@ async def _stream_model_files(engine, fields=None, filter_func=None):
                 continue
             session = AsyncSession(engine)
             try:
-                if (
-                    event.type != EventType.DELETED
-                    and _event_model_id(event.data) is not None
-                    and _event_timestamps_missing(event.data)
-                ):
-                    persisted = await session.get(
-                        ModelFile, _event_model_id(event.data)
-                    )
-                    if persisted is not None:
-                        event.data = persisted
+                event.data = await _reload_event_model_file_if_needed(session, event)
                 matches = ModelFile._match_fields(event, fields) and (
                     not filter_func or ModelFile._safe_filter(filter_func, event.data)
                 )
@@ -177,6 +168,16 @@ async def _stream_model_files(engine, fields=None, filter_func=None):
             yield ModelFile._format_event(event)
     except asyncio.CancelledError:
         return
+
+
+async def _reload_event_model_file_if_needed(session, event):
+    if event.type not in (EventType.CREATED, EventType.UPDATED):
+        return event.data
+    model_file_id = _event_model_id(event.data)
+    if model_file_id is None or not _event_timestamps_missing(event.data):
+        return event.data
+    persisted = await session.get(ModelFile, model_file_id)
+    return persisted if persisted is not None else event.data
 
 
 def _event_model_id(data):

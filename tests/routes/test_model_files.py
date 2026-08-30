@@ -807,6 +807,22 @@ async def _run_model_file_crud(tmp_path):
         )
         assert reloaded_created_event["data"]["created_at"] is not None
         assert reloaded_created_event["data"]["updated_at"] is not None
+
+        for event_type in (EventType.UPDATED, EventType.CREATED):
+            next_event = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0.05)
+            expired_event = await session.get(ModelFile, created.id)
+            session.expire(expired_event, ["created_at", "updated_at"])
+            assert "created_at" not in expired_event.__dict__
+            assert "updated_at" not in expired_event.__dict__
+            await ModelFile._publish_event(event_type, expired_event)
+            reloaded_expired_event = json.loads(
+                await asyncio.wait_for(next_event, timeout=2)
+            )
+            assert reloaded_expired_event["type"] == event_type.value
+            assert reloaded_expired_event["data"]["id"] == created.id
+            assert reloaded_expired_event["data"]["created_at"] is not None
+            assert reloaded_expired_event["data"]["updated_at"] is not None
         await stream.aclose()
 
         sync_task = ModelStorageSyncTask(
