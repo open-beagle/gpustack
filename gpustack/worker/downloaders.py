@@ -514,14 +514,17 @@ def download_resolved_revision_to_staging(
             )
             return str(destination)
         files = sorted(
-            (item.path, int(item.size or 0))
+            (path, int(size or 0))
             for item in ModelScopeHubApi().list_repo_files(
                 model_id,
                 "model",
                 revision=revision,
                 recursive=True,
             )
-            if modelscope_file_selected(item.path, patterns, ignored_patterns)
+            for path, row_type, size in [_modelscope_preheat_file_info(item)]
+            if _modelscope_preheat_download_selected(
+                path, row_type, patterns, ignored_patterns
+            )
         )
         _download_preheat_files(
             files,
@@ -585,6 +588,26 @@ def _modelscope_download_ignore_patterns(patterns, ignored_patterns):
     for name in (".gitattributes", ".gitignore", ".gitmodules"):
         ignored.extend((name, f"**/{name}"))
     return ignored
+
+
+def _modelscope_preheat_file_info(item):
+    if isinstance(item, dict):
+        return (
+            item.get("path") or item.get("Path"),
+            item.get("type") or item.get("Type"),
+            item.get("size", item.get("Size", 0)),
+        )
+    return (
+        getattr(item, "path", None),
+        getattr(item, "type", None),
+        getattr(item, "size", 0),
+    )
+
+
+def _modelscope_preheat_download_selected(path, row_type, patterns, ignored_patterns):
+    if row_type == "tree":
+        return False
+    return modelscope_file_selected(path, patterns, ignored_patterns)
 
 
 def _preheat_file_selected(path, patterns, ignored_patterns):

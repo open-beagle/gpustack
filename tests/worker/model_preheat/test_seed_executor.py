@@ -440,6 +440,112 @@ def test_modelscope_preheat_progress_download_ignores_default_git_metadata(tmp_p
     assert progress == [(("model.bin",), 10, 10)]
 
 
+def test_modelscope_preheat_progress_download_skips_directory_rows(tmp_path):
+    from gpustack.server.model_preheat_revision import modelscope_filelist_revision
+
+    files = [
+        type(
+            "File",
+            (),
+            {"path": "1_Pooling", "type": "tree", "size": 0, "blob_id": "a" * 64},
+        )(),
+        type(
+            "File",
+            (),
+            {
+                "path": "1_Pooling/config.json",
+                "type": "blob",
+                "size": 10,
+                "blob_id": "b" * 64,
+            },
+        )(),
+    ]
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="Qwen/Qwen3-Embedding-0.6B",
+        revision=modelscope_filelist_revision(files),
+        requested_revision="master",
+        file_patterns=(),
+    )
+    attempted = []
+    progress = []
+
+    def download_file(*, file_path, local_dir, **kwargs):
+        del kwargs
+        attempted.append(file_path)
+        path = Path(local_dir) / file_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"model")
+        return str(path)
+
+    with (
+        patch("gpustack.worker.downloaders.ModelScopeHubApi") as hub_api,
+        patch(
+            "gpustack.worker.downloaders.model_file_download",
+            side_effect=download_file,
+        ),
+    ):
+        hub_api.return_value.list_repo_files.return_value = files
+        download_resolved_revision_to_staging(
+            identity,
+            tmp_path / "staging",
+            progress_callback=lambda completed, downloaded_size, total_size: progress.append(
+                (completed, downloaded_size, total_size)
+            ),
+        )
+
+    assert attempted == ["1_Pooling/config.json"]
+    assert (tmp_path / "staging" / "1_Pooling" / "config.json").is_file()
+    assert progress == [(("1_Pooling/config.json",), 10, 10)]
+
+
+def test_modelscope_preheat_progress_download_supports_dict_rows(tmp_path):
+    from gpustack.server.model_preheat_revision import modelscope_filelist_revision
+
+    files = [
+        {"Path": "1_Pooling", "Type": "tree", "Size": 0, "Sha256": "a" * 64},
+        {
+            "Path": "1_Pooling/config.json",
+            "Type": "blob",
+            "Size": 10,
+            "Sha256": "b" * 64,
+        },
+    ]
+    identity = ModelPreheatIdentity(
+        source="modelscope",
+        model_id="Qwen/Qwen3-Embedding-0.6B",
+        revision=modelscope_filelist_revision(files),
+        requested_revision="master",
+        file_patterns=(),
+    )
+    attempted = []
+
+    def download_file(*, file_path, local_dir, **kwargs):
+        del kwargs
+        attempted.append(file_path)
+        path = Path(local_dir) / file_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"model")
+        return str(path)
+
+    with (
+        patch("gpustack.worker.downloaders.ModelScopeHubApi") as hub_api,
+        patch(
+            "gpustack.worker.downloaders.model_file_download",
+            side_effect=download_file,
+        ),
+    ):
+        hub_api.return_value.list_repo_files.return_value = files
+        download_resolved_revision_to_staging(
+            identity,
+            tmp_path / "staging",
+            progress_callback=lambda *args: None,
+        )
+
+    assert attempted == ["1_Pooling/config.json"]
+    assert (tmp_path / "staging" / "1_Pooling" / "config.json").is_file()
+
+
 def test_modelscope_preheat_progress_download_keeps_existing_git_metadata(tmp_path):
     files = [
         type(
