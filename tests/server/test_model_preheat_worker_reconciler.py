@@ -289,7 +289,7 @@ def test_preheat_source_keeps_frozen_credentials_and_trusted_local_task(tmp_path
             engine, ready_probe=FakeReadyProbe(_ready_result())
         )
         await reconciler.reconcile_policies()
-        async with AsyncSession(engine) as session:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
             policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
             source = await resolve_distribution_source(session, policy)
         await engine.dispose()
@@ -359,7 +359,7 @@ def test_manually_disabled_policy_is_not_reenabled_by_materialization(tmp_path):
             engine, ready_probe=FakeReadyProbe(_ready_result())
         )
         await reconciler.reconcile_policies()
-        async with AsyncSession(engine) as session:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
             policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
             policy.enabled = False
             policy.profile_version_stale = False
@@ -498,7 +498,7 @@ def test_scheduled_windows_reuse_existing_active_worker_task(tmp_path):
         task_id, _ = await _seed(engine)
         reconciler = ModelPreheatWorkerReconciler(engine)
         await reconciler.reconcile_policies()
-        async with AsyncSession(engine) as session:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
             policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
             source = await session.get(ModelPreheatTask, task_id)
             worker = (
@@ -705,10 +705,11 @@ def test_new_worker_gets_incremental_connectivity_then_idempotent_distribution(
                 )
             ).all()
             parent = await session.get(ModelPreheatTask, task_id)
+            run = await session.get(ModelPreheatDistributionPolicyRun, manual_run.id)
         await engine.dispose()
-        return checks, tasks, links, parent.target_worker_uuids, probe.calls
+        return checks, tasks, links, parent.target_worker_uuids, probe.calls, run
 
-    checks, tasks, links, targets, probe_calls = asyncio.run(run())
+    checks, tasks, links, targets, probe_calls, distribution_run = asyncio.run(run())
     assert len(checks) == 1
     assert len(tasks) == 1
     assert tasks[0].task_id is None
@@ -717,6 +718,250 @@ def test_new_worker_gets_incremental_connectivity_then_idempotent_distribution(
     assert [link.task_id for link in links] == [tasks[0].id]
     assert targets == ["old-uuid"]
     assert probe_calls == 0
+    assert distribution_run.state == ModelPreheatDistributionPolicyRunStateEnum.PENDING
+    assert distribution_run.finished_at is None
+
+
+def test_distribution_run_finishes_after_linked_tasks_are_terminal(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(engine)
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            source = await session.get(ModelPreheatTask, task_id)
+            worker = (
+                await session.exec(
+                    select(Worker).where(Worker.worker_uuid == "old-uuid")
+                )
+            ).one()
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="manual-finish",
+            )
+            session.add(run)
+            await session.flush()
+            worker_task = await _create_or_rebind_distribution_task(
+                session, policy, source, worker, run_key=run.operation_key
+            )
+            session.add(
+                ModelPreheatDistributionPolicyRunTask(
+                    run_id=run.id, task_id=worker_task.id
+                )
+            )
+            await session.commit()
+            run_id = run.id
+            worker_task_id = worker_task.id
+        await reconciler._settle_policy_runs()
+        async with AsyncSession(engine) as session:
+            running_run = await session.get(ModelPreheatDistributionPolicyRun, run_id)
+            running_state = running_run.state
+            running_finished_at = running_run.finished_at
+            worker_task = await session.get(ModelPreheatWorkerTask, worker_task_id)
+            worker_task.state = ModelPreheatWorkerTaskStateEnum.READY
+            worker_task.finished_at = datetime.now(timezone.utc)
+            session.add(worker_task)
+            await session.commit()
+        await reconciler._settle_policy_runs()
+        async with AsyncSession(engine) as session:
+            finished_run = await session.get(ModelPreheatDistributionPolicyRun, run_id)
+            finished_state = finished_run.state
+            finished_finished_at = finished_run.finished_at
+        await engine.dispose()
+        return running_state, running_finished_at, finished_state, finished_finished_at
+
+    running_state, running_finished_at, finished_state, finished_finished_at = (
+        asyncio.run(run())
+    )
+    assert running_state == ModelPreheatDistributionPolicyRunStateEnum.PENDING
+    assert running_finished_at is None
+    assert finished_state == ModelPreheatDistributionPolicyRunStateEnum.READY
+    assert finished_finished_at is not None
+
+
+def test_distribution_run_active_lease_prevents_early_settle(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(engine)
+        await reconciler.reconcile_policies()
+        now = datetime.now(timezone.utc)
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            source = await session.get(ModelPreheatTask, task_id)
+            worker = (
+                await session.exec(
+                    select(Worker).where(Worker.worker_uuid == "old-uuid")
+                )
+            ).one()
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=now,
+                operation_key="manual-active-lease",
+                lease_owner="planner",
+                lease_token="token",
+                lease_expires_at=now + timedelta(minutes=1),
+            )
+            session.add(run)
+            await session.flush()
+            worker_task = await _create_or_rebind_distribution_task(
+                session, policy, source, worker, run_key=run.operation_key
+            )
+            worker_task.state = ModelPreheatWorkerTaskStateEnum.READY
+            worker_task.finished_at = now
+            session.add(
+                ModelPreheatDistributionPolicyRunTask(
+                    run_id=run.id, task_id=worker_task.id
+                )
+            )
+            await session.commit()
+            run_id = run.id
+        await reconciler._settle_policy_runs()
+        async with AsyncSession(engine) as session:
+            active_run = await session.get(ModelPreheatDistributionPolicyRun, run_id)
+            active_values = (active_run.state, active_run.finished_at)
+            active_run.lease_owner = None
+            active_run.lease_token = None
+            active_run.lease_expires_at = None
+            session.add(active_run)
+            await session.commit()
+        await reconciler._settle_policy_runs()
+        async with AsyncSession(engine) as session:
+            settled_run = await session.get(ModelPreheatDistributionPolicyRun, run_id)
+            settled_values = (settled_run.state, settled_run.finished_at is not None)
+        await engine.dispose()
+        return active_values, settled_values
+
+    active_values, settled_values = asyncio.run(run())
+    assert active_values == (ModelPreheatDistributionPolicyRunStateEnum.PENDING, None)
+    assert settled_values == (ModelPreheatDistributionPolicyRunStateEnum.READY, True)
+
+
+def test_distribution_run_expired_lease_can_settle_after_planner_crash(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(engine)
+        await reconciler.reconcile_policies()
+        now = datetime.now(timezone.utc)
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            source = await session.get(ModelPreheatTask, task_id)
+            worker = (
+                await session.exec(
+                    select(Worker).where(Worker.worker_uuid == "old-uuid")
+                )
+            ).one()
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=now,
+                operation_key="manual-expired-lease",
+                lease_owner="crashed-planner",
+                lease_token="token",
+                lease_expires_at=now - timedelta(seconds=1),
+            )
+            session.add(run)
+            await session.flush()
+            worker_task = await _create_or_rebind_distribution_task(
+                session, policy, source, worker, run_key=run.operation_key
+            )
+            worker_task.state = ModelPreheatWorkerTaskStateEnum.READY
+            worker_task.finished_at = now
+            session.add(
+                ModelPreheatDistributionPolicyRunTask(
+                    run_id=run.id, task_id=worker_task.id
+                )
+            )
+            await session.commit()
+            run_id = run.id
+        await reconciler._settle_policy_runs()
+        async with AsyncSession(engine) as session:
+            settled = await session.get(ModelPreheatDistributionPolicyRun, run_id)
+            values = (
+                settled.state,
+                settled.lease_owner,
+                settled.lease_token,
+                settled.lease_expires_at,
+                settled.finished_at is not None,
+            )
+        await engine.dispose()
+        return values
+
+    assert asyncio.run(run()) == (
+        ModelPreheatDistributionPolicyRunStateEnum.READY,
+        None,
+        None,
+        None,
+        True,
+    )
+
+
+def test_distribution_run_keeps_error_code_for_partial_terminal_tasks(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, _ = await _seed(engine)
+        reconciler = ModelPreheatWorkerReconciler(engine)
+        await reconciler.reconcile_policies()
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            policy = (await session.exec(select(ModelPreheatDistributionPolicy))).one()
+            source = await session.get(ModelPreheatTask, task_id)
+            worker = (
+                await session.exec(
+                    select(Worker).where(Worker.worker_uuid == "old-uuid")
+                )
+            ).one()
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy.id,
+                trigger=ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="manual-partial",
+            )
+            session.add(run)
+            await session.flush()
+            ready_task = await _create_or_rebind_distribution_task(
+                session, policy, source, worker, run_key=run.operation_key
+            )
+            ready_task.state = ModelPreheatWorkerTaskStateEnum.READY
+            ready_task.finished_at = datetime.now(timezone.utc)
+            error_task = ModelPreheatWorkerTask(
+                distribution_policy_id=policy.id,
+                operation_key="manual-partial-error",
+                worker_uuid="error-uuid",
+                role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                state=ModelPreheatWorkerTaskStateEnum.ERROR,
+                error_code="s3_read_failed",
+                finished_at=datetime.now(timezone.utc),
+            )
+            session.add(error_task)
+            await session.flush()
+            session.add_all(
+                [
+                    ModelPreheatDistributionPolicyRunTask(
+                        run_id=run.id, task_id=ready_task.id
+                    ),
+                    ModelPreheatDistributionPolicyRunTask(
+                        run_id=run.id, task_id=error_task.id
+                    ),
+                ]
+            )
+            await session.commit()
+            run_id = run.id
+        await reconciler._settle_policy_runs()
+        async with AsyncSession(engine) as session:
+            run = await session.get(ModelPreheatDistributionPolicyRun, run_id)
+            values = (run.state, run.error_code)
+        await engine.dispose()
+        return values
+
+    assert asyncio.run(run()) == (
+        ModelPreheatDistributionPolicyRunStateEnum.READY,
+        "s3_read_failed",
+    )
 
 
 def test_maintenance_profile_does_not_create_distribution_for_existing_policy(tmp_path):

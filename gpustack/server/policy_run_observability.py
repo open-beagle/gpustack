@@ -104,7 +104,9 @@ async def preheat_schedule_run_observations(session, runs, *, include_tasks=Fals
         )
         for task in workers:
             grouped[task.task_id].append(
-                _preheat_worker_item(task, worker_lookup, artifact_lookup)
+                _preheat_worker_item(
+                    task, worker_lookup, artifact_lookup, parent_lookup=parents
+                )
             )
     observations = {}
     for run in runs:
@@ -264,12 +266,22 @@ def _lookup_worker(lookup, worker_id, worker_uuid):
     return lookup.get(("id", worker_id)) or lookup.get(("uuid", worker_uuid))
 
 
-def _preheat_worker_item(task, worker_lookup=None, artifact_lookup=None):
+def _preheat_worker_item(
+    task, worker_lookup=None, artifact_lookup=None, parent_lookup=None
+):
     worker = _lookup_worker(worker_lookup or {}, task.worker_id, task.worker_uuid)
     artifact = (artifact_lookup or {}).get(task.distribution_artifact_id)
+    parent = (parent_lookup or {}).get(task.task_id)
     return PolicyRunTaskPublic(
         id=task.id,
-        model_id=artifact.model_id if artifact is not None else None,
+        model_id=(
+            artifact.model_id
+            if artifact is not None
+            else parent.model_id
+            if parent is not None
+            else None
+        ),
+        worker_id=task.worker_id,
         worker_uuid=task.worker_uuid,
         worker_name=worker.name if worker is not None else None,
         worker_ip=worker.ip if worker is not None else None,

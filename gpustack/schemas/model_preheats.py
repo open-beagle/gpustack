@@ -294,6 +294,8 @@ class ModelPreheatWorkerTaskPublic(SQLModel):
     parent_attempt: int = 1
     worker_uuid: str
     worker_id: Optional[int] = None
+    worker_name: Optional[str] = None
+    worker_ip: Optional[str] = None
     role: ModelPreheatWorkerTaskRoleEnum
     state: ModelPreheatWorkerTaskStateEnum
     attempt: int
@@ -684,6 +686,8 @@ class ModelPreheatTaskPublic(SQLModel):
     transfer_source: Optional[str] = None
     transfer_profile_id: Optional[int] = None
     source_worker_id: Optional[int] = None
+    progress: float = 0
+    worker_tasks: list[ModelPreheatWorkerTaskPublic] = Field(default_factory=list)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     created_at: datetime

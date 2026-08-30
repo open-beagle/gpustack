@@ -24,6 +24,8 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
     ModelPreheatDistributionPolicyArtifact,
     ModelPreheatDistributionPolicyCreate,
+    ModelPreheatDistributionPolicyRun,
+    ModelPreheatDistributionPolicyRunTask,
     ModelPreheatDistributionSelectionModeEnum,
 )
 from gpustack.schemas.model_storage_sync import (
@@ -253,6 +255,9 @@ def test_refresh_discovers_three_sources_from_shared_s3_in_independent_database(
                     ModelPreheatArtifact.__table__,
                     ModelPreheatDistributionPolicy.__table__,
                     ModelPreheatDistributionPolicyArtifact.__table__,
+                    ModelPreheatDistributionPolicyRun.__table__,
+                    ModelPreheatDistributionPolicyRunTask.__table__,
+                    ModelPreheatWorkerTask.__table__,
                 ],
             )
         async with AsyncSession(engine) as session:

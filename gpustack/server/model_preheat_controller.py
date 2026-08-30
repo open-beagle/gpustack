@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,11 +22,14 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTaskStateEnum,
     is_terminal_task,
 )
+from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
+from gpustack.schemas.models import SourceEnum
 from gpustack.schemas.workers import (
     MODEL_STORAGE_PROTOCOL_VERSION,
     Worker,
     WorkerStateEnum,
 )
+from gpustack.server.bus import EventType
 
 
 logger = logging.getLogger(__name__)
@@ -114,8 +119,9 @@ class ModelPreheatController:
 
     async def reconcile_task(self, task_id: int):
         try:
-            async with AsyncSession(self._engine) as session:
-                await self._reconcile(session, task_id)
+            model_file_events = []
+            async with AsyncSession(self._engine, expire_on_commit=False) as session:
+                await self._reconcile(session, task_id, model_file_events)
                 task = await session.get(
                     ModelPreheatTask, task_id, populate_existing=True
                 )
@@ -126,19 +132,22 @@ class ModelPreheatController:
                         )
                     )
                 await session.commit()
+            for event_type, model_file in model_file_events:
+                await ModelFile._publish_event(event_type, model_file)
         except (IntegrityError, OperationalError):
             return
 
-    async def _reconcile(self, session, task_id):
+    async def _reconcile(self, session, task_id, model_file_events=None):
         task = await session.get(ModelPreheatTask, task_id)
-        if (
-            task is None
-            or task.desired_state != ModelPreheatDesiredStateEnum.RUNNING
-            or is_terminal_task(task)
-        ):
+        if task is None or task.desired_state != ModelPreheatDesiredStateEnum.RUNNING:
             return
 
         all_workers = await _current_workers(session)
+        await _backfill_ready_seed_model_files(
+            session, task, all_workers, model_file_events
+        )
+        if is_terminal_task(task):
+            return
         if task.delivery_mode == ModelPreheatDeliveryModeEnum.S3_ONLY:
             await self._reconcile_s3_only(session, task, all_workers)
             return
@@ -218,6 +227,18 @@ class ModelPreheatController:
                     finished_at=datetime.now(timezone.utc),
                 )
                 return
+            if task.artifact_id and task.s3_manifest_path:
+                if not await _cas_parent_update(
+                    session,
+                    task,
+                    execution_state=ModelPreheatExecutionStateEnum.DISTRIBUTING,
+                    local_cache_hit_worker_uuids=valid_targets,
+                    transfer_source="s3",
+                    transfer_profile_id=task.s3_profile_id,
+                ):
+                    return
+                _create_distribution_tasks(session, task, targets, set(valid_targets))
+                return
             target_candidates = sorted(
                 worker_uuid
                 for worker_uuid in targets
@@ -245,18 +266,6 @@ class ModelPreheatController:
                 ):
                     return
                 _add_seed_child(session, task, worker)
-                return
-            if task.artifact_id and task.s3_manifest_path:
-                if not await _cas_parent_update(
-                    session,
-                    task,
-                    execution_state=ModelPreheatExecutionStateEnum.DISTRIBUTING,
-                    local_cache_hit_worker_uuids=valid_targets,
-                    transfer_source="s3",
-                    transfer_profile_id=task.s3_profile_id,
-                ):
-                    return
-                _create_distribution_tasks(session, task, targets, set(valid_targets))
                 return
             seed_uuid = (
                 task.seed_worker_uuid
@@ -293,6 +302,9 @@ class ModelPreheatController:
             if active_seed.state != ModelPreheatWorkerTaskStateEnum.READY:
                 return
             result = active_seed.resumable_cursor or {}
+            await _register_seed_model_file_if_ready(
+                session, task, active_seed, result, all_workers, model_file_events
+            )
             if (
                 not task.artifact_id
                 or not task.s3_manifest_path
@@ -548,3 +560,177 @@ def _finish(task, state, message=None):
     task.state_message = message
     task.progress = 100
     task.finished_at = datetime.now(timezone.utc)
+
+
+async def _register_seed_model_file_if_ready(
+    session, task, seed, result, workers, model_file_events=None
+):
+    if (
+        task.delivery_mode == ModelPreheatDeliveryModeEnum.S3_ONLY
+        or result.get("state") != "ready"
+        or result.get("local_cache_state") != "valid"
+        or not result.get("local_dir")
+        or not result.get("resolved_paths")
+        or not result.get("artifact_id")
+        or not result.get("resolved_revision")
+    ):
+        return
+    if result.get("request_digest") and result["request_digest"] != task.request_digest:
+        return
+    if task.artifact_id is not None and result["artifact_id"] != task.artifact_id:
+        return
+    if task.resolved_revision != "ollama-pending" and (
+        result["resolved_revision"] != task.resolved_revision
+    ):
+        return
+    source = _model_file_source(task.source)
+    model_source = _model_file_source_fields(
+        source,
+        task.model_id,
+        task.include_patterns,
+    )
+    worker = workers.get(seed.worker_uuid)
+    if worker is None:
+        return
+    source_index = _distributed_model_source_index(
+        worker.id,
+        task.s3_profile_id,
+        result["artifact_id"],
+    )
+    existing = await _existing_preheat_model_file(
+        session, source_index, worker.id, source, model_source
+    )
+    values = {
+        "source": source,
+        **model_source,
+        "local_dir": result["local_dir"],
+        "worker_id": worker.id,
+        "worker_uuid_snapshot": seed.worker_uuid,
+        "worker_name_snapshot": worker.name,
+        "cleanup_on_delete": False,
+        "size": result.get("total_size") or seed.total_size or 0,
+        "download_progress": 100,
+        "resolved_paths": result.get("resolved_paths") or [],
+        "state": ModelFileStateEnum.READY,
+        "state_message": None,
+        "requested_revision": task.requested_revision,
+        "resolved_revision": result["resolved_revision"],
+    }
+    if existing is None:
+        model_file = ModelFile(source_index=source_index, **values)
+        session.add(model_file)
+        await session.flush()
+        if model_file_events is not None:
+            model_file_events.append(
+                (EventType.CREATED, ModelFile.model_validate(model_file.model_dump()))
+            )
+        return
+    changed = existing.source_index != source_index
+    for field, value in values.items():
+        if getattr(existing, field) != value:
+            changed = True
+        setattr(existing, field, value)
+    existing.source_index = source_index
+    session.add(existing)
+    await session.flush()
+    if changed and model_file_events is not None:
+        model_file_events.append(
+            (EventType.UPDATED, ModelFile.model_validate(existing.model_dump()))
+        )
+
+
+async def _backfill_ready_seed_model_files(
+    session, task, workers, model_file_events=None
+):
+    if task.delivery_mode == ModelPreheatDeliveryModeEnum.S3_ONLY:
+        return
+    seeds = (
+        await session.exec(
+            select(ModelPreheatWorkerTask)
+            .where(
+                ModelPreheatWorkerTask.task_id == task.id,
+                ModelPreheatWorkerTask.parent_attempt == task.attempt,
+                ModelPreheatWorkerTask.role == ModelPreheatWorkerTaskRoleEnum.SEED,
+                ModelPreheatWorkerTask.state == ModelPreheatWorkerTaskStateEnum.READY,
+            )
+            .order_by(ModelPreheatWorkerTask.id)
+        )
+    ).all()
+    for seed in seeds:
+        await _register_seed_model_file_if_ready(
+            session,
+            task,
+            seed,
+            seed.resumable_cursor or {},
+            workers,
+            model_file_events,
+        )
+
+
+async def _existing_preheat_model_file(
+    session, source_index, worker_id, source, model_source
+):
+    existing = (
+        await session.exec(select(ModelFile).where(ModelFile.source_index == source_index))
+    ).first()
+    if existing is not None or worker_id is None:
+        return existing
+    conditions = [
+        ModelFile.worker_id == worker_id,
+        ModelFile.source == source,
+        ModelFile.state == ModelFileStateEnum.ERROR,
+        ModelFile.local_dir.is_(None),
+        ModelFile.resolved_revision.is_(None),
+    ]
+    for field, value in model_source.items():
+        conditions.append(
+            getattr(ModelFile, field).is_(None)
+            if value is None
+            else getattr(ModelFile, field) == value
+        )
+    candidates = (
+        await session.exec(
+            select(ModelFile).where(*conditions).order_by(ModelFile.id.desc())
+        )
+    ).all()
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _model_file_source(source):
+    if source == "modelscope":
+        return SourceEnum.MODEL_SCOPE
+    if source == "huggingface":
+        return SourceEnum.HUGGING_FACE
+    if source == "ollama_library":
+        return SourceEnum.OLLAMA_LIBRARY
+    return source
+
+
+def _model_file_source_fields(source, model_id, include_patterns):
+    first_pattern = include_patterns[0] if include_patterns else None
+    if source == SourceEnum.MODEL_SCOPE:
+        return {
+            "model_scope_model_id": model_id,
+            "model_scope_file_path": first_pattern if first_pattern else None,
+        }
+    if source == SourceEnum.HUGGING_FACE:
+        return {
+            "huggingface_repo_id": model_id,
+            "huggingface_filename": first_pattern if first_pattern else None,
+        }
+    if source == SourceEnum.OLLAMA_LIBRARY:
+        return {"ollama_library_model_name": model_id}
+    return {"local_path": model_id}
+
+
+def _distributed_model_source_index(worker_id, profile_id, artifact_id):
+    seed = json.dumps(
+        {
+            "worker_id": worker_id,
+            "profile_id": profile_id,
+            "artifact_id": artifact_id,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(f"distributed-artifact:{seed}".encode("utf-8")).hexdigest()

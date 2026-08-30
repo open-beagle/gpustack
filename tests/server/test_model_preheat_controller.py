@@ -25,6 +25,7 @@ from gpustack.server.model_preheat_controller import (
     LocalInventoryProbeResult,
     ModelPreheatController,
 )
+from gpustack.server.bus import EventType
 from gpustack.worker.model_preheat.identity import ModelPreheatIdentity
 
 
@@ -126,7 +127,7 @@ async def _children(engine, task_id):
         ).all()
 
 
-def test_target_local_candidate_precedes_bound_s3_artifact(tmp_path):
+def test_bound_s3_artifact_precedes_local_candidate(tmp_path):
     async def run():
         engine = await _database(tmp_path)
         task_id, _ = await _seed(engine, artifact_id="c" * 64)
@@ -141,7 +142,8 @@ def test_target_local_candidate_precedes_bound_s3_artifact(tmp_path):
     children, probed = asyncio.run(run())
     assert probed == [("worker-a", "worker-b", "worker-peer")]
     assert [(child.worker_uuid, child.role) for child in children] == [
-        ("worker-b", ModelPreheatWorkerTaskRoleEnum.SEED)
+        ("worker-a", ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE),
+        ("worker-b", ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE),
     ]
 
 
@@ -326,6 +328,160 @@ def test_seed_completion_uses_bound_artifact_for_distribution(tmp_path):
         for child in children
         if child.role == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE
     ] == ["worker-b"]
+
+
+def test_ready_seed_reconcile_backfills_worker_model_file(tmp_path, monkeypatch):
+    published = []
+
+    async def capture_event(event_type, model_file):
+        published.append((event_type, model_file.id, model_file.state))
+
+    monkeypatch.setattr(ModelFile, "_publish_event", capture_event)
+
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, worker_ids = await _seed(engine)
+        controller = ModelPreheatController(
+            engine, inventory_probe=FakeInventoryProbe({})
+        )
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+            parent.artifact_id = "d" * 64
+            parent.s3_manifest_path = f"prefix/{'d' * 64}/manifest.json"
+            parent.manifest_digest = "e" * 64
+            seed = (await session.exec(select(ModelPreheatWorkerTask))).one()
+            seed.state = ModelPreheatWorkerTaskStateEnum.READY
+            seed.progress = 100
+            seed.total_size = 123
+            seed.resumable_cursor = {
+                "state": "ready",
+                "request_digest": parent.request_digest,
+                "artifact_id": "d" * 64,
+                "local_cache_state": "valid",
+                "resolved_revision": parent.resolved_revision,
+                "local_dir": "/models/org/model",
+                "resolved_paths": ["/models/org/model"],
+                "total_size": 123,
+            }
+            session.add_all([parent, seed])
+            await session.commit()
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            model_file = (
+                await session.exec(
+                    select(ModelFile).where(ModelFile.worker_id == worker_ids["worker-a"])
+                )
+            ).one()
+        await engine.dispose()
+        return model_file
+
+    model_file = asyncio.run(run())
+    assert model_file.state.value == "ready"
+    assert model_file.model_scope_model_id == "org/model"
+    assert model_file.local_dir == "/models/org/model"
+    assert model_file.resolved_paths == ["/models/org/model"]
+    assert published == [(EventType.CREATED, model_file.id, model_file.state)]
+
+
+def test_ready_seed_backfill_uses_current_worker_registration(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, worker_ids = await _seed(engine)
+        controller = ModelPreheatController(
+            engine, inventory_probe=FakeInventoryProbe({})
+        )
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+            parent.artifact_id = "d" * 64
+            parent.s3_manifest_path = f"prefix/{'d' * 64}/manifest.json"
+            parent.manifest_digest = "e" * 64
+            seed = (await session.exec(select(ModelPreheatWorkerTask))).one()
+            seed.state = ModelPreheatWorkerTaskStateEnum.READY
+            seed.progress = 100
+            seed.total_size = 123
+            seed.resumable_cursor = {
+                "state": "ready",
+                "request_digest": parent.request_digest,
+                "artifact_id": "d" * 64,
+                "local_cache_state": "valid",
+                "resolved_revision": parent.resolved_revision,
+                "local_dir": "/models/org/model",
+                "resolved_paths": ["/models/org/model"],
+                "total_size": 123,
+            }
+            replacement = Worker(
+                name="worker-a-new",
+                hostname="worker-a-new",
+                ip="127.0.0.2",
+                port=10150,
+                worker_uuid="worker-a",
+                state=WorkerStateEnum.READY,
+                model_storage_protocol_version=1,
+            )
+            session.add_all([parent, seed, replacement])
+            await session.commit()
+            await session.refresh(replacement)
+            replacement_id = replacement.id
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            model_files = (await session.exec(select(ModelFile))).all()
+        await engine.dispose()
+        return model_files, worker_ids["worker-a"], replacement_id
+
+    model_files, old_worker_id, replacement_id = asyncio.run(run())
+    assert len(model_files) == 1
+    assert model_files[0].worker_id == replacement_id
+    assert model_files[0].worker_id != old_worker_id
+    assert model_files[0].worker_name_snapshot == "worker-a-new"
+
+
+def test_terminal_ready_seed_backfills_worker_model_file(tmp_path):
+    async def run():
+        engine = await _database(tmp_path)
+        task_id, worker_ids = await _seed(engine)
+        controller = ModelPreheatController(
+            engine, inventory_probe=FakeInventoryProbe({})
+        )
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            parent = await session.get(ModelPreheatTask, task_id)
+            parent.artifact_id = "d" * 64
+            parent.s3_manifest_path = f"prefix/{'d' * 64}/manifest.json"
+            parent.manifest_digest = "e" * 64
+            parent.execution_state = ModelPreheatExecutionStateEnum.READY
+            parent.finished_at = datetime.now(timezone.utc)
+            seed = (await session.exec(select(ModelPreheatWorkerTask))).one()
+            seed.state = ModelPreheatWorkerTaskStateEnum.READY
+            seed.progress = 100
+            seed.total_size = 123
+            seed.resumable_cursor = {
+                "state": "ready",
+                "request_digest": parent.request_digest,
+                "artifact_id": "d" * 64,
+                "local_cache_state": "valid",
+                "resolved_revision": parent.resolved_revision,
+                "local_dir": "/models/org/model",
+                "resolved_paths": ["/models/org/model"],
+                "total_size": 123,
+            }
+            session.add_all([parent, seed])
+            await session.commit()
+        await controller.reconcile_task(task_id)
+        async with AsyncSession(engine) as session:
+            model_file = (
+                await session.exec(
+                    select(ModelFile).where(ModelFile.worker_id == worker_ids["worker-a"])
+                )
+            ).one()
+        await engine.dispose()
+        return model_file
+
+    model_file = asyncio.run(run())
+    assert model_file.state.value == "ready"
+    assert model_file.model_scope_model_id == "org/model"
+    assert model_file.local_dir == "/models/org/model"
 
 
 def test_distribution_terminal_states_aggregate_partial(tmp_path):

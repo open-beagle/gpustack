@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 import hashlib
 import json
 import logging
@@ -120,6 +121,8 @@ class ModelPreheatWorkerReconciler:
         self._ready_probe = ready_probe
         self._connectivity_creator = connectivity_creator
         self._interval = interval
+        self._run_lease_owner = uuid4().hex
+        self._run_lease_ttl = timedelta(seconds=60)
         self._continuous_safety_interval = timedelta(minutes=5)
         self._next_continuous_safety_at = None
 
@@ -158,6 +161,7 @@ class ModelPreheatWorkerReconciler:
             await self.reconcile_worker(worker_uuid, event_driven=True)
 
     async def reconcile_all(self):
+        await self._settle_policy_runs()
         await self.reconcile_policies()
         async with AsyncSession(self._engine) as session:
             workers = await current_registered_workers(session)
@@ -325,12 +329,18 @@ class ModelPreheatWorkerReconciler:
         operation_key = distribution_policy_run_operation_key(
             policy_id, window, trigger.value, unique_suffix
         )
+        now = datetime.now(timezone.utc)
+        lease_token = uuid4().hex
         async with AsyncSession(self._engine, expire_on_commit=False) as session:
             run = ModelPreheatDistributionPolicyRun(
                 policy_id=policy_id,
                 trigger=trigger,
                 window_start_utc=window,
                 operation_key=operation_key,
+                lease_owner=self._run_lease_owner,
+                lease_token=lease_token,
+                lease_expires_at=now + self._run_lease_ttl,
+                started_at=now,
             )
             session.add(run)
             try:
@@ -341,20 +351,55 @@ class ModelPreheatWorkerReconciler:
                 return None
         error_code = None
         result = None
+        lease_lost = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            self._policy_run_lease_heartbeat(run.id, lease_token, lease_lost)
+        )
         try:
             result = await self.reconcile_policy(
-                policy_id, operation_key, run_id=run.id
+                policy_id,
+                operation_key,
+                lease_check=lambda: not lease_lost.is_set(),
+                run_id=run.id,
             )
         except Exception as exc:
             error_code = type(exc).__name__
             raise
         finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
             outcome = result.get("outcome") if isinstance(result, dict) else None
             result_error = (
                 result.get("error_code") if isinstance(result, dict) else None
             )
+            if lease_lost.is_set():
+                error_code = error_code or "distribution_run_lease_lost"
             effective_error = error_code or result_error
             has_created = _distribution_outcome_has_created(outcome)
+            values = {
+                "error_code": effective_error,
+                "outcome": outcome,
+            }
+            if has_created:
+                values.update(
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    finished_at=None,
+                )
+            else:
+                values.update(
+                    state=(
+                        ModelPreheatDistributionPolicyRunStateEnum.ERROR
+                        if effective_error
+                        else ModelPreheatDistributionPolicyRunStateEnum.READY
+                    ),
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    finished_at=datetime.now(timezone.utc),
+                )
             async with AsyncSession(self._engine) as session:
                 await session.exec(
                     update(ModelPreheatDistributionPolicyRun)
@@ -362,21 +407,45 @@ class ModelPreheatWorkerReconciler:
                         ModelPreheatDistributionPolicyRun.id == run.id,
                         ModelPreheatDistributionPolicyRun.state
                         == ModelPreheatDistributionPolicyRunStateEnum.PENDING,
+                        ModelPreheatDistributionPolicyRun.lease_owner
+                        == self._run_lease_owner,
+                        ModelPreheatDistributionPolicyRun.lease_token == lease_token,
                     )
-                    .values(
-                        state=(
-                            ModelPreheatDistributionPolicyRunStateEnum.ERROR
-                            if effective_error and not has_created
-                            else ModelPreheatDistributionPolicyRunStateEnum.READY
-                        ),
-                        error_code=effective_error,
-                        outcome=outcome,
-                        finished_at=datetime.now(timezone.utc),
-                    )
+                    .values(**values)
                 )
                 await session.commit()
         async with AsyncSession(self._engine, expire_on_commit=False) as session:
             return await session.get(ModelPreheatDistributionPolicyRun, run.id)
+
+    async def _renew_policy_run_lease(self, run_id, token, now=None):
+        now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        async with AsyncSession(self._engine) as session:
+            result = await session.exec(
+                update(ModelPreheatDistributionPolicyRun)
+                .where(
+                    ModelPreheatDistributionPolicyRun.id == run_id,
+                    ModelPreheatDistributionPolicyRun.state
+                    == ModelPreheatDistributionPolicyRunStateEnum.PENDING,
+                    ModelPreheatDistributionPolicyRun.lease_owner
+                    == self._run_lease_owner,
+                    ModelPreheatDistributionPolicyRun.lease_token == token,
+                    ModelPreheatDistributionPolicyRun.lease_expires_at > now,
+                )
+                .values(lease_expires_at=now + self._run_lease_ttl)
+            )
+            await session.commit()
+        return result.rowcount == 1
+
+    async def _policy_run_lease_heartbeat(self, run_id, token, lease_lost):
+        while True:
+            await asyncio.sleep(max(0.005, self._run_lease_ttl.total_seconds() / 4))
+            try:
+                renewed = await self._renew_policy_run_lease(run_id, token)
+            except Exception:
+                renewed = False
+            if not renewed:
+                lease_lost.set()
+                return
 
     async def reconcile_worker(
         self, worker_uuid, *, event_driven=False, safety_check=True
@@ -653,6 +722,69 @@ class ModelPreheatWorkerReconciler:
             and current_worker_state == WorkerStateEnum.READY
         ):
             await self.reconcile_worker(worker_uuid)
+
+    async def _settle_policy_runs(self):
+        terminal = {
+            ModelPreheatWorkerTaskStateEnum.READY,
+            ModelPreheatWorkerTaskStateEnum.ERROR,
+            ModelPreheatWorkerTaskStateEnum.CANCELED,
+            ModelPreheatWorkerTaskStateEnum.SKIPPED_WORKER_REMOVED,
+        }
+        async with AsyncSession(self._engine) as session:
+            now = datetime.now(timezone.utc)
+            runs = (
+                await session.exec(
+                    select(ModelPreheatDistributionPolicyRun).where(
+                        ModelPreheatDistributionPolicyRun.state
+                        == ModelPreheatDistributionPolicyRunStateEnum.PENDING,
+                        (
+                            ModelPreheatDistributionPolicyRun.lease_expires_at.is_(None)
+                            | (ModelPreheatDistributionPolicyRun.lease_expires_at <= now)
+                        ),
+                    )
+                )
+            ).all()
+            for run in runs:
+                tasks = (
+                    await session.exec(
+                        select(ModelPreheatWorkerTask)
+                        .join(
+                            ModelPreheatDistributionPolicyRunTask,
+                            ModelPreheatDistributionPolicyRunTask.task_id
+                            == ModelPreheatWorkerTask.id,
+                        )
+                        .where(ModelPreheatDistributionPolicyRunTask.run_id == run.id)
+                    )
+                ).all()
+                if not tasks or any(task.state not in terminal for task in tasks):
+                    continue
+                ready_count = sum(
+                    task.state == ModelPreheatWorkerTaskStateEnum.READY
+                    for task in tasks
+                )
+                run.state = (
+                    ModelPreheatDistributionPolicyRunStateEnum.READY
+                    if ready_count
+                    else ModelPreheatDistributionPolicyRunStateEnum.ERROR
+                )
+                task_error_code = next(
+                    (task.error_code for task in tasks if task.error_code), None
+                )
+                if task_error_code is not None:
+                    run.error_code = task_error_code
+                elif run.state == ModelPreheatDistributionPolicyRunStateEnum.ERROR:
+                    run.error_code = (
+                        run.error_code or "distribution_run_failed"
+                    )
+                run.finished_at = max(
+                    (task.finished_at for task in tasks if task.finished_at is not None),
+                    default=now,
+                )
+                run.lease_owner = None
+                run.lease_token = None
+                run.lease_expires_at = None
+                session.add(run)
+            await session.commit()
 
 
 async def _ensure_policy(session, task):

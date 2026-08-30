@@ -44,6 +44,7 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatTasksPublic,
     ModelPreheatTargetScopeEnum,
     ModelPreheatWorkerTask,
+    ModelPreheatWorkerTaskPublic,
     ModelPreheatWorkerTaskStateEnum,
     is_terminal_task,
     operation_key_for,
@@ -92,7 +93,10 @@ async def get_model_preheat(session: SessionDep, id: int):
     task = await ModelPreheatTask.one_by_id(session, id)
     if task is None:
         raise NotFoundException(message="model_preheat_task_not_found")
-    return _to_public(task)
+    return _to_public(
+        task,
+        worker_tasks=await _worker_tasks_public(session, task.id, task.attempt),
+    )
 
 
 @router.delete("/{id}")
@@ -770,7 +774,11 @@ async def _exact_artifact_match(session, profile, identity):
     return matches[0] if len(matches) == 1 else None
 
 
-def _to_public(task: ModelPreheatTask, deduplicated: bool = False):
+def _to_public(
+    task: ModelPreheatTask,
+    deduplicated: bool = False,
+    worker_tasks: list[ModelPreheatWorkerTaskPublic] | None = None,
+):
     values = task.model_dump(
         exclude={"s3_profile_snapshot_encrypted", "encryption_key_version"}
     )
@@ -781,7 +789,51 @@ def _to_public(task: ModelPreheatTask, deduplicated: bool = False):
         created_at=task.created_at,
         updated_at=task.updated_at,
         deduplicated=deduplicated,
+        worker_tasks=worker_tasks or [],
     )
+
+
+async def _worker_tasks_public(session, task_id, attempt):
+    tasks = (
+        await session.exec(
+            select(ModelPreheatWorkerTask)
+            .where(
+                ModelPreheatWorkerTask.task_id == task_id,
+                ModelPreheatWorkerTask.parent_attempt == attempt,
+            )
+            .order_by(ModelPreheatWorkerTask.id)
+        )
+    ).all()
+    if not tasks:
+        return []
+    worker_ids = {task.worker_id for task in tasks if task.worker_id is not None}
+    worker_uuids = {task.worker_uuid for task in tasks if task.worker_uuid}
+    conditions = []
+    if worker_ids:
+        conditions.append(Worker.id.in_(worker_ids))
+    if worker_uuids:
+        conditions.append(Worker.worker_uuid.in_(worker_uuids))
+    workers = {}
+    if conditions:
+        rows = (await session.exec(select(Worker).where(or_(*conditions)))).all()
+        for worker in rows:
+            workers[("id", worker.id)] = worker
+            workers[("uuid", worker.worker_uuid)] = worker
+    result = []
+    for task in tasks:
+        worker = workers.get(("id", task.worker_id)) or workers.get(
+            ("uuid", task.worker_uuid)
+        )
+        result.append(
+            ModelPreheatWorkerTaskPublic.model_validate(
+                task,
+                update={
+                    "worker_name": worker.name if worker is not None else None,
+                    "worker_ip": worker.ip if worker is not None else None,
+                },
+            )
+        )
+    return result
 
 
 async def _task_or_404(session, task_id):

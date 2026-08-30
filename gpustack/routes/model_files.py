@@ -174,9 +174,9 @@ async def _reload_event_model_file_if_needed(session, event):
     if event.type not in (EventType.CREATED, EventType.UPDATED):
         return event.data
     model_file_id = _event_model_id(event.data)
-    if model_file_id is None or not _event_timestamps_missing(event.data):
+    if model_file_id is None:
         return event.data
-    persisted = await session.get(ModelFile, model_file_id)
+    persisted = await _reload_model_file_by_id(session, model_file_id)
     return persisted if persisted is not None else event.data
 
 
@@ -237,6 +237,7 @@ async def get_model_file(session: SessionDep, id: int):
 
 
 async def _model_files_public(session, model_files):
+    model_files = await _reload_model_files_missing_required_fields(session, model_files)
     model_file_ids = [item.id for item in model_files if item.id is not None]
     executions = {}
     if model_file_ids:
@@ -340,6 +341,30 @@ async def _model_files_public(session, model_files):
             )
         )
     return result
+
+
+async def _reload_model_files_missing_required_fields(session, model_files):
+    reloaded = []
+    for model_file in model_files:
+        model_file_id = getattr(model_file, "id", None)
+        if model_file_id is None or not _event_timestamps_missing(model_file):
+            reloaded.append(model_file)
+            continue
+        persisted = await _reload_model_file_by_id(session, model_file_id)
+        reloaded.append(persisted if persisted is not None else model_file)
+    return reloaded
+
+
+async def _reload_model_file_by_id(session, model_file_id):
+    if not hasattr(session, "exec"):
+        return await session.get(ModelFile, model_file_id)
+    return (
+        await session.exec(
+            select(ModelFile)
+            .where(ModelFile.id == model_file_id)
+            .execution_options(populate_existing=True)
+        )
+    ).first()
 
 
 @router.post("", response_model=ModelFilePublic)

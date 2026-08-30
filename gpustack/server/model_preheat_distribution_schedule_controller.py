@@ -3,7 +3,7 @@ from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import func, or_, update
+from sqlalchemy import exists, func, or_, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -12,6 +12,7 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicy,
     ModelPreheatDistributionPolicyRun,
     ModelPreheatDistributionPolicyRunStateEnum,
+    ModelPreheatDistributionPolicyRunTask,
     ModelPreheatDistributionPolicyRunTriggerEnum,
     ModelPreheatDistributionPolicyTriggerModeEnum,
     distribution_policy_run_operation_key,
@@ -41,7 +42,16 @@ class ModelPreheatDistributionScheduleController:
                 await session.exec(
                     select(ModelPreheatDistributionPolicyRun.id).where(
                         ModelPreheatDistributionPolicyRun.state
-                        == ModelPreheatDistributionPolicyRunStateEnum.PENDING
+                        == ModelPreheatDistributionPolicyRunStateEnum.PENDING,
+                        ModelPreheatDistributionPolicyRun.trigger
+                        == ModelPreheatDistributionPolicyRunTriggerEnum.SCHEDULED,
+                        or_(
+                            ~exists().where(
+                                ModelPreheatDistributionPolicyRunTask.run_id
+                                == ModelPreheatDistributionPolicyRun.id
+                            ),
+                            ModelPreheatDistributionPolicyRun.lease_expires_at <= now,
+                        ),
                     )
                 )
             ).all()
@@ -110,6 +120,15 @@ class ModelPreheatDistributionScheduleController:
                     ModelPreheatDistributionPolicyRun.id == run_id,
                     ModelPreheatDistributionPolicyRun.state
                     == ModelPreheatDistributionPolicyRunStateEnum.PENDING,
+                    ModelPreheatDistributionPolicyRun.trigger
+                    == ModelPreheatDistributionPolicyRunTriggerEnum.SCHEDULED,
+                    or_(
+                        ~exists().where(
+                            ModelPreheatDistributionPolicyRunTask.run_id
+                            == ModelPreheatDistributionPolicyRun.id
+                        ),
+                        ModelPreheatDistributionPolicyRun.lease_expires_at <= now,
+                    ),
                     or_(
                         ModelPreheatDistributionPolicyRun.lease_owner.is_(None),
                         ModelPreheatDistributionPolicyRun.lease_expires_at.is_(None),
@@ -241,6 +260,24 @@ class ModelPreheatDistributionScheduleController:
     async def _finish_run(
         self, run_id, token, error_code, *, outcome=None, has_created=False
     ):
+        values = {
+            "error_code": error_code,
+            "outcome": outcome,
+            "lease_owner": None,
+            "lease_token": None,
+            "lease_expires_at": None,
+        }
+        if has_created:
+            values["finished_at"] = None
+        else:
+            values.update(
+                state=(
+                    ModelPreheatDistributionPolicyRunStateEnum.ERROR
+                    if error_code
+                    else ModelPreheatDistributionPolicyRunStateEnum.READY
+                ),
+                finished_at=datetime.now(timezone.utc),
+            )
         async with AsyncSession(self._engine) as session:
             await session.exec(
                 update(ModelPreheatDistributionPolicyRun)
@@ -251,18 +288,6 @@ class ModelPreheatDistributionScheduleController:
                     ModelPreheatDistributionPolicyRun.lease_owner == self._lease_owner,
                     ModelPreheatDistributionPolicyRun.lease_token == token,
                 )
-                .values(
-                    state=(
-                        ModelPreheatDistributionPolicyRunStateEnum.ERROR
-                        if error_code and not has_created
-                        else ModelPreheatDistributionPolicyRunStateEnum.READY
-                    ),
-                    error_code=error_code,
-                    outcome=outcome,
-                    finished_at=datetime.now(timezone.utc),
-                    lease_owner=None,
-                    lease_token=None,
-                    lease_expires_at=None,
-                )
+                .values(**values)
             )
             await session.commit()
