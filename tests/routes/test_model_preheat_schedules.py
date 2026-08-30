@@ -26,6 +26,11 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3Profile,
     ModelPreheatS3ProfileLifecycleStateEnum,
 )
+from gpustack.schemas.model_preheat_schedules import (
+    ModelPreheatScheduleRun,
+    ModelPreheatScheduleRunStateEnum,
+    ModelPreheatScheduleRunTriggerEnum,
+)
 from gpustack.schemas.model_preheats import ModelPreheatCreate, ModelPreheatTask
 from gpustack.schemas.users import User
 from gpustack.server.db import get_session
@@ -1279,6 +1284,87 @@ def test_schedule_run_now_persists_task_creation_error_run(tmp_path):
     assert runs.status_code == 200, runs.text
     assert runs.json()["pagination"]["total"] == 1
     assert runs.json()["items"][0]["error_code"] == "target_workers_not_idle"
+
+
+def test_delete_model_preheat_schedule_run_removes_terminal_record(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id = asyncio.run(_seed_profile(engine))
+
+    async def seed_run(schedule_id):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            run = ModelPreheatScheduleRun(
+                schedule_id=schedule_id,
+                window_start_utc=datetime.now(timezone.utc),
+                window_end_utc=datetime.now(timezone.utc),
+                trigger=ModelPreheatScheduleRunTriggerEnum.MANUAL,
+                state=ModelPreheatScheduleRunStateEnum.ERROR,
+                operation_key="delete-terminal-preheat-run",
+                error_code="target_workers_not_idle",
+                finished_at=datetime.now(timezone.utc),
+                created_by_user_id=1,
+            )
+            session.add(run)
+            await session.commit()
+            return run.id
+
+    with TestClient(app) as client:
+        created = client.post("/v1/model-preheat-schedules", json=_payload(profile_id))
+        run_id = asyncio.run(seed_run(created.json()["id"]))
+        response = client.delete(
+            f"/v1/model-preheat-schedules/{created.json()['id']}/runs/{run_id}"
+        )
+
+    async def exists():
+        async with AsyncSession(engine) as session:
+            return await session.get(ModelPreheatScheduleRun, run_id)
+
+    persisted = asyncio.run(exists())
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+    assert persisted is None
+
+
+def test_delete_model_preheat_schedule_run_rejects_active_record(tmp_path):
+    app, engine = _test_app(tmp_path)
+    profile_id = asyncio.run(_seed_profile(engine))
+
+    async def seed_run(schedule_id):
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            run = ModelPreheatScheduleRun(
+                schedule_id=schedule_id,
+                window_start_utc=datetime.now(timezone.utc),
+                window_end_utc=datetime.now(timezone.utc),
+                trigger=ModelPreheatScheduleRunTriggerEnum.MANUAL,
+                state=ModelPreheatScheduleRunStateEnum.RUNNING,
+                operation_key="delete-active-preheat-run",
+                started_at=datetime.now(timezone.utc),
+                created_by_user_id=1,
+            )
+            session.add(run)
+            await session.commit()
+            return run.id
+
+    with TestClient(app) as client:
+        created = client.post("/v1/model-preheat-schedules", json=_payload(profile_id))
+        run_id = asyncio.run(seed_run(created.json()["id"]))
+        response = client.delete(
+            f"/v1/model-preheat-schedules/{created.json()['id']}/runs/{run_id}"
+        )
+
+    async def exists():
+        async with AsyncSession(engine) as session:
+            return await session.get(ModelPreheatScheduleRun, run_id)
+
+    persisted = asyncio.run(exists())
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+    assert response.status_code == 409, response.text
+    assert response.json()["message"] == "model_preheat_schedule_run_in_use"
+    assert persisted is not None
 
 
 def test_schedule_patterns_survive_create_unrelated_patch_and_worker_matching(tmp_path):

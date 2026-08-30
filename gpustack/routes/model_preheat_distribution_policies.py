@@ -17,6 +17,8 @@ from gpustack.schemas.model_preheat_distribution_policies import (
     ModelPreheatDistributionPolicyPublic,
     ModelPreheatDistributionPolicyRun,
     ModelPreheatDistributionPolicyRunPublic,
+    ModelPreheatDistributionPolicyRunStateEnum,
+    ModelPreheatDistributionPolicyRunTask,
     ModelPreheatDistributionPolicyRunsPublic,
     ModelPreheatDistributionPolicyUpdate,
     ModelPreheatDistributionSelectionModeEnum,
@@ -101,6 +103,43 @@ async def get_distribution_policy_run(session: SessionDep, run_id: int):
         session, [run], include_tasks=True
     )
     return await _run_public(session, run, observations[run.id])
+
+
+@router.delete("/runs/{run_id}")
+async def delete_distribution_policy_run(session: SessionDep, run_id: int):
+    run = await session.get(ModelPreheatDistributionPolicyRun, run_id)
+    if run is None:
+        raise NotFoundException(
+            message="model_preheat_distribution_policy_run_not_found"
+        )
+    if run.state == ModelPreheatDistributionPolicyRunStateEnum.PENDING:
+        raise HTTPException(409, "Conflict", "distribution_policy_run_in_use")
+    active_task_id = (
+        await session.exec(
+            select(ModelPreheatWorkerTask.id)
+            .join(
+                ModelPreheatDistributionPolicyRunTask,
+                ModelPreheatDistributionPolicyRunTask.task_id
+                == ModelPreheatWorkerTask.id,
+            )
+            .where(
+                ModelPreheatDistributionPolicyRunTask.run_id == run.id,
+                ModelPreheatWorkerTask.role
+                == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                ModelPreheatWorkerTask.state.not_in(_TERMINAL_DISTRIBUTION_TASK_STATES),
+            )
+        )
+    ).first()
+    if active_task_id is not None:
+        raise HTTPException(409, "Conflict", "distribution_policy_run_in_use")
+    await session.exec(
+        delete(ModelPreheatDistributionPolicyRunTask).where(
+            ModelPreheatDistributionPolicyRunTask.run_id == run.id
+        )
+    )
+    await session.delete(run)
+    await session.commit()
+    return {"ok": True}
 
 
 @router.get("", response_model=ModelPreheatDistributionPoliciesPublic)

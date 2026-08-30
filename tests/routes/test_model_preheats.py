@@ -19,17 +19,27 @@ from gpustack.api import exceptions
 from gpustack.api.auth import get_admin_user
 from gpustack.model_preheat_credentials import generate_model_preheat_credential_key
 from gpustack.routes import model_preheats
+from gpustack.schemas.model_preheat_distribution_policies import (
+    ModelPreheatDistributionPolicy,
+)
 from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3ConnectivityStateEnum,
     ModelPreheatS3Profile,
     ModelPreheatS3ProfileLifecycleStateEnum,
 )
+from gpustack.schemas.model_preheat_schedules import (
+    ModelPreheatScheduleRun,
+    ModelPreheatScheduleRunStateEnum,
+    ModelPreheatScheduleRunTriggerEnum,
+)
 from gpustack.schemas.model_preheats import (
     ModelPreheatConnectivityCheckStateEnum,
+    ModelPreheatArtifact,
     ModelPreheatBackfillPolicyEnum,
     ModelPreheatDesiredStateEnum,
     ModelPreheatExecutionStateEnum,
     ModelPreheatIdempotencyRecord,
+    ModelPreheatInventoryManifestStateEnum,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatTask,
     ModelPreheatTaskLock,
@@ -206,6 +216,208 @@ def payload(profile_id, worker_ids, **overrides):
     }
     result.update(overrides)
     return result
+
+
+async def _seed_preheat_task_record(
+    session, state=ModelPreheatExecutionStateEnum.READY
+):
+    profile, workers = await _seed(session)
+    task = ModelPreheatTask(
+        source="modelscope",
+        model_id="Qwen/Qwen-Image-2512",
+        requested_revision="main",
+        resolved_revision="commit-123",
+        include_patterns=[],
+        exclude_patterns=[],
+        selection_digest="selection",
+        request_identity={
+            "source": "modelscope",
+            "model_id": "Qwen/Qwen-Image-2512",
+            "requested_revision": "main",
+            "include_patterns": [],
+            "exclude_patterns": [],
+        },
+        request_digest="c" * 64,
+        desired_state=(
+            ModelPreheatDesiredStateEnum.RUNNING
+            if state == ModelPreheatExecutionStateEnum.PENDING
+            else ModelPreheatDesiredStateEnum.RUNNING
+        ),
+        execution_state=state,
+        artifact_id="a" * 64 if state == ModelPreheatExecutionStateEnum.READY else None,
+        seed_worker_uuid=workers[0].worker_uuid,
+        seed_worker_id=workers[0].id,
+        target_scope=ModelPreheatTargetScopeEnum.SELECTED_WORKERS,
+        target_worker_uuids=[worker.worker_uuid for worker in workers],
+        target_worker_snapshot=[
+            {"worker_uuid": worker.worker_uuid, "worker_id": worker.id}
+            for worker in workers
+        ],
+        s3_profile_id=profile.id,
+        s3_profile_config_version=profile.config_version,
+        s3_profile_snapshot_encrypted={"ciphertext": "snapshot"},
+        encryption_key_version="v1",
+        s3_backfill_policy=ModelPreheatBackfillPolicyEnum.WHEN_MISSING,
+        finished_at=(
+            datetime.now(timezone.utc)
+            if state
+            in {
+                ModelPreheatExecutionStateEnum.READY,
+                ModelPreheatExecutionStateEnum.ERROR,
+                ModelPreheatExecutionStateEnum.CANCELED,
+                ModelPreheatExecutionStateEnum.PARTIAL,
+            }
+            else None
+        ),
+    )
+    session.add(task)
+    await session.flush()
+    worker_task = ModelPreheatWorkerTask(
+        task_id=task.id,
+        worker_uuid=workers[0].worker_uuid,
+        worker_id=workers[0].id,
+        role=ModelPreheatWorkerTaskRoleEnum.SEED,
+        state=(
+            ModelPreheatWorkerTaskStateEnum.READY
+            if state == ModelPreheatExecutionStateEnum.READY
+            else ModelPreheatWorkerTaskStateEnum.PENDING
+        ),
+    )
+    artifact = ModelPreheatArtifact(
+        profile_id=profile.id,
+        profile_config_version=profile.config_version,
+        artifact_id="a" * 64,
+        source=task.source,
+        model_id=task.model_id,
+        resolved_revision=task.resolved_revision,
+        include_patterns=[],
+        exclude_patterns=[],
+        manifest_path=f"model-storage/modelscope/Qwen/Test/{'a' * 64}/manifest.json",
+        manifest_digest="d" * 64,
+        file_count=1,
+        total_size=1,
+        manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+        last_verified_at=datetime.now(timezone.utc),
+        created_by_task_id=task.id,
+    )
+    policy = ModelPreheatDistributionPolicy(
+        name="from-preheat",
+        profile_id=profile.id,
+        profile_config_version=profile.config_version,
+        request_identity=task.request_identity,
+        request_digest=task.request_digest,
+        target_scope=task.target_scope,
+        worker_selector={"worker_uuids": [workers[0].worker_uuid]},
+        gpu_selector={},
+        selector_digest="d" * 64,
+        created_by_task_id=task.id,
+    )
+    run = ModelPreheatScheduleRun(
+        schedule_id=1,
+        window_start_utc=datetime.now(timezone.utc),
+        window_end_utc=datetime.now(timezone.utc),
+        trigger=ModelPreheatScheduleRunTriggerEnum.MANUAL,
+        state=ModelPreheatScheduleRunStateEnum.READY,
+        operation_key="preheat-task-delete-run",
+        task_id=task.id,
+    )
+    idem = ModelPreheatIdempotencyRecord(
+        user_id=1,
+        operation="model_preheats.create",
+        idempotency_key="delete-task-key",
+        request_hash="e" * 64,
+        resource_type="model_preheat_task",
+        resource_id=task.id,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    lock = ModelPreheatTaskLock(
+        operation_key="delete-task-operation",
+        task_id=task.id,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    session.add_all([worker_task, artifact, policy, run, idem, lock])
+    await session.flush()
+    ids = (task.id, worker_task.id, artifact.id, policy.id, run.id)
+    await session.commit()
+    return ids
+
+
+def test_delete_model_preheat_removes_terminal_task_record_without_artifacts(tmp_path):
+    app, engine = _test_app(tmp_path)
+
+    async def seed():
+        async with AsyncSession(engine) as session:
+            return await _seed_preheat_task_record(session)
+
+    task_id, worker_task_id, artifact_id, policy_id, run_id = asyncio.run(seed())
+    with TestClient(app) as client:
+        response = client.delete(f"{API_PREFIX}/{task_id}")
+
+    async def persisted():
+        async with AsyncSession(engine) as session:
+            artifact = await session.get(ModelPreheatArtifact, artifact_id)
+            policy = await session.get(ModelPreheatDistributionPolicy, policy_id)
+            run = await session.get(ModelPreheatScheduleRun, run_id)
+            idempotency = (
+                await session.exec(
+                    select(ModelPreheatIdempotencyRecord).where(
+                        ModelPreheatIdempotencyRecord.resource_id == task_id,
+                        ModelPreheatIdempotencyRecord.resource_type
+                        == "model_preheat_task",
+                    )
+                )
+            ).first()
+            return (
+                await session.get(ModelPreheatTask, task_id),
+                await session.get(ModelPreheatWorkerTask, worker_task_id),
+                artifact,
+                policy,
+                run,
+                idempotency,
+            )
+
+    task, worker_task, artifact, policy, run, idempotency = asyncio.run(persisted())
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+    assert task is None
+    assert worker_task is None
+    assert artifact is not None
+    assert artifact.created_by_task_id is None
+    assert policy is not None
+    assert policy.created_by_task_id is None
+    assert run is not None
+    assert run.task_id is None
+    assert idempotency is None
+
+
+def test_delete_model_preheat_rejects_active_task_record(tmp_path):
+    app, engine = _test_app(tmp_path)
+
+    async def seed():
+        async with AsyncSession(engine) as session:
+            task_id, *_ = await _seed_preheat_task_record(
+                session, ModelPreheatExecutionStateEnum.PENDING
+            )
+            return task_id
+
+    task_id = asyncio.run(seed())
+    with TestClient(app) as client:
+        response = client.delete(f"{API_PREFIX}/{task_id}")
+
+    async def exists():
+        async with AsyncSession(engine) as session:
+            return await session.get(ModelPreheatTask, task_id)
+
+    task = asyncio.run(exists())
+    asyncio.run(_drop_tables(engine))
+    asyncio.run(engine.dispose())
+
+    assert response.status_code == 409, response.text
+    assert response.json()["message"] == "model_preheat_task_in_use"
+    assert task is not None
 
 
 def test_create_rejects_maintenance_profile(tmp_path):

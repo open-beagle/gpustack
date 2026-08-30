@@ -191,6 +191,161 @@ def test_delete_distribution_policy_unlinks_terminal_worker_tasks(tmp_path):
     assert response.json() == {"ok": True}
 
 
+def test_delete_distribution_policy_run_unlinks_run_tasks_only(tmp_path):
+    app, engine = _test_app(tmp_path)
+    policy_id = asyncio.run(_seed(engine))
+
+    async def seed_run():
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy_id,
+                trigger=ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+                state=ModelPreheatDistributionPolicyRunStateEnum.READY,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="delete-single-run",
+            )
+            task = ModelPreheatWorkerTask(
+                distribution_policy_id=policy_id,
+                operation_key="delete-single-run-task",
+                worker_uuid="worker-terminal",
+                role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                state=ModelPreheatWorkerTaskStateEnum.READY,
+            )
+            session.add_all([run, task])
+            await session.flush()
+            session.add(
+                ModelPreheatDistributionPolicyRunTask(run_id=run.id, task_id=task.id)
+            )
+            await session.commit()
+            return run.id, task.id
+
+    run_id, task_id = asyncio.run(seed_run())
+    with TestClient(app) as client:
+        response = client.delete(
+            f"/v1/model-preheat-distribution-policies/runs/{run_id}"
+        )
+
+    async def persisted():
+        async with AsyncSession(engine) as session:
+            return (
+                await session.get(ModelPreheatDistributionPolicyRun, run_id),
+                await session.get(
+                    ModelPreheatDistributionPolicyRunTask,
+                    (run_id, task_id),
+                ),
+                await session.get(ModelPreheatWorkerTask, task_id),
+                await session.get(ModelPreheatDistributionPolicy, policy_id),
+            )
+
+    run, link, task, policy = asyncio.run(persisted())
+    asyncio.run(engine.dispose())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True}
+    assert run is None
+    assert link is None
+    assert task is not None
+    assert policy is not None
+
+
+def test_delete_distribution_policy_run_rejects_pending_run(tmp_path):
+    app, engine = _test_app(tmp_path)
+    policy_id = asyncio.run(_seed(engine))
+
+    async def seed_run():
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy_id,
+                trigger=ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+                state=ModelPreheatDistributionPolicyRunStateEnum.PENDING,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key="delete-pending-run",
+            )
+            session.add(run)
+            await session.commit()
+            return run.id
+
+    run_id = asyncio.run(seed_run())
+    with TestClient(app) as client:
+        response = client.delete(
+            f"/v1/model-preheat-distribution-policies/runs/{run_id}"
+        )
+
+    async def exists():
+        async with AsyncSession(engine) as session:
+            return await session.get(ModelPreheatDistributionPolicyRun, run_id)
+
+    persisted = asyncio.run(exists())
+    asyncio.run(engine.dispose())
+
+    assert response.status_code == 409, response.text
+    assert response.json()["message"] == "distribution_policy_run_in_use"
+    assert persisted is not None
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        ModelPreheatWorkerTaskStateEnum.PENDING,
+        ModelPreheatWorkerTaskStateEnum.RUNNING,
+        ModelPreheatWorkerTaskStateEnum.PAUSED,
+    ],
+)
+def test_delete_distribution_policy_run_rejects_active_linked_task(tmp_path, state):
+    app, engine = _test_app(tmp_path)
+    policy_id = asyncio.run(_seed(engine))
+
+    async def seed_run():
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            run = ModelPreheatDistributionPolicyRun(
+                policy_id=policy_id,
+                trigger=ModelPreheatDistributionPolicyRunTriggerEnum.MANUAL,
+                state=ModelPreheatDistributionPolicyRunStateEnum.READY,
+                window_start_utc=datetime.now(timezone.utc),
+                operation_key=f"delete-active-linked-run-{state.value}",
+            )
+            task = ModelPreheatWorkerTask(
+                distribution_policy_id=policy_id,
+                operation_key=f"delete-active-linked-task-{state.value}",
+                worker_uuid="worker-active",
+                role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+                state=state,
+            )
+            session.add_all([run, task])
+            await session.flush()
+            session.add(
+                ModelPreheatDistributionPolicyRunTask(run_id=run.id, task_id=task.id)
+            )
+            await session.commit()
+            return run.id, task.id
+
+    run_id, task_id = asyncio.run(seed_run())
+    with TestClient(app) as client:
+        response = client.delete(
+            f"/v1/model-preheat-distribution-policies/runs/{run_id}"
+        )
+
+    async def persisted():
+        async with AsyncSession(engine) as session:
+            return (
+                await session.get(ModelPreheatDistributionPolicyRun, run_id),
+                await session.get(
+                    ModelPreheatDistributionPolicyRunTask,
+                    (run_id, task_id),
+                ),
+                await session.get(ModelPreheatWorkerTask, task_id),
+            )
+
+    run, link, task = asyncio.run(persisted())
+    asyncio.run(engine.dispose())
+
+    assert response.status_code == 409, response.text
+    assert response.json()["message"] == "distribution_policy_run_in_use"
+    assert run is not None
+    assert link is not None
+    assert task is not None
+
+
 @pytest.mark.parametrize(
     "state",
     [

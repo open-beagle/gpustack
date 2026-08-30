@@ -23,6 +23,10 @@ from gpustack.schemas.model_preheat_s3_profiles import (
     ModelPreheatS3Profile,
     ModelPreheatS3ProfileLifecycleStateEnum,
 )
+from gpustack.schemas.model_preheat_distribution_policies import (
+    ModelPreheatDistributionPolicy,
+)
+from gpustack.schemas.model_preheat_schedules import ModelPreheatScheduleRun
 from gpustack.schemas.model_preheats import (
     ModelPreheatCreate,
     ModelPreheatDeliveryModeEnum,
@@ -31,6 +35,7 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatInventoryManifestStateEnum,
     ModelPreheatTask,
+    ModelPreheatIdempotencyRecord,
     ModelPreheatTaskLock,
     ModelPreheatTaskPublic,
     ModelPreheatTasksPublic,
@@ -85,6 +90,43 @@ async def get_model_preheat(session: SessionDep, id: int):
     if task is None:
         raise NotFoundException(message="model_preheat_task_not_found")
     return _to_public(task)
+
+
+@router.delete("/{id}")
+async def delete_model_preheat(session: SessionDep, id: int):
+    task = await ModelPreheatTask.one_by_id(session, id)
+    if task is None:
+        raise NotFoundException(message="model_preheat_task_not_found")
+    if not is_terminal_task(task):
+        raise HTTPException(409, "Conflict", "model_preheat_task_in_use")
+    await release_task_lock_if_terminal(session, task)
+    await session.exec(
+        update(ModelPreheatScheduleRun)
+        .where(ModelPreheatScheduleRun.task_id == task.id)
+        .values(task_id=None)
+    )
+    await session.exec(
+        update(ModelPreheatArtifact)
+        .where(ModelPreheatArtifact.created_by_task_id == task.id)
+        .values(created_by_task_id=None)
+    )
+    await session.exec(
+        update(ModelPreheatDistributionPolicy)
+        .where(ModelPreheatDistributionPolicy.created_by_task_id == task.id)
+        .values(created_by_task_id=None)
+    )
+    await session.exec(
+        delete(ModelPreheatIdempotencyRecord).where(
+            ModelPreheatIdempotencyRecord.resource_type == "model_preheat_task",
+            ModelPreheatIdempotencyRecord.resource_id == task.id,
+        )
+    )
+    await session.exec(
+        delete(ModelPreheatWorkerTask).where(ModelPreheatWorkerTask.task_id == task.id)
+    )
+    await session.delete(task)
+    await session.commit()
+    return {"ok": True}
 
 
 @router.post("/{id}/cancel", response_model=ModelPreheatTaskPublic)

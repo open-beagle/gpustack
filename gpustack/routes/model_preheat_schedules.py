@@ -184,6 +184,23 @@ async def get_model_preheat_schedule_run(session: SessionDep, id: int, run_id: i
     return _run_public(run, observations[run.id])
 
 
+@router.delete("/{id}/runs/{run_id}")
+async def delete_model_preheat_schedule_run(session: SessionDep, id: int, run_id: int):
+    await _schedule_or_404(session, id)
+    run = await session.get(ModelPreheatScheduleRun, run_id)
+    if run is None or run.schedule_id != id:
+        raise NotFoundException(message="model_preheat_schedule_run_not_found")
+    if run.state in {
+        ModelPreheatScheduleRunStateEnum.PENDING,
+        ModelPreheatScheduleRunStateEnum.RUNNING,
+        ModelPreheatScheduleRunStateEnum.PAUSED,
+    }:
+        raise HTTPException(409, "Conflict", "model_preheat_schedule_run_in_use")
+    await session.delete(run)
+    await session.commit()
+    return {"ok": True}
+
+
 @router.patch("/{id}", response_model=ModelPreheatSchedulePublic)
 async def update_model_preheat_schedule(
     session: SessionDep,
