@@ -6,6 +6,7 @@ import posixpath
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
@@ -488,6 +489,11 @@ async def complete_model_preheat_worker_task(
     now = _utcnow()
     if task.task_id is not None and result_payload.get("state") == "ready":
         await _bind_preheat_artifact(session, task, result_payload, now)
+    elif (
+        task.distribution_policy_id is not None
+        and result_payload.get("state") == "ready"
+    ):
+        await _bind_distribution_artifact(session, task, result_payload, now)
     result = await session.exec(
         _active_lease_update(worker_task_id, complete, now).values(
             state=ModelPreheatWorkerTaskStateEnum.READY,
@@ -1000,6 +1006,37 @@ async def _bind_preheat_artifact(session, worker_task, result, now):
     if worker_task.role == ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE:
         _validate_distributed_model_paths(result)
         await _upsert_distributed_model_file(session, parent, worker_task, result, now)
+    await session.flush()
+
+
+async def _bind_distribution_artifact(session, worker_task, result, now):
+    _validate_distributed_model_paths(result)
+    policy, source = await _active_distribution_source(
+        session,
+        worker_task.distribution_policy_id,
+        worker_task.distribution_artifact_id,
+    )
+    artifact = source.artifact
+    if (
+        worker_task.distribution_request_digest
+        and result["request_digest"] != worker_task.distribution_request_digest
+    ):
+        _conflict("request_digest_mismatch")
+    if result["artifact_id"] != artifact.artifact_id:
+        _conflict("artifact_binding_conflict")
+    if result["resolved_revision"] != artifact.resolved_revision:
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    if not result["manifest_path"].endswith(f"/{artifact.artifact_id}/manifest.json"):
+        raise HTTPException(422, "Invalid", "invalid_preheat_result")
+    parent = SimpleNamespace(
+        source=artifact.source,
+        model_id=artifact.model_id,
+        include_patterns=list(artifact.include_patterns),
+        requested_revision=(policy.request_identity or {}).get("requested_revision"),
+        resolved_revision=artifact.resolved_revision,
+        s3_profile_id=policy.profile_id,
+    )
+    await _upsert_distributed_model_file(session, parent, worker_task, result, now)
     await session.flush()
 
 

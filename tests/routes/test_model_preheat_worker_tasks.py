@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, FastAPI
@@ -17,11 +18,18 @@ from gpustack.model_preheat_credentials import (
 )
 from gpustack.routes import model_preheat_worker_tasks
 from gpustack.schemas.model_preheat_s3_profiles import ModelPreheatS3Profile
+from gpustack.schemas.model_preheat_distribution_policies import (
+    ModelPreheatDistributionPolicy,
+    ModelPreheatDistributionSelectionModeEnum,
+    ModelPreheatDistributionPolicyTriggerModeEnum,
+    distribution_selector_digest,
+)
 from gpustack.schemas.model_files import ModelFile, ModelFileStateEnum
 from gpustack.schemas.model_preheats import (
     ModelPreheatArtifact,
     ModelPreheatBackfillPolicyEnum,
     ModelPreheatConnectivityCheckStateEnum,
+    ModelPreheatInventoryManifestStateEnum,
     ModelPreheatS3ConnectivityCheck,
     ModelPreheatTargetScopeEnum,
     ModelPreheatTask,
@@ -175,6 +183,102 @@ async def _seed(
         task_id = task.id
         await session.commit()
         return child_id, task_id, identity.request_digest
+
+
+async def _seed_distribution_policy_task(
+    engine,
+    key,
+    *,
+    artifact_id="c" * 64,
+    source="modelscope",
+    model_id="Qwen/Qwen-7B-Chat-Int8",
+    resolved_revision="a" * 40,
+):
+    cipher = ModelPreheatCredentialCipher(key, "v1")
+    identity = ModelPreheatIdentity(
+        source=source,
+        model_id=model_id,
+        revision=resolved_revision,
+        file_patterns=(),
+    )
+    async with AsyncSession(engine) as session:
+        worker = Worker(
+            id=1,
+            name="worker-a",
+            hostname="worker-a",
+            ip="127.0.0.1",
+            port=10150,
+            worker_uuid="worker-uuid",
+            state=WorkerStateEnum.READY,
+            model_storage_protocol_version=1,
+        )
+        profile = ModelPreheatS3Profile(
+            name="storage",
+            endpoint="https://s3.example.com",
+            bucket="models",
+            prefix="model-storage",
+            access_key_encrypted=cipher.encrypt("access-plain"),
+            secret_key_encrypted=cipher.encrypt("secret-plain"),
+            encryption_key_version="v1",
+            config_version=3,
+        )
+        session.add_all([worker, profile])
+        await session.flush()
+        artifact = ModelPreheatArtifact(
+            profile_id=profile.id,
+            profile_config_version=profile.config_version,
+            artifact_id=artifact_id,
+            source=source,
+            model_id=model_id,
+            resolved_revision=resolved_revision,
+            include_patterns=[],
+            exclude_patterns=[],
+            manifest_path=f"model-storage/modelscope/Qwen/Test/{artifact_id}/manifest.json",
+            manifest_digest="d" * 64,
+            file_count=2,
+            total_size=10,
+            manifest_state=ModelPreheatInventoryManifestStateEnum.VALID,
+            last_verified_at=datetime.now(timezone.utc),
+        )
+        session.add(artifact)
+        await session.flush()
+        policy = ModelPreheatDistributionPolicy(
+            name="policy-a",
+            selection_mode=ModelPreheatDistributionSelectionModeEnum.FIXED,
+            profile_id=profile.id,
+            profile_config_version=profile.config_version,
+            request_identity={
+                "source": identity.source,
+                "model_id": identity.model_path,
+                "requested_revision": identity.requested_revision_path,
+                "include_patterns": [],
+                "exclude_patterns": [],
+            },
+            request_digest=identity.request_digest,
+            target_scope=ModelPreheatTargetScopeEnum.SEED_WORKER,
+            worker_selector={"worker_uuids": [worker.worker_uuid]},
+            gpu_selector={},
+            selector_digest=distribution_selector_digest(
+                {"worker_uuids": [worker.worker_uuid]}, {}
+            ),
+            source_artifact_id=artifact.id,
+            trigger_mode=ModelPreheatDistributionPolicyTriggerModeEnum.MANUAL,
+        )
+        session.add(policy)
+        await session.flush()
+        child = ModelPreheatWorkerTask(
+            distribution_policy_id=policy.id,
+            distribution_artifact_id=artifact.artifact_id,
+            distribution_request_digest=identity.request_digest,
+            worker_uuid=worker.worker_uuid,
+            worker_id=worker.id,
+            role=ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
+        )
+        session.add(child)
+        await session.flush()
+        child_id = child.id
+        await session.commit()
+        return child_id, identity.request_digest
 
 
 def _claim(client, child_id):
@@ -444,6 +548,110 @@ def test_distribution_complete_registers_ready_model_file(tmp_path):
     assert model_file.resolved_paths == [
         "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
     ]
+    asyncio.run(engine.dispose())
+
+
+def test_policy_distribution_complete_registers_ready_model_file(tmp_path):
+    app, engine, key = _test_app(tmp_path)
+    artifact_id = "c" * 64
+    child_id, request_digest = asyncio.run(
+        _seed_distribution_policy_task(
+            engine,
+            key,
+            artifact_id=artifact_id,
+            model_id="Qwen/Qwen-7B-Chat-Int8",
+        )
+    )
+    result = {
+        **_ready_result(request_digest, artifact_id),
+        "transfer_source": "s3",
+        "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8",
+        "resolved_paths": [
+            "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
+        ],
+    }
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def inspect():
+        async with AsyncSession(engine) as session:
+            rows = (await session.exec(select(ModelFile))).all()
+            return rows
+
+    model_files = asyncio.run(inspect())
+    assert completed.status_code == 200, completed.text
+    assert len(model_files) == 1
+    model_file = model_files[0]
+    assert model_file.state == ModelFileStateEnum.READY
+    assert model_file.worker_id == 1
+    assert model_file.model_scope_model_id == "Qwen/Qwen-7B-Chat-Int8"
+    assert model_file.resolved_revision == "a" * 40
+    assert model_file.resolved_paths == [
+        "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
+    ]
+    asyncio.run(engine.dispose())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_message"),
+    [
+        ("request_digest", "e" * 64, "request_digest_mismatch"),
+        ("artifact_id", "f" * 64, "artifact_binding_conflict"),
+        ("resolved_revision", "b" * 40, "invalid_preheat_result"),
+        (
+            "manifest_path",
+            "model-storage/modelscope/Qwen/Test/not-the-artifact/manifest.json",
+            "invalid_preheat_result",
+        ),
+    ],
+)
+def test_policy_distribution_complete_rejects_identity_mismatch(
+    tmp_path, field, value, expected_message
+):
+    app, engine, key = _test_app(tmp_path)
+    artifact_id = "c" * 64
+    child_id, request_digest = asyncio.run(
+        _seed_distribution_policy_task(engine, key, artifact_id=artifact_id)
+    )
+    result = {
+        **_ready_result(request_digest, artifact_id),
+        "transfer_source": "s3",
+        "local_dir": "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8",
+        "resolved_paths": [
+            "/var/lib/gpustack/cache/model_scope/Qwen/Qwen-7B-Chat-Int8"
+        ],
+        field: value,
+    }
+    with TestClient(app) as client:
+        claim = _claim(client, child_id)
+        completed = client.post(
+            f"{API_PREFIX}/{child_id}/complete",
+            json={
+                "worker_uuid": "worker-uuid",
+                "worker_id": 1,
+                "attempt": claim["attempt"],
+                "lease_token": claim["lease_token"],
+                "result": result,
+            },
+        )
+
+    async def count_model_files():
+        async with AsyncSession(engine) as session:
+            return len((await session.exec(select(ModelFile))).all())
+
+    assert completed.status_code in {409, 422}, completed.text
+    assert completed.json()["message"] == expected_message
+    assert asyncio.run(count_model_files()) == 0
     asyncio.run(engine.dispose())
 
 
