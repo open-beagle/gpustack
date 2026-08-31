@@ -7,6 +7,7 @@ import pytest
 
 from gpustack.schemas.workers import Worker
 from gpustack.client.generated_worker_client import WorkerClient
+from gpustack.worker.preheat_credential import store_preheat_credential
 from gpustack.worker.worker_manager import WorkerManager
 
 
@@ -232,11 +233,43 @@ def test_worker_client_keeps_newer_credential_when_responses_arrive_out_of_order
     client.last_model_preheat_credential = None
     client._last_model_preheat_credential_generation = -1
 
-    client._remember_model_preheat_credential("mpw_1_2_new-secret")
-    client._remember_model_preheat_credential("mpw_1_1_old-secret")
+    client._remember_model_preheat_credential("mpwg_1_2_new-secret")
+    client._remember_model_preheat_credential("mpwg_1_1_old-secret")
 
-    assert client.last_model_preheat_credential == "mpw_1_2_new-secret"
+    assert client.last_model_preheat_credential == "mpwg_1_2_new-secret"
 
 
 def test_worker_client_delete_remains_public_api():
     assert callable(getattr(WorkerClient, "delete", None))
+
+
+def test_stale_manager_response_cannot_replace_newer_disk_credential(tmp_path):
+    credential_path = tmp_path / "model_preheat_worker_credential"
+    assert store_preheat_credential(str(credential_path), "mpwg_1_2_new") is True
+    manager = WorkerManager.__new__(WorkerManager)
+    manager._preheat_credential_path = str(credential_path)
+    manager._clientset = SimpleNamespace(set_model_preheat_worker_credential=Mock())
+
+    assert manager._store_preheat_credential("mpwg_1_1_old") is False
+    assert manager._load_preheat_credential() is True
+    assert credential_path.read_text(encoding="utf-8") == "mpwg_1_2_new"
+    manager._clientset.set_model_preheat_worker_credential.assert_called_once_with(
+        "mpwg_1_2_new"
+    )
+
+
+def test_other_process_newer_credential_replaces_legacy_disk_credential(tmp_path):
+    credential_path = tmp_path / "model_preheat_worker_credential"
+    assert store_preheat_credential(str(credential_path), "mpw_1_old_secret") is True
+
+    assert store_preheat_credential(str(credential_path), "mpwg_1_3_new") is True
+    assert credential_path.read_text(encoding="utf-8") == "mpwg_1_3_new"
+
+
+def test_credential_order_uses_identity_before_generation(tmp_path):
+    credential_path = tmp_path / "model_preheat_worker_credential"
+    assert store_preheat_credential(str(credential_path), "mpwg_3_9_old") is True
+    assert store_preheat_credential(str(credential_path), "mpwg_4_0_new") is True
+    assert credential_path.read_text(encoding="utf-8") == "mpwg_4_0_new"
+    assert store_preheat_credential(str(credential_path), "mpwg_3_10_stale") is False
+    assert store_preheat_credential(str(credential_path), "mpwg_2_99_older") is False

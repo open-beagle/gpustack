@@ -3,6 +3,7 @@ import secrets
 import tempfile
 
 import requests
+from filelock import SoftFileLock
 
 
 WORKER_CREDENTIAL_FILENAME = "model_preheat_worker_credential"
@@ -14,10 +15,21 @@ class WorkerCredentialBootstrapError(RuntimeError):
     """远程 Worker 引导失败时返回不包含敏感信息的错误。"""
 
 
-def store_preheat_credential(credential_path: str, credential: str) -> None:
+def store_preheat_credential(credential_path: str, credential: str) -> bool:
     """原子写入 Worker 专用凭据，失败时保留原文件。"""
     directory = os.path.dirname(credential_path) or "."
     os.makedirs(directory, exist_ok=True)
+    with SoftFileLock(f"{credential_path}.lock"):
+        existing = _read_credential(credential_path)
+        if _credential_order(existing) > _credential_order(credential):
+            return False
+        _write_preheat_credential(credential_path, credential, directory)
+        return True
+
+
+def _write_preheat_credential(
+    credential_path: str, credential: str, directory: str
+) -> None:
     descriptor = None
     temporary_path = None
     try:
@@ -43,6 +55,31 @@ def store_preheat_credential(credential_path: str, credential: str) -> None:
             except OSError:
                 pass
         raise
+
+
+def _read_credential(credential_path: str) -> str | None:
+    try:
+        with open(credential_path, "r", encoding="utf-8") as file:
+            return file.read().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def _credential_order(credential: str | None) -> tuple[int, int]:
+    parts = credential.split("_", 3) if isinstance(credential, str) else []
+    if len(parts) == 4 and parts[0] == "mpwg":
+        try:
+            return int(parts[1]), int(parts[2])
+        except ValueError:
+            pass
+    if isinstance(credential, str):
+        parts = credential.split("_", 2)
+        if len(parts) == 3 and parts[0] == "mpw":
+            try:
+                return int(parts[1]), 0
+            except ValueError:
+                pass
+    return -1, -1
 
 
 def load_or_create_worker_upgrade_proof(data_dir: str) -> str:
@@ -129,7 +166,7 @@ def bootstrap_remote_worker_credential(
         payload.get("worker_id") != worker_id
         or payload.get("worker_uuid") != worker_uuid
         or not isinstance(credential, str)
-        or not credential.startswith("mpw_")
+        or not credential.startswith(("mpw_", "mpwg_"))
     ):
         raise WorkerCredentialBootstrapError(
             "worker_credential_bootstrap_response_invalid"

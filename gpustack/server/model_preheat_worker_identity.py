@@ -29,6 +29,7 @@ WORKER_CREDENTIAL_RECOVERY_TTL = WORKER_CREDENTIAL_TTL
 WORKER_UPGRADE_PROOF_TTL = timedelta(hours=24)
 WORKER_CREDENTIAL_RENEW_WINDOW = timedelta(hours=6)
 WORKER_CREDENTIAL_PREFIX = "mpw"
+WORKER_CREDENTIAL_GENERATION_PREFIX = "mpwg"
 WORKER_CREDENTIAL_HEADER = "X-GPUStack-Worker-Credential"
 
 
@@ -153,11 +154,9 @@ async def issue_model_preheat_worker_credential(
             .execution_options(synchronize_session=False)
         )
         secret = secrets.token_urlsafe(32)
-        # 第三段携带签发代次。旧客户端仍按 ``mpw_<identity_id>_<secret>``
-        # 解析身份 ID；新客户端据此丢弃乱序的旧注册响应。
-        token = (
-            f"{WORKER_CREDENTIAL_PREFIX}_{identity_id}_{pending_token_version}_{secret}"
-        )
+        # 新前缀避免与旧 ``mpw_<identity_id>_<secret>``（secret 可含下划线）
+        # 混淆；新客户端据此丢弃乱序的旧注册响应。
+        token = f"{WORKER_CREDENTIAL_GENERATION_PREFIX}_{identity_id}_{pending_token_version}_{secret}"
         session.add(
             ModelPreheatWorkerPendingCredential(
                 identity_id=identity_id,
@@ -315,20 +314,37 @@ async def _validated_confirmed_identity(
     if credential_id is None:
         return None
     identity = await session.get(ModelPreheatWorkerIdentity, credential_id)
-    if (
-        not _identity_token_is_active(identity, now)
-        or (worker_uuid is not None and identity.worker_uuid != worker_uuid)
-        or not hmac.compare_digest(identity.token_hash, _hash_token(credential))
+    if not await _confirmed_identity_matches(
+        session, identity, credential, worker_uuid, now, require_current=require_current
     ):
-        return None
-    if require_current and not await _identity_is_current_worker(session, identity):
         return None
     identity_id = identity.id
     renew_required = identity.expires_at <= now + WORKER_CREDENTIAL_RENEW_WINDOW
     if renew_required:
         await _renew_model_preheat_worker_credential(session, identity, now)
-        return await session.get(ModelPreheatWorkerIdentity, identity_id)
+        identity = await session.get(ModelPreheatWorkerIdentity, identity_id)
+        if not await _confirmed_identity_matches(
+            session,
+            identity,
+            credential,
+            worker_uuid,
+            now,
+            require_current=require_current,
+        ):
+            return None
     return identity
+
+
+async def _confirmed_identity_matches(
+    session, identity, credential, worker_uuid, now, *, require_current
+):
+    if (
+        not _identity_token_is_active(identity, now)
+        or (worker_uuid is not None and identity.worker_uuid != worker_uuid)
+        or not hmac.compare_digest(identity.token_hash, _hash_token(credential))
+    ):
+        return False
+    return not require_current or await _identity_is_current_worker(session, identity)
 
 
 async def _renew_model_preheat_worker_credential(session, identity, now):
@@ -345,6 +361,8 @@ async def _renew_model_preheat_worker_credential(session, identity, now):
             ModelPreheatWorkerIdentity.token_hash == identity.token_hash,
             ModelPreheatWorkerIdentity.expires_at == identity.expires_at,
             ModelPreheatWorkerIdentity.expires_at > now,
+            ModelPreheatWorkerIdentity.bootstrap_required.is_(False),
+            ModelPreheatWorkerIdentity.revoked_at.is_(None),
         )
         .values(expires_at=now + WORKER_CREDENTIAL_TTL)
         .execution_options(synchronize_session=False)
@@ -567,7 +585,7 @@ async def issue_embedded_worker_credential_file(
         identity.bootstrap_required = False
         session.add(identity)
         await session.flush()
-    token = f"{WORKER_CREDENTIAL_PREFIX}_{identity.id}_{secret}"
+    token = f"{WORKER_CREDENTIAL_GENERATION_PREFIX}_{identity.id}_{identity.token_version}_{secret}"
     identity.token_hash = _hash_token(token)
     session.add(identity)
     # 先写盘再提交：写盘失败时回滚身份变更，保证下次可重试（可恢复）。
@@ -627,11 +645,20 @@ def _write_credential_file(credential_path: str, credential: str) -> None:
 def _credential_id(token):
     if not isinstance(token, str):
         return None
-    parts = token.split("_", 2)
-    if len(parts) != 3 or parts[0] != WORKER_CREDENTIAL_PREFIX:
+    if token.startswith(f"{WORKER_CREDENTIAL_GENERATION_PREFIX}_"):
+        parts = token.split("_", 3)
+        if len(parts) != 4 or not parts[2].isdigit() or not parts[3]:
+            return None
+        value = parts[1]
+    elif token.startswith(f"{WORKER_CREDENTIAL_PREFIX}_"):
+        parts = token.split("_", 2)
+        if len(parts) != 3 or not parts[2]:
+            return None
+        value = parts[1]
+    else:
         return None
     try:
-        value = int(parts[1])
+        value = int(value)
     except ValueError:
         return None
     return value if value > 0 else None

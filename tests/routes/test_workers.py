@@ -171,7 +171,7 @@ def test_new_worker_creation_issues_credential_and_returns_loaded_worker(tmp_pat
     (worker_id, worker_uuid), headers = asyncio.run(run())
     assert worker_id is not None
     assert worker_uuid == "new-worker-uuid"
-    assert headers["X-GPUStack-Worker-Credential"].startswith("mpw_")
+    assert headers["X-GPUStack-Worker-Credential"].startswith("mpwg_")
     assert headers["cache-control"] == "no-store"
 
 
@@ -390,6 +390,88 @@ def test_concurrent_confirmed_credential_renewal_keeps_both_requests_valid(
     assert asyncio.run(run()) == ["renew-race-worker-uuid", "renew-race-worker-uuid"]
 
 
+@pytest.mark.parametrize("change", ["rotation", "revoke"])
+def test_renewal_revalidates_credential_after_concurrent_state_change(
+    tmp_path, monkeypatch, change
+):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / f'renew-{change}.db'}", poolclass=NullPool
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda connection: SQLModel.metadata.create_all(
+                    connection,
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
+                )
+            )
+        async with AsyncSession(engine) as session:
+            worker = Worker(
+                name="renew-change",
+                hostname="renew-change",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="renew-change-uuid",
+            )
+            session.add(worker)
+            await session.commit()
+            await session.refresh(worker)
+            worker_id, worker_uuid = worker.id, worker.worker_uuid
+            token = await issue_model_preheat_worker_credential(
+                session, worker_id, worker_uuid
+            )
+            await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=session,
+                credential=token,
+            )
+            identity = (
+                await session.exec(
+                    select(ModelPreheatWorkerIdentity).where(
+                        ModelPreheatWorkerIdentity.worker_id == worker_id
+                    )
+                )
+            ).one()
+            now = datetime.now(timezone.utc)
+            identity.expires_at = (
+                now
+                + worker_credential_identity.WORKER_CREDENTIAL_RENEW_WINDOW
+                - timedelta(seconds=1)
+            )
+            session.add(identity)
+            await session.commit()
+
+        async def change_during_renew(session, identity, now):
+            current = await session.get(ModelPreheatWorkerIdentity, identity.id)
+            if change == "rotation":
+                current.token_hash = "rotated-token-hash"
+                current.token_version += 1
+            else:
+                current.revoked_at = now
+            session.add(current)
+            await session.commit()
+            return False
+
+        monkeypatch.setattr(worker_credential_identity, "_utcnow", lambda: now)
+        monkeypatch.setattr(
+            worker_credential_identity,
+            "_renew_model_preheat_worker_credential",
+            change_during_renew,
+        )
+        async with AsyncSession(engine) as session:
+            valid = await validate_model_preheat_worker_credential(
+                session, token, worker_uuid
+            )
+        await engine.dispose()
+        return valid
+
+    assert asyncio.run(run()) is None
+
+
 def test_existing_worker_uuid_cannot_be_rebound_with_shared_token_only():
     request = SimpleNamespace(
         state=SimpleNamespace(user=SimpleNamespace(username="system/worker/10.0.0.2"))
@@ -411,6 +493,12 @@ def test_existing_worker_uuid_cannot_be_rebound_with_shared_token_only():
                 )
             )
     assert error.value.message == "Invalid worker registration credentials"
+
+
+def test_credential_id_accepts_legacy_secret_with_underscores_and_strict_new_format():
+    assert worker_credential_identity._credential_id("mpw_1_12_abc") == 1
+    assert worker_credential_identity._credential_id("mpwg_2_3_secret_value") == 2
+    assert worker_credential_identity._credential_id("mpwg_2_bad_secret") is None
 
 
 def test_initial_worker_credential_response_loss_recovers_via_admin_bootstrap(tmp_path):
@@ -532,7 +620,7 @@ def test_upgraded_worker_bootstrap_recovery_credential_only_allows_registration(
                 id=worker_id,
             )
             assert response.headers["cache-control"] == "no-store"
-            assert bootstrap.credential.startswith("mpw_")
+            assert bootstrap.credential.startswith("mpwg_")
             assert bootstrap.worker_id == worker_id
             await get_model_preheat_worker_identity(
                 request=SimpleNamespace(state=SimpleNamespace()),
@@ -619,7 +707,7 @@ def test_upgraded_worker_bootstrap_recovery_credential_only_allows_registration(
     assert new is not None
     assert recovery_after_repeated_loss is not None
     assert old_after_confirmation is None
-    assert headers["X-GPUStack-Worker-Credential"].startswith("mpw_")
+    assert headers["X-GPUStack-Worker-Credential"].startswith("mpwg_")
 
 
 def test_system_worker_cannot_call_admin_credential_bootstrap():

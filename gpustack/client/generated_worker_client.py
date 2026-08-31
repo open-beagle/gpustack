@@ -143,7 +143,7 @@ class WorkerClient:
 
 def _credential_generation(credential):
     parts = credential.split("_", 3) if isinstance(credential, str) else []
-    if len(parts) == 4 and parts[0] == "mpw":
+    if len(parts) == 4 and parts[0] == "mpwg":
         try:
             return int(parts[2])
         except ValueError:

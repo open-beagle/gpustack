@@ -156,8 +156,11 @@ class WorkerManager:
         credential = self._clientset.workers.last_model_preheat_credential
         if not credential:
             raise RuntimeError("worker_preheat_credential_unavailable")
-        self._store_preheat_credential(credential)
-        self._clientset.set_model_preheat_worker_credential(credential)
+        if self._store_preheat_credential(credential):
+            self._clientset.set_model_preheat_worker_credential(credential)
+        else:
+            # 另一个进程已落盘更高代次，绝不能用当前慢响应回退内存 header。
+            self._load_preheat_credential()
         if upgrade_proof is not None:
             self._clear_upgrade_proof()
 
@@ -179,7 +182,7 @@ class WorkerManager:
         return False
 
     def _store_preheat_credential(self, credential):
-        store_preheat_credential(self._preheat_credential_path, credential)
+        return store_preheat_credential(self._preheat_credential_path, credential)
 
     def _load_or_create_upgrade_proof(self):
         data_dir = getattr(self, "_preheat_upgrade_proof_data_dir", None)
