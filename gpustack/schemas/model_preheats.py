@@ -309,6 +309,7 @@ class ModelPreheatWorkerPendingCredential(SQLModel, BaseModelMixin, table=True):
         )
     )
     token_hash: str = Field(sa_column=Column(String(64), nullable=False))
+    identity_token_version: int
     expires_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
 
 

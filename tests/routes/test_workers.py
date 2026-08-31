@@ -35,6 +35,7 @@ from gpustack.schemas.workers import (
     WorkerStatus,
 )
 from gpustack.schemas.users import User
+import gpustack.server.model_preheat_worker_identity as worker_credential_identity
 from gpustack.server.model_preheat_worker_identity import (
     WORKER_CREDENTIAL_TTL,
     get_model_preheat_worker_identity,
@@ -557,15 +558,168 @@ def test_concurrent_rotation_candidates_confirm_once(tmp_path):
             await get_model_preheat_worker_identity(
                 request=request,
                 session=validation_session,
-                credential=first,
+                credential=second,
             )
-            second_after_confirmation = await validate_model_preheat_worker_credential(
-                validation_session, second, worker_uuid
+            first_after_confirmation = await validate_model_preheat_worker_credential(
+                validation_session, first, worker_uuid
             )
         await engine.dispose()
-        return first_pending, second_pending, second_after_confirmation
+        return first_pending, second_pending, first_after_confirmation
 
-    first_pending, second_pending, second_after_confirmation = asyncio.run(run())
+    first_pending, second_pending, first_after_confirmation = asyncio.run(run())
     assert first_pending is not None
     assert second_pending is not None
-    assert second_after_confirmation is None
+    assert first_after_confirmation is None
+
+
+def test_stale_pending_confirmation_cannot_replace_new_generation(
+    tmp_path, monkeypatch
+):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'worker-stale-candidate.db'}",
+            poolclass=NullPool,
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: SQLModel.metadata.create_all(
+                    sync_connection,
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
+                )
+            )
+        async with AsyncSession(engine) as setup_session:
+            worker = Worker(
+                name="stale-candidate-worker",
+                hostname="stale-candidate-worker",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="stale-candidate-worker-uuid",
+            )
+            setup_session.add(worker)
+            await setup_session.commit()
+            await setup_session.refresh(worker)
+            worker_id = worker.id
+            worker_uuid = worker.worker_uuid
+            confirmed = await issue_model_preheat_worker_credential(
+                setup_session, worker_id, worker_uuid
+            )
+            await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=setup_session,
+                credential=confirmed,
+            )
+            stale = await issue_model_preheat_worker_credential(
+                setup_session, worker_id, worker_uuid
+            )
+
+        pending_loaded = asyncio.Event()
+        continue_confirmation = asyncio.Event()
+        original_pending_credential = worker_credential_identity._pending_credential
+
+        async def pause_after_pending_read(session, credential_id, credential, now):
+            pending = await original_pending_credential(
+                session, credential_id, credential, now
+            )
+            if credential == stale:
+                # SQLite 的读事务会阻塞独立 session 提交；真实服务在此边界
+                # 可被其他 Server 更新，因此释放本测试会话的读取快照后再继续。
+                session.expunge(pending)
+                await session.rollback()
+                pending_loaded.set()
+                await continue_confirmation.wait()
+            return pending
+
+        monkeypatch.setattr(
+            worker_credential_identity,
+            "_pending_credential",
+            pause_after_pending_read,
+        )
+        async with AsyncSession(engine) as stale_session:
+            stale_confirmation = asyncio.create_task(
+                get_model_preheat_worker_identity(
+                    request=SimpleNamespace(state=SimpleNamespace()),
+                    session=stale_session,
+                    credential=stale,
+                )
+            )
+            await pending_loaded.wait()
+            async with AsyncSession(engine) as issue_session:
+                current = await issue_model_preheat_worker_credential(
+                    issue_session, worker_id, worker_uuid
+                )
+            async with AsyncSession(engine) as observer_session:
+                recovery_before_stale_confirmation = (
+                    await validate_model_preheat_worker_registration_credential(
+                        observer_session, confirmed, worker_uuid
+                    )
+                )
+                current_before_stale_confirmation = (
+                    await validate_model_preheat_worker_credential(
+                        observer_session, current, worker_uuid
+                    )
+                )
+            continue_confirmation.set()
+            with pytest.raises(UnauthorizedException):
+                await stale_confirmation
+
+        async with AsyncSession(engine) as validation_session:
+            current_after_stale_confirmation = (
+                await validate_model_preheat_worker_credential(
+                    validation_session, current, worker_uuid
+                )
+            )
+            recovery_after_stale_confirmation = (
+                await validate_model_preheat_worker_registration_credential(
+                    validation_session, confirmed, worker_uuid
+                )
+            )
+            await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=validation_session,
+                credential=current,
+            )
+            before_admin_reset = await issue_model_preheat_worker_credential(
+                validation_session, worker_id, worker_uuid
+            )
+            after_admin_reset = await issue_model_preheat_worker_credential(
+                validation_session,
+                worker_id,
+                worker_uuid,
+                reset_pending=True,
+            )
+            with pytest.raises(UnauthorizedException):
+                await get_model_preheat_worker_identity(
+                    request=SimpleNamespace(state=SimpleNamespace()),
+                    session=validation_session,
+                    credential=before_admin_reset,
+                )
+            reset_principal = await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=validation_session,
+                credential=after_admin_reset,
+            )
+        await engine.dispose()
+        return (
+            recovery_before_stale_confirmation,
+            current_before_stale_confirmation,
+            current_after_stale_confirmation,
+            recovery_after_stale_confirmation,
+            reset_principal,
+        )
+
+    (
+        recovery_before_stale_confirmation,
+        current_before_stale_confirmation,
+        current_after_stale_confirmation,
+        recovery_after_stale_confirmation,
+        reset_principal,
+    ) = asyncio.run(run())
+    assert recovery_before_stale_confirmation is not None
+    assert current_before_stale_confirmation is not None
+    assert current_after_stale_confirmation is not None
+    assert recovery_after_stale_confirmation is not None
+    assert reset_principal is not None

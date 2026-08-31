@@ -69,6 +69,7 @@ async def issue_model_preheat_worker_credential(
                 await session.rollback()
                 continue
             identity_id = identity.id
+            pending_token_version = identity.token_version
         else:
             identity_id = identity.id
             token_hash_condition = (
@@ -122,6 +123,7 @@ async def issue_model_preheat_worker_credential(
             if result.rowcount != 1:
                 await session.rollback()
                 continue
+            pending_token_version = identity.token_version + 1
         if reset_pending:
             await session.exec(
                 delete(ModelPreheatWorkerPendingCredential).where(
@@ -144,6 +146,7 @@ async def issue_model_preheat_worker_credential(
             ModelPreheatWorkerPendingCredential(
                 identity_id=identity_id,
                 token_hash=_hash_token(token),
+                identity_token_version=pending_token_version,
                 expires_at=now + WORKER_CREDENTIAL_TTL,
             )
         )
@@ -282,6 +285,7 @@ async def _confirm_pending_credential(session, credential, now):
         .where(
             ModelPreheatWorkerIdentity.id == identity_id,
             ModelPreheatWorkerIdentity.token_hash.is_(None),
+            ModelPreheatWorkerIdentity.token_version == pending.identity_token_version,
             ModelPreheatWorkerIdentity.bootstrap_required.is_(False),
             ModelPreheatWorkerIdentity.revoked_at.is_(None),
         )
