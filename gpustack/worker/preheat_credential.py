@@ -1,10 +1,12 @@
 import os
+import secrets
 import tempfile
 
 import requests
 
 
 WORKER_CREDENTIAL_FILENAME = "model_preheat_worker_credential"
+WORKER_UPGRADE_PROOF_FILENAME = "model_preheat_worker_upgrade_proof"
 WORKER_UUID_FILENAME = "worker_uuid"
 
 
@@ -41,6 +43,32 @@ def store_preheat_credential(credential_path: str, credential: str) -> None:
             except OSError:
                 pass
         raise
+
+
+def load_or_create_worker_upgrade_proof(data_dir: str) -> str:
+    """返回 Worker 升级交接 proof；仅在本机专用凭据缺失时由调用方使用。"""
+    proof_path = os.path.join(data_dir, WORKER_UPGRADE_PROOF_FILENAME)
+    try:
+        with open(proof_path, "r", encoding="utf-8") as file:
+            proof = file.read().strip()
+        if _is_upgrade_proof(proof):
+            return proof
+    except FileNotFoundError:
+        pass
+    proof = secrets.token_urlsafe(32)
+    store_preheat_credential(proof_path, proof)
+    return proof
+
+
+def clear_worker_upgrade_proof(data_dir: str) -> None:
+    """凭据落盘后尽力删除 proof；失败不记录敏感内容。"""
+    proof_path = os.path.join(data_dir, WORKER_UPGRADE_PROOF_FILENAME)
+    try:
+        os.unlink(proof_path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
 
 
 def bootstrap_remote_worker_credential(
@@ -136,3 +164,11 @@ def _fsync_directory(directory: str) -> None:
         pass
     finally:
         os.close(descriptor)
+
+
+def _is_upgrade_proof(proof: str) -> bool:
+    return (
+        isinstance(proof, str)
+        and len(proof) >= 43
+        and all(character.isalnum() or character in "-_" for character in proof)
+    )

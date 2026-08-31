@@ -1,3 +1,5 @@
+import base64
+import binascii
 import hashlib
 import hmac
 import secrets
@@ -8,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 
 from fastapi import Depends, Header, Request
-from sqlalchemy import delete, update
+from sqlalchemy import delete, exists, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -24,6 +26,7 @@ from gpustack.server.db import get_session
 
 WORKER_CREDENTIAL_TTL = timedelta(hours=24)
 WORKER_CREDENTIAL_RECOVERY_TTL = WORKER_CREDENTIAL_TTL
+WORKER_UPGRADE_PROOF_TTL = timedelta(hours=24)
 WORKER_CREDENTIAL_RENEW_WINDOW = timedelta(hours=6)
 WORKER_CREDENTIAL_PREFIX = "mpw"
 WORKER_CREDENTIAL_HEADER = "X-GPUStack-Worker-Credential"
@@ -84,9 +87,16 @@ async def issue_model_preheat_worker_credential(
             )
             recovery_token_hash = identity.registration_recovery_token_hash
             recovery_issued_at = identity.registration_recovery_issued_at
+            upgrade_proof_hash = identity.upgrade_proof_hash
+            upgrade_proof_window_started_at = identity.upgrade_proof_window_started_at
             if reset_pending:
                 recovery_token_hash = None
                 recovery_issued_at = None
+                upgrade_proof_hash = None
+                upgrade_proof_window_started_at = None
+            elif identity.bootstrap_required:
+                upgrade_proof_hash = None
+                upgrade_proof_window_started_at = None
             elif (
                 recovery_token_hash is None
                 or recovery_issued_at is None
@@ -113,6 +123,8 @@ async def issue_model_preheat_worker_credential(
                     token_hash=None,
                     registration_recovery_token_hash=recovery_token_hash,
                     registration_recovery_issued_at=recovery_issued_at,
+                    upgrade_proof_hash=upgrade_proof_hash,
+                    upgrade_proof_window_started_at=upgrade_proof_window_started_at,
                     token_version=identity.token_version + 1,
                     bootstrap_required=False,
                     expires_at=now + WORKER_CREDENTIAL_TTL,
@@ -229,6 +241,76 @@ async def validate_model_preheat_worker_registration_credential(
     return identity
 
 
+async def bind_model_preheat_worker_upgrade_proof(
+    session, worker: Worker, worker_update, upgrade_proof: str
+) -> bool:
+    """仅为 f9 migration 产生的旧身份绑定一次升级 proof。"""
+    now = _utcnow()
+    if (
+        not _is_upgrade_proof(upgrade_proof)
+        or worker_update.name != worker.name
+        or worker_update.hostname != worker.hostname
+        or worker_update.ip != worker.ip
+    ):
+        return False
+    identity = (
+        await session.exec(
+            select(ModelPreheatWorkerIdentity).where(
+                ModelPreheatWorkerIdentity.worker_id == worker.id
+            )
+        )
+    ).first()
+    if identity is None:
+        return False
+    if not await _identity_is_current_worker(session, identity):
+        return False
+    identity_id = identity.id
+    proof_hash = _hash_token(upgrade_proof)
+    no_pending_credential = ~exists(
+        select(ModelPreheatWorkerPendingCredential.id).where(
+            ModelPreheatWorkerPendingCredential.identity_id == identity_id
+        )
+    )
+    result = await session.exec(
+        update(ModelPreheatWorkerIdentity)
+        .where(
+            ModelPreheatWorkerIdentity.id == identity_id,
+            ModelPreheatWorkerIdentity.bootstrap_required.is_(True),
+            ModelPreheatWorkerIdentity.token_hash.is_(None),
+            ModelPreheatWorkerIdentity.registration_recovery_token_hash.is_(None),
+            ModelPreheatWorkerIdentity.upgrade_proof_hash.is_(None),
+            ModelPreheatWorkerIdentity.revoked_at.is_(None),
+            ModelPreheatWorkerIdentity.upgrade_proof_window_started_at.is_not(None),
+            ModelPreheatWorkerIdentity.upgrade_proof_window_started_at
+            > now - WORKER_UPGRADE_PROOF_TTL,
+            no_pending_credential,
+        )
+        .values(
+            upgrade_proof_hash=proof_hash,
+            bootstrap_required=False,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 1:
+        session.expire(identity)
+        return True
+    identity = await session.get(ModelPreheatWorkerIdentity, identity_id)
+    if (
+        identity is None
+        or identity.bootstrap_required
+        or identity.token_hash is not None
+        or identity.registration_recovery_token_hash is not None
+        or identity.revoked_at is not None
+        or identity.upgrade_proof_window_started_at is None
+        or identity.upgrade_proof_window_started_at <= now - WORKER_UPGRADE_PROOF_TTL
+        or not hmac.compare_digest(identity.upgrade_proof_hash or "", proof_hash)
+    ):
+        return False
+    # 若进程在 proof CAS 与签发之间异常退出，同一 proof 可在窗口内补发；
+    # 不同 proof 仍因哈希不匹配被拒绝。
+    return True
+
+
 async def _validated_confirmed_identity(
     session, credential, worker_uuid, now, *, require_current=True
 ):
@@ -294,6 +376,8 @@ async def _confirm_pending_credential(session, credential, now):
             expires_at=now + WORKER_CREDENTIAL_TTL,
             registration_recovery_token_hash=None,
             registration_recovery_issued_at=None,
+            upgrade_proof_hash=None,
+            upgrade_proof_window_started_at=None,
         )
         .execution_options(synchronize_session=False)
     )
@@ -345,6 +429,20 @@ def _identity_token_is_active(identity, now):
         and identity.expires_at is not None
         and identity.expires_at > now
     )
+
+
+def _is_upgrade_proof(proof: str) -> bool:
+    if (
+        not isinstance(proof, str)
+        or len(proof) < 43
+        or not all(character.isalnum() or character in "-_" for character in proof)
+    ):
+        return False
+    try:
+        decoded = base64.urlsafe_b64decode(proof + "=" * (-len(proof) % 4))
+    except (ValueError, binascii.Error):
+        return False
+    return len(decoded) >= 32
 
 
 def _principal(identity):

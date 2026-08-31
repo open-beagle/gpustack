@@ -99,10 +99,19 @@ class WorkerClient:
         )
         return WorkerPublic.model_validate(response.json())
 
-    def update(self, id: int, model_update: WorkerUpdate, *, registration=False):
+    def update(
+        self,
+        id: int,
+        model_update: WorkerUpdate,
+        *,
+        registration=False,
+        upgrade_proof=None,
+    ):
         headers = {"Content-Type": "application/json"}
         if registration:
             headers["X-GPUStack-Worker-Registration"] = "true"
+        if upgrade_proof:
+            headers["X-GPUStack-Worker-Upgrade-Proof"] = upgrade_proof
         response = self._client.get_httpx_client().put(
             f"{self._url}/{id}",
             content=model_update.model_dump_json(),

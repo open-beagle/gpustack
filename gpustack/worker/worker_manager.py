@@ -23,7 +23,11 @@ from gpustack.worker.collector import WorkerStatusCollector
 from gpustack.worker.rpc_server import RPCServer, RPCServerProcessInfo
 from gpustack.detectors.detector_factory import DetectorFactory
 from gpustack.utils.profiling import time_decorator
-from gpustack.worker.preheat_credential import store_preheat_credential
+from gpustack.worker.preheat_credential import (
+    clear_worker_upgrade_proof,
+    load_or_create_worker_upgrade_proof,
+    store_preheat_credential,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +59,7 @@ class WorkerManager:
         self._preheat_credential_path = os.path.join(
             cfg.data_dir, "model_preheat_worker_credential"
         )
+        self._preheat_upgrade_proof_data_dir = cfg.data_dir
         self._load_preheat_credential()
 
         self._worker_name_from_config = cfg.worker_name is not None
@@ -114,7 +119,10 @@ class WorkerManager:
         self._registration_completed = True
 
     def _register_worker(self, worker: Worker):
-        self._load_preheat_credential()
+        has_credential = self._load_preheat_credential()
+        upgrade_proof = None
+        if not has_credential:
+            upgrade_proof = self._load_or_create_upgrade_proof()
         logger.info(
             f"Registering worker: {worker.name}",
         )
@@ -130,7 +138,10 @@ class WorkerManager:
                 # keep labels from the existing worker
                 worker.labels = same_worker.labels
                 self._clientset.workers.update(
-                    id=same_worker.id, model_update=worker, registration=True
+                    id=same_worker.id,
+                    model_update=worker,
+                    registration=True,
+                    upgrade_proof=upgrade_proof,
                 )
             else:
                 self._clientset.workers.create(worker)
@@ -143,6 +154,8 @@ class WorkerManager:
             raise RuntimeError("worker_preheat_credential_unavailable")
         self._store_preheat_credential(credential)
         self._clientset.set_model_preheat_worker_credential(credential)
+        if upgrade_proof is not None:
+            self._clear_upgrade_proof()
 
         if update_name_file:
             # Modify files only after successful registration to avoid inconsistency problem
@@ -156,11 +169,24 @@ class WorkerManager:
                 credential = file.read().strip()
             if credential:
                 self._clientset.set_model_preheat_worker_credential(credential)
+                return True
         except FileNotFoundError:
-            return
+            pass
+        return False
 
     def _store_preheat_credential(self, credential):
         store_preheat_credential(self._preheat_credential_path, credential)
+
+    def _load_or_create_upgrade_proof(self):
+        data_dir = getattr(self, "_preheat_upgrade_proof_data_dir", None)
+        if not data_dir:
+            return None
+        return load_or_create_worker_upgrade_proof(data_dir)
+
+    def _clear_upgrade_proof(self):
+        data_dir = getattr(self, "_preheat_upgrade_proof_data_dir", None)
+        if data_dir:
+            clear_worker_upgrade_proof(data_dir)
 
     def _check_same_worker(self) -> tuple[Worker | None, bool]:
         def _get_worker(params: dict) -> Worker | None:

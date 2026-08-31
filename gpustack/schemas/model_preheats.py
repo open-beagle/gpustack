@@ -280,6 +280,12 @@ class ModelPreheatWorkerIdentity(SQLModel, BaseModelMixin, table=True):
     registration_recovery_issued_at: Optional[datetime] = Field(
         default=None, sa_column=Column(UTCDateTime, nullable=True)
     )
+    upgrade_proof_hash: Optional[str] = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    upgrade_proof_window_started_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
     token_version: int = 0
     bootstrap_required: bool = True
     expires_at: Optional[datetime] = Field(

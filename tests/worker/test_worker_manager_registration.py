@@ -182,3 +182,42 @@ def test_store_preheat_credential_replaces_file_atomically_with_private_mode(
     assert credential_path.read_text(encoding="utf-8") == "new-credential"
     assert stat.S_IMODE(os.stat(credential_path).st_mode) == 0o600
     assert not list(tmp_path.glob(".model_preheat_worker_credential.*"))
+
+
+def test_register_existing_legacy_worker_sends_and_clears_upgrade_proof(tmp_path):
+    workers = Mock()
+    existing_worker = SimpleNamespace(
+        id=1,
+        worker_uuid="worker-uuid",
+        labels={},
+    )
+    workers.list.side_effect = [
+        SimpleNamespace(items=[existing_worker]),
+        SimpleNamespace(items=[existing_worker]),
+    ]
+    workers.last_model_preheat_credential = "rotated-credential"
+    clientset = SimpleNamespace(
+        workers=workers,
+        set_model_preheat_worker_credential=Mock(),
+    )
+    manager = WorkerManager.__new__(WorkerManager)
+    manager._preheat_credential_path = str(tmp_path / "model_preheat_worker_credential")
+    manager._preheat_upgrade_proof_data_dir = str(tmp_path)
+    manager._clientset = clientset
+    manager._worker_name = "worker-a"
+    manager._worker_uuid = "worker-uuid"
+
+    manager._register_worker(
+        Worker(
+            id=1,
+            name="worker-a",
+            hostname="worker-a",
+            ip="127.0.0.1",
+            port=10150,
+            worker_uuid="worker-uuid",
+        )
+    )
+
+    proof = workers.update.call_args.kwargs["upgrade_proof"]
+    assert len(proof) >= 43
+    assert not (tmp_path / "model_preheat_worker_upgrade_proof").exists()
