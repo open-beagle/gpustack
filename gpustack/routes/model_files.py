@@ -499,7 +499,13 @@ async def delete_model_file(
 
     # cleanup、活动任务检查与 DELETE 必须留在同一个事务中。ActiveRecord 的
     # update/delete helper 会分别提交，导致父记录锁在真正删除前被释放。
-    event_snapshot = ModelFile.model_validate(model_file.model_dump())
+    await session.refresh(
+        model_file,
+        attribute_names=[column.key for column in model_file.__mapper__.column_attrs],
+    )
+    event_snapshot_values = _model_file_public_source(model_file)
+    event_snapshot = ModelFile.model_validate(event_snapshot_values)
+    event_snapshot.__dict__.update(event_snapshot_values)
     try:
         if cleanup is not None and model_file.cleanup_on_delete != cleanup:
             model_file.cleanup_on_delete = cleanup

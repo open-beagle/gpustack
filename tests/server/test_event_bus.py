@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime
 
 import pytest
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -19,6 +20,40 @@ from gpustack.schemas.models import (
 )
 from gpustack.schemas.users import User
 from gpustack.schemas.workers import Worker, WorkerPublic, WorkerStateEnum
+
+
+class SnapshotColumn:
+    def __init__(self, key):
+        self.key = key
+
+
+class SnapshotMapper:
+    column_attrs = [SnapshotColumn("created_at"), SnapshotColumn("updated_at")]
+
+
+class SnapshotEventModel:
+    __table__ = object()
+    __mapper__ = SnapshotMapper()
+
+    def __init__(self, now):
+        self.id = 9
+        self.name = "snapshot-event"
+        self._now = now
+
+    def model_dump(self):
+        return {"id": self.id, "name": self.name}
+
+    def __getattr__(self, name):
+        if name in {"created_at", "updated_at"}:
+            return self._now
+        raise AttributeError(name)
+
+
+class SnapshotEventModelPublic(BaseModel):
+    id: int
+    name: str
+    created_at: datetime
+    updated_at: datetime
 
 
 @pytest.mark.asyncio
@@ -44,6 +79,25 @@ async def test_publish_model_instance_event_uses_fixed_public_snapshot():
         assert isinstance(event.data, ModelInstancePublic)
         assert event.data is not instance
         assert event.data.name == "instance-7"
+    finally:
+        event_bus.unsubscribe(topic, subscriber)
+
+
+@pytest.mark.asyncio
+async def test_publish_public_snapshot_includes_orm_column_timestamps():
+    topic = "test-snapshot-column-event"
+    subscriber = event_bus.subscribe(topic, public_snapshot=True)
+    now = datetime.now()
+
+    try:
+        await event_bus.publish(
+            topic, Event(type=EventType.UPDATED, data=SnapshotEventModel(now))
+        )
+        event = await subscriber.receive()
+
+        assert isinstance(event.data, SnapshotEventModelPublic)
+        assert event.data.created_at == now
+        assert event.data.updated_at == now
     finally:
         event_bus.unsubscribe(topic, subscriber)
 
@@ -490,6 +544,50 @@ def test_streaming_helpers_handle_model_instance_without_orm_instrumentation():
 
     assert isinstance(public, ModelInstancePublic)
     assert public.id == 7
+    assert public.created_at == now
+    assert public.updated_at == now
+
+
+def test_streaming_helpers_include_orm_column_timestamps():
+    now = datetime.now()
+
+    class Column:
+        def __init__(self, key):
+            self.key = key
+
+    class Mapper:
+        column_attrs = [Column("created_at"), Column("updated_at")]
+
+    class EventData:
+        __mapper__ = Mapper()
+
+        def __init__(self):
+            self.id = 8
+            self.name = "instance-8"
+            self.model_id = 3
+            self.model_name = "model-a"
+            self.source = SourceEnum.LOCAL_PATH
+            self.local_path = "/models/a"
+
+        def model_dump(self):
+            return {
+                "id": self.id,
+                "name": self.name,
+                "model_id": self.model_id,
+                "model_name": self.model_name,
+                "source": self.source,
+                "local_path": self.local_path,
+            }
+
+        def __getattr__(self, name):
+            if name in {"created_at", "updated_at"}:
+                return now
+            raise AttributeError(name)
+
+    public = ModelInstance._convert_to_public_class(EventData())
+
+    assert isinstance(public, ModelInstancePublic)
+    assert public.id == 8
     assert public.created_at == now
     assert public.updated_at == now
 

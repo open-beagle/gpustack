@@ -527,6 +527,15 @@ class ActiveRecordMixin:
                     continue
                 source.setdefault(key, value)
 
+        mapper = getattr(data, "__mapper__", None)
+        if mapper is not None:
+            for column in mapper.column_attrs:
+                if column.key in source:
+                    continue
+                value = cls._safe_event_value(data, column.key, None)
+                if value is not None:
+                    source[column.key] = value
+
         class_module = importlib.import_module(cls.__module__)
         public_class = getattr(class_module, f"{cls.__name__}Public", None)
         if public_class:

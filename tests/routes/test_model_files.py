@@ -861,8 +861,6 @@ async def _run_model_file_crud(tmp_path):
         assert recovered_event["data"]["state_message"] == "after-orphan-event"
         assert recovered_event["data"]["created_at"] is not None
         assert recovered_event["data"]["updated_at"] is not None
-        await stream.aclose()
-
         sync_task = ModelStorageSyncTask(
             model_file_id=created.id,
             worker_id=worker.id,
@@ -883,7 +881,15 @@ async def _run_model_file_crud(tmp_path):
         )
         sync_task = await ModelStorageSyncTask.create(session, sync_task)
 
+        next_event = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0.05)
         await delete_model_file(session, created.id)
+        deleted_event = json.loads(await asyncio.wait_for(next_event, timeout=2))
+        assert deleted_event["type"] == EventType.DELETED.value
+        assert deleted_event["data"]["id"] == created.id
+        assert deleted_event["data"]["created_at"] is not None
+        assert deleted_event["data"]["updated_at"] is not None
+        await stream.aclose()
 
     async with AsyncSession(engine) as session:
         assert await ModelFile.one_by_id(session, created.id) is None

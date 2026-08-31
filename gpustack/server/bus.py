@@ -171,6 +171,17 @@ async def _snapshot_event(event: Event) -> Event:
                 if not key.startswith("_")
             }
         )
+        mapper = getattr(data, "__mapper__", None)
+        if mapper is not None:
+            for column in mapper.column_attrs:
+                if column.key in source:
+                    continue
+                try:
+                    value = getattr(data, column.key)
+                except Exception:
+                    continue
+                if value is not None:
+                    source[column.key] = value
         data = public_class.model_validate(source)
     elif hasattr(data, "model_copy"):
         data = data.model_copy(deep=True)
