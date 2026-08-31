@@ -33,7 +33,9 @@ from gpustack.schemas.workers import (
 )
 from gpustack.schemas.users import User
 from gpustack.server.model_preheat_worker_identity import (
+    get_model_preheat_worker_identity,
     validate_model_preheat_worker_credential,
+    validate_model_preheat_worker_registration_credential,
 )
 
 
@@ -172,7 +174,7 @@ def test_existing_worker_uuid_cannot_be_rebound_with_shared_token_only():
             new=AsyncMock(return_value=True),
         ),
         patch(
-            "gpustack.routes.workers.validate_model_preheat_worker_credential",
+            "gpustack.routes.workers.validate_model_preheat_worker_registration_credential",
             new=AsyncMock(return_value=None),
         ),
     ):
@@ -185,7 +187,7 @@ def test_existing_worker_uuid_cannot_be_rebound_with_shared_token_only():
     assert error.value.message == "Invalid worker registration credentials"
 
 
-def test_upgraded_worker_requires_admin_bootstrap_then_rotates_on_registration(
+def test_upgraded_worker_bootstrap_recovery_credential_only_allows_registration(
     tmp_path,
 ):
     async def run():
@@ -261,15 +263,67 @@ def test_upgraded_worker_requires_admin_bootstrap_then_rotates_on_registration(
             old_identity = await validate_model_preheat_worker_credential(
                 session, bootstrap.credential, worker_uuid
             )
+            recovery_identity = (
+                await validate_model_preheat_worker_registration_credential(
+                    session, bootstrap.credential, worker_uuid
+                )
+            )
             new_identity = await validate_model_preheat_worker_credential(
                 session, rotated, worker_uuid
             )
+            # 丢失轮换响应后，旧凭据只能重试注册，不能访问 Worker 任务/payload。
+            await _authorize_worker_registration(
+                system_request, session, worker_uuid, bootstrap.credential
+            )
+            retry_response = Response()
+            await _issue_preheat_credential(
+                system_request,
+                retry_response,
+                session,
+                worker,
+                True,
+            )
+            retry_rotated = retry_response.headers["X-GPUStack-Worker-Credential"]
+            recovery_after_repeated_loss = (
+                await validate_model_preheat_worker_registration_credential(
+                    session, bootstrap.credential, worker_uuid
+                )
+            )
+            principal_request = SimpleNamespace(state=SimpleNamespace())
+            await get_model_preheat_worker_identity(
+                request=principal_request,
+                session=session,
+                credential=retry_rotated,
+            )
+            old_after_confirmation = (
+                await validate_model_preheat_worker_registration_credential(
+                    session, bootstrap.credential, worker_uuid
+                )
+            )
         await engine.dispose()
-        return old_identity, new_identity
+        return (
+            old_identity,
+            recovery_identity,
+            new_identity,
+            recovery_after_repeated_loss,
+            old_after_confirmation,
+            registration_response.headers,
+        )
 
-    old_identity, new_identity = asyncio.run(run())
-    assert old_identity is None
-    assert new_identity is not None
+    (
+        old,
+        recovery,
+        new,
+        recovery_after_repeated_loss,
+        old_after_confirmation,
+        headers,
+    ) = asyncio.run(run())
+    assert old is None
+    assert recovery is not None
+    assert new is not None
+    assert recovery_after_repeated_loss is not None
+    assert old_after_confirmation is None
+    assert headers["X-GPUStack-Worker-Credential"].startswith("mpw_")
 
 
 def test_system_worker_cannot_call_admin_credential_bootstrap():

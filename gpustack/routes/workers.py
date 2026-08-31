@@ -30,6 +30,7 @@ from gpustack.server.model_preheat_worker_identity import (
     WORKER_CREDENTIAL_HEADER,
     issue_model_preheat_worker_credential,
     validate_model_preheat_worker_credential,
+    validate_model_preheat_worker_registration_credential,
     worker_uuid_has_credential,
 )
 
@@ -207,7 +208,7 @@ async def _authorize_worker_registration(
         return
     if not await worker_uuid_has_credential(session, worker_uuid):
         return
-    identity = await validate_model_preheat_worker_credential(
+    identity = await validate_model_preheat_worker_registration_credential(
         session, worker_credential, worker_uuid
     )
     if identity is None:

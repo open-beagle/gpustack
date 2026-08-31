@@ -276,6 +276,10 @@ class ModelPreheatWorkerIdentity(SQLModel, BaseModelMixin, table=True):
     )
     worker_uuid: str
     token_hash: Optional[str] = None
+    registration_recovery_token_hash: Optional[str] = None
+    registration_recovery_issued_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime, nullable=True)
+    )
     token_version: int = 0
     bootstrap_required: bool = True
     expires_at: Optional[datetime] = Field(

@@ -65,6 +65,20 @@ async def issue_model_preheat_worker_credential(session, worker_id, worker_uuid)
         session.add(identity)
         await session.flush()
     else:
+        # 新凭据尚未完成正常鉴权前，保留 Worker 本地仍可能持有的恢复凭据。
+        # 连续丢失轮换响应时不能用 Worker 从未收到过的中间凭据替换它。
+        if identity.registration_recovery_token_hash is None:
+            if (
+                identity.token_hash is not None
+                and not identity.bootstrap_required
+                and identity.revoked_at is None
+                and identity.expires_at is not None
+                and identity.expires_at > now
+            ):
+                identity.registration_recovery_token_hash = identity.token_hash
+                identity.registration_recovery_issued_at = now
+            else:
+                identity.registration_recovery_issued_at = None
         identity.token_version += 1
         identity.worker_uuid = worker_uuid
         identity.expires_at = now + WORKER_CREDENTIAL_TTL
@@ -108,16 +122,22 @@ async def get_model_preheat_worker_identity(
     ).first()
     if current is None or current.id != identity.worker_id:
         raise _unauthorized()
-    if identity.expires_at <= now + WORKER_CREDENTIAL_RENEW_WINDOW:
-        identity.expires_at = now + WORKER_CREDENTIAL_TTL
-        session.add(identity)
-        await session.commit()
     principal = ModelPreheatWorkerPrincipal(
         worker_id=identity.worker_id,
         worker_uuid=identity.worker_uuid,
         credential_id=identity.id,
         token_version=identity.token_version,
     )
+    renewed = identity.expires_at <= now + WORKER_CREDENTIAL_RENEW_WINDOW
+    if renewed:
+        identity.expires_at = now + WORKER_CREDENTIAL_TTL
+    recovery_confirmed = identity.registration_recovery_token_hash is not None
+    if recovery_confirmed:
+        identity.registration_recovery_token_hash = None
+        identity.registration_recovery_issued_at = None
+    session.add(identity)
+    if renewed or recovery_confirmed:
+        await session.commit()
     request.state.model_preheat_worker = principal
     return principal
 
@@ -151,6 +171,47 @@ async def validate_model_preheat_worker_credential(
         ).first()
         if current is None or current.id != identity.worker_id:
             return None
+    return identity
+
+
+async def validate_model_preheat_worker_registration_credential(
+    session, credential, worker_uuid
+):
+    """仅用于 Worker 注册；恢复凭据不得进入任何任务或执行接口。"""
+    identity = await validate_model_preheat_worker_credential(
+        session, credential, worker_uuid
+    )
+    if identity is not None:
+        if identity.registration_recovery_token_hash is not None:
+            identity.registration_recovery_token_hash = None
+            identity.registration_recovery_issued_at = None
+            session.add(identity)
+            await session.commit()
+        return identity
+    credential_id = _credential_id(credential)
+    if credential_id is None:
+        return None
+    identity = await session.get(ModelPreheatWorkerIdentity, credential_id)
+    if (
+        identity is None
+        or identity.worker_uuid != worker_uuid
+        or identity.bootstrap_required
+        or identity.revoked_at is not None
+        or identity.registration_recovery_token_hash is None
+        or not hmac.compare_digest(
+            identity.registration_recovery_token_hash, _hash_token(credential)
+        )
+    ):
+        return None
+    current = (
+        await session.exec(
+            select(Worker)
+            .where(Worker.worker_uuid == worker_uuid)
+            .order_by(Worker.id.desc())
+        )
+    ).first()
+    if current is None or current.id != identity.worker_id:
+        return None
     return identity
 
 

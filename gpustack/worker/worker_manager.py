@@ -23,6 +23,7 @@ from gpustack.worker.collector import WorkerStatusCollector
 from gpustack.worker.rpc_server import RPCServer, RPCServerProcessInfo
 from gpustack.detectors.detector_factory import DetectorFactory
 from gpustack.utils.profiling import time_decorator
+from gpustack.worker.preheat_credential import store_preheat_credential
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +141,8 @@ class WorkerManager:
         credential = self._clientset.workers.last_model_preheat_credential
         if not credential:
             raise RuntimeError("worker_preheat_credential_unavailable")
-        self._clientset.set_model_preheat_worker_credential(credential)
         self._store_preheat_credential(credential)
+        self._clientset.set_model_preheat_worker_credential(credential)
 
         if update_name_file:
             # Modify files only after successful registration to avoid inconsistency problem
@@ -159,14 +160,7 @@ class WorkerManager:
             return
 
     def _store_preheat_credential(self, credential):
-        os.makedirs(os.path.dirname(self._preheat_credential_path), exist_ok=True)
-        descriptor = os.open(
-            self._preheat_credential_path,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            0o600,
-        )
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-            file.write(credential)
+        store_preheat_credential(self._preheat_credential_path, credential)
 
     def _check_same_worker(self) -> tuple[Worker | None, bool]:
         def _get_worker(params: dict) -> Worker | None:

@@ -8,12 +8,21 @@ from gpustack.cmd.download_tools import setup_download_tools_cmd
 from gpustack.cmd.draw import setup_draw_cmd
 from gpustack.cmd.reset_admin_password import setup_reset_admin_password_cmd
 from gpustack.cmd.version import setup_version_cmd
+from gpustack.cmd.bootstrap_worker_credential import (
+    setup_bootstrap_worker_credential_cmd,
+)
 
 
 def main():
     # Filter out known deprecation warnings from dependencies
-    warnings.filterwarnings("ignore", category=DeprecationWarning, module="websockets.legacy")
-    warnings.filterwarnings("ignore", category=DeprecationWarning, module="uvicorn.protocols.websockets.websockets_impl")
+    warnings.filterwarnings(
+        "ignore", category=DeprecationWarning, module="websockets.legacy"
+    )
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        module="uvicorn.protocols.websockets.websockets_impl",
+    )
 
     parser = argparse.ArgumentParser(
         description="GPUStack",
@@ -24,7 +33,8 @@ def main():
         ),
     )
     subparsers = parser.add_subparsers(
-        help="sub-command help", metavar='{start,chat,download-tools,version}'
+        help="sub-command help",
+        metavar='{start,chat,download-tools,bootstrap-worker-credential,version}',
     )
 
     setup_start_cmd(subparsers)
@@ -33,6 +43,7 @@ def main():
     setup_download_tools_cmd(subparsers)
     setup_version_cmd(subparsers)
     setup_reset_admin_password_cmd(subparsers)
+    setup_bootstrap_worker_credential_cmd(subparsers)
 
     args = parser.parse_args()
     if hasattr(args, "func"):
