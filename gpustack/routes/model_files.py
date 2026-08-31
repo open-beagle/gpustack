@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -47,6 +48,7 @@ from gpustack.server.model_file_download_execution_service import (
 from gpustack.server.bus import EventType
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 async def lock_model_file_for_sync_or_delete(session, model_file_id: int):
@@ -162,7 +164,17 @@ async def _stream_model_files(engine, fields=None, filter_func=None):
                         event.type = EventType.DELETED
                         yield ModelFile._format_event(event)
                     continue
-                event.data = (await _model_files_public(session, [event.data]))[0]
+                public_items = await _model_files_public(
+                    session, [event.data], skip_incomplete=True
+                )
+                if not public_items:
+                    logger.warning(
+                        "Skipping incomplete model file event %s for id %s",
+                        event.type,
+                        _event_model_id(event.data),
+                    )
+                    continue
+                event.data = public_items[0]
             finally:
                 with anyio.CancelScope(shield=True):
                     await session.close()
@@ -240,7 +252,7 @@ async def get_model_file(session: SessionDep, id: int):
     return (await _model_files_public(session, [model_file]))[0]
 
 
-async def _model_files_public(session, model_files):
+async def _model_files_public(session, model_files, skip_incomplete=False):
     model_files = await _reload_model_files_missing_required_fields(session, model_files)
     model_file_ids = [item.id for item in model_files if item.id is not None]
     executions = {}
@@ -304,6 +316,8 @@ async def _model_files_public(session, model_files):
 
     result = []
     for model_file in model_files:
+        if skip_incomplete and _event_timestamps_missing(model_file):
+            continue
         execution = executions.get(model_file.id)
         owner_worker = owner_workers.get(model_file.worker_id)
         worker_available = bool(
@@ -316,7 +330,7 @@ async def _model_files_public(session, model_files):
         )
         result.append(
             ModelFilePublic.model_validate(
-                model_file,
+                _model_file_public_source(model_file),
                 update={
                     "transfer_source": execution.transfer_source if execution else None,
                     "transfer_profile_id": (
@@ -345,6 +359,34 @@ async def _model_files_public(session, model_files):
             )
         )
     return result
+
+
+def _model_file_public_source(model_file):
+    if hasattr(model_file, "model_dump"):
+        source = model_file.model_dump()
+    else:
+        source = {
+            key: value
+            for key, value in getattr(model_file, "__dict__", {}).items()
+            if not key.startswith("_")
+        }
+
+    mapper = getattr(model_file, "__mapper__", None)
+    if mapper is not None:
+        for column in mapper.column_attrs:
+            try:
+                source[column.key] = getattr(model_file, column.key)
+            except Exception:
+                continue
+    else:
+        source.update(
+            {
+                key: value
+                for key, value in getattr(model_file, "__dict__", {}).items()
+                if not key.startswith("_")
+            }
+        )
+    return source
 
 
 async def _reload_model_files_missing_required_fields(session, model_files):

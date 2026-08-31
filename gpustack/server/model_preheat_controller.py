@@ -620,10 +620,9 @@ async def _register_seed_model_file_if_ready(
         model_file = ModelFile(source_index=source_index, **values)
         session.add(model_file)
         await session.flush()
+        await session.refresh(model_file)
         if model_file_events is not None:
-            model_file_events.append(
-                (EventType.CREATED, ModelFile.model_validate(model_file.model_dump()))
-            )
+            model_file_events.append((EventType.CREATED, model_file))
         return
     changed = existing.source_index != source_index
     for field, value in values.items():
@@ -633,10 +632,9 @@ async def _register_seed_model_file_if_ready(
     existing.source_index = source_index
     session.add(existing)
     await session.flush()
+    await session.refresh(existing)
     if changed and model_file_events is not None:
-        model_file_events.append(
-            (EventType.UPDATED, ModelFile.model_validate(existing.model_dump()))
-        )
+        model_file_events.append((EventType.UPDATED, existing))
 
 
 async def _backfill_ready_seed_model_files(

@@ -842,6 +842,25 @@ async def _run_model_file_crud(tmp_path):
         assert reloaded_string_event["data"]["id"] == created.id
         assert reloaded_string_event["data"]["created_at"] is not None
         assert reloaded_string_event["data"]["updated_at"] is not None
+
+        next_event = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0.05)
+        orphan_event = ModelFile(
+            id=created.id + 1000,
+            source=SourceEnum.LOCAL_PATH,
+            local_path="/models/orphan.gguf",
+            worker_id=worker.id,
+            state=ModelFileStateEnum.READY,
+        )
+        await ModelFile._publish_event(EventType.UPDATED, orphan_event)
+        model_file = await ModelFile.one_by_id(session, created.id)
+        model_file.state_message = "after-orphan-event"
+        await model_file.update(session)
+        recovered_event = json.loads(await asyncio.wait_for(next_event, timeout=2))
+        assert recovered_event["data"]["id"] == created.id
+        assert recovered_event["data"]["state_message"] == "after-orphan-event"
+        assert recovered_event["data"]["created_at"] is not None
+        assert recovered_event["data"]["updated_at"] is not None
         await stream.aclose()
 
         sync_task = ModelStorageSyncTask(
