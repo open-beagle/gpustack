@@ -7,7 +7,7 @@ from fastapi import Response
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import ForbiddenException, UnauthorizedException
@@ -162,6 +162,7 @@ def test_new_worker_creation_issues_credential_and_returns_loaded_worker(tmp_pat
                     system_reserved=None,
                     status=None,
                 ),
+                upgrade_proof="a" * 43,
             )
             result = worker.id, worker.worker_uuid
         await engine.dispose()
@@ -172,6 +173,221 @@ def test_new_worker_creation_issues_credential_and_returns_loaded_worker(tmp_pat
     assert worker_uuid == "new-worker-uuid"
     assert headers["X-GPUStack-Worker-Credential"].startswith("mpw_")
     assert headers["cache-control"] == "no-store"
+
+
+def test_new_worker_creation_response_loss_recovers_only_with_same_proof(tmp_path):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'new-worker-retry.db'}",
+            poolclass=NullPool,
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: SQLModel.metadata.create_all(
+                    sync_connection,
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
+                )
+            )
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                user=SimpleNamespace(username="system/worker/10.0.0.4")
+            )
+        )
+        worker_in = WorkerCreate(
+            name="retry-worker",
+            hostname="retry-worker",
+            ip="127.0.0.1",
+            port=10150,
+            worker_uuid="retry-worker-uuid",
+            system_reserved=None,
+            status=None,
+        )
+        proof = "a" * 43
+        async with AsyncSession(engine) as session:
+            await create_worker(
+                request=request,
+                response=Response(),
+                session=session,
+                worker_in=worker_in,
+                upgrade_proof=proof,
+            )
+            retry_response = Response()
+            retry = await create_worker(
+                request=request,
+                response=retry_response,
+                session=session,
+                worker_in=worker_in,
+                upgrade_proof=proof,
+            )
+            with pytest.raises(UnauthorizedException):
+                await create_worker(
+                    request=request,
+                    response=Response(),
+                    session=session,
+                    worker_in=worker_in,
+                    upgrade_proof="b" * 43,
+                )
+            credential = retry_response.headers["X-GPUStack-Worker-Credential"]
+            retry_worker_uuid = retry.worker_uuid
+            principal = await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=session,
+                credential=credential,
+            )
+        await engine.dispose()
+        return retry_worker_uuid, principal
+
+    worker_uuid, principal = asyncio.run(run())
+    assert worker_uuid == "retry-worker-uuid"
+    assert principal.worker_uuid == "retry-worker-uuid"
+
+
+def test_confirmed_credential_renews_inside_window(tmp_path, monkeypatch):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'credential-renew.db'}",
+            poolclass=NullPool,
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: SQLModel.metadata.create_all(
+                    sync_connection,
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
+                )
+            )
+        async with AsyncSession(engine) as session:
+            worker = Worker(
+                name="renew-worker",
+                hostname="renew-worker",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="renew-worker-uuid",
+            )
+            session.add(worker)
+            await session.commit()
+            await session.refresh(worker)
+            worker_id = worker.id
+            worker_uuid = worker.worker_uuid
+            token = await issue_model_preheat_worker_credential(
+                session, worker_id, worker_uuid
+            )
+            now = datetime.now(timezone.utc)
+            monkeypatch.setattr(worker_credential_identity, "_utcnow", lambda: now)
+            await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=session,
+                credential=token,
+            )
+            identity = (
+                await session.exec(
+                    select(ModelPreheatWorkerIdentity).where(
+                        ModelPreheatWorkerIdentity.worker_id == worker_id
+                    )
+                )
+            ).one()
+            identity.expires_at = (
+                now
+                + worker_credential_identity.WORKER_CREDENTIAL_RENEW_WINDOW
+                - timedelta(seconds=1)
+            )
+            session.add(identity)
+            await session.commit()
+            await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=session,
+                credential=token,
+            )
+            await session.refresh(identity)
+            return now, identity.expires_at
+        await engine.dispose()
+
+    now, expires_at = asyncio.run(run())
+    assert expires_at == now + WORKER_CREDENTIAL_TTL
+
+
+def test_concurrent_confirmed_credential_renewal_keeps_both_requests_valid(
+    tmp_path, monkeypatch
+):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'credential-renew-race.db'}",
+            poolclass=NullPool,
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: SQLModel.metadata.create_all(
+                    sync_connection,
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
+                )
+            )
+        async with AsyncSession(engine) as session:
+            worker = Worker(
+                name="renew-race-worker",
+                hostname="renew-race-worker",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="renew-race-worker-uuid",
+            )
+            session.add(worker)
+            await session.commit()
+            await session.refresh(worker)
+            worker_id, worker_uuid = worker.id, worker.worker_uuid
+            token = await issue_model_preheat_worker_credential(
+                session, worker_id, worker_uuid
+            )
+            await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=session,
+                credential=token,
+            )
+            identity = (
+                await session.exec(
+                    select(ModelPreheatWorkerIdentity).where(
+                        ModelPreheatWorkerIdentity.worker_id == worker_id
+                    )
+                )
+            ).one()
+            now = datetime.now(timezone.utc)
+            identity.expires_at = (
+                now
+                + worker_credential_identity.WORKER_CREDENTIAL_RENEW_WINDOW
+                - timedelta(seconds=1)
+            )
+            session.add(identity)
+            await session.commit()
+        monkeypatch.setattr(worker_credential_identity, "_utcnow", lambda: now)
+        start = asyncio.Event()
+
+        async def renew():
+            async with AsyncSession(engine) as session:
+                await start.wait()
+                principal = await get_model_preheat_worker_identity(
+                    request=SimpleNamespace(state=SimpleNamespace()),
+                    session=session,
+                    credential=token,
+                )
+                return principal.worker_uuid
+
+        first, second = asyncio.create_task(renew()), asyncio.create_task(renew())
+        await asyncio.sleep(0)
+        start.set()
+        result = await asyncio.gather(first, second)
+        await engine.dispose()
+        return result
+
+    assert asyncio.run(run()) == ["renew-race-worker-uuid", "renew-race-worker-uuid"]
 
 
 def test_existing_worker_uuid_cannot_be_rebound_with_shared_token_only():

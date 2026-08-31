@@ -15,6 +15,7 @@ class WorkerClient:
         self._client = client
         self._url = f"{client._base_url}/v1/workers"
         self.last_model_preheat_credential = None
+        self._last_model_preheat_credential_generation = -1
 
     def list(self, params: Dict[str, Any] = None) -> WorkersPublic:
         response = self._client.get_httpx_client().get(self._url, params=params)
@@ -87,15 +88,18 @@ class WorkerClient:
         raise_if_response_error(response)
         return WorkerPublic.model_validate(response.json())
 
-    def create(self, model_create: WorkerCreate):
+    def create(self, model_create: WorkerCreate, *, upgrade_proof=None):
+        headers = {"Content-Type": "application/json"}
+        if upgrade_proof:
+            headers["X-GPUStack-Worker-Upgrade-Proof"] = upgrade_proof
         response = self._client.get_httpx_client().post(
             self._url,
             content=model_create.model_dump_json(),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
         raise_if_response_error(response)
-        self.last_model_preheat_credential = response.headers.get(
-            "X-GPUStack-Worker-Credential"
+        self._remember_model_preheat_credential(
+            response.headers.get("X-GPUStack-Worker-Credential")
         )
         return WorkerPublic.model_validate(response.json())
 
@@ -119,11 +123,29 @@ class WorkerClient:
         )
         raise_if_response_error(response)
         if registration:
-            self.last_model_preheat_credential = response.headers.get(
-                "X-GPUStack-Worker-Credential"
+            self._remember_model_preheat_credential(
+                response.headers.get("X-GPUStack-Worker-Credential")
             )
         return WorkerPublic.model_validate(response.json())
+
+    def _remember_model_preheat_credential(self, credential):
+        if not credential:
+            return
+        generation = _credential_generation(credential)
+        if generation >= self._last_model_preheat_credential_generation:
+            self.last_model_preheat_credential = credential
+            self._last_model_preheat_credential_generation = generation
 
     def delete(self, id: int):
         response = self._client.get_httpx_client().delete(f"{self._url}/{id}")
         raise_if_response_error(response)
+
+
+def _credential_generation(credential):
+    parts = credential.split("_", 3) if isinstance(credential, str) else []
+    if len(parts) == 4 and parts[0] == "mpw":
+        try:
+            return int(parts[2])
+        except ValueError:
+            pass
+    return 0

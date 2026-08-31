@@ -28,8 +28,10 @@ from gpustack.server.services import WorkerService
 from gpustack.api.auth import SYSTEM_WORKER_USER_PREFIX
 from gpustack.server.model_preheat_worker_identity import (
     WORKER_CREDENTIAL_HEADER,
-    bind_model_preheat_worker_upgrade_proof,
+    bind_new_model_preheat_worker_registration_proof,
     issue_model_preheat_worker_credential,
+    is_model_preheat_worker_registration_proof,
+    validate_new_model_preheat_worker_registration_proof,
     validate_model_preheat_worker_credential,
     validate_model_preheat_worker_registration_credential,
     worker_uuid_has_credential,
@@ -133,7 +135,28 @@ async def create_worker(
 ):
     existing = await Worker.one_by_field(session, "name", worker_in.name)
     if existing:
+        if (
+            existing.worker_uuid == worker_in.worker_uuid
+            and _is_system_worker_request(request)
+            and await validate_new_model_preheat_worker_registration_proof(
+                session, existing, upgrade_proof
+            )
+        ):
+            credential = await issue_model_preheat_worker_credential(
+                session, existing.id, existing.worker_uuid
+            )
+            response.headers[WORKER_CREDENTIAL_HEADER] = credential
+            response.headers["Cache-Control"] = "no-store"
+            return existing
+        if _is_system_worker_request(request):
+            raise UnauthorizedException(
+                message="Invalid worker registration credentials"
+            )
         raise AlreadyExistsException(message=f"worker f{worker_in.name} already exists")
+    if _is_system_worker_request(
+        request
+    ) and not is_model_preheat_worker_registration_proof(upgrade_proof):
+        raise UnauthorizedException(message="Invalid worker registration credentials")
     await _authorize_worker_registration(
         request,
         session,
@@ -145,6 +168,21 @@ async def create_worker(
     try:
         worker_in.compute_state()
         worker = await Worker.create(session, worker_in)
+        worker_id = worker.id
+        worker_uuid = worker.worker_uuid
+        if _is_system_worker_request(
+            request
+        ) and not await bind_new_model_preheat_worker_registration_proof(
+            session, worker, upgrade_proof
+        ):
+            raise UnauthorizedException(
+                message="Invalid worker registration credentials"
+            )
+        worker = await Worker.one_by_id(session, worker_id)
+        if worker is None or worker.worker_uuid != worker_uuid:
+            raise UnauthorizedException(
+                message="Invalid worker registration credentials"
+            )
         await _issue_preheat_credential(request, response, session, worker, True)
         await session.refresh(worker)
         return worker
@@ -172,9 +210,12 @@ async def update_worker(
     worker = await Worker.one_by_id(session, id)
     if not worker:
         raise NotFoundException(message="worker not found")
-    upgrade_bootstrap = False
     if rotate_preheat_credential:
-        upgrade_bootstrap = await _authorize_worker_registration(
+        if worker_in.worker_uuid != worker.worker_uuid:
+            raise UnauthorizedException(
+                message="Invalid worker registration credentials"
+            )
+        await _authorize_worker_registration(
             request,
             session,
             worker.worker_uuid,
@@ -185,27 +226,15 @@ async def update_worker(
         )
 
     try:
-        preissued_credential = None
-        if upgrade_bootstrap:
-            # WorkerService.update 会独立提交。先将 proof CAS 与待确认凭据一并
-            # 提交，避免旧身份停在“proof 已绑定但未签发”的中间状态。
-            preissued_credential = await issue_model_preheat_worker_credential(
-                session, worker.id, worker.worker_uuid
-            )
-            worker = await Worker.one_by_id(session, id)
         worker_in.compute_state()
         await WorkerService(session).update(worker, worker_in)
-        if preissued_credential is None:
-            await _issue_preheat_credential(
-                request,
-                response,
-                session,
-                worker,
-                rotate_preheat_credential,
-            )
-        else:
-            response.headers[WORKER_CREDENTIAL_HEADER] = preissued_credential
-            response.headers["Cache-Control"] = "no-store"
+        await _issue_preheat_credential(
+            request,
+            response,
+            session,
+            worker,
+            rotate_preheat_credential,
+        )
         await session.refresh(worker)
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to update worker: {e}")
@@ -241,7 +270,7 @@ async def _authorize_worker_registration(
     upgrade_proof=None,
 ):
     user = getattr(request.state, "user", None)
-    if user is None or not user.username.startswith(SYSTEM_WORKER_USER_PREFIX):
+    if not _is_system_worker_request(request):
         return False
     if not await worker_uuid_has_credential(session, worker_uuid):
         return False
@@ -250,15 +279,12 @@ async def _authorize_worker_registration(
     )
     if identity is not None:
         return False
-    if (
-        worker is not None
-        and worker_update is not None
-        and await bind_model_preheat_worker_upgrade_proof(
-            session, worker, worker_update, upgrade_proof
-        )
-    ):
-        return True
     raise UnauthorizedException(message="Invalid worker registration credentials")
+
+
+def _is_system_worker_request(request):
+    user = getattr(request.state, "user", None)
+    return user is not None and user.username.startswith(SYSTEM_WORKER_USER_PREFIX)
 
 
 @router.delete("/{id}")

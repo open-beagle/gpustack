@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 
 from fastapi import Depends, Header, Request
-from sqlalchemy import delete, exists, update
+from sqlalchemy import delete, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -153,7 +153,11 @@ async def issue_model_preheat_worker_credential(
             .execution_options(synchronize_session=False)
         )
         secret = secrets.token_urlsafe(32)
-        token = f"{WORKER_CREDENTIAL_PREFIX}_{identity_id}_{secret}"
+        # 第三段携带签发代次。旧客户端仍按 ``mpw_<identity_id>_<secret>``
+        # 解析身份 ID；新客户端据此丢弃乱序的旧注册响应。
+        token = (
+            f"{WORKER_CREDENTIAL_PREFIX}_{identity_id}_{pending_token_version}_{secret}"
+        )
         session.add(
             ModelPreheatWorkerPendingCredential(
                 identity_id=identity_id,
@@ -241,18 +245,12 @@ async def validate_model_preheat_worker_registration_credential(
     return identity
 
 
-async def bind_model_preheat_worker_upgrade_proof(
-    session, worker: Worker, worker_update, upgrade_proof: str
+async def bind_new_model_preheat_worker_registration_proof(
+    session, worker: Worker, upgrade_proof: str
 ) -> bool:
-    """仅为 f9 migration 产生的旧身份绑定一次升级 proof。"""
+    """只为数据库中刚创建的新 Worker 绑定本地生成的恢复 proof。"""
     now = _utcnow()
-    if (
-        not _is_upgrade_proof(upgrade_proof)
-        or worker_update.worker_uuid != worker.worker_uuid
-        or worker_update.name != worker.name
-        or worker_update.hostname != worker.hostname
-        or worker_update.ip != worker.ip
-    ):
+    if not is_model_preheat_worker_registration_proof(upgrade_proof):
         return False
     identity = (
         await session.exec(
@@ -261,41 +259,39 @@ async def bind_model_preheat_worker_upgrade_proof(
             )
         )
     ).first()
-    if identity is None:
+    if identity is not None:
         return False
-    if not await _identity_is_current_worker(session, identity):
+    identity = ModelPreheatWorkerIdentity(
+        worker_id=worker.id,
+        worker_uuid=worker.worker_uuid,
+        bootstrap_required=False,
+        upgrade_proof_hash=_hash_token(upgrade_proof),
+        upgrade_proof_window_started_at=now,
+        expires_at=now + WORKER_CREDENTIAL_TTL,
+    )
+    session.add(identity)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
         return False
-    identity_id = identity.id
-    proof_hash = _hash_token(upgrade_proof)
-    no_pending_credential = ~exists(
-        select(ModelPreheatWorkerPendingCredential.id).where(
-            ModelPreheatWorkerPendingCredential.identity_id == identity_id
+    return True
+
+
+async def validate_new_model_preheat_worker_registration_proof(
+    session, worker: Worker, upgrade_proof: str
+) -> bool:
+    """仅允许首次创建时绑定的同一 proof 在窗口内补发候选凭据。"""
+    now = _utcnow()
+    if not is_model_preheat_worker_registration_proof(upgrade_proof):
+        return False
+    identity = (
+        await session.exec(
+            select(ModelPreheatWorkerIdentity).where(
+                ModelPreheatWorkerIdentity.worker_id == worker.id
+            )
         )
-    )
-    result = await session.exec(
-        update(ModelPreheatWorkerIdentity)
-        .where(
-            ModelPreheatWorkerIdentity.id == identity_id,
-            ModelPreheatWorkerIdentity.bootstrap_required.is_(True),
-            ModelPreheatWorkerIdentity.token_hash.is_(None),
-            ModelPreheatWorkerIdentity.registration_recovery_token_hash.is_(None),
-            ModelPreheatWorkerIdentity.upgrade_proof_hash.is_(None),
-            ModelPreheatWorkerIdentity.revoked_at.is_(None),
-            ModelPreheatWorkerIdentity.upgrade_proof_window_started_at.is_not(None),
-            ModelPreheatWorkerIdentity.upgrade_proof_window_started_at
-            > now - WORKER_UPGRADE_PROOF_TTL,
-            no_pending_credential,
-        )
-        .values(
-            upgrade_proof_hash=proof_hash,
-            bootstrap_required=False,
-        )
-        .execution_options(synchronize_session=False)
-    )
-    if result.rowcount == 1:
-        session.expire(identity)
-        return True
-    identity = await session.get(ModelPreheatWorkerIdentity, identity_id)
+    ).first()
     if (
         identity is None
         or identity.bootstrap_required
@@ -304,11 +300,11 @@ async def bind_model_preheat_worker_upgrade_proof(
         or identity.revoked_at is not None
         or identity.upgrade_proof_window_started_at is None
         or identity.upgrade_proof_window_started_at <= now - WORKER_UPGRADE_PROOF_TTL
-        or not hmac.compare_digest(identity.upgrade_proof_hash or "", proof_hash)
+        or not hmac.compare_digest(
+            identity.upgrade_proof_hash or "", _hash_token(upgrade_proof)
+        )
     ):
         return False
-    # 若进程在 proof CAS 与签发之间异常退出，同一 proof 可在窗口内补发；
-    # 不同 proof 仍因哈希不匹配被拒绝。
     return True
 
 
@@ -327,7 +323,37 @@ async def _validated_confirmed_identity(
         return None
     if require_current and not await _identity_is_current_worker(session, identity):
         return None
+    identity_id = identity.id
+    renew_required = identity.expires_at <= now + WORKER_CREDENTIAL_RENEW_WINDOW
+    if renew_required:
+        await _renew_model_preheat_worker_credential(session, identity, now)
+        return await session.get(ModelPreheatWorkerIdentity, identity_id)
     return identity
+
+
+async def _renew_model_preheat_worker_credential(session, identity, now):
+    if (
+        identity.expires_at is None
+        or identity.expires_at > now + WORKER_CREDENTIAL_RENEW_WINDOW
+    ):
+        return False
+    result = await session.exec(
+        update(ModelPreheatWorkerIdentity)
+        .where(
+            ModelPreheatWorkerIdentity.id == identity.id,
+            ModelPreheatWorkerIdentity.token_version == identity.token_version,
+            ModelPreheatWorkerIdentity.token_hash == identity.token_hash,
+            ModelPreheatWorkerIdentity.expires_at == identity.expires_at,
+            ModelPreheatWorkerIdentity.expires_at > now,
+        )
+        .values(expires_at=now + WORKER_CREDENTIAL_TTL)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 1:
+        await session.commit()
+        return True
+    await session.rollback()
+    return False
 
 
 async def _validated_pending_identity(
@@ -432,7 +458,7 @@ def _identity_token_is_active(identity, now):
     )
 
 
-def _is_upgrade_proof(proof: str) -> bool:
+def is_model_preheat_worker_registration_proof(proof: str) -> bool:
     if (
         not isinstance(proof, str)
         or len(proof) < 43

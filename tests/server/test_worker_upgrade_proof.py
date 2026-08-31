@@ -89,38 +89,24 @@ async def _create_engine(tmp_path, name):
     return engine
 
 
-def test_legacy_worker_upgrade_proof_bootstraps_and_closes_after_confirmation(
-    tmp_path, monkeypatch
-):
+def test_legacy_worker_upgrade_proof_cannot_claim_existing_identity(tmp_path):
     async def run():
         engine = await _create_engine(tmp_path, "proof-success.db")
         proof = _proof("a")
         async with AsyncSession(engine) as session:
             worker_id, worker_uuid = await _create_worker_identity(session)
             worker, worker_update = await _worker_update(session, worker_id)
-            response = Response()
-            await update_worker(
-                request=_system_request(),
-                response=response,
-                session=session,
-                id=worker_id,
-                worker_in=worker_update,
-                rotate_preheat_credential=True,
-                worker_credential=None,
-                upgrade_proof=proof,
-            )
-            credential = response.headers["X-GPUStack-Worker-Credential"]
             with pytest.raises(UnauthorizedException):
-                await get_model_preheat_worker_identity(
-                    request=SimpleNamespace(state=SimpleNamespace()),
+                await update_worker(
+                    request=_system_request(),
+                    response=Response(),
                     session=session,
-                    credential=proof,
+                    id=worker_id,
+                    worker_in=worker_update,
+                    rotate_preheat_credential=True,
+                    worker_credential=None,
+                    upgrade_proof=proof,
                 )
-            principal = await get_model_preheat_worker_identity(
-                request=SimpleNamespace(state=SimpleNamespace()),
-                session=session,
-                credential=credential,
-            )
             identity = (
                 await session.exec(
                     select(ModelPreheatWorkerIdentity).where(
@@ -140,19 +126,64 @@ def test_legacy_worker_upgrade_proof_bootstraps_and_closes_after_confirmation(
                     upgrade_proof=proof,
                 )
         await engine.dispose()
-        return principal, identity
+        return identity
 
-    monkeypatch.setattr(
-        "gpustack.server.services.logger.trace", lambda *_: None, raising=False
-    )
-    principal, identity = asyncio.run(run())
-    assert principal.worker_uuid == "legacy-worker-uuid"
-    assert identity.bootstrap_required is False
+    identity = asyncio.run(run())
+    assert identity.bootstrap_required is True
     assert identity.upgrade_proof_hash is None
-    assert identity.upgrade_proof_window_started_at is None
 
 
-def test_upgrade_proof_retries_only_same_bound_proof_across_sessions(tmp_path):
+@pytest.mark.parametrize("credential_kind", ["current", "pending", "recovery"])
+def test_registration_rejects_worker_uuid_mutation_for_all_credentials(
+    tmp_path, credential_kind
+):
+    async def run():
+        engine = await _create_engine(tmp_path, f"uuid-{credential_kind}.db")
+        async with AsyncSession(engine) as session:
+            worker_id, worker_uuid = await _create_worker_identity(
+                session, bootstrap_required=False
+            )
+            current = await issue_model_preheat_worker_credential(
+                session, worker_id, worker_uuid
+            )
+            await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=session,
+                credential=current,
+            )
+            pending = await issue_model_preheat_worker_credential(
+                session, worker_id, worker_uuid
+            )
+            credential = {"current": pending, "pending": pending, "recovery": current}[
+                credential_kind
+            ]
+            if credential_kind == "current":
+                await get_model_preheat_worker_identity(
+                    request=SimpleNamespace(state=SimpleNamespace()),
+                    session=session,
+                    credential=pending,
+                )
+                credential = pending
+            worker, worker_update = await _worker_update(session, worker_id)
+            worker_update.worker_uuid = "attacker-worker-uuid"
+            with pytest.raises(UnauthorizedException):
+                await update_worker(
+                    request=_system_request(),
+                    response=Response(),
+                    session=session,
+                    id=worker_id,
+                    worker_in=worker_update,
+                    rotate_preheat_credential=True,
+                    worker_credential=credential,
+                )
+            return await session.get(Worker, worker_id)
+        await engine.dispose()
+
+    worker = asyncio.run(run())
+    assert worker.worker_uuid == "legacy-worker-uuid"
+
+
+def test_legacy_upgrade_proofs_cannot_retry_or_bind(tmp_path):
     async def run():
         engine = await _create_engine(tmp_path, "proof-retry.db")
         first_proof = _proof("b")
@@ -160,18 +191,16 @@ def test_upgrade_proof_retries_only_same_bound_proof_across_sessions(tmp_path):
         async with AsyncSession(engine) as initial_session:
             worker_id, worker_uuid = await _create_worker_identity(initial_session)
             worker, worker_update = await _worker_update(initial_session, worker_id)
-            await _authorize_worker_registration(
-                _system_request(),
-                initial_session,
-                worker_uuid,
-                None,
-                worker=worker,
-                worker_update=worker_update,
-                upgrade_proof=first_proof,
-            )
-            lost_credential = await issue_model_preheat_worker_credential(
-                initial_session, worker_id, worker_uuid
-            )
+            with pytest.raises(UnauthorizedException):
+                await _authorize_worker_registration(
+                    _system_request(),
+                    initial_session,
+                    worker_uuid,
+                    None,
+                    worker=worker,
+                    worker_update=worker_update,
+                    upgrade_proof=first_proof,
+                )
         async with AsyncSession(engine) as competing_session:
             worker, worker_update = await _worker_update(competing_session, worker_id)
             with pytest.raises(UnauthorizedException):
@@ -186,33 +215,22 @@ def test_upgrade_proof_retries_only_same_bound_proof_across_sessions(tmp_path):
                 )
         async with AsyncSession(engine) as retry_session:
             worker, worker_update = await _worker_update(retry_session, worker_id)
-            await _authorize_worker_registration(
-                _system_request(),
-                retry_session,
-                worker_uuid,
-                None,
-                worker=worker,
-                worker_update=worker_update,
-                upgrade_proof=first_proof,
-            )
-            retry_credential = await issue_model_preheat_worker_credential(
-                retry_session, worker_id, worker_uuid
-            )
-            await get_model_preheat_worker_identity(
-                request=SimpleNamespace(state=SimpleNamespace()),
-                session=retry_session,
-                credential=retry_credential,
-            )
-            lost_after_confirmation = await validate_model_preheat_worker_credential(
-                retry_session, lost_credential, worker_uuid
-            )
+            with pytest.raises(UnauthorizedException):
+                await _authorize_worker_registration(
+                    _system_request(),
+                    retry_session,
+                    worker_uuid,
+                    None,
+                    worker=worker,
+                    worker_update=worker_update,
+                    upgrade_proof=first_proof,
+                )
         await engine.dispose()
-        return lost_after_confirmation
 
-    assert asyncio.run(run()) is None
+    asyncio.run(run())
 
 
-def test_different_upgrade_proofs_have_one_atomic_binder(tmp_path):
+def test_different_legacy_upgrade_proofs_are_both_rejected(tmp_path):
     async def run():
         engine = await _create_engine(tmp_path, "proof-cas.db")
         async with AsyncSession(engine) as setup_session:
@@ -247,7 +265,7 @@ def test_different_upgrade_proofs_have_one_atomic_binder(tmp_path):
         await engine.dispose()
         return bound
 
-    assert sorted(asyncio.run(run())) == [False, True]
+    assert sorted(asyncio.run(run())) == [False, False]
 
 
 def test_upgrade_proof_rejects_different_worker_uuid_without_state_change(tmp_path):

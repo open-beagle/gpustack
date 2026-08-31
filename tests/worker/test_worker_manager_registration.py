@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from gpustack.schemas.workers import Worker
+from gpustack.client.generated_worker_client import WorkerClient
 from gpustack.worker.worker_manager import WorkerManager
 
 
@@ -88,7 +89,7 @@ def test_register_worker_keeps_existing_credentials_when_file_is_absent(tmp_path
     clientset.set_model_preheat_worker_credential.assert_called_once_with(
         "rotated-credential"
     )
-    workers.update.assert_called_once()
+    workers.create.assert_called_once()
 
 
 def test_register_worker_keeps_previous_memory_credential_when_atomic_write_fails(
@@ -184,7 +185,9 @@ def test_store_preheat_credential_replaces_file_atomically_with_private_mode(
     assert not list(tmp_path.glob(".model_preheat_worker_credential.*"))
 
 
-def test_register_existing_legacy_worker_sends_and_clears_upgrade_proof(tmp_path):
+def test_register_existing_worker_without_credential_retries_create_with_proof(
+    tmp_path,
+):
     workers = Mock()
     existing_worker = SimpleNamespace(
         id=1,
@@ -218,6 +221,22 @@ def test_register_existing_legacy_worker_sends_and_clears_upgrade_proof(tmp_path
         )
     )
 
-    proof = workers.update.call_args.kwargs["upgrade_proof"]
+    proof = workers.create.call_args.kwargs["upgrade_proof"]
     assert len(proof) >= 43
     assert not (tmp_path / "model_preheat_worker_upgrade_proof").exists()
+    workers.update.assert_not_called()
+
+
+def test_worker_client_keeps_newer_credential_when_responses_arrive_out_of_order():
+    client = WorkerClient.__new__(WorkerClient)
+    client.last_model_preheat_credential = None
+    client._last_model_preheat_credential_generation = -1
+
+    client._remember_model_preheat_credential("mpw_1_2_new-secret")
+    client._remember_model_preheat_credential("mpw_1_1_old-secret")
+
+    assert client.last_model_preheat_credential == "mpw_1_2_new-secret"
+
+
+def test_worker_client_delete_remains_public_api():
+    assert callable(getattr(WorkerClient, "delete", None))

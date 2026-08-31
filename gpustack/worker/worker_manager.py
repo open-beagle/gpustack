@@ -121,8 +121,6 @@ class WorkerManager:
     def _register_worker(self, worker: Worker):
         has_credential = self._load_preheat_credential()
         upgrade_proof = None
-        if not has_credential:
-            upgrade_proof = self._load_or_create_upgrade_proof()
         logger.info(
             f"Registering worker: {worker.name}",
         )
@@ -137,14 +135,20 @@ class WorkerManager:
             if existing:
                 # keep labels from the existing worker
                 worker.labels = same_worker.labels
-                self._clientset.workers.update(
-                    id=same_worker.id,
-                    model_update=worker,
-                    registration=True,
-                    upgrade_proof=upgrade_proof,
-                )
+                if has_credential:
+                    self._clientset.workers.update(
+                        id=same_worker.id,
+                        model_update=worker,
+                        registration=True,
+                    )
+                else:
+                    # 首次 POST 已提交但响应丢失时，持久 proof 是唯一恢复秘密。
+                    # legacy 身份没有这份秘密，服务端会拒绝并提示管理员 bootstrap。
+                    upgrade_proof = self._load_or_create_upgrade_proof()
+                    self._clientset.workers.create(worker, upgrade_proof=upgrade_proof)
             else:
-                self._clientset.workers.create(worker)
+                upgrade_proof = self._load_or_create_upgrade_proof()
+                self._clientset.workers.create(worker, upgrade_proof=upgrade_proof)
         except Exception as e:
             logger.error(f"Failed to register worker: {e}")
             raise
