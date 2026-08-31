@@ -27,7 +27,11 @@ from gpustack.schemas.model_preheats import (
     ModelPreheatWorkerTaskRoleEnum,
     ModelPreheatWorkerTaskStateEnum,
 )
-from gpustack.schemas.workers import Worker, WorkerStateEnum
+from gpustack.schemas.workers import (
+    MODEL_STORAGE_PROTOCOL_VERSION,
+    Worker,
+    WorkerStateEnum,
+)
 from gpustack.server.bus import Event, EventType
 from gpustack.server.model_preheat_worker_identity import (
     ModelPreheatWorkerPrincipal,
@@ -130,10 +134,9 @@ def test_paused_event_waits_and_duplicate_pending_event_claims_once():
     assert executions == [2]
 
 
-def test_busy_worker_defers_claim_until_idle():
+def test_busy_worker_does_not_defer_preheat_claim():
     async def run():
         client = ResumeClient()
-        idle = False
 
         async def execute(payload, context):
             del payload, context
@@ -144,36 +147,30 @@ def test_busy_worker_defers_claim_until_idle():
             worker_uuid="worker-uuid",
             clientset=SimpleNamespace(model_preheat_worker_tasks=client),
             execution_handler=execute,
-            idle_check=lambda: idle,
+            idle_check=lambda: False,
             heartbeat_interval=60,
         )
         pending = _public_task(ModelPreheatWorkerTaskStateEnum.PENDING)
         manager.handle_event(Event(EventType.UPDATED, pending.model_dump(mode="json")))
-        await asyncio.sleep(0)
-        busy_claims = client.claim_count
-        idle = True
-        manager.handle_event(Event(EventType.UPDATED, pending.model_dump(mode="json")))
         await asyncio.wait_for(client.completed.wait(), timeout=1)
         await manager.shutdown()
-        return busy_claims, client.claim_count
+        return client.claim_count
 
-    assert asyncio.run(run()) == (0, 1)
+    assert asyncio.run(run()) == 1
 
 
-def test_running_preheat_yields_when_worker_becomes_busy():
+def test_running_preheat_continues_when_worker_becomes_busy():
     async def run():
         client = ResumeClient()
         idle = True
         started = asyncio.Event()
-        canceled = asyncio.Event()
+        finish = asyncio.Event()
 
         async def execute(payload, context):
             del payload, context
             started.set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                canceled.set()
+            await finish.wait()
+            return {"state": "ready"}
 
         manager = ModelPreheatManager(
             worker_id=11,
@@ -187,11 +184,13 @@ def test_running_preheat_yields_when_worker_becomes_busy():
         manager.handle_event(Event(EventType.UPDATED, pending.model_dump(mode="json")))
         await asyncio.wait_for(started.wait(), timeout=1)
         idle = False
-        await asyncio.wait_for(canceled.wait(), timeout=1)
+        await asyncio.sleep(0.03)
+        finish.set()
+        await asyncio.wait_for(client.completed.wait(), timeout=1)
         await manager.shutdown()
         return client.complete_count
 
-    assert asyncio.run(run()) == 0
+    assert asyncio.run(run()) == 1
 
 
 def test_paused_event_immediately_stops_active_handler_and_confirms_with_lease():
@@ -405,9 +404,17 @@ async def _seed_resumed_worker_task(session):
         port=10150,
         worker_uuid="worker-uuid",
         state=WorkerStateEnum.READY,
+        model_storage_protocol_version=MODEL_STORAGE_PROTOCOL_VERSION,
     )
     session.add(worker)
     await session.flush()
+    request_identity = {
+        "source": "huggingface",
+        "model_id": "org/model",
+        "requested_revision": None,
+        "include_patterns": [],
+        "exclude_patterns": [],
+    }
     task = ModelPreheatTask(
         source="huggingface",
         model_id="org/model",
@@ -415,6 +422,8 @@ async def _seed_resumed_worker_task(session):
         include_patterns=[],
         exclude_patterns=[],
         selection_digest="b" * 64,
+        request_identity=request_identity,
+        request_digest="c" * 64,
         cache_key="c" * 64,
         generation_id="preheat-resume",
         seed_worker_uuid=worker.worker_uuid,

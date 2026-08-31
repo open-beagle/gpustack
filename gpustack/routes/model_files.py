@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 from typing import Optional
 
 import anyio
@@ -193,8 +194,11 @@ def _event_model_id(data):
 
 def _event_timestamps_missing(data):
     values = getattr(data, "__dict__", {})
-    return not isinstance(values, dict) or any(
-        values.get(field) is None for field in ("created_at", "updated_at")
+    if not isinstance(values, dict):
+        return True
+    return any(
+        not isinstance(values.get(field), datetime)
+        for field in ("created_at", "updated_at")
     )
 
 

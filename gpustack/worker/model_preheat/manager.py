@@ -35,10 +35,6 @@ class ModelPreheatExecutionHandler(Protocol):
     ) -> Awaitable[dict]: ...
 
 
-class ModelPreheatYield(RuntimeError):
-    pass
-
-
 @dataclass(frozen=True)
 class _LeaseIdentity:
     worker_task_id: int
@@ -133,7 +129,7 @@ class ModelPreheatManager:
         self._heartbeat_interval = heartbeat_interval
         self._reconcile_interval = reconcile_interval
         self._max_concurrent_tasks = max_concurrent_tasks
-        self._idle_check = idle_check or (lambda: True)
+        del idle_check
         self._active_tasks: dict[int, asyncio.Task] = {}
         self._pause_requested: set[int] = set()
         self._connect_timeout_log_times: dict[str, float] = {}
@@ -200,7 +196,6 @@ class ModelPreheatManager:
                 ModelPreheatWorkerTaskStateEnum.RUNNING,
             }
             or not self._supports_role(worker_task.role)
-            or not self._worker_is_idle_for(worker_task.role)
             or worker_task.id in self._active_tasks
             or len(self._active_tasks) >= self._max_concurrent_tasks
         ):
@@ -427,22 +422,10 @@ class ModelPreheatManager:
             )
 
     async def _heartbeat_loop(self, context: ModelPreheatExecutionContext, role):
+        del role
         while True:
             await asyncio.sleep(self._heartbeat_interval)
-            if not self._worker_is_idle_for(role):
-                raise ModelPreheatYield("worker_became_busy")
             await context.heartbeat()
-
-    def _worker_is_idle_for(self, role):
-        if role not in {
-            ModelPreheatWorkerTaskRoleEnum.SEED,
-            ModelPreheatWorkerTaskRoleEnum.DISTRIBUTE,
-        }:
-            return True
-        try:
-            return bool(self._idle_check())
-        except Exception:
-            return False
 
     async def _fail(self, lease, error_code, result=None, *, role=None):
         if result is None:

@@ -823,6 +823,25 @@ async def _run_model_file_crud(tmp_path):
             assert reloaded_expired_event["data"]["id"] == created.id
             assert reloaded_expired_event["data"]["created_at"] is not None
             assert reloaded_expired_event["data"]["updated_at"] is not None
+
+        next_event = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0.05)
+        string_timestamp_event = SimpleNamespace(
+            id=created.id,
+            source=SourceEnum.LOCAL_PATH,
+            local_path="/models/original.gguf",
+            worker_id=worker.id,
+            state=ModelFileStateEnum.READY,
+            created_at="2026-08-31 01:30:00",
+            updated_at="2026-08-31 01:30:00",
+        )
+        await ModelFile._publish_event(EventType.UPDATED, string_timestamp_event)
+        reloaded_string_event = json.loads(
+            await asyncio.wait_for(next_event, timeout=2)
+        )
+        assert reloaded_string_event["data"]["id"] == created.id
+        assert reloaded_string_event["data"]["created_at"] is not None
+        assert reloaded_string_event["data"]["updated_at"] is not None
         await stream.aclose()
 
         sync_task = ModelStorageSyncTask(
