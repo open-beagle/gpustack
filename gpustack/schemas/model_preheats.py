@@ -290,6 +290,28 @@ class ModelPreheatWorkerIdentity(SQLModel, BaseModelMixin, table=True):
     )
 
 
+class ModelPreheatWorkerPendingCredential(SQLModel, BaseModelMixin, table=True):
+    __tablename__ = "model_preheat_worker_pending_credentials"
+    __table_args__ = (
+        UniqueConstraint(
+            "identity_id",
+            "token_hash",
+            name="uix_preheat_worker_pending_credential_token",
+        ),
+        Index("ix_preheat_worker_pending_credential_identity", "identity_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    identity_id: int = Field(
+        sa_column=Column(
+            ForeignKey("model_preheat_worker_identities.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    token_hash: str = Field(sa_column=Column(String(64), nullable=False))
+    expires_at: datetime = Field(sa_column=Column(UTCDateTime, nullable=False))
+
+
 class ModelPreheatWorkerTaskPublic(SQLModel):
     id: int
     task_id: Optional[int] = None

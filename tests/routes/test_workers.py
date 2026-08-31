@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -20,7 +20,10 @@ from gpustack.routes.workers import (
     get_workers,
 )
 from gpustack.schemas.common import ListParams, PaginatedList, Pagination
-from gpustack.schemas.model_preheats import ModelPreheatWorkerIdentity
+from gpustack.schemas.model_preheats import (
+    ModelPreheatWorkerIdentity,
+    ModelPreheatWorkerPendingCredential,
+)
 from gpustack.schemas.workers import (
     CPUInfo,
     GPUCoreInfo,
@@ -33,7 +36,9 @@ from gpustack.schemas.workers import (
 )
 from gpustack.schemas.users import User
 from gpustack.server.model_preheat_worker_identity import (
+    WORKER_CREDENTIAL_TTL,
     get_model_preheat_worker_identity,
+    issue_model_preheat_worker_credential,
     validate_model_preheat_worker_credential,
     validate_model_preheat_worker_registration_credential,
 )
@@ -129,7 +134,11 @@ def test_new_worker_creation_issues_credential_and_returns_loaded_worker(tmp_pat
             await connection.run_sync(
                 lambda sync_connection: SQLModel.metadata.create_all(
                     sync_connection,
-                    tables=[Worker.__table__, ModelPreheatWorkerIdentity.__table__],
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
                 )
             )
         request = SimpleNamespace(
@@ -187,6 +196,67 @@ def test_existing_worker_uuid_cannot_be_rebound_with_shared_token_only():
     assert error.value.message == "Invalid worker registration credentials"
 
 
+def test_initial_worker_credential_response_loss_recovers_via_admin_bootstrap(tmp_path):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'initial-worker-bootstrap.db'}",
+            poolclass=NullPool,
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: SQLModel.metadata.create_all(
+                    sync_connection,
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
+                )
+            )
+        system_request = SimpleNamespace(
+            state=SimpleNamespace(
+                user=SimpleNamespace(username="system/worker/10.0.0.9")
+            )
+        )
+        admin = User(
+            id=1,
+            username="admin",
+            is_admin=True,
+            hashed_password="unused",
+        )
+        async with AsyncSession(engine) as session:
+            worker = Worker(
+                name="initial-worker",
+                hostname="initial-worker",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="initial-worker-uuid",
+            )
+            session.add(worker)
+            await session.commit()
+            await session.refresh(worker)
+            worker_id = worker.id
+            worker_uuid = worker.worker_uuid
+            await issue_model_preheat_worker_credential(session, worker_id, worker_uuid)
+            with pytest.raises(UnauthorizedException):
+                await _authorize_worker_registration(
+                    system_request, session, worker_uuid, None
+                )
+            bootstrap = await bootstrap_model_preheat_worker_credential(
+                response=Response(),
+                session=session,
+                current_user=admin,
+                id=worker_id,
+            )
+            recovered = await validate_model_preheat_worker_credential(
+                session, bootstrap.credential, worker_uuid
+            )
+        await engine.dispose()
+        return recovered
+
+    assert asyncio.run(run()) is not None
+
+
 def test_upgraded_worker_bootstrap_recovery_credential_only_allows_registration(
     tmp_path,
 ):
@@ -199,7 +269,11 @@ def test_upgraded_worker_bootstrap_recovery_credential_only_allows_registration(
             await connection.run_sync(
                 lambda sync_connection: SQLModel.metadata.create_all(
                     sync_connection,
-                    tables=[Worker.__table__, ModelPreheatWorkerIdentity.__table__],
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
                 )
             )
         system_request = SimpleNamespace(
@@ -243,6 +317,11 @@ def test_upgraded_worker_bootstrap_recovery_credential_only_allows_registration(
             assert response.headers["cache-control"] == "no-store"
             assert bootstrap.credential.startswith("mpw_")
             assert bootstrap.worker_id == worker_id
+            await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=session,
+                credential=bootstrap.credential,
+            )
 
             await _authorize_worker_registration(
                 system_request,
@@ -341,3 +420,152 @@ def test_system_worker_cannot_call_admin_credential_bootstrap():
                 id=1,
             )
         )
+
+
+def test_recovery_credential_expires_but_pending_candidates_remain_safe(
+    tmp_path, monkeypatch
+):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'worker-recovery-ttl.db'}",
+            poolclass=NullPool,
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: SQLModel.metadata.create_all(
+                    sync_connection,
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
+                )
+            )
+        async with AsyncSession(engine) as session:
+            worker = Worker(
+                name="ttl-worker",
+                hostname="ttl-worker",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="ttl-worker-uuid",
+            )
+            session.add(worker)
+            await session.commit()
+            await session.refresh(worker)
+            worker_id = worker.id
+            worker_uuid = worker.worker_uuid
+            first = await issue_model_preheat_worker_credential(
+                session, worker_id, worker_uuid
+            )
+            await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=session,
+                credential=first,
+            )
+            second = await issue_model_preheat_worker_credential(
+                session, worker_id, worker_uuid
+            )
+            return engine, worker_uuid, first, second
+
+    engine, worker_uuid, first, second = asyncio.run(run())
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        "gpustack.server.model_preheat_worker_identity._utcnow",
+        lambda: now + WORKER_CREDENTIAL_TTL - timedelta(seconds=1),
+    )
+
+    async def within_ttl():
+        async with AsyncSession(engine) as session:
+            recovery = await validate_model_preheat_worker_registration_credential(
+                session, first, worker_uuid
+            )
+            normal = await validate_model_preheat_worker_credential(
+                session, first, worker_uuid
+            )
+            return recovery, normal
+
+    recovery, normal = asyncio.run(within_ttl())
+    assert recovery is not None
+    assert normal is None
+    monkeypatch.setattr(
+        "gpustack.server.model_preheat_worker_identity._utcnow",
+        lambda: now + timedelta(days=30),
+    )
+
+    async def expired():
+        async with AsyncSession(engine) as session:
+            recovery = await validate_model_preheat_worker_registration_credential(
+                session, first, worker_uuid
+            )
+            pending = await validate_model_preheat_worker_credential(
+                session, second, worker_uuid
+            )
+            return recovery, pending
+
+    recovery, pending = asyncio.run(expired())
+    assert recovery is None
+    assert pending is None
+    asyncio.run(engine.dispose())
+
+
+def test_concurrent_rotation_candidates_confirm_once(tmp_path):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'worker-candidates.db'}",
+            poolclass=NullPool,
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: SQLModel.metadata.create_all(
+                    sync_connection,
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
+                )
+            )
+        async with AsyncSession(engine) as setup_session:
+            worker = Worker(
+                name="candidate-worker",
+                hostname="candidate-worker",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="candidate-worker-uuid",
+            )
+            setup_session.add(worker)
+            await setup_session.commit()
+            await setup_session.refresh(worker)
+            worker_id = worker.id
+            worker_uuid = worker.worker_uuid
+        async with AsyncSession(engine) as first_session:
+            first = await issue_model_preheat_worker_credential(
+                first_session, worker_id, worker_uuid
+            )
+        async with AsyncSession(engine) as second_session:
+            second = await issue_model_preheat_worker_credential(
+                second_session, worker_id, worker_uuid
+            )
+        async with AsyncSession(engine) as validation_session:
+            first_pending = await validate_model_preheat_worker_credential(
+                validation_session, first, worker_uuid
+            )
+            second_pending = await validate_model_preheat_worker_credential(
+                validation_session, second, worker_uuid
+            )
+            request = SimpleNamespace(state=SimpleNamespace())
+            await get_model_preheat_worker_identity(
+                request=request,
+                session=validation_session,
+                credential=first,
+            )
+            second_after_confirmation = await validate_model_preheat_worker_credential(
+                validation_session, second, worker_uuid
+            )
+        await engine.dispose()
+        return first_pending, second_pending, second_after_confirmation
+
+    first_pending, second_pending, second_after_confirmation = asyncio.run(run())
+    assert first_pending is not None
+    assert second_pending is not None
+    assert second_after_confirmation is None

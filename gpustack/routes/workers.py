@@ -107,7 +107,7 @@ async def bootstrap_model_preheat_worker_credential(
     worker_id = worker.id
     worker_uuid = worker.worker_uuid
     credential = await issue_model_preheat_worker_credential(
-        session, worker_id, worker_uuid
+        session, worker_id, worker_uuid, reset_pending=True
     )
     response.headers["Cache-Control"] = "no-store"
     return ModelPreheatWorkerCredentialBootstrap(

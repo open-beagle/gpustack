@@ -8,17 +8,22 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 
 from fastapi import Depends, Header, Request
-from sqlalchemy import update
+from sqlalchemy import delete, update
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import UnauthorizedException
-from gpustack.schemas.model_preheats import ModelPreheatWorkerIdentity
+from gpustack.schemas.model_preheats import (
+    ModelPreheatWorkerIdentity,
+    ModelPreheatWorkerPendingCredential,
+)
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import get_session
 
 
 WORKER_CREDENTIAL_TTL = timedelta(hours=24)
+WORKER_CREDENTIAL_RECOVERY_TTL = WORKER_CREDENTIAL_TTL
 WORKER_CREDENTIAL_RENEW_WINDOW = timedelta(hours=6)
 WORKER_CREDENTIAL_PREFIX = "mpw"
 WORKER_CREDENTIAL_HEADER = "X-GPUStack-Worker-Credential"
@@ -32,63 +37,119 @@ class ModelPreheatWorkerPrincipal:
     token_version: int
 
 
-async def issue_model_preheat_worker_credential(session, worker_id, worker_uuid):
+async def issue_model_preheat_worker_credential(
+    session, worker_id, worker_uuid, *, reset_pending=False
+):
     worker = await session.get(Worker, worker_id)
     if worker is None or worker.worker_uuid != worker_uuid:
         raise ValueError("worker_registration_invalid")
-    now = _utcnow()
-    await session.exec(
-        update(ModelPreheatWorkerIdentity)
-        .where(
-            ModelPreheatWorkerIdentity.worker_uuid == worker_uuid,
-            ModelPreheatWorkerIdentity.worker_id != worker_id,
-            ModelPreheatWorkerIdentity.revoked_at.is_(None),
-        )
-        .values(revoked_at=now)
-        .execution_options(synchronize_session=False)
-    )
-    identity = (
+    # 凭据签发与待确认候选的写入必须是同一事务。比较 token_version 和当前
+    # token 状态，避免慢请求在另一台 Server 已确认候选后用旧 ORM 状态覆盖它。
+    for _ in range(3):
+        now = _utcnow()
+        identity = (
+            await session.exec(
+                select(ModelPreheatWorkerIdentity).where(
+                    ModelPreheatWorkerIdentity.worker_id == worker_id
+                )
+            )
+        ).first()
+        if identity is None:
+            identity = ModelPreheatWorkerIdentity(
+                worker_id=worker_id,
+                worker_uuid=worker_uuid,
+                bootstrap_required=False,
+                expires_at=now + WORKER_CREDENTIAL_TTL,
+            )
+            session.add(identity)
+            try:
+                await session.flush()
+            except IntegrityError:
+                # 并发首签发由另一请求创建了同一 Worker 的身份，重新读取即可。
+                await session.rollback()
+                continue
+            identity_id = identity.id
+        else:
+            identity_id = identity.id
+            token_hash_condition = (
+                ModelPreheatWorkerIdentity.token_hash.is_(None)
+                if identity.token_hash is None
+                else ModelPreheatWorkerIdentity.token_hash == identity.token_hash
+            )
+            revoked_at_condition = (
+                ModelPreheatWorkerIdentity.revoked_at.is_(None)
+                if identity.revoked_at is None
+                else ModelPreheatWorkerIdentity.revoked_at == identity.revoked_at
+            )
+            recovery_token_hash = identity.registration_recovery_token_hash
+            recovery_issued_at = identity.registration_recovery_issued_at
+            if reset_pending:
+                recovery_token_hash = None
+                recovery_issued_at = None
+            elif (
+                recovery_token_hash is None
+                or recovery_issued_at is None
+                or recovery_issued_at + WORKER_CREDENTIAL_RECOVERY_TTL <= now
+            ):
+                if _identity_token_is_active(identity, now):
+                    recovery_token_hash = identity.token_hash
+                    recovery_issued_at = now
+                else:
+                    recovery_token_hash = None
+                    recovery_issued_at = None
+            result = await session.exec(
+                update(ModelPreheatWorkerIdentity)
+                .where(
+                    ModelPreheatWorkerIdentity.id == identity_id,
+                    ModelPreheatWorkerIdentity.token_version == identity.token_version,
+                    ModelPreheatWorkerIdentity.bootstrap_required
+                    == identity.bootstrap_required,
+                    token_hash_condition,
+                    revoked_at_condition,
+                )
+                .values(
+                    worker_uuid=worker_uuid,
+                    token_hash=None,
+                    registration_recovery_token_hash=recovery_token_hash,
+                    registration_recovery_issued_at=recovery_issued_at,
+                    token_version=identity.token_version + 1,
+                    bootstrap_required=False,
+                    expires_at=now + WORKER_CREDENTIAL_TTL,
+                    revoked_at=None,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                await session.rollback()
+                continue
+        if reset_pending:
+            await session.exec(
+                delete(ModelPreheatWorkerPendingCredential).where(
+                    ModelPreheatWorkerPendingCredential.identity_id == identity_id
+                )
+            )
         await session.exec(
-            select(ModelPreheatWorkerIdentity).where(
-                ModelPreheatWorkerIdentity.worker_id == worker_id
+            update(ModelPreheatWorkerIdentity)
+            .where(
+                ModelPreheatWorkerIdentity.worker_uuid == worker_uuid,
+                ModelPreheatWorkerIdentity.worker_id != worker_id,
+                ModelPreheatWorkerIdentity.revoked_at.is_(None),
+            )
+            .values(revoked_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        secret = secrets.token_urlsafe(32)
+        token = f"{WORKER_CREDENTIAL_PREFIX}_{identity_id}_{secret}"
+        session.add(
+            ModelPreheatWorkerPendingCredential(
+                identity_id=identity_id,
+                token_hash=_hash_token(token),
+                expires_at=now + WORKER_CREDENTIAL_TTL,
             )
         )
-    ).first()
-    secret = secrets.token_urlsafe(32)
-    if identity is None:
-        identity = ModelPreheatWorkerIdentity(
-            worker_id=worker_id,
-            worker_uuid=worker_uuid,
-            bootstrap_required=False,
-            expires_at=now + WORKER_CREDENTIAL_TTL,
-        )
-        session.add(identity)
-        await session.flush()
-    else:
-        # 新凭据尚未完成正常鉴权前，保留 Worker 本地仍可能持有的恢复凭据。
-        # 连续丢失轮换响应时不能用 Worker 从未收到过的中间凭据替换它。
-        if identity.registration_recovery_token_hash is None:
-            if (
-                identity.token_hash is not None
-                and not identity.bootstrap_required
-                and identity.revoked_at is None
-                and identity.expires_at is not None
-                and identity.expires_at > now
-            ):
-                identity.registration_recovery_token_hash = identity.token_hash
-                identity.registration_recovery_issued_at = now
-            else:
-                identity.registration_recovery_issued_at = None
-        identity.token_version += 1
-        identity.worker_uuid = worker_uuid
-        identity.expires_at = now + WORKER_CREDENTIAL_TTL
-        identity.revoked_at = None
-        identity.bootstrap_required = False
-    token = f"{WORKER_CREDENTIAL_PREFIX}_{identity.id}_{secret}"
-    identity.token_hash = _hash_token(token)
-    session.add(identity)
-    await session.commit()
-    return token
+        await session.commit()
+        return token
+    raise RuntimeError("worker_credential_rotation_conflict")
 
 
 async def get_model_preheat_worker_identity(
@@ -101,43 +162,13 @@ async def get_model_preheat_worker_identity(
     credential_id = _credential_id(credential)
     if credential_id is None:
         raise _unauthorized()
-    identity = await session.get(ModelPreheatWorkerIdentity, credential_id)
     now = _utcnow()
-    if (
-        identity is None
-        or identity.bootstrap_required
-        or identity.token_hash is None
-        or identity.revoked_at is not None
-        or identity.expires_at is None
-        or identity.expires_at <= now
-        or not hmac.compare_digest(identity.token_hash, _hash_token(credential))
-    ):
+    identity = await _validated_confirmed_identity(session, credential, None, now)
+    if identity is None:
+        identity = await _confirm_pending_credential(session, credential, now)
+    if identity is None:
         raise _unauthorized()
-    current = (
-        await session.exec(
-            select(Worker)
-            .where(Worker.worker_uuid == identity.worker_uuid)
-            .order_by(Worker.id.desc())
-        )
-    ).first()
-    if current is None or current.id != identity.worker_id:
-        raise _unauthorized()
-    principal = ModelPreheatWorkerPrincipal(
-        worker_id=identity.worker_id,
-        worker_uuid=identity.worker_uuid,
-        credential_id=identity.id,
-        token_version=identity.token_version,
-    )
-    renewed = identity.expires_at <= now + WORKER_CREDENTIAL_RENEW_WINDOW
-    if renewed:
-        identity.expires_at = now + WORKER_CREDENTIAL_TTL
-    recovery_confirmed = identity.registration_recovery_token_hash is not None
-    if recovery_confirmed:
-        identity.registration_recovery_token_hash = None
-        identity.registration_recovery_issued_at = None
-    session.add(identity)
-    if renewed or recovery_confirmed:
-        await session.commit()
+    principal = _principal(identity)
     request.state.model_preheat_worker = principal
     return principal
 
@@ -145,33 +176,15 @@ async def get_model_preheat_worker_identity(
 async def validate_model_preheat_worker_credential(
     session, credential, worker_uuid, *, require_current=True
 ):
-    credential_id = _credential_id(credential)
-    if credential_id is None:
-        return None
-    identity = await session.get(ModelPreheatWorkerIdentity, credential_id)
     now = _utcnow()
-    if (
-        identity is None
-        or identity.worker_uuid != worker_uuid
-        or identity.bootstrap_required
-        or identity.token_hash is None
-        or identity.revoked_at is not None
-        or identity.expires_at is None
-        or identity.expires_at <= now
-        or not hmac.compare_digest(identity.token_hash, _hash_token(credential))
-    ):
-        return None
-    if require_current:
-        current = (
-            await session.exec(
-                select(Worker)
-                .where(Worker.worker_uuid == worker_uuid)
-                .order_by(Worker.id.desc())
-            )
-        ).first()
-        if current is None or current.id != identity.worker_id:
-            return None
-    return identity
+    identity = await _validated_confirmed_identity(
+        session, credential, worker_uuid, now, require_current=require_current
+    )
+    if identity is not None:
+        return identity
+    return await _validated_pending_identity(
+        session, credential, worker_uuid, now, require_current=require_current
+    )
 
 
 async def validate_model_preheat_worker_registration_credential(
@@ -182,11 +195,6 @@ async def validate_model_preheat_worker_registration_credential(
         session, credential, worker_uuid
     )
     if identity is not None:
-        if identity.registration_recovery_token_hash is not None:
-            identity.registration_recovery_token_hash = None
-            identity.registration_recovery_issued_at = None
-            session.add(identity)
-            await session.commit()
         return identity
     credential_id = _credential_id(credential)
     if credential_id is None:
@@ -198,6 +206,9 @@ async def validate_model_preheat_worker_registration_credential(
         or identity.bootstrap_required
         or identity.revoked_at is not None
         or identity.registration_recovery_token_hash is None
+        or identity.registration_recovery_issued_at is None
+        or identity.registration_recovery_issued_at + WORKER_CREDENTIAL_RECOVERY_TTL
+        <= _utcnow()
         or not hmac.compare_digest(
             identity.registration_recovery_token_hash, _hash_token(credential)
         )
@@ -213,6 +224,132 @@ async def validate_model_preheat_worker_registration_credential(
     if current is None or current.id != identity.worker_id:
         return None
     return identity
+
+
+async def _validated_confirmed_identity(
+    session, credential, worker_uuid, now, *, require_current=True
+):
+    credential_id = _credential_id(credential)
+    if credential_id is None:
+        return None
+    identity = await session.get(ModelPreheatWorkerIdentity, credential_id)
+    if (
+        not _identity_token_is_active(identity, now)
+        or (worker_uuid is not None and identity.worker_uuid != worker_uuid)
+        or not hmac.compare_digest(identity.token_hash, _hash_token(credential))
+    ):
+        return None
+    if require_current and not await _identity_is_current_worker(session, identity):
+        return None
+    return identity
+
+
+async def _validated_pending_identity(
+    session, credential, worker_uuid, now, *, require_current=True
+):
+    credential_id = _credential_id(credential)
+    if credential_id is None:
+        return None
+    pending = await _pending_credential(session, credential_id, credential, now)
+    if pending is None:
+        return None
+    identity = await session.get(ModelPreheatWorkerIdentity, pending.identity_id)
+    if (
+        identity is None
+        or identity.bootstrap_required
+        or identity.revoked_at is not None
+        or (worker_uuid is not None and identity.worker_uuid != worker_uuid)
+    ):
+        return None
+    if require_current and not await _identity_is_current_worker(session, identity):
+        return None
+    return identity
+
+
+async def _confirm_pending_credential(session, credential, now):
+    credential_id = _credential_id(credential)
+    if credential_id is None:
+        return None
+    pending = await _pending_credential(session, credential_id, credential, now)
+    if pending is None:
+        return None
+    identity = await session.get(ModelPreheatWorkerIdentity, pending.identity_id)
+    if identity is None or not await _identity_is_current_worker(session, identity):
+        return None
+    identity_id = identity.id
+    result = await session.exec(
+        update(ModelPreheatWorkerIdentity)
+        .where(
+            ModelPreheatWorkerIdentity.id == identity_id,
+            ModelPreheatWorkerIdentity.token_hash.is_(None),
+            ModelPreheatWorkerIdentity.bootstrap_required.is_(False),
+            ModelPreheatWorkerIdentity.revoked_at.is_(None),
+        )
+        .values(
+            token_hash=pending.token_hash,
+            expires_at=now + WORKER_CREDENTIAL_TTL,
+            registration_recovery_token_hash=None,
+            registration_recovery_issued_at=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        await session.rollback()
+        return None
+    await session.exec(
+        delete(ModelPreheatWorkerPendingCredential).where(
+            ModelPreheatWorkerPendingCredential.identity_id == identity_id
+        )
+    )
+    await session.commit()
+    return await session.get(ModelPreheatWorkerIdentity, identity_id)
+
+
+async def _pending_credential(session, credential_id, credential, now):
+    pending = (
+        await session.exec(
+            select(ModelPreheatWorkerPendingCredential).where(
+                ModelPreheatWorkerPendingCredential.identity_id == credential_id,
+                ModelPreheatWorkerPendingCredential.expires_at > now,
+            )
+        )
+    ).all()
+    expected_hash = _hash_token(credential)
+    for candidate in pending:
+        if hmac.compare_digest(candidate.token_hash, expected_hash):
+            return candidate
+    return None
+
+
+async def _identity_is_current_worker(session, identity):
+    current = (
+        await session.exec(
+            select(Worker)
+            .where(Worker.worker_uuid == identity.worker_uuid)
+            .order_by(Worker.id.desc())
+        )
+    ).first()
+    return current is not None and current.id == identity.worker_id
+
+
+def _identity_token_is_active(identity, now):
+    return (
+        identity is not None
+        and not identity.bootstrap_required
+        and identity.token_hash is not None
+        and identity.revoked_at is None
+        and identity.expires_at is not None
+        and identity.expires_at > now
+    )
+
+
+def _principal(identity):
+    return ModelPreheatWorkerPrincipal(
+        worker_id=identity.worker_id,
+        worker_uuid=identity.worker_uuid,
+        credential_id=identity.id,
+        token_version=identity.token_version,
+    )
 
 
 async def worker_uuid_has_credential(session, worker_uuid):
