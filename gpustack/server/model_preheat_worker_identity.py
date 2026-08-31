@@ -248,6 +248,7 @@ async def bind_model_preheat_worker_upgrade_proof(
     now = _utcnow()
     if (
         not _is_upgrade_proof(upgrade_proof)
+        or worker_update.worker_uuid != worker.worker_uuid
         or worker_update.name != worker.name
         or worker_update.hostname != worker.hostname
         or worker_update.ip != worker.ip

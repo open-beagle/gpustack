@@ -250,6 +250,50 @@ def test_different_upgrade_proofs_have_one_atomic_binder(tmp_path):
     assert sorted(asyncio.run(run())) == [False, True]
 
 
+def test_upgrade_proof_rejects_different_worker_uuid_without_state_change(tmp_path):
+    async def run():
+        engine = await _create_engine(tmp_path, "proof-wrong-uuid.db")
+        async with AsyncSession(engine) as session:
+            worker_id, worker_uuid = await _create_worker_identity(session)
+            worker, worker_update = await _worker_update(session, worker_id)
+            worker_update.worker_uuid = "different-worker-uuid"
+            with pytest.raises(UnauthorizedException):
+                await update_worker(
+                    request=_system_request(),
+                    response=Response(),
+                    session=session,
+                    id=worker_id,
+                    worker_in=worker_update,
+                    rotate_preheat_credential=True,
+                    worker_credential=None,
+                    upgrade_proof=_proof("g"),
+                )
+            worker_after = await session.get(Worker, worker_id)
+            identity_after = (
+                await session.exec(
+                    select(ModelPreheatWorkerIdentity).where(
+                        ModelPreheatWorkerIdentity.worker_id == worker_id
+                    )
+                )
+            ).one()
+            pending_after = (
+                await session.exec(
+                    select(ModelPreheatWorkerPendingCredential).where(
+                        ModelPreheatWorkerPendingCredential.identity_id
+                        == identity_after.id
+                    )
+                )
+            ).all()
+        await engine.dispose()
+        return worker_after, identity_after, pending_after
+
+    worker_after, identity_after, pending_after = asyncio.run(run())
+    assert worker_after.worker_uuid == "legacy-worker-uuid"
+    assert identity_after.bootstrap_required is True
+    assert identity_after.upgrade_proof_hash is None
+    assert pending_after == []
+
+
 @pytest.mark.parametrize(
     "bootstrap_required,window,hostname,ip",
     [
