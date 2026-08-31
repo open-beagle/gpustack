@@ -37,6 +37,8 @@ class ModelPreheatWorkerTaskClient:
         with self._client.get_httpx_client().stream(
             "GET", self._url, params=params, timeout=None
         ) as response:
+            if response.status_code >= 400:
+                response.read()
             raise_if_response_error(response)
             for line in response.iter_lines():
                 if line:
@@ -66,6 +68,8 @@ class ModelPreheatWorkerTaskClient:
             params=params,
             timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
         ) as response:
+            if response.status_code >= 400:
+                await response.aread()
             raise_if_response_error(response)
             lines = response.aiter_lines()
             while True:

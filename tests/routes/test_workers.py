@@ -1027,3 +1027,53 @@ def test_stale_pending_confirmation_cannot_replace_new_generation(
     assert current_after_stale_confirmation is not None
     assert recovery_after_stale_confirmation is not None
     assert reset_principal is not None
+
+
+def test_pending_confirmation_recovers_when_parallel_request_already_confirmed(
+    tmp_path,
+):
+    async def run():
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'pending-confirmed-race.db'}",
+            poolclass=NullPool,
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: SQLModel.metadata.create_all(
+                    sync_connection,
+                    tables=[
+                        Worker.__table__,
+                        ModelPreheatWorkerIdentity.__table__,
+                        ModelPreheatWorkerPendingCredential.__table__,
+                    ],
+                )
+            )
+        async with AsyncSession(engine) as session:
+            worker = Worker(
+                name="parallel-confirm-worker",
+                hostname="parallel-confirm-worker",
+                ip="127.0.0.1",
+                port=10150,
+                worker_uuid="parallel-confirm-worker-uuid",
+            )
+            session.add(worker)
+            await session.commit()
+            await session.refresh(worker)
+            credential = await issue_model_preheat_worker_credential(
+                session, worker.id, worker.worker_uuid
+            )
+            first = await get_model_preheat_worker_identity(
+                request=SimpleNamespace(state=SimpleNamespace()),
+                session=session,
+                credential=credential,
+            )
+            second = await worker_credential_identity._confirm_pending_credential(
+                session, credential, datetime.now(timezone.utc)
+            )
+        await engine.dispose()
+        return first, second
+
+    first, second = asyncio.run(run())
+    assert first is not None
+    assert second is not None
+    assert second.worker_id == first.worker_id

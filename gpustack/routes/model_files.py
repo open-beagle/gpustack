@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import inspect
 from sqlalchemy.exc import NoInspectionAvailable
+from sqlalchemy.orm import noload
 from sqlmodel import String, cast, func, or_, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -177,7 +178,12 @@ async def _stream_model_files(engine, fields=None, filter_func=None):
                 event.data = public_items[0]
             finally:
                 with anyio.CancelScope(shield=True):
-                    await session.close()
+                    try:
+                        await session.close()
+                    except ValueError as exc:
+                        if str(exc) != "Connection closed":
+                            raise
+                        return
             yield ModelFile._format_event(event)
     except asyncio.CancelledError:
         return
@@ -408,6 +414,7 @@ async def _reload_model_file_by_id(session, model_file_id):
         await session.exec(
             select(ModelFile)
             .where(ModelFile.id == model_file_id)
+            .options(noload(ModelFile.instances))
             .execution_options(populate_existing=True)
         )
     ).first()

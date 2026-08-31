@@ -37,6 +37,8 @@ class ModelStorageSyncTaskClient:
             params=params,
             timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
         ) as response:
+            if response.status_code >= 400:
+                await response.aread()
             raise_if_response_error(response)
             lines = response.aiter_lines()
             while True:

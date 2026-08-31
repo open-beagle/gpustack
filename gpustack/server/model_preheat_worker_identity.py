@@ -402,7 +402,7 @@ async def _confirm_pending_credential(session, credential, now):
         return None
     pending = await _pending_credential(session, credential_id, credential, now)
     if pending is None:
-        return None
+        return await _validated_confirmed_identity(session, credential, None, now)
     identity = await session.get(ModelPreheatWorkerIdentity, pending.identity_id)
     if identity is None or not await _identity_is_current_worker(session, identity):
         return None
@@ -428,7 +428,7 @@ async def _confirm_pending_credential(session, credential, now):
     )
     if result.rowcount != 1:
         await session.rollback()
-        return None
+        return await _validated_confirmed_identity(session, credential, None, now)
     await session.exec(
         delete(ModelPreheatWorkerPendingCredential).where(
             ModelPreheatWorkerPendingCredential.identity_id == identity_id

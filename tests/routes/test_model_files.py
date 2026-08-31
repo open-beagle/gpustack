@@ -117,6 +117,39 @@ def test_streaming_cancellation_closes_session_outside_cancel_scope(
     anyio.run(run)
 
 
+def test_model_file_stream_stops_when_cancel_closes_sqlite_connection(monkeypatch):
+    class ClosingSession:
+        def __init__(self, _engine):
+            pass
+
+        async def get(self, *_args):
+            return SimpleNamespace(
+                id=1,
+                worker_id=1,
+                created_at=None,
+                updated_at=None,
+            )
+
+        async def exec(self, *_args):
+            return SimpleNamespace(first=lambda: None, all=lambda: [])
+
+        async def close(self):
+            raise ValueError("Connection closed")
+
+    async def subscribe(_cls, _engine):
+        yield Event(EventType.UPDATED, SimpleNamespace(id=1))
+
+    async def run():
+        stream = _stream_model_files(object(), fields={"worker_id": 2})
+        assert await anext(stream)
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+
+    monkeypatch.setattr(model_files_routes, "AsyncSession", ClosingSession)
+    monkeypatch.setattr(ModelFile, "subscribe", classmethod(subscribe))
+    anyio.run(run)
+
+
 def test_model_file_crud_cascades_sync_tasks(tmp_path):
     asyncio.run(_run_model_file_crud(tmp_path))
 
